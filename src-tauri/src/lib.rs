@@ -1,9 +1,13 @@
 pub mod archive;
+pub mod classify;
+pub mod cleanup;
 pub mod commands;
 pub mod db;
 pub mod i18n;
 pub mod ignore;
 pub mod rules;
+pub mod safe_fs;
+pub mod scan;
 pub mod scheduler;
 pub mod tray;
 pub mod watcher;
@@ -12,6 +16,7 @@ use commands::*;
 use db::{init_db, FOLDER_MODE_SILENT};
 use directories::ProjectDirs;
 use std::collections::HashMap;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tauri::Manager;
@@ -26,6 +31,7 @@ pub struct AppState {
     /// Last destination folder waiting to be opened when app is activated by notification click
     pub pending_open_folder: Arc<Mutex<Option<String>>>,
     pub scheduler: scheduler::Scheduler,
+    pub is_scanning: Arc<AtomicBool>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -74,6 +80,15 @@ pub fn run() {
             } else if let Some(window) = app.get_webview_window("settings") {
                 let _ = window.show();
                 let _ = window.set_focus();
+            } else if let Some(window) = app.get_webview_window("dashboard") {
+                let _ = window.show();
+                let _ = window.set_focus();
+            } else if let Some(window) = app.get_webview_window("cleanup") {
+                let _ = window.show();
+                let _ = window.set_focus();
+            } else if let Some(window) = app.get_webview_window("suggestions") {
+                let _ = window.show();
+                let _ = window.set_focus();
             }
         }))
         .manage(AppState {
@@ -84,6 +99,7 @@ pub fn run() {
             ignored_files,
             pending_open_folder,
             scheduler: scheduler::Scheduler::new(),
+            is_scanning: Arc::new(AtomicBool::new(false)),
         })
         .setup(|app| {
             // Hid app from dock on macOS
@@ -160,6 +176,7 @@ pub fn run() {
             remove_folder_cmd,
             update_folder_mode_cmd,
             get_logs_cmd,
+            get_cleanup_logs_cmd,
             get_stats_cmd,
             undo_action_cmd,
             undo_all_cmd,
@@ -188,6 +205,17 @@ pub fn run() {
             get_version_cmd,
             export_rules_cmd,
             import_rules_cmd,
+            start_scan_cmd,
+            is_scanning_cmd,
+            get_dashboard_stats_cmd,
+            find_duplicates_cmd,
+            find_large_files_cmd,
+            find_stale_files_cmd,
+            find_empty_dirs_cmd,
+            execute_cleanup_cmd,
+            get_suggestions_cmd,
+            dismiss_suggestion_cmd,
+            accept_suggestion_cmd,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

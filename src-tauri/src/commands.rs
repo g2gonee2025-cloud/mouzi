@@ -1,11 +1,14 @@
 use crate::db::*;
 use crate::ignore::{load_mouziignore, save_mouziignore};
 use crate::rules::manual_scan_folder;
+use crate::safe_fs::{move_file, MoveOutcome};
+use crate::scan::{self, ScanEvent};
 use crate::AppState;
 use serde::Serialize;
 use std::path::Path;
+use std::sync::atomic::Ordering;
 use std::time::Instant;
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_notification::NotificationExt;
 
@@ -122,51 +125,134 @@ pub fn get_stats_cmd() -> Result<Vec<(String, i64)>, String> {
     get_weekly_stats().map_err(|e| e.to_string())
 }
 
+// ---------------------------------------------------------------------------
+// Undo helpers
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UndoResult {
+    pub status: String, // "ok" | "collision" | "missing" | "failed"
+    pub message: Option<String>,
+    pub restored_to: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UndoAllResult {
+    pub count: usize,
+    pub results: Vec<UndoResult>,
+}
+
+fn perform_undo(
+    conn: &rusqlite::Connection,
+    ignored: &mut std::collections::HashMap<String, Instant>,
+    id: i64,
+    source: String,
+    dest: Option<String>,
+) -> Result<UndoResult, String> {
+    let dest_path = match dest {
+        Some(ref d) if !d.is_empty() => std::path::Path::new(d),
+        _ => {
+            conn.execute("UPDATE action_logs SET undone=1 WHERE id=?1", [id])
+                .map_err(|e| e.to_string())?;
+            return Ok(UndoResult {
+                status: "missing".to_string(),
+                message: None,
+                restored_to: None,
+            });
+        }
+    };
+
+    if !dest_path.exists() {
+        conn.execute("UPDATE action_logs SET undone=1 WHERE id=?1", [id])
+            .map_err(|e| e.to_string())?;
+        return Ok(UndoResult {
+            status: "missing".to_string(),
+            message: None,
+            restored_to: None,
+        });
+    }
+
+    let src_path = std::path::Path::new(&source);
+
+    match move_file(dest_path, src_path) {
+        Ok(MoveOutcome::Moved) => {
+            // The watcher must ignore both the path the file left and the path it landed on.
+            ignored.insert(dest_path.to_string_lossy().to_string(), Instant::now());
+            ignored.insert(source.clone(), Instant::now());
+            conn.execute("UPDATE action_logs SET undone=1 WHERE id=?1", [id])
+                .map_err(|e| e.to_string())?;
+            Ok(UndoResult {
+                status: "ok".to_string(),
+                message: None,
+                restored_to: Some(source),
+            })
+        }
+        Ok(MoveOutcome::MovedWithNewName(name)) => {
+            let restored = src_path.with_file_name(&name).to_string_lossy().to_string();
+            ignored.insert(dest_path.to_string_lossy().to_string(), Instant::now());
+            ignored.insert(restored.clone(), Instant::now());
+            conn.execute("UPDATE action_logs SET undone=1 WHERE id=?1", [id])
+                .map_err(|e| e.to_string())?;
+            Ok(UndoResult {
+                status: "collision".to_string(),
+                message: None,
+                restored_to: Some(restored),
+            })
+        }
+        Err(e) => Ok(UndoResult {
+            status: "failed".to_string(),
+            message: Some(e),
+            restored_to: None,
+        }),
+    }
+}
+
 #[tauri::command]
-pub fn undo_action_cmd(id: i64, state: tauri::State<AppState>) -> Result<bool, String> {
+pub fn undo_action_cmd(id: i64, state: tauri::State<AppState>) -> Result<UndoResult, String> {
     let db = get_db();
     let conn = db.lock().unwrap();
-    let log: Option<(String, String)> = conn
+    let (source, dest): (String, Option<String>) = conn
         .query_row(
             "SELECT source_path, destination_path FROM action_logs WHERE id=?1 AND undone=0",
             [id],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
-        .ok();
+        .map_err(|e| format!("No undoable action found for id={}: {}", id, e))?;
 
-    if let Some((source, dest)) = log {
-        if !dest.is_empty() && std::path::Path::new(&dest).exists() {
-            let _ = std::fs::rename(&dest, &source);
-            // Ignore this file for 5 seconds so the watcher doesn't re-process it
-            let mut ignored = state.ignored_files.lock().unwrap();
-            ignored.insert(source, Instant::now());
-        }
-        conn.execute("UPDATE action_logs SET undone=1 WHERE id=?1", [id])
-            .map_err(|e| e.to_string())?;
-        Ok(true)
-    } else {
-        Ok(false)
-    }
+    let mut ignored = state.ignored_files.lock().unwrap();
+    perform_undo(&conn, &mut ignored, id, source, dest)
 }
 
 #[tauri::command]
-pub fn undo_all_cmd(state: tauri::State<AppState>) -> Result<i32, String> {
+pub fn undo_all_cmd(state: tauri::State<AppState>) -> Result<UndoAllResult, String> {
     let logs = crate::db::get_undoable_logs().map_err(|e| e.to_string())?;
     let db = get_db();
     let conn = db.lock().unwrap();
-    let mut count = 0;
+    let mut ignored = state.ignored_files.lock().unwrap();
 
+    let mut results = Vec::with_capacity(logs.len());
     for (id, source, dest) in logs {
-        if !dest.is_empty() && std::path::Path::new(&dest).exists() {
-            let _ = std::fs::rename(&dest, &source);
-            let mut ignored = state.ignored_files.lock().unwrap();
-            ignored.insert(source, Instant::now());
+        match perform_undo(&conn, &mut ignored, id, source, dest) {
+            Ok(r) => results.push(r),
+            Err(e) => {
+                results.push(UndoResult {
+                    status: "failed".to_string(),
+                    message: Some(e),
+                    restored_to: None,
+                });
+            }
         }
-        let _ = conn.execute("UPDATE action_logs SET undone=1 WHERE id=?1", [id]);
-        count += 1;
     }
 
-    Ok(count)
+    let count = results.iter().filter(|r| r.status != "failed").count();
+    Ok(UndoAllResult { count, results })
+}
+
+#[tauri::command]
+pub fn get_cleanup_logs_cmd(limit: i64) -> Result<Vec<CleanupAction>, String> {
+    get_cleanup_logs(limit).map_err(|e| e.to_string())
 }
 
 /// Return the current app version and release date.
@@ -424,4 +510,268 @@ pub fn import_rules_cmd(path: String, replace: bool) -> Result<usize, String> {
         count += 1;
     }
     Ok(count)
+}
+
+// ---------------------------------------------------------------------------
+// Scan / Dashboard commands
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScanStarted {
+    pub started: bool,
+}
+
+/// Scan all watched (non-paused) folders in the background.
+/// Returns immediately; emits `scan-progress` events during the walk and
+/// `scan-complete` per root when done.
+#[tauri::command]
+pub fn start_scan_cmd(app: AppHandle, state: tauri::State<'_, AppState>) -> Result<ScanStarted, String> {
+    let roots: Vec<String> = get_watched_folders()
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .filter(|f| !is_folder_paused_mode(&f.mode))
+        .map(|f| f.path)
+        .collect();
+    if roots.is_empty() {
+        return Ok(ScanStarted { started: false });
+    }
+    let is_scanning = state.is_scanning.clone();
+    if is_scanning.swap(true, Ordering::SeqCst) {
+        return Ok(ScanStarted { started: false });
+    }
+    std::thread::spawn(move || {
+        scan::scan_roots(&roots, |event| match event {
+            ScanEvent::Progress(p) => {
+                let _ = app.emit("scan-progress", p);
+            }
+            ScanEvent::Complete(s) => {
+                let _ = app.emit("scan-complete", s);
+            }
+        });
+        is_scanning.store(false, Ordering::SeqCst);
+    });
+    Ok(ScanStarted { started: true })
+}
+
+/// Returns `true` while a scan is in progress.
+#[tauri::command]
+pub fn is_scanning_cmd(state: tauri::State<'_, AppState>) -> bool {
+    state.is_scanning.load(Ordering::SeqCst)
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DashboardStats {
+    pub total_files: i64,
+    pub total_bytes: i64,
+    pub category_breakdown: Vec<CategoryStat>,
+    pub largest_files: Vec<LargestFile>,
+    pub watched_roots: Vec<RootStat>,
+    pub last_scan_at: Option<i64>,
+}
+
+/// Aggregate stats for the dashboard view.
+#[tauri::command]
+pub fn get_dashboard_stats_cmd() -> Result<DashboardStats, String> {
+    let stats = get_inventory_stats().map_err(|e| e.to_string())?;
+    let category_breakdown = get_category_distribution().map_err(|e| e.to_string())?;
+    let largest_files = get_largest_files(50).map_err(|e| e.to_string())?;
+    let watched_roots = get_root_summaries().map_err(|e| e.to_string())?;
+    Ok(DashboardStats {
+        total_files: stats.total_files,
+        total_bytes: stats.total_bytes,
+        category_breakdown,
+        largest_files,
+        watched_roots,
+        last_scan_at: stats.last_scan_at,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Cleanup commands
+// ---------------------------------------------------------------------------
+
+/// Find duplicate files across the scanned inventory.
+#[tauri::command]
+pub fn find_duplicates_cmd() -> Result<Vec<crate::cleanup::DuplicateGroup>, String> {
+    if !crate::cleanup::has_inventory() {
+        return Err("No scan data — run a scan first".to_string());
+    }
+    crate::cleanup::find_duplicates()
+}
+
+/// Find files larger than a given threshold (in bytes).
+#[tauri::command]
+pub fn find_large_files_cmd(min_bytes: i64) -> Result<Vec<crate::cleanup::CleanupFile>, String> {
+    if !crate::cleanup::has_inventory() {
+        return Err("No scan data — run a scan first".to_string());
+    }
+    crate::cleanup::find_large_files(min_bytes)
+}
+
+/// Find files not modified in the given number of days.
+#[tauri::command]
+pub fn find_stale_files_cmd(days: i64) -> Result<Vec<crate::cleanup::CleanupFile>, String> {
+    if !crate::cleanup::has_inventory() {
+        return Err("No scan data — run a scan first".to_string());
+    }
+    crate::cleanup::find_stale_files(days)
+}
+
+/// Find deepest empty directories under watched roots.
+#[tauri::command]
+pub fn find_empty_dirs_cmd() -> Result<Vec<String>, String> {
+    if !crate::cleanup::has_inventory() {
+        return Err("No scan data — run a scan first".to_string());
+    }
+    crate::cleanup::find_empty_dirs()
+}
+
+/// Execute a batch of cleanup actions (trash files / remove empty dirs).
+#[tauri::command]
+pub fn execute_cleanup_cmd(
+    actions: Vec<crate::cleanup::CleanupRequest>,
+) -> Result<Vec<crate::cleanup::CleanupOutcome>, String> {
+    Ok(crate::cleanup::execute_cleanup(&actions))
+}
+
+// ---------------------------------------------------------------------------
+// Suggestion commands (AI-assisted organization)
+// ---------------------------------------------------------------------------
+
+/// Get category suggestions for unclassified files in the inventory.
+#[tauri::command]
+pub fn get_suggestions_cmd(limit: i64) -> Result<Vec<crate::classify::Suggestion>, String> {
+    let provider = crate::classify::detect_provider();
+    let limit = limit.clamp(1, 200) as usize;
+    Ok(crate::classify::get_suggestions(limit, provider.as_ref()))
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcceptOutcome {
+    pub path: String,
+    pub status: String, // "ok" | "missing" | "failed"
+    pub message: Option<String>,
+    pub dest: Option<String>,
+}
+
+/// Dismiss a suggestion so it no longer appears in the list.
+#[tauri::command]
+pub fn dismiss_suggestion_cmd(path: String) -> Result<(), String> {
+    crate::db::dismiss_suggestion(&path).map_err(|e| e.to_string())
+}
+
+/// Move a file into its suggested category folder and optionally create a
+/// matching rule. Returns a per-file status; never panics on missing files.
+#[tauri::command]
+pub fn accept_suggestion_cmd(
+    path: String,
+    suggested_category: String,
+    create_rule: bool,
+) -> Result<AcceptOutcome, String> {
+    let src = Path::new(&path);
+    if !src.exists() {
+        return Ok(AcceptOutcome {
+            path,
+            status: "missing".to_string(),
+            message: None,
+            dest: None,
+        });
+    }
+
+    let file_name = src
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let dest = src
+        .parent()
+        .map(|p| p.join(&suggested_category).join(&file_name))
+        .unwrap_or_else(|| Path::new(&suggested_category).join(&file_name));
+
+    let outcome = match move_file(src, &dest) {
+        Ok(MoveOutcome::Moved) => AcceptOutcome {
+            path: path.clone(),
+            status: "ok".to_string(),
+            message: None,
+            dest: Some(dest.to_string_lossy().into_owned()),
+        },
+        Ok(MoveOutcome::MovedWithNewName(name)) => {
+            let actual = dest.with_file_name(&name);
+            AcceptOutcome {
+                path: path.clone(),
+                status: "ok".to_string(),
+                message: None,
+                dest: Some(actual.to_string_lossy().into_owned()),
+            }
+        }
+        Err(e) => AcceptOutcome {
+            path: path.clone(),
+            status: "failed".to_string(),
+            message: Some(e),
+            dest: None,
+        },
+    };
+
+    if outcome.status == "ok" {
+        let _ = crate::db::log_action(&ActionLog {
+            id: None,
+            timestamp: chrono::Utc::now(),
+            source_path: path.clone(),
+            destination_path: outcome.dest.clone(),
+            action: "move".to_string(),
+            file_name: file_name.clone(),
+            file_type: suggested_category.clone(),
+            undone: false,
+        });
+
+        if create_rule {
+            create_suggestion_rule(&file_name, &suggested_category);
+        }
+
+        let _ = crate::db::update_inventory_category(&path, &suggested_category);
+        let _ = crate::db::clear_dismissed_suggestion(&path);
+    }
+
+    Ok(outcome)
+}
+
+/// Create a rule from a suggestion acceptance. Skips insertion if an enabled
+/// move rule already covers the same extension with the same destination.
+fn create_suggestion_rule(file_name: &str, category: &str) {
+    let ext = file_name
+        .rfind('.')
+        .and_then(|dot| file_name.get(dot + 1..))
+        .map(str::to_lowercase);
+    let ext = match ext {
+        Some(e) if !e.is_empty() => e,
+        _ => return,
+    };
+
+    let already_covered = get_rules()
+        .map(|rules| {
+            rules.iter().any(|r| {
+                r.enabled
+                    && r.action == "move"
+                    && r.destination == category
+                    && (r.extensions.iter().any(|e| e == &ext) || r.extensions.contains(&"*".to_string()))
+            })
+        })
+        .unwrap_or(false);
+    if already_covered {
+        return;
+    }
+
+    let _ = add_rule(&Rule {
+        id: None,
+        name: category.to_string(),
+        priority: 10,
+        enabled: true,
+        extensions: vec![ext],
+        pattern: None,
+        destination: category.to_string(),
+        action: "move".to_string(),
+        folder_id: 0,
+    });
 }

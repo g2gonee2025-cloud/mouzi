@@ -3,7 +3,11 @@ use rusqlite::{params, Connection, Result as SqliteResult};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 use once_cell::sync::OnceCell;
+
+/// Number of inventory rows to insert per transaction batch.
+pub const INVENTORY_BATCH_SIZE: usize = 500;
 
 // ---------------------------------------------------------------------------
 // Folder modes
@@ -68,6 +72,18 @@ pub struct ActionLog {
     pub file_name: String,
     pub file_type: String,
     pub undone: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CleanupAction {
+    pub id: Option<i64>,
+    pub timestamp: DateTime<Utc>,
+    pub path: String,
+    pub prev_path: Option<String>,
+    pub dest: Option<String>,
+    pub action: String,
+    pub status: String,
+    pub undoable: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -155,6 +171,65 @@ pub fn init_db(app_dir: PathBuf) -> SqliteResult<()> {
         [],
     )?;
 
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS cleanup_actions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            path TEXT NOT NULL,
+            prev_path TEXT,
+            dest TEXT,
+            action TEXT NOT NULL,
+            status TEXT NOT NULL,
+            undoable INTEGER NOT NULL DEFAULT 0
+        )",
+        [],
+    )?;
+
+    // File inventory table for scan/dashboard
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS file_inventory (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            root_path TEXT NOT NULL,
+            path TEXT NOT NULL UNIQUE,
+            size INTEGER NOT NULL DEFAULT 0,
+            mtime INTEGER NOT NULL DEFAULT 0,
+            category TEXT NOT NULL DEFAULT 'Other',
+            scanned_at INTEGER NOT NULL DEFAULT 0
+        )",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_file_inventory_root ON file_inventory(root_path)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_file_inventory_size ON file_inventory(size)",
+        [],
+    )?;
+
+    // Dismissed suggestions for AI-assisted organization
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS dismissed_suggestions (
+            path TEXT PRIMARY KEY,
+            dismissed_at INTEGER NOT NULL DEFAULT 0
+        )",
+        [],
+    )?;
+
+    // Persistent content-hash cache for duplicate detection, keyed by
+    // (path, size, mtime): any change to size or mtime invalidates the entry.
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS hash_cache (
+            path TEXT NOT NULL,
+            size INTEGER NOT NULL,
+            mtime INTEGER NOT NULL,
+            hash TEXT NOT NULL,
+            is_full INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (path, size, mtime)
+        )",
+        [],
+    )?;
+
     // Migration: add missing columns
     let cols: Vec<String> = conn.prepare("PRAGMA table_info(settings)")?
         .query_map([], |row| row.get::<_, String>(1))?
@@ -222,11 +297,9 @@ pub fn migrate_rules_to_relative() -> SqliteResult<()> {
             .query_map([format!("{}%", folder_norm)], |row| Ok((row.get(0)?, row.get(1)?)))?
             .collect::<SqliteResult<Vec<_>>>()?;
         for (id, dest) in rows {
-            let relative = if dest.starts_with(&folder_norm) {
-                dest[folder_norm.len()..].trim_start_matches('/').trim_start_matches('\\').to_string()
-            } else {
-                dest.clone()
-            };
+            let relative = dest.strip_prefix(folder_norm)
+                    .map(|s| s.trim_start_matches('/').trim_start_matches('\\').to_string())
+                    .unwrap_or_else(|| dest.clone());
             if !relative.is_empty() && relative != dest {
                 conn.execute("UPDATE rules SET destination = ?1 WHERE id = ?2", params![relative, id])?;
             }
@@ -409,14 +482,18 @@ pub fn get_recent_logs(limit: i64) -> SqliteResult<Vec<ActionLog>> {
     Ok(logs)
 }
 
-pub fn get_undoable_logs() -> SqliteResult<Vec<(i64, String, String)>> {
+pub fn get_undoable_logs() -> SqliteResult<Vec<(i64, String, Option<String>)>> {
     let db = get_db();
     let conn = db.lock().unwrap();
     let mut stmt = conn.prepare(
         "SELECT id, source_path, destination_path FROM action_logs WHERE undone = 0 ORDER BY timestamp DESC"
     )?;
     let logs = stmt.query_map([], |row| {
-        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(2)?,
+        ))
     })?
     .collect::<SqliteResult<Vec<_>>>()?;
     Ok(logs)
@@ -507,4 +584,530 @@ pub fn clear_logs() -> SqliteResult<()> {
     let conn = db.lock().unwrap();
     conn.execute("DELETE FROM action_logs", [])?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// cleanup_actions helpers
+// ---------------------------------------------------------------------------
+
+pub fn insert_cleanup_action(action: &CleanupAction) -> SqliteResult<i64> {
+    let db = get_db();
+    let conn = db.lock().unwrap();
+    conn.execute(
+        "INSERT INTO cleanup_actions (timestamp, path, prev_path, dest, action, status, undoable)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            action.timestamp.to_rfc3339(),
+            action.path,
+            action.prev_path,
+            action.dest,
+            action.action,
+            action.status,
+            action.undoable as i32,
+        ],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+pub fn get_cleanup_logs(limit: i64) -> SqliteResult<Vec<CleanupAction>> {
+    let db = get_db();
+    let conn = db.lock().unwrap();
+    let mut stmt = conn.prepare(
+        "SELECT id, timestamp, path, prev_path, dest, action, status, undoable
+         FROM cleanup_actions ORDER BY timestamp DESC LIMIT ?1",
+    )?;
+    let logs = stmt
+        .query_map(params![limit], |row| {
+            let ts_str: String = row.get(1)?;
+            Ok(CleanupAction {
+                id: row.get(0)?,
+                timestamp: DateTime::parse_from_rfc3339(&ts_str)
+                    .unwrap()
+                    .with_timezone(&Utc),
+                path: row.get(2)?,
+                prev_path: row.get(3)?,
+                dest: row.get(4)?,
+                action: row.get(5)?,
+                status: row.get(6)?,
+                undoable: row.get::<_, i32>(7)? != 0,
+            })
+        })?
+        .collect::<SqliteResult<Vec<_>>>()?;
+    Ok(logs)
+}
+
+pub fn mark_cleanup_undone(id: i64) -> SqliteResult<()> {
+    let db = get_db();
+    let conn = db.lock().unwrap();
+    conn.execute(
+        "UPDATE cleanup_actions SET undoable = 0, status = 'undone' WHERE id = ?1",
+        params![id],
+    )?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// file_inventory types and helpers
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize)]
+pub struct InventoryRow {
+    pub path: String,
+    pub size: i64,
+    pub mtime: i64,
+    pub category: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct InventoryStats {
+    pub total_files: i64,
+    pub total_bytes: i64,
+    pub last_scan_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CategoryStat {
+    pub category: String,
+    pub files: i64,
+    pub bytes: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LargestFile {
+    pub path: String,
+    pub size: i64,
+    pub mtime: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RootStat {
+    pub path: String,
+    pub files: i64,
+    pub bytes: i64,
+}
+
+#[cfg(test)]
+fn create_file_inventory_table(conn: &Connection) -> SqliteResult<()> {
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS file_inventory (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            root_path TEXT NOT NULL,
+            path TEXT NOT NULL UNIQUE,
+            size INTEGER NOT NULL DEFAULT 0,
+            mtime INTEGER NOT NULL DEFAULT 0,
+            category TEXT NOT NULL DEFAULT 'Other',
+            scanned_at INTEGER NOT NULL DEFAULT 0
+        )",
+        [],
+    )?;
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_file_inventory_root ON file_inventory(root_path)", [])?;
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_file_inventory_size ON file_inventory(size)", [])?;
+    Ok(())
+}
+
+// Internal helpers taking a &Connection (testable with in-memory DB).
+fn now_epoch() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+fn append_inventory_batch_on(conn: &mut Connection, root: &str, rows: &[InventoryRow]) -> SqliteResult<()> {
+    let scanned_at = now_epoch();
+    let tx = conn.transaction()?;
+    {
+        let mut stmt = tx.prepare(
+            "INSERT OR REPLACE INTO file_inventory (root_path, path, size, mtime, category, scanned_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )?;
+        for row in rows {
+            stmt.execute(params![root, row.path, row.size, row.mtime, row.category, scanned_at])?;
+        }
+    }
+    tx.commit()
+}
+
+fn replace_inventory_on(conn: &mut Connection, root: &str, rows: &[InventoryRow]) -> SqliteResult<()> {
+    conn.execute("DELETE FROM file_inventory WHERE root_path = ?1", params![root])?;
+    for chunk in rows.chunks(INVENTORY_BATCH_SIZE) {
+        append_inventory_batch_on(conn, root, chunk)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn clear_inventory_on(conn: &Connection, root: &str) -> SqliteResult<()> {
+    conn.execute("DELETE FROM file_inventory WHERE root_path = ?1", params![root]).map(|_| ())
+}
+
+fn get_inventory_stats_on(conn: &Connection) -> SqliteResult<InventoryStats> {
+    conn.query_row(
+        "SELECT COUNT(*), COALESCE(SUM(size), 0), MAX(scanned_at) FROM file_inventory",
+        [],
+        |row| {
+            Ok(InventoryStats {
+                total_files: row.get(0)?,
+                total_bytes: row.get(1)?,
+                last_scan_at: row.get(2)?,
+            })
+        },
+    )
+}
+
+fn get_largest_files_on(conn: &Connection, limit: i64) -> SqliteResult<Vec<LargestFile>> {
+    let mut stmt = conn.prepare(
+        "SELECT path, size, mtime FROM file_inventory ORDER BY size DESC LIMIT ?1",
+    )?;
+    let rows = stmt
+        .query_map(params![limit], |row| {
+            Ok(LargestFile {
+                path: row.get(0)?,
+                size: row.get(1)?,
+                mtime: row.get(2)?,
+            })
+        })?
+        .collect::<SqliteResult<Vec<_>>>()?;
+    Ok(rows)
+}
+
+fn get_category_distribution_on(conn: &Connection) -> SqliteResult<Vec<CategoryStat>> {
+    let mut stmt = conn.prepare(
+        "SELECT category, COUNT(*), COALESCE(SUM(size), 0) FROM file_inventory GROUP BY category ORDER BY 3 DESC",
+    )?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(CategoryStat {
+                category: row.get(0)?,
+                files: row.get(1)?,
+                bytes: row.get(2)?,
+            })
+        })?
+        .collect::<SqliteResult<Vec<_>>>()?;
+    Ok(rows)
+}
+
+fn get_root_summaries_on(conn: &Connection) -> SqliteResult<Vec<RootStat>> {
+    let mut stmt = conn.prepare(
+        "SELECT root_path, COUNT(*), COALESCE(SUM(size), 0) FROM file_inventory GROUP BY root_path ORDER BY 3 DESC",
+    )?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(RootStat {
+                path: row.get(0)?,
+                files: row.get(1)?,
+                bytes: row.get(2)?,
+            })
+        })?
+        .collect::<SqliteResult<Vec<_>>>()?;
+    Ok(rows)
+}
+
+// Public wrappers that use the global DB.
+
+pub fn replace_inventory_for_root(root: &str, rows: &[InventoryRow]) -> SqliteResult<()> {
+    let db = get_db();
+    let mut conn = db.lock().unwrap();
+    replace_inventory_on(&mut conn, root, rows)
+}
+
+pub fn append_inventory_batch(root: &str, rows: &[InventoryRow]) -> SqliteResult<()> {
+    let db = get_db();
+    let mut conn = db.lock().unwrap();
+    append_inventory_batch_on(&mut conn, root, rows)
+}
+
+pub fn clear_inventory_for_root(root: &str) -> SqliteResult<()> {
+    let db = get_db();
+    let conn = db.lock().unwrap();
+    conn.execute("DELETE FROM file_inventory WHERE root_path = ?1", params![root])
+        .map(|_| ())
+}
+
+pub fn get_inventory_stats() -> SqliteResult<InventoryStats> {
+    let db = get_db();
+    let conn = db.lock().unwrap();
+    get_inventory_stats_on(&conn)
+}
+
+pub fn get_largest_files(limit: i64) -> SqliteResult<Vec<LargestFile>> {
+    let db = get_db();
+    let conn = db.lock().unwrap();
+    get_largest_files_on(&conn, limit)
+}
+
+pub fn get_category_distribution() -> SqliteResult<Vec<CategoryStat>> {
+    let db = get_db();
+    let conn = db.lock().unwrap();
+    get_category_distribution_on(&conn)
+}
+
+pub fn get_root_summaries() -> SqliteResult<Vec<RootStat>> {
+    let db = get_db();
+    let conn = db.lock().unwrap();
+    get_root_summaries_on(&conn)
+}
+
+// ---------------------------------------------------------------------------
+// hash_cache helpers
+// ---------------------------------------------------------------------------
+
+pub fn get_cached_hash(path: &str, size: i64, mtime: i64) -> SqliteResult<Option<(String, bool)>> {
+    let db = get_db();
+    let conn = db.lock().unwrap();
+    let mut stmt = conn.prepare(
+        "SELECT hash, is_full FROM hash_cache WHERE path = ?1 AND size = ?2 AND mtime = ?3",
+    )?;
+    let mut rows = stmt.query_map(params![path, size, mtime], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i32>(1)? != 0))
+    })?;
+    match rows.next() {
+        Some(Ok(v)) => Ok(Some(v)),
+        Some(Err(e)) => Err(e),
+        None => Ok(None),
+    }
+}
+
+pub fn set_cached_hash(path: &str, size: i64, mtime: i64, hash: &str, is_full: bool) -> SqliteResult<()> {
+    let db = get_db();
+    let conn = db.lock().unwrap();
+    conn.execute(
+        "INSERT OR REPLACE INTO hash_cache (path, size, mtime, hash, is_full) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![path, size, mtime, hash, is_full as i32],
+    )?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Cleanup query helpers
+// ---------------------------------------------------------------------------
+
+pub fn count_inventory_files() -> SqliteResult<i64> {
+    let db = get_db();
+    let conn = db.lock().unwrap();
+    conn.query_row("SELECT COUNT(*) FROM file_inventory", [], |row| row.get(0))
+}
+
+/// Return (size, path, mtime) for each size group that has >1 file.
+/// Groups are returned unsorted (caller may sort by size desc).
+pub type SizeGroup = (i64, Vec<(String, i64)>);
+pub fn get_inventory_size_groups() -> SqliteResult<Vec<SizeGroup>> {
+    let db = get_db();
+    let conn = db.lock().unwrap();
+    let mut stmt = conn.prepare(
+        "SELECT size, path, mtime FROM file_inventory
+         WHERE size IN (SELECT size FROM file_inventory GROUP BY size HAVING COUNT(*) > 1)
+         ORDER BY size DESC, path",
+    )?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?
+        .collect::<SqliteResult<Vec<_>>>()?;
+    let mut groups: std::collections::HashMap<i64, Vec<(String, i64)>> = std::collections::HashMap::new();
+    for (size, path, mtime) in rows {
+        groups.entry(size).or_default().push((path, mtime));
+    }
+    Ok(groups.into_iter().collect())
+}
+
+pub fn get_large_files_from_inventory(min_bytes: i64) -> SqliteResult<Vec<LargestFile>> {
+    let db = get_db();
+    let conn = db.lock().unwrap();
+    let mut stmt = conn.prepare(
+        "SELECT path, size, mtime FROM file_inventory WHERE size >= ?1 ORDER BY size DESC",
+    )?;
+    let rows = stmt
+        .query_map(params![min_bytes], |row| {
+            Ok(LargestFile {
+                path: row.get(0)?,
+                size: row.get(1)?,
+                mtime: row.get(2)?,
+            })
+        })?
+        .collect::<SqliteResult<Vec<_>>>()?;
+    Ok(rows)
+}
+
+pub fn get_stale_files_from_inventory(cutoff_mtime: i64) -> SqliteResult<Vec<LargestFile>> {
+    let db = get_db();
+    let conn = db.lock().unwrap();
+    let mut stmt = conn.prepare(
+        "SELECT path, size, mtime FROM file_inventory WHERE mtime < ?1 ORDER BY mtime ASC",
+    )?;
+    let rows = stmt
+        .query_map(params![cutoff_mtime], |row| {
+            Ok(LargestFile {
+                path: row.get(0)?,
+                size: row.get(1)?,
+                mtime: row.get(2)?,
+            })
+        })?
+        .collect::<SqliteResult<Vec<_>>>()?;
+    Ok(rows)
+}
+
+// ---------------------------------------------------------------------------
+// Suggestion helpers (dismissed_suggestions + unclassified files)
+// ---------------------------------------------------------------------------
+
+pub fn dismiss_suggestion(path: &str) -> SqliteResult<()> {
+    let db = get_db();
+    let conn = db.lock().unwrap();
+    let now = now_epoch();
+    conn.execute(
+        "INSERT OR IGNORE INTO dismissed_suggestions (path, dismissed_at) VALUES (?1, ?2)",
+        params![path, now],
+    )?;
+    Ok(())
+}
+
+pub fn clear_dismissed_suggestion(path: &str) -> SqliteResult<()> {
+    let db = get_db();
+    let conn = db.lock().unwrap();
+    conn.execute("DELETE FROM dismissed_suggestions WHERE path = ?1", params![path])?;
+    Ok(())
+}
+
+pub fn get_dismissed_suggestions() -> SqliteResult<std::collections::HashSet<String>> {
+    let db = get_db();
+    let conn = db.lock().unwrap();
+    let mut stmt = conn.prepare("SELECT path FROM dismissed_suggestions")?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<SqliteResult<Vec<_>>>()?;
+    Ok(rows.into_iter().collect())
+}
+
+pub fn get_unclassified_files(limit: i64) -> SqliteResult<Vec<InventoryRow>> {
+    let db = get_db();
+    let conn = db.lock().unwrap();
+    let mut stmt = conn.prepare(
+        "SELECT path, size, mtime, category FROM file_inventory WHERE category = 'Other' ORDER BY size DESC LIMIT ?1",
+    )?;
+    let rows = stmt
+        .query_map(params![limit], |row| {
+            Ok(InventoryRow {
+                path: row.get(0)?,
+                size: row.get(1)?,
+                mtime: row.get(2)?,
+                category: row.get(3)?,
+            })
+        })?
+        .collect::<SqliteResult<Vec<_>>>()?;
+    Ok(rows)
+}
+
+pub fn update_inventory_category(path: &str, category: &str) -> SqliteResult<()> {
+    let db = get_db();
+    let conn = db.lock().unwrap();
+    conn.execute(
+        "UPDATE file_inventory SET category = ?1 WHERE path = ?2",
+        params![category, path],
+    )?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Test infrastructure — shared across all test modules
+// ---------------------------------------------------------------------------
+
+/// Lock that serialises all DB-touching tests so they don't interfere via the
+/// global OnceCell DB.  Acquired at the top of every test that touches the DB.
+#[cfg(test)]
+pub static TEST_DB_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Initialise the global DB if it has not been set yet.  Idempotent so
+/// multiple test modules can call it without panicking.
+#[cfg(test)]
+pub fn init_test_db() {
+    if DB.get().is_none() {
+        let dir = std::env::temp_dir().join(format!("mouzi-db-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = init_db(dir);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mem_conn_with_inventory() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        create_file_inventory_table(&conn).unwrap();
+        conn
+    }
+
+    #[test]
+    fn inventory_replace_and_stats_roundtrip() {
+        let mut conn = mem_conn_with_inventory();
+
+        let rows = vec![
+            InventoryRow { path: "/a/b.pdf".into(), size: 100, mtime: 1, category: "Documents".into() },
+            InventoryRow { path: "/a/c.jpg".into(), size: 200, mtime: 2, category: "Images".into() },
+        ];
+        replace_inventory_on(&mut conn, "/root1", &rows).unwrap();
+
+        // stats
+        let stats = get_inventory_stats_on(&conn).unwrap();
+        assert_eq!(stats.total_files, 2);
+        assert_eq!(stats.total_bytes, 300);
+        assert!(stats.last_scan_at.is_some());
+
+        // category distribution
+        let dist = get_category_distribution_on(&conn).unwrap();
+        assert_eq!(dist.len(), 2);
+        let doc = dist.iter().find(|c| c.category == "Documents").unwrap();
+        assert_eq!((doc.files, doc.bytes), (1, 100));
+        let img = dist.iter().find(|c| c.category == "Images").unwrap();
+        assert_eq!((img.files, img.bytes), (1, 200));
+
+        // largest files
+        let largest = get_largest_files_on(&conn, 1).unwrap();
+        assert_eq!(largest.len(), 1);
+        assert_eq!(largest[0].path, "/a/c.jpg");
+        assert_eq!(largest[0].size, 200);
+
+        // root summaries
+        let roots = get_root_summaries_on(&conn).unwrap();
+        assert_eq!(roots.len(), 1);
+        assert_eq!((roots[0].files, roots[0].bytes), (2, 300));
+        assert_eq!(roots[0].path, "/root1");
+
+        // second root does not mix
+        let rows2 = vec![InventoryRow { path: "/b/x.txt".into(), size: 5, mtime: 3, category: "Other".into() }];
+        replace_inventory_on(&mut conn, "/root2", &rows2).unwrap();
+        let stats2 = get_inventory_stats_on(&conn).unwrap();
+        assert_eq!(stats2.total_files, 3);
+
+        // replace same root truncates old rows
+        replace_inventory_on(&mut conn, "/root1", &[InventoryRow { path: "/a/d.txt".into(), size: 5, mtime: 3, category: "Other".into() }]).unwrap();
+        let stats3 = get_inventory_stats_on(&conn).unwrap();
+        assert_eq!(stats3.total_files, 2); // root1:1, root2:1
+
+        // clear root2
+        clear_inventory_on(&conn, "/root2").unwrap();
+        assert_eq!(get_inventory_stats_on(&conn).unwrap().total_files, 1);
+    }
+
+    #[test]
+    fn inventory_batch_chunking() {
+        // Insert more than INVENTORY_BATCH_SIZE rows to exercise chunking.
+        let mut conn = mem_conn_with_inventory();
+        let rows: Vec<InventoryRow> = (0..INVENTORY_BATCH_SIZE + 10)
+            .map(|i| InventoryRow {
+                path: format!("/chunk/{}.txt", i),
+                size: i as i64,
+                mtime: i as i64,
+                category: "Other".into(),
+            })
+            .collect();
+        replace_inventory_on(&mut conn, "/root", &rows).unwrap();
+        let stats = get_inventory_stats_on(&conn).unwrap();
+        assert_eq!(stats.total_files, (INVENTORY_BATCH_SIZE + 10) as i64);
+    }
 }
