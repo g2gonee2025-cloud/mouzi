@@ -4,6 +4,9 @@ import { initI18n, SupportedLang } from "./i18n";
 import { useAppStore } from "./store/useAppStore";
 import Popup from "./components/Popup";
 import Settings from "./components/Settings";
+import Dashboard from "./pages/Dashboard";
+import Cleanup from "./pages/Cleanup";
+import Suggestions from "./pages/Suggestions";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { onAction } from "@tauri-apps/plugin-notification";
@@ -50,8 +53,7 @@ function App() {
   }, [settings?.theme]);
 
   useEffect(() => {
-    const unlisten = listen("file-organized", (event) => {
-      console.log("File organized:", event.payload);
+    const unlisten = listen("file-organized", () => {
       useAppStore.getState().loadLogs();
       useAppStore.getState().loadStats();
     });
@@ -60,7 +62,6 @@ function App() {
 
     // Listen for notification action clicks centrally
     onAction((notification) => {
-      console.log("Notification click received:", notification);
       const destFolder = (notification.extra as Record<string, unknown> | undefined)?.destFolder as string | undefined;
       if (destFolder) {
         invoke("open_folder_cmd", { path: destFolder })
@@ -106,7 +107,17 @@ function App() {
 
   return (
     <div className="h-full w-full">
-      {hash === "settings" ? <Settings /> : <Popup />}
+      {hash === "settings" ? (
+          <Settings />
+        ) : hash === "dashboard" ? (
+          <Dashboard />
+        ) : hash === "cleanup" ? (
+          <Cleanup />
+        ) : hash === "suggestions" ? (
+          <Suggestions />
+        ) : (
+          <Popup />
+        )}
     </div>
   );
 }

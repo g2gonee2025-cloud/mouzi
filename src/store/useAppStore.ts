@@ -61,6 +61,17 @@ export interface ScheduleSettings {
   schedule_time_4: string | null;
 }
 
+export interface UndoResult {
+  status: string; // 'ok' | 'collision' | 'missing' | 'failed'
+  message: string | null;
+  restoredTo: string | null;
+}
+
+export interface UndoAllResult {
+  count: number;
+  results: UndoResult[];
+}
+
 interface AppState {
   rules: Rule[];
   folders: WatchedFolder[];
@@ -80,8 +91,8 @@ interface AppState {
   loadLogs: () => Promise<void>;
   loadStats: () => Promise<void>;
   scanFolder: (path: string) => Promise<{ file: string; rule: string; destination: string }[]>;
-  undoAction: (id: number) => Promise<boolean>;
-  undoAll: () => Promise<number>;
+  undoAction: (id: number) => Promise<UndoResult>;
+  undoAll: () => Promise<UndoAllResult>;
   addFolder: (path: string, mode: string) => Promise<void>;
   removeFolder: (id: number) => Promise<void>;
   updateFolderMode: (id: number, mode: string) => Promise<void>;
@@ -163,21 +174,19 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   undoAction: async (id) => {
-    const success = await invoke<boolean>('undo_action_cmd', { id });
-    if (success) {
-      await get().loadLogs();
-      await get().loadStats();
-    }
-    return success;
+    const result = await invoke<UndoResult>('undo_action_cmd', { id });
+    await get().loadLogs();
+    await get().loadStats();
+    return result;
   },
 
   undoAll: async () => {
-    const count = await invoke<number>('undo_all_cmd');
-    if (count > 0) {
+    const result = await invoke<UndoAllResult>('undo_all_cmd');
+    if (result.count > 0) {
       await get().loadLogs();
       await get().loadStats();
     }
-    return count;
+    return result;
   },
 
   addFolder: async (path, mode) => {
