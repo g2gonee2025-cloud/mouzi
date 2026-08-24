@@ -16,6 +16,12 @@ pub struct Scheduler {
     last_run_dates: Arc<Mutex<HashMap<usize, NaiveDate>>>,
 }
 
+impl Default for Scheduler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Scheduler {
     pub fn new() -> Self {
         Self {

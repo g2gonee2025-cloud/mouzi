@@ -9,10 +9,7 @@ use std::path::{Path, PathBuf};
 /// On Windows this tries to open with write access; if another process holds
 /// the file without FILE_SHARE_WRITE the open will fail.
 fn is_file_locked(path: &Path) -> bool {
-    match fs::OpenOptions::new().write(true).open(path) {
-        Ok(_) => false,
-        Err(_) => true,
-    }
+    fs::OpenOptions::new().write(true).open(path).is_err()
 }
 
 /// Check whether a file has passed its grace period since last modification.
