@@ -281,7 +281,7 @@ pub fn suggest_category(filename: &str, extension: &str) -> (&'static str, f64) 
     }
 
     // Pick the category with the highest score
-    let best = scores.into_iter().max_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+    let best = scores.into_iter().max_by(|a, b| a.1.total_cmp(&b.1));
 
     match best {
         Some((cat, score)) if score > 0.0 => {

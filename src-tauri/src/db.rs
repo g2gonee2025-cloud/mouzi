@@ -1,4 +1,4 @@
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeZone, Utc};
 use rusqlite::{params, Connection, Result as SqliteResult};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -469,7 +469,7 @@ pub fn get_recent_logs(limit: i64) -> SqliteResult<Vec<ActionLog>> {
         let ts_str: String = row.get(1)?;
         Ok(ActionLog {
             id: row.get(0)?,
-            timestamp: DateTime::parse_from_rfc3339(&ts_str).unwrap().with_timezone(&Utc),
+            timestamp: DateTime::parse_from_rfc3339(&ts_str).map(|d| d.with_timezone(&Utc)).unwrap_or_else(|_| Utc.timestamp_opt(0, 0).unwrap()),
             source_path: row.get(2)?,
             destination_path: row.get(3)?,
             action: row.get(4)?,
@@ -622,8 +622,8 @@ pub fn get_cleanup_logs(limit: i64) -> SqliteResult<Vec<CleanupAction>> {
             Ok(CleanupAction {
                 id: row.get(0)?,
                 timestamp: DateTime::parse_from_rfc3339(&ts_str)
-                    .unwrap()
-                    .with_timezone(&Utc),
+                    .map(|d| d.with_timezone(&Utc))
+                    .unwrap_or_else(|_| Utc.timestamp_opt(0, 0).unwrap()),
                 path: row.get(2)?,
                 prev_path: row.get(3)?,
                 dest: row.get(4)?,
@@ -1035,6 +1035,7 @@ pub fn init_test_db() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
 
     fn mem_conn_with_inventory() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -1109,5 +1110,39 @@ mod tests {
         replace_inventory_on(&mut conn, "/root", &rows).unwrap();
         let stats = get_inventory_stats_on(&conn).unwrap();
         assert_eq!(stats.total_files, (INVENTORY_BATCH_SIZE + 10) as i64);
+    }
+
+    #[test]
+    fn recent_logs_survives_corrupt_timestamp() {
+        let _guard = TEST_DB_LOCK.lock().unwrap();
+        init_test_db();
+        let db = get_db();
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO action_logs (timestamp, source_path, destination_path, action, file_name, file_type, undone) VALUES ('not-a-date', '/corrupt-test', '/dst', 'move', 'f.txt', 'text', 0)",
+            [],
+        ).unwrap();
+        drop(conn);
+        let logs = get_recent_logs(100).unwrap();
+        let corrupt = logs.iter().find(|l| l.source_path == "/corrupt-test");
+        assert!(corrupt.is_some(), "corrupt row should be returned with epoch fallback");
+        assert_eq!(corrupt.unwrap().timestamp, Utc.timestamp_opt(0, 0).unwrap());
+    }
+
+    #[test]
+    fn cleanup_logs_survives_corrupt_timestamp() {
+        let _guard = TEST_DB_LOCK.lock().unwrap();
+        init_test_db();
+        let db = get_db();
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO cleanup_actions (timestamp, path, prev_path, dest, action, status, undoable) VALUES ('not-a-date', '/corrupt-cleanup', '/prev', '/dest', 'delete', 'ok', 0)",
+            [],
+        ).unwrap();
+        drop(conn);
+        let logs = get_cleanup_logs(100).unwrap();
+        let corrupt = logs.iter().find(|l| l.path == "/corrupt-cleanup");
+        assert!(corrupt.is_some(), "corrupt cleanup row should be returned with epoch fallback");
+        assert_eq!(corrupt.unwrap().timestamp, Utc.timestamp_opt(0, 0).unwrap());
     }
 }

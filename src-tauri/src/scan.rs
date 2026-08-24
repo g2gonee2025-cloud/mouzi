@@ -164,7 +164,10 @@ pub fn scan_roots(paths: &[String], mut progress: impl FnMut(ScanEvent)) -> Vec<
     let mut summaries = Vec::with_capacity(paths.len());
     for root in paths {
         let patterns = load_mouziignore(root);
-        let _ = clear_inventory_for_root(root);
+        if let Err(e) = clear_inventory_for_root(root) {
+            eprintln!("[scan] failed to clear inventory for {}: {} — skipping root", root, e);
+            continue;
+        }
 
         let mut walk = RootWalk {
             root: root.as_str(),
