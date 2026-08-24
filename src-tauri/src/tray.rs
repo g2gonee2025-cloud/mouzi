@@ -9,11 +9,14 @@ pub fn setup_tray(app: &AppHandle, lang: &str) -> Result<(), Box<dyn std::error:
     let i18n = TrayI18n::new(lang);
 
     let quit_i = MenuItem::with_id(app, "quit", i18n.get("quit"), true, None::<&str>)?;
-    let settings_i = MenuItem::with_id(app, "settings", i18n.get("settings"), true, None::<&str>)?;
     let clean_i = MenuItem::with_id(app, "clean", i18n.get("clean_now"), true, None::<&str>)?;
+    let suggestions_i = MenuItem::with_id(app, "suggestions", i18n.get("suggestions"), true, None::<&str>)?;
+    let dashboard_i = MenuItem::with_id(app, "dashboard", i18n.get("dashboard"), true, None::<&str>)?;
+    let cleanup_i = MenuItem::with_id(app, "cleanup", i18n.get("cleanup"), true, None::<&str>)?;
+    let settings_i = MenuItem::with_id(app, "settings", i18n.get("settings"), true, None::<&str>)?;
     let separator = PredefinedMenuItem::separator(app)?;
 
-    let menu = Menu::with_items(app, &[&clean_i, &settings_i, &separator, &quit_i])?;
+    let menu = Menu::with_items(app, &[&clean_i, &suggestions_i, &dashboard_i, &cleanup_i, &settings_i, &separator, &quit_i])?;
 
     let mut builder = TrayIconBuilder::with_id("tray")
         .tooltip(i18n.get("tooltip"))
@@ -24,6 +27,15 @@ pub fn setup_tray(app: &AppHandle, lang: &str) -> Result<(), Box<dyn std::error:
             }
             "settings" => {
                 show_settings_window(app);
+            }
+            "dashboard" => {
+                show_dashboard_window(app);
+            }
+            "suggestions" => {
+                show_suggestions_window(app);
+            }
+            "cleanup" => {
+                show_cleanup_window(app);
             }
             "clean" => {
                 let _ = perform_clean(app);
@@ -138,6 +150,75 @@ pub fn show_settings_window(app: &AppHandle) {
         )
         .title(i18n.get("settings_title"))
         .inner_size(900.0, 650.0)
+        .min_inner_size(700.0, 500.0)
+        .build();
+
+        if let Ok(win) = window {
+            let _ = win.show();
+            let _ = win.set_focus();
+        }
+    }
+}
+
+pub fn show_dashboard_window(app: &AppHandle) {
+    let i18n = TrayI18n::new(&tray_lang(app));
+    if let Some(window) = app.get_webview_window("dashboard") {
+        let _ = window.show();
+        let _ = window.set_focus();
+    } else {
+        let window = tauri::WebviewWindowBuilder::new(
+            app,
+            "dashboard",
+            tauri::WebviewUrl::App("/#/dashboard".into()),
+        )
+        .title(i18n.get("dashboard_title"))
+        .inner_size(1024.0, 768.0)
+        .min_inner_size(800.0, 600.0)
+        .build();
+
+        if let Ok(win) = window {
+            let _ = win.show();
+            let _ = win.set_focus();
+        }
+    }
+}
+
+pub fn show_suggestions_window(app: &AppHandle) {
+    let i18n = TrayI18n::new(&tray_lang(app));
+    if let Some(window) = app.get_webview_window("suggestions") {
+        let _ = window.show();
+        let _ = window.set_focus();
+    } else {
+        let window = tauri::WebviewWindowBuilder::new(
+            app,
+            "suggestions",
+            tauri::WebviewUrl::App("/#/suggestions".into()),
+        )
+        .title(i18n.get("suggestions_title"))
+        .inner_size(900.0, 700.0)
+        .min_inner_size(700.0, 500.0)
+        .build();
+
+        if let Ok(win) = window {
+            let _ = win.show();
+            let _ = win.set_focus();
+        }
+    }
+}
+
+pub fn show_cleanup_window(app: &AppHandle) {
+    let i18n = TrayI18n::new(&tray_lang(app));
+    if let Some(window) = app.get_webview_window("cleanup") {
+        let _ = window.show();
+        let _ = window.set_focus();
+    } else {
+        let window = tauri::WebviewWindowBuilder::new(
+            app,
+            "cleanup",
+            tauri::WebviewUrl::App("/#/cleanup".into()),
+        )
+        .title(i18n.get("cleanup_title"))
+        .inner_size(900.0, 700.0)
         .min_inner_size(700.0, 500.0)
         .build();
 
