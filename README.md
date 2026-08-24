@@ -1,5 +1,7 @@
 # Mouzi 🧹🐁
 
+> **Fork notice:** This is a personal fork of [hsr88/mouzi](https://github.com/hsr88/mouzi) (MIT), elevated with a storage dashboard, smart cleanup (dedup / large / stale / empty-dir), AI-assisted classification, and a proper undo/audit trail. All credit for the original organizer goes to the upstream authors.
+
 > **Your downloads, tamed.**
 
 Mouzi is a silent, elegant file organizer that lives in your system tray and keeps your Downloads folder (and any other folder) automatically tidy. It runs quietly in the background, monitors selected folders, and moves, renames, or sorts files based on customizable rules.
