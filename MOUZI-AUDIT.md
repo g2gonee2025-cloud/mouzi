@@ -1864,3 +1864,247 @@ back to a plan figure.
 **Scope of this pass.** 1 of the 21 audit reports, 14 of 21 absorbed in total, plus two findings
 verified directly by the orchestrator. Section 1's executive summary now predates eight addenda and
 should be reconciled against them.
+
+---
+
+## 15. Addendum - tenth pass: window lifecycle, the capability ACL, and the event bus
+
+The Rust core lifecycle report (`lib.rs`, `tray.rs`, `capabilities/default.json`, `tauri.conf.json`).
+It was checked against the pinned Tauri source rather than against documentation prose, and checking
+it **narrowed** one earlier Critical and produced a more precise one in its place.
+
+The lockfile pins **tauri 2.11.1**. Three facts about Tauri 2 govern everything below, and each was
+read out of the crate source rather than assumed:
+
+1. A webview whose label is matched by **no** capability receives **no** ACL permissions. An empty
+   `windows` list matches nothing.
+2. **App-defined `#[tauri::command]` handlers bypass the ACL entirely** when the app ships no
+   permission manifest. There is no `src-tauri/permissions/` directory and `build.rs` registers none,
+   so every one of the 50 commands is callable from any window, local origin, without an ACL check.
+3. `plugin:event|listen` and every other `plugin:*` command are **always** ACL-checked, with no
+   equivalent bypass.
+
+Facts 2 and 3 together mean the capability defect in section 2 (C3) breaks far less than a first read
+suggests, and breaks something different. That correction is recorded in 15.2.
+
+### 15.1 CRITICAL C13 - the window the user actually sees has no capability, so the dashboard's live scan progress can never arrive
+
+**This refines C3 and should be read alongside it.**
+
+The capability file `capabilities/default.json:5` lists its windows as
+`["main", "popup", "settings", "dashboard", "cleanup", "suggestions"]`. The windows the application
+actually creates at runtime are `main` (from `tauri.conf.json`) and `app` (built at
+`tray.rs:178-186`). **`app` is not in the list.** `settings`, `dashboard`, `cleanup` and
+`suggestions` are never created as windows at all - they are hash routes inside `app`.
+
+Because `app` matches no capability, and because fact 2 holds, the **data** half of the workspace
+works: `invoke("get_dashboard_stats_cmd")`, `invoke("get_inventory_files_cmd")`,
+`invoke("find_duplicates_cmd")` and every other app command succeed from `app` with no ACL check. So
+the dashboard renders, the treemap draws, the numbers are real.
+
+What breaks is everything routed through a plugin, and the most important casualty is
+`plugin:event|listen`:
+
+| Call site | Plugin command | Status in the `app` window |
+|---|---|---|
+| `App.tsx:63` `listen("file-organized", ...)` | `plugin:event\|listen` | **denied** |
+| `useDashboardStore.ts:200` `listen("scan-progress", ...)` | `plugin:event\|listen` | **denied** |
+| `useDashboardStore.ts:207` `listen("scan-complete", ...)` | `plugin:event\|listen` | **denied** |
+| `App.tsx:70` `onAction(...)` from `plugin-notification` | `plugin:notification\|*` | **denied** |
+| `Settings.tsx:5` `save`, `open` from `plugin-dialog` | `plugin:dialog\|*` | **denied** |
+| all 50 `invoke(...)` app commands | none - not ACL-gated | **allowed** |
+
+The consequence is that **the dashboard's live scan progress, which is milestone M2's headline
+feature, cannot work in the only window the user can open.** `listen` rejects; in `App.tsx:63` the
+rejection is unhandled; in `useDashboardStore` the `await` throws so the `.then()` continuation in
+`Dashboard.tsx:52` never runs. No `scan-progress` event is ever received, so the progress bar never
+moves. The scan still runs, and the numbers are still correct on the next manual refresh - the
+window where the defect is invisible.
+
+**Why the plan's own gate would not have caught it.** M2's exit criterion is that files appearing in a
+watched folder show up in the dashboard treemap and stats. That passes, because the initial
+`refresh()` uses `invoke`, which is not ACL-gated. The failure is confined to the part of M2 that
+only exists at runtime.
+
+**Correction to section 2 (C3).** C3 was recorded as "the capability file is missing the `app` label,
+which breaks the Tauri ACL, and the app will look like it works because app commands bypass the
+ACL". The mechanism and the observation are both confirmed. What was wrong was the implied severity
+and the implied symptom: I implied a broad breakage and named the dialogs as the visible failure.
+The dialogs are indeed broken. But the *most* serious consequence is not the dialogs - it is
+`listen`, and therefore the live progress bar. One line in the JSON still fixes all of it; the label
+is `app` and it must be added.
+
+### 15.2 HIGH H32 - "Clean Now" in the tray runs a full recursive walk and file moves on the main thread
+
+`tray.rs:40-42` handles the menu event and calls `perform_clean` directly. `perform_clean`
+(`tray.rs:108-123`) calls `db::get_watched_folders()` - which takes the single global database
+mutex - and then `manual_scan_folder(&folder.path)` **synchronously, for every enabled watched
+folder**, which walks the tree and moves files.
+
+Tauri delivers `on_menu_event` on the main thread. So selecting one menu item freezes the entire
+application for the duration of the walk: no window paints, no IPC is served, the tray menu does not
+respond, and there is no progress indication and no cancellation. On a large watched folder that is
+minutes of a visibly hung application, ending in a tray "Clean Now" that gave no feedback while it
+happened (H33).
+
+The scheduler performs **the same work** and gets it right: `scheduler.rs:36` wraps it in
+`thread::spawn`. The correct fix is to give `perform_clean` the same treatment, which is a two-line
+change.
+
+### 15.3 HIGH H33 - the tray's "Clean Now" result message is emitted to nobody
+
+`tray.rs:118-121` builds a human-readable result string and emits it as the `show-notification` event
+whenever `total > 0`. There is **no listener for `show-notification` anywhere in the frontend.** A
+full event-to-listener inventory:
+
+| Event | Emitted at | Listened at |
+|---|---|---|
+| `file-organized` | `watcher.rs:110`, `watcher.rs:120` (per file) | `App.tsx:63`, `Popup.tsx:72` |
+| `file-detected` | `watcher.rs:234`, `watcher.rs:288` (per file) | **none** |
+| `scan-progress` | `commands.rs:546` | `useDashboardStore.ts:200` |
+| `scan-complete` | `commands.rs:549` | `useDashboardStore.ts:207` |
+| `show-notification` | `tray.rs:120` | **none** |
+| `scheduled-clean-done` | `scheduler.rs:120` | **none** |
+
+So a user who picks "Clean Now" from the tray is told nothing at all - not how many files were
+organised, not that the operation ran, not that it did nothing. The result is computed and then
+discarded. `git log -S"show-notification"` shows the event was introduced in the base commit
+`c4eac33` and has never had a listener, so this is not a regression introduced by the elevate work;
+it is an upstream defect the fork inherited and did not fix. The application does have a working
+notification plugin, so the plumbing exists and is simply unused on this path.
+
+`scheduled-clean-done` has the same shape: after a scheduled clean nothing in the UI updates until
+the user refocuses the window. Lower impact, same cause.
+
+### 15.4 HIGH H34 - milestone M5's event batching is not addressed, and the cost is larger than one emit per file
+
+`file-organized` is emitted **once per file**, from inside the per-file loop at `watcher.rs:110`.
+Both listeners respond with no debounce and no coalescing: `App.tsx:63-66` calls `loadLogs()` and
+`loadStats()`, and `Popup.tsx:72` additionally calls `getPendingFiles()`.
+
+Those are all app commands, so by fact 2 they are **not** ACL-gated - they run, on the main thread,
+each acquiring the single global database mutex. There is a direct contrast in the same codebase:
+the dashboard's `scan-complete` path **is** debounced (200 ms, in `useDashboardStore`), so the author
+knew the pattern and applied it to one path only.
+
+Measured consequence, and this is the compounding part rather than a separate defect: the leftover
+`main` window described in 15.5 also renders the Popup route and therefore also holds a
+`file-organized` listener. So **each organised file costs two windows times three database queries,
+all serialised on one mutex, all on the main thread** - six main-thread round trips per file, so a
+batch of N organised files costs 6N. This is the same class as the confirmed concurrency problem in
+the sibling `file-dashboard` project, where a nightly job and a request contended and one scan ran
+16.9 minutes against a 7.6-9.0 minute baseline. Different codebase, same shape.
+
+### 15.5 MEDIUM M41 - a leftover invisible window runs the whole app and polls the database every three seconds, forever
+
+`tauri.conf.json` declares a `main` window at 800x600 with `visible: false`. **No Rust code
+anywhere references the `"main"` label** - it is never shown, never focused, never closed. Yet it is
+created at startup and lives for the life of the process.
+
+It is, however, in the capability list, so it receives full ACL permissions and runs the entire React
+application. With an empty location hash, `App.tsx` renders its default route, which is `Popup`. And
+`Popup.tsx:91-93` sets a `setInterval` that calls `get_pending_files_cmd` **every three seconds**.
+So the application permanently runs a hidden window that executes a database query every three
+seconds, forever, for a window no user can see and no code path ever displays.
+
+Two consequences worth separating. The wasted work is real but small. The more interesting
+consequence is that this phantom window is the only thing preventing the process from exiting when
+every visible window is closed - an accidental dependency on dead configuration for a
+correctness-adjacent behaviour. Deleting the `main` window without adding an explicit exit policy
+would change the application's lifecycle, so this is not a one-line deletion.
+
+### 15.6 MEDIUM M42 - the single global database mutex is contended from both the main thread and the notify thread
+
+`db::get_db()` returns one `Arc<Mutex<Connection>>` guarding one `Connection`. `tray_lang()`
+(`tray.rs:62-66`) acquires it on the **main thread** every time a window is shown or the tooltip is
+refreshed, and `update_tray_tooltip` is invoked **per detected file** from `watcher.rs:238` and
+`watcher.rs:292` on the **notify thread**.
+
+So the main thread and the notify thread contend for one lock. If the notify thread holds it, the
+main thread blocks inside `show_app_window`; if the main thread holds it during a slow query, the
+notify event loop stalls and filesystem events are delivered late. No deadlock was found and none is
+claimed - the lock ordering is acyclic, consistent with section 10's finding. This is contention and
+latency, not deadlock, and it is recorded as such.
+
+Compounding it, `tray_lang()` rebuilds a sixteen-entry `HashMap` on every call, so the per-file
+tooltip refresh is a database round trip plus a sixteen-entry map construction, once per detected
+file.
+
+### 15.7 MEDIUM M43 - `close_settings` closes the workspace from every route, including the dashboard
+
+`commands.rs:385` `close_settings` calls `crate::tray::hide_app_window`. It is invoked from
+`Dashboard.tsx:88` and `Settings.tsx:327` - that is, the dashboard's back control and the settings
+page's close control call the same command. Since the consolidation, "close settings" means "hide
+the entire application", so the dashboard's back chevron minimises the whole window instead of
+navigating back. The name no longer describes what it does, and the behaviour on the dashboard is
+not what the control looks like it does.
+
+### 15.8 MEDIUM M44 - the workspace window is destroyed on close, with no handler, losing all state
+
+There is no `on_window_event` handler in the Rust code and no `onCloseRequested` anywhere in the
+frontend. Closing the `app` window with the X therefore **destroys** the webview rather than hiding
+it. The next tray click rebuilds it, which is a full SPA reload: a fresh WebView2 instance, a fresh
+i18n boot, and a fresh round of `invoke` calls for settings, stats and inventory. Any in-progress
+filter or selection is gone, and there is no way to detect that the window was closed rather than
+hidden - so `useDashboardStore`'s scan listeners, if they were ever registered, would need
+re-establishment.
+
+### 15.9 LOW
+
+- **The plan's single-instance claim is stale, not the code.** Plan section 2 recorded
+  `lib.rs:71-77` as knowing only `popup` and `settings`. The current code at `lib.rs:76-82` knows
+  `app` and `popup`, which is correct for the consolidated window model. Recorded so the plan anchor
+  is not "corrected" back.
+- **Single-instance focus does not un-minimise.** `lib.rs:76-82` calls `show()` and `set_focus()` but
+  never `unminimize()`. On Windows, focusing a minimised window is not reliably sufficient to restore
+  it. **UNVERIFIED** - not run.
+- **Three `.unwrap()` calls on mutex locks** in the single-instance path and watcher:
+  `lib.rs:53`, `lib.rs:156`, `watcher.rs:134`. A panic between lock and write poisons the mutex, and
+  every later acquisition panics in turn.
+- **`lib.rs:105` `.expect("Failed to initialize database")`** aborts the process if the database
+  cannot be opened, and the `create_dir_all` on the line above it swallows its error with `.ok()` -
+  so the panic message cannot say which path failed.
+- **`TrayI18n::get` has no English fallback.** `i18n.rs:186` returns the key itself on a miss, so a
+  key missing from a non-English locale renders the raw key in the tray menu. All ten locales
+  currently carry all sixteen keys, so this is latent.
+- **`lib.rs:53` does not un-minimise** is listed above; the tooltip on a running scan never reflects
+  scan state, only folder counts.
+
+### 15.10 Recorded as sound, so the counts above are not inflated
+
+- **The tray dashboard entry exists and is wired.** `tray.rs:14` registers id `dashboard` with i18n
+  key `dashboard`; `tray.rs:31-33` routes it to `show_app_window(app, "/#/dashboard",
+  "dashboard_title")`. Plan D3's "entry via tray menu item" is satisfied.
+- **The tray's Rust-side i18n is complete and consistent.** `i18n.rs` carries the five new keys in
+  all ten locales (verified at the ten insertion blocks from `i18n.rs:20` through `i18n.rs:179`),
+  matching the frontend's ten locales exactly. It is a *second* i18n system alongside the frontend's
+  JSON files, which is a maintainability concern already recorded as M28, not a defect in the
+  coverage.
+- **Left-click shows the popup, right-click shows the menu** using Tauri's default behaviour; no
+  explicit right-click handler is needed and none is missing.
+- **The scheduler does threading correctly** (`scheduler.rs:36`), which is the proof that H32 has a
+  known-good precedent inside the same crate rather than requiring a new pattern.
+- **Zero `async fn` in the entire Rust backend**, confirmed by enumeration. This independently
+  corroborates C12 in section 14, arrived at from the opposite direction - this report was looking
+  for async commands and found none.
+- **`main.rs` and `build.rs` are trivial**, with no hidden initialisation.
+
+### 15.11 What this section changes about the earlier conclusions
+
+- **C3 is reclassified again, and C13 replaces it as the precise statement.** C3 said the missing
+  `app` label "breaks the Tauri capability ACL". True. What it did not say is that app commands are
+  exempt, so the breakage is confined to plugin calls - and that the single most important plugin
+  call in the application is `listen`, on the scan-progress path that milestone M2 exists to
+  deliver. C3 also implied the dialogs were the visible symptom; they are broken, but they are the
+  *lesser* failure.
+- **C12 is corroborated** by an independent route.
+- **D3's non-implementation (H31) is confirmed from the lifecycle side**, and the causal chain is now
+  explicit: the capability file was updated to match the *plan* rather than the *code*, which is
+  what produced a window list describing windows that are never created.
+- **One new High is added that no earlier section covered** - H33, the tray's primary action
+  producing no feedback whatsoever, dead since the upstream base commit.
+
+---
+
+**Scope of this pass.** 1 of the 21 audit reports, 15 of 21 absorbed in total. Section 1's executive
+summary now predates nine addenda and should be reconciled against them.
