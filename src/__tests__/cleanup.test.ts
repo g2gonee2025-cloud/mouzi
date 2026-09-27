@@ -3,6 +3,7 @@ import {
   reclaimableBytes,
   sortGroups,
   buildDuplicateActions,
+  resolveKeeper,
   type DuplicateGroup,
 } from "../utils/cleanup";
 
@@ -56,14 +57,54 @@ describe("buildDuplicateActions", () => {
     });
   });
 
-  it("trashes everything when no keeper is chosen", () => {
+  it("keeps the first file when no keeper has been chosen", () => {
     const a = group("hashA", [100, 100]);
     const actions = buildDuplicateActions([a], {});
-    expect(actions).toHaveLength(2);
-    expect(actions.every((x) => x.kind === "trash_duplicate")).toBe(true);
+    expect(actions).toHaveLength(1);
+    expect(actions[0].path).toBe(a.files[1].path);
+    expect(actions[0].keepPath).toBe(a.files[0].path);
+  });
+
+  it("never leaves keepPath unset, so the backend self-reference guard still runs", () => {
+    const a = group("hashA", [100, 100, 100]);
+    for (const action of buildDuplicateActions([a], {})) {
+      expect(action.keepPath).toBe(a.files[0].path);
+      expect(action.path).not.toBe(action.keepPath);
+    }
+  });
+
+  it("falls back to the first file when the chosen keeper left the group", () => {
+    const a = group("hashA", [100, 100]);
+    const actions = buildDuplicateActions([a], { hashA: "C:/gone/missing.txt" });
+    expect(actions).toHaveLength(1);
+    expect(actions[0].path).toBe(a.files[1].path);
+  });
+
+  it("skips a group with no files at all", () => {
+    expect(buildDuplicateActions([{ hash: "empty", files: [] }], {})).toHaveLength(0);
   });
 
   it("returns empty for empty groups", () => {
     expect(buildDuplicateActions([], {})).toHaveLength(0);
+  });
+});
+
+describe("resolveKeeper", () => {
+  it("defaults to the first file", () => {
+    const a = group("hashA", [100, 100]);
+    expect(resolveKeeper(a, {})).toBe(a.files[0].path);
+  });
+
+  it("returns the chosen copy when it is still in the group", () => {
+    const a = group("hashA", [100, 100]);
+    expect(resolveKeeper(a, { hashA: a.files[1].path })).toBe(a.files[1].path);
+  });
+
+  it("agrees with the badge the card renders", () => {
+    const a = group("hashA", [100, 100, 100]);
+    const keeper = resolveKeeper(a, {});
+    expect(a.files.filter((f) => f.path !== keeper)).toHaveLength(
+      buildDuplicateActions([a], {}).length,
+    );
   });
 });

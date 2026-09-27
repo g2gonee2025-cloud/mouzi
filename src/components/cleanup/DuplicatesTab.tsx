@@ -9,6 +9,7 @@ import {
   reclaimableBytes,
   sortGroups,
   buildDuplicateActions,
+  resolveKeeper,
   type DuplicateGroup,
 } from "../../utils/cleanup";
 import { Search, Trash2, Check } from "lucide-react";
@@ -26,6 +27,13 @@ export default function DuplicatesTab() {
   );
   const reclaimable = useMemo(() => reclaimableBytes(groups), [groups]);
 
+  // The button count and the card badges are both derived from this, so what
+  // the user is told they are about to delete is what actually gets sent.
+  const actions = useMemo(
+    () => buildDuplicateActions(groups, selected),
+    [groups, selected],
+  );
+
   const handleFind = () => store.findDuplicates();
 
   const handleKeep = (hash: string, path: string) => {
@@ -33,7 +41,6 @@ export default function DuplicatesTab() {
   };
 
   const handleConfirm = async () => {
-    const actions = buildDuplicateActions(groups, selected);
     await store.executeCleanup(actions);
     setShowResults(true);
   };
@@ -92,21 +99,14 @@ export default function DuplicatesTab() {
             </span>
             <button
               onClick={handleConfirm}
-              disabled={store.busy}
+              disabled={store.busy || actions.length === 0}
               className="flex items-center gap-1.5 rounded-md bg-red-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-red-700 disabled:opacity-50 transition-colors"
             >
               <Trash2 size={14} />
               {store.busy
                 ? t("app.loading")
                 : t("cleanup.confirm", {
-                    count: groups.reduce<number>(
-                      (sum, g) =>
-                        sum +
-                        g.files.filter(
-                          (f) => f.path !== selected[g.hash],
-                        ).length,
-                      0,
-                    ),
+                    count: actions.length,
                   })}
             </button>
           </div>
@@ -116,7 +116,7 @@ export default function DuplicatesTab() {
               <DuplicateGroupCard
                 key={g.hash}
                 group={g}
-                keepPath={selected[g.hash] ?? g.files[0]?.path}
+                keepPath={resolveKeeper(g, selected)}
                 onKeep={handleKeep}
               />
             ))}
@@ -133,7 +133,7 @@ function DuplicateGroupCard({
   onKeep,
 }: {
   group: DuplicateGroup;
-  keepPath: string;
+  keepPath: string | undefined;
   onKeep: (hash: string, path: string) => void;
 }) {
   const { t } = useTranslation();
