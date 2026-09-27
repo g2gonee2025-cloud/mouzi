@@ -1,6 +1,6 @@
 import { useEffect, useCallback, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
+import { navigateHash } from "../utils/paths";
 import { useSuggestionsStore } from "../store/useSuggestionsStore";
 import {
   Sparkles,
@@ -82,7 +82,7 @@ export default function Suggestions() {
   }, [handleFocus]);
 
   const handleClose = () => {
-    getCurrentWebviewWindow().close().catch(console.error);
+    navigateHash("dashboard");
   };
 
   return (

@@ -1,29 +1,31 @@
 import { useMemo } from "react";
 import { useTranslation } from "react-i18next";
 import { formatBytes } from "../../utils/format";
+import { categoryColor, percentOf } from "../../utils/dashboard";
 
 interface CategoryBarsProps {
   data: Array<{ category: string; files: number; bytes: number }>;
   totalBytes: number;
+  selected?: string | null;
+  onSelect?: (category: string | null) => void;
 }
 
-const COLORS = [
-  "#f59e0b", "#3b82f6", "#10b981", "#ef4444",
-  "#8b5cf6", "#ec4899", "#14b8a6", "#f97316",
-  "#6366f1", "#84cc16",
-];
-
-export default function CategoryBars({ data, totalBytes }: CategoryBarsProps) {
+export default function CategoryBars({
+  data,
+  totalBytes,
+  selected,
+  onSelect,
+}: CategoryBarsProps) {
   const { t } = useTranslation();
 
   const sorted = useMemo(
     () => [...data].sort((a, b) => b.bytes - a.bytes),
-    [data]
+    [data],
   );
 
   if (sorted.length === 0) {
     return (
-      <div className="rounded-lg border border-border bg-surface-dark p-4">
+      <div className="rounded-xl border border-border bg-surface-dark p-4 h-full">
         <h3 className="text-sm font-semibold text-text mb-3">{t("dashboard.categoryBreakdown")}</h3>
         <div className="flex items-center justify-center h-32 text-xs text-text-muted">
           {t("dashboard.noData")}
@@ -33,35 +35,43 @@ export default function CategoryBars({ data, totalBytes }: CategoryBarsProps) {
   }
 
   return (
-    <div className="rounded-lg border border-border bg-surface-dark p-4">
+    <div className="rounded-xl border border-border bg-surface-dark p-4 h-full">
       <h3 className="text-sm font-semibold text-text mb-3">{t("dashboard.categoryBreakdown")}</h3>
       <div className="space-y-2">
-        {sorted.map((item, i) => {
-          const pct = totalBytes > 0 ? (item.bytes / totalBytes) * 100 : 0;
+        {sorted.map((item) => {
+          const pct = percentOf(item.bytes, totalBytes);
+          const isOn = selected === item.category;
           return (
-            <div key={item.category}>
+            <button
+              key={item.category}
+              type="button"
+              onClick={() => onSelect?.(isOn ? null : item.category)}
+              className={`w-full text-left rounded-md px-1.5 py-1 -mx-1.5 transition-colors ${
+                isOn ? "bg-surface" : "hover:bg-surface/60"
+              }`}
+            >
               <div className="flex items-center justify-between text-xs mb-1">
                 <div className="flex items-center gap-1.5">
                   <span
                     className="inline-block w-2 h-2 rounded-sm"
-                    style={{ backgroundColor: COLORS[i % COLORS.length] }}
+                    style={{ backgroundColor: categoryColor(item.category) }}
                   />
                   <span className="text-text font-medium">{item.category}</span>
                 </div>
-                <span className="text-text-muted">
+                <span className="text-text-muted tabular-nums">
                   {item.files.toLocaleString()} {t("dashboard.filesLabel")} · {formatBytes(item.bytes)}
                 </span>
               </div>
-              <div className="h-2 bg-border rounded-full overflow-hidden">
+              <div className="h-1.5 bg-border rounded-full overflow-hidden">
                 <div
-                  className="h-full rounded-full transition-all"
+                  className="h-full rounded-full"
                   style={{
                     width: `${Math.max(pct, 1)}%`,
-                    backgroundColor: COLORS[i % COLORS.length],
+                    backgroundColor: categoryColor(item.category),
                   }}
                 />
               </div>
-            </div>
+            </button>
           );
         })}
       </div>

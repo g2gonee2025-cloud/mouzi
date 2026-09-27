@@ -149,6 +149,19 @@ Mouzi-0.1.5-1.x86_64.rpm:    62a2e565f4dcd3e6a19c19122d4399b77684c07826419d2515a
 
 ---
 
+## 🛠 Run from source
+
+From this project directory — not a global `tauri` binary:
+
+```bash
+npm install
+npm run tauri -- dev
+```
+
+On Windows, `start-mouzi.bat` in this folder runs the same command.
+
+---
+
 ## 🚀 Quick Start
 
 1. **Download** Mouzi for your OS using the links above.

@@ -13,11 +13,6 @@ use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_notification::NotificationExt;
 
 #[tauri::command]
-pub fn greet(name: &str) -> String {
-    format!("Hello, {}! You've been greeted from Rust!", name)
-}
-
-#[tauri::command]
 pub fn get_system_language() -> String {
     let locale = sys_locale::get_locale().unwrap_or_else(|| "en".to_string());
     let lang = locale.split('-').next().unwrap_or("en").to_lowercase();
@@ -389,9 +384,7 @@ pub fn close_popup(app: AppHandle) {
 
 #[tauri::command]
 pub fn close_settings(app: AppHandle) {
-    if let Some(window) = app.get_webview_window("settings") {
-        let _ = window.close();
-    }
+    crate::tray::hide_app_window(&app);
 }
 
 #[tauri::command]
@@ -520,6 +513,7 @@ pub fn import_rules_cmd(path: String, replace: bool) -> Result<usize, String> {
 #[serde(rename_all = "camelCase")]
 pub struct ScanStarted {
     pub started: bool,
+    pub reason: Option<String>,
 }
 
 /// Scan all watched (non-paused) folders in the background.
@@ -534,11 +528,17 @@ pub fn start_scan_cmd(app: AppHandle, state: tauri::State<'_, AppState>) -> Resu
         .map(|f| f.path)
         .collect();
     if roots.is_empty() {
-        return Ok(ScanStarted { started: false });
+        return Ok(ScanStarted {
+            started: false,
+            reason: Some("no_roots".into()),
+        });
     }
     let is_scanning = state.is_scanning.clone();
     if is_scanning.swap(true, Ordering::SeqCst) {
-        return Ok(ScanStarted { started: false });
+        return Ok(ScanStarted {
+            started: false,
+            reason: Some("already_running".into()),
+        });
     }
     std::thread::spawn(move || {
         scan::scan_roots(&roots, |event| match event {
@@ -551,7 +551,10 @@ pub fn start_scan_cmd(app: AppHandle, state: tauri::State<'_, AppState>) -> Resu
         });
         is_scanning.store(false, Ordering::SeqCst);
     });
-    Ok(ScanStarted { started: true })
+    Ok(ScanStarted {
+        started: true,
+        reason: None,
+    })
 }
 
 /// Returns `true` while a scan is in progress.
@@ -566,9 +569,12 @@ pub struct DashboardStats {
     pub total_files: i64,
     pub total_bytes: i64,
     pub category_breakdown: Vec<CategoryStat>,
-    pub largest_files: Vec<LargestFile>,
+    pub largest_files: Vec<InventoryFile>,
+    pub recent_files: Vec<InventoryFile>,
     pub watched_roots: Vec<RootStat>,
     pub last_scan_at: Option<i64>,
+    pub insights: DashboardInsights,
+    pub age_buckets: Vec<AgeBucket>,
 }
 
 /// Aggregate stats for the dashboard view.
@@ -576,16 +582,39 @@ pub struct DashboardStats {
 pub fn get_dashboard_stats_cmd() -> Result<DashboardStats, String> {
     let stats = get_inventory_stats().map_err(|e| e.to_string())?;
     let category_breakdown = get_category_distribution().map_err(|e| e.to_string())?;
-    let largest_files = get_largest_files(50).map_err(|e| e.to_string())?;
+    let largest_files = get_inventory_files("size", None, None, None, 50).map_err(|e| e.to_string())?;
+    let recent_files = get_inventory_files("mtime", None, None, None, 50).map_err(|e| e.to_string())?;
     let watched_roots = get_root_summaries().map_err(|e| e.to_string())?;
+    let insights = get_dashboard_insights().map_err(|e| e.to_string())?;
+    let age_buckets = get_age_buckets().map_err(|e| e.to_string())?;
     Ok(DashboardStats {
         total_files: stats.total_files,
         total_bytes: stats.total_bytes,
         category_breakdown,
         largest_files,
+        recent_files,
         watched_roots,
         last_scan_at: stats.last_scan_at,
+        insights,
+        age_buckets,
     })
+}
+
+/// Browse inventory files with optional category, root, and name filters.
+#[tauri::command]
+pub fn get_inventory_files_cmd(
+    sort: Option<String>,
+    category: Option<String>,
+    root: Option<String>,
+    query: Option<String>,
+    limit: Option<i64>,
+) -> Result<Vec<InventoryFile>, String> {
+    let sort = sort.unwrap_or_else(|| "size".into());
+    let cat = category.as_deref().filter(|s| !s.is_empty());
+    let root = root.as_deref().filter(|s| !s.is_empty());
+    let query = query.as_deref().filter(|s| !s.is_empty());
+    let limit = limit.unwrap_or(50).clamp(1, 200);
+    get_inventory_files(&sort, cat, root, query, limit).map_err(|e| e.to_string())
 }
 
 // ---------------------------------------------------------------------------

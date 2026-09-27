@@ -137,94 +137,115 @@ pub fn update_tray_tooltip(app: &AppHandle, count: usize) {
     }
 }
 
-pub fn show_settings_window(app: &AppHandle) {
+/// Convert a Tauri app URL (`/#/dashboard`) to a `location.hash` fragment (`#/dashboard`).
+/// Assigning `location.hash = '/#/dashboard'` becomes `#/#/dashboard`, which parseHash
+/// does not treat as the dashboard route.
+pub fn workspace_fragment(url_or_hash: &str) -> String {
+    let s = url_or_hash.trim();
+    if let Some(rest) = s.strip_prefix("/#") {
+        format!("#{rest}")
+    } else if s.starts_with('#') {
+        s.to_string()
+    } else {
+        format!("#/{s}")
+    }
+}
+
+/// Script that sets `location.hash` in the workspace webview.
+/// Quotes and line breaks are stripped so this is safe to `eval`.
+pub fn location_hash_script(hash: &str) -> String {
+    let fragment = workspace_fragment(hash);
+    let safe: String = fragment
+        .chars()
+        .filter(|c| !matches!(*c, '\'' | '\\' | '\n' | '\r'))
+        .collect();
+    format!("window.location.hash = '{safe}'")
+}
+
+/// One workspace window for dashboard, cleanup, suggestions, and settings.
+/// The tray popup stays a separate compact flyout.
+/// `url` is a Tauri webview path (`/#/dashboard`); eval uses the fragment only.
+fn show_app_window(app: &AppHandle, url: &str, title_key: &str) {
     let i18n = TrayI18n::new(&tray_lang(app));
-    if let Some(window) = app.get_webview_window("settings") {
+    let title = i18n.get(title_key);
+    if let Some(window) = app.get_webview_window("app") {
+        let _ = window.eval(&location_hash_script(url));
+        let _ = window.set_title(title);
         let _ = window.show();
         let _ = window.set_focus();
-    } else {
-        let window = tauri::WebviewWindowBuilder::new(
-            app,
-            "settings",
-            tauri::WebviewUrl::App("/#/settings".into()),
-        )
-        .title(i18n.get("settings_title"))
-        .inner_size(900.0, 650.0)
-        .min_inner_size(700.0, 500.0)
-        .build();
-
-        if let Ok(win) = window {
-            let _ = win.show();
-            let _ = win.set_focus();
-        }
+        return;
     }
+    let window = tauri::WebviewWindowBuilder::new(
+        app,
+        "app",
+        tauri::WebviewUrl::App(url.into()),
+    )
+    .title(title)
+    .inner_size(1100.0, 820.0)
+    .min_inner_size(800.0, 600.0)
+    .build();
+
+    if let Ok(win) = window {
+        let _ = win.show();
+        let _ = win.set_focus();
+    }
+}
+
+pub fn hide_app_window(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("app") {
+        let _ = window.hide();
+    }
+}
+
+pub fn show_settings_window(app: &AppHandle) {
+    show_app_window(app, "/#/settings", "settings_title");
 }
 
 pub fn show_dashboard_window(app: &AppHandle) {
-    let i18n = TrayI18n::new(&tray_lang(app));
-    if let Some(window) = app.get_webview_window("dashboard") {
-        let _ = window.show();
-        let _ = window.set_focus();
-    } else {
-        let window = tauri::WebviewWindowBuilder::new(
-            app,
-            "dashboard",
-            tauri::WebviewUrl::App("/#/dashboard".into()),
-        )
-        .title(i18n.get("dashboard_title"))
-        .inner_size(1024.0, 768.0)
-        .min_inner_size(800.0, 600.0)
-        .build();
-
-        if let Ok(win) = window {
-            let _ = win.show();
-            let _ = win.set_focus();
-        }
-    }
+    show_app_window(app, "/#/dashboard", "dashboard_title");
 }
 
 pub fn show_suggestions_window(app: &AppHandle) {
-    let i18n = TrayI18n::new(&tray_lang(app));
-    if let Some(window) = app.get_webview_window("suggestions") {
-        let _ = window.show();
-        let _ = window.set_focus();
-    } else {
-        let window = tauri::WebviewWindowBuilder::new(
-            app,
-            "suggestions",
-            tauri::WebviewUrl::App("/#/suggestions".into()),
-        )
-        .title(i18n.get("suggestions_title"))
-        .inner_size(900.0, 700.0)
-        .min_inner_size(700.0, 500.0)
-        .build();
-
-        if let Ok(win) = window {
-            let _ = win.show();
-            let _ = win.set_focus();
-        }
-    }
+    show_app_window(app, "/#/suggestions", "suggestions_title");
 }
 
 pub fn show_cleanup_window(app: &AppHandle) {
-    let i18n = TrayI18n::new(&tray_lang(app));
-    if let Some(window) = app.get_webview_window("cleanup") {
-        let _ = window.show();
-        let _ = window.set_focus();
-    } else {
-        let window = tauri::WebviewWindowBuilder::new(
-            app,
-            "cleanup",
-            tauri::WebviewUrl::App("/#/cleanup".into()),
-        )
-        .title(i18n.get("cleanup_title"))
-        .inner_size(900.0, 700.0)
-        .min_inner_size(700.0, 500.0)
-        .build();
+    show_app_window(app, "/#/cleanup", "cleanup_title");
+}
 
-        if let Ok(win) = window {
-            let _ = win.show();
-            let _ = win.set_focus();
-        }
+#[cfg(test)]
+mod tests {
+    use super::{location_hash_script, workspace_fragment};
+
+    fn assigned_fragment(script: &str) -> &str {
+        script
+            .split('\'')
+            .nth(1)
+            .expect("eval script must quote the hash")
+    }
+
+    #[test]
+    fn location_hash_script_sets_route() {
+        assert_eq!(
+            location_hash_script("#/dashboard"),
+            "window.location.hash = '#/dashboard'"
+        );
+    }
+
+    #[test]
+    fn location_hash_script_strips_quotes_and_breaks() {
+        assert_eq!(
+            location_hash_script("#'evil\n"),
+            "window.location.hash = '#evil'"
+        );
+    }
+
+    #[test]
+    fn production_webview_url_eval_is_a_dashboard_fragment() {
+        let url = "/#/dashboard";
+        assert_eq!(workspace_fragment(url), "#/dashboard");
+        let script = location_hash_script(url);
+        assert_eq!(assigned_fragment(script.as_str()), "#/dashboard");
+        assert_ne!(assigned_fragment(script.as_str()), "/#/dashboard");
     }
 }

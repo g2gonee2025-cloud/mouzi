@@ -81,7 +81,6 @@ interface AppState {
   schedule: ScheduleSettings | null;
   pendingFiles: [string, string][];
   isLoading: boolean;
-  currentView: 'popup' | 'settings';
 
   loadSettings: () => Promise<void>;
   saveSettings: (settings: AppSettings) => Promise<void>;
@@ -116,7 +115,6 @@ export const useAppStore = create<AppState>((set, get) => ({
   schedule: null,
   pendingFiles: [],
   isLoading: false,
-  currentView: 'popup',
 
   loadSettings: async () => {
     const settings = await invoke<AppSettings>('get_settings_cmd');

@@ -134,3 +134,63 @@ input[type="checkbox"]:focus-visible {
   outline: 2px solid var(--color-primary-val);
   outline-offset: 2px;
 }
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+.storage-ribbon {
+  display: flex;
+  height: 28px;
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--color-border-val);
+  transform-origin: left center;
+}
+
+.storage-ribbon-seg {
+  height: 100%;
+  border: 0;
+  padding: 0;
+  min-width: 3px;
+  cursor: pointer;
+  transition: opacity 0.15s ease, filter 0.15s ease;
+}
+
+.storage-ribbon-seg:hover {
+  filter: brightness(1.08);
+}
+
+.storage-ribbon-seg:focus-visible {
+  outline: 2px solid var(--color-primary-val);
+  outline-offset: -2px;
+}
+
+.scan-bar {
+  height: 3px;
+  border-radius: 999px;
+  background: linear-gradient(
+    90deg,
+    transparent,
+    var(--color-primary-val),
+    transparent
+  );
+  background-size: 40% 100%;
+  animation: scan-slide 1.4s linear infinite;
+}
+
+@keyframes scan-slide {
+  from { background-position: -40% 0; }
+  to { background-position: 140% 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .scan-bar {
+    animation: none;
+    background: var(--color-primary-val);
+  }
+  .storage-ribbon-seg,
+  .scan-bar {
+    transition: none;
+  }
+}

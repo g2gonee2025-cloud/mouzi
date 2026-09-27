@@ -206,6 +206,14 @@ pub fn init_db(app_dir: PathBuf) -> SqliteResult<()> {
         "CREATE INDEX IF NOT EXISTS idx_file_inventory_size ON file_inventory(size)",
         [],
     )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_file_inventory_category ON file_inventory(category)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_file_inventory_mtime ON file_inventory(mtime)",
+        [],
+    )?;
 
     // Dismissed suggestions for AI-assisted organization
     conn.execute(
@@ -686,6 +694,40 @@ pub struct RootStat {
     pub bytes: i64,
 }
 
+pub const LARGE_FILE_BYTES: i64 = 100 * 1024 * 1024;
+pub const STALE_FILE_DAYS: i64 = 365;
+pub const SAME_SIZE_MIN_BYTES: i64 = 1024;
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DashboardInsights {
+    pub large_files: i64,
+    pub large_bytes: i64,
+    pub stale_files: i64,
+    pub stale_bytes: i64,
+    pub same_size_groups: i64,
+    pub same_size_extra_bytes: i64,
+    pub other_files: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgeBucket {
+    pub bucket: String,
+    pub files: i64,
+    pub bytes: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InventoryFile {
+    pub path: String,
+    pub size: i64,
+    pub mtime: i64,
+    pub category: String,
+    pub root_path: String,
+}
+
 #[cfg(test)]
 fn create_file_inventory_table(conn: &Connection) -> SqliteResult<()> {
     conn.execute(
@@ -702,6 +744,8 @@ fn create_file_inventory_table(conn: &Connection) -> SqliteResult<()> {
     )?;
     conn.execute("CREATE INDEX IF NOT EXISTS idx_file_inventory_root ON file_inventory(root_path)", [])?;
     conn.execute("CREATE INDEX IF NOT EXISTS idx_file_inventory_size ON file_inventory(size)", [])?;
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_file_inventory_category ON file_inventory(category)", [])?;
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_file_inventory_mtime ON file_inventory(mtime)", [])?;
     Ok(())
 }
 
@@ -803,6 +847,134 @@ fn get_root_summaries_on(conn: &Connection) -> SqliteResult<Vec<RootStat>> {
     Ok(rows)
 }
 
+fn get_insights_on(conn: &Connection, now: i64) -> SqliteResult<DashboardInsights> {
+    let (large_files, large_bytes): (i64, i64) = conn.query_row(
+        "SELECT COUNT(*), COALESCE(SUM(size), 0) FROM file_inventory WHERE size >= ?1",
+        params![LARGE_FILE_BYTES],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let stale_cutoff = now - STALE_FILE_DAYS * 86_400;
+    let (stale_files, stale_bytes): (i64, i64) = conn.query_row(
+        "SELECT COUNT(*), COALESCE(SUM(size), 0) FROM file_inventory WHERE mtime > 0 AND mtime < ?1",
+        params![stale_cutoff],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let (same_size_groups, same_size_extra_bytes): (i64, i64) = conn.query_row(
+        "SELECT COUNT(*), COALESCE(SUM((cnt - 1) * size), 0) FROM (
+            SELECT size, COUNT(*) AS cnt FROM file_inventory
+            WHERE size > ?1 GROUP BY size HAVING COUNT(*) > 1
+         )",
+        params![SAME_SIZE_MIN_BYTES],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let other_files: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM file_inventory WHERE category = 'Other'",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(DashboardInsights {
+        large_files,
+        large_bytes,
+        stale_files,
+        stale_bytes,
+        same_size_groups,
+        same_size_extra_bytes,
+        other_files,
+    })
+}
+
+fn get_age_buckets_on(conn: &Connection, now: i64) -> SqliteResult<Vec<AgeBucket>> {
+    let d7 = now - 7 * 86_400;
+    let d30 = now - 30 * 86_400;
+    let d90 = now - 90 * 86_400;
+    let d365 = now - 365 * 86_400;
+    let mut stmt = conn.prepare(
+        "SELECT CASE
+            WHEN mtime >= ?1 THEN '7d'
+            WHEN mtime >= ?2 THEN '30d'
+            WHEN mtime >= ?3 THEN '90d'
+            WHEN mtime >= ?4 THEN '365d'
+            ELSE 'older'
+         END AS bucket,
+         COUNT(*),
+         COALESCE(SUM(size), 0)
+         FROM file_inventory
+         GROUP BY 1",
+    )?;
+    let rows = stmt
+        .query_map(params![d7, d30, d90, d365], |row| {
+            Ok(AgeBucket {
+                bucket: row.get(0)?,
+                files: row.get(1)?,
+                bytes: row.get(2)?,
+            })
+        })?
+        .collect::<SqliteResult<Vec<_>>>()?;
+    let mut by_key = std::collections::HashMap::new();
+    for row in rows {
+        by_key.insert(row.bucket.clone(), row);
+    }
+    const ORDER: [&str; 5] = ["7d", "30d", "90d", "365d", "older"];
+    Ok(ORDER
+        .iter()
+        .map(|key| {
+            by_key.get(*key).cloned().unwrap_or(AgeBucket {
+                bucket: (*key).to_string(),
+                files: 0,
+                bytes: 0,
+            })
+        })
+        .collect())
+}
+
+fn get_inventory_files_on(
+    conn: &Connection,
+    sort: &str,
+    category: Option<&str>,
+    root: Option<&str>,
+    query: Option<&str>,
+    limit: i64,
+) -> SqliteResult<Vec<InventoryFile>> {
+    let order = if sort == "mtime" {
+        "mtime DESC, path ASC"
+    } else {
+        "size DESC, path ASC"
+    };
+    let cat = category.unwrap_or("");
+    let root_path = root.unwrap_or("");
+    let q = query.unwrap_or("").trim();
+    let sanitized: String = q
+        .chars()
+        .filter(|c| *c != '%' && *c != '_' && *c != '\\')
+        .collect();
+    let like = if sanitized.is_empty() {
+        String::new()
+    } else {
+        format!("%{}%", sanitized.to_lowercase())
+    };
+    let sql = format!(
+        "SELECT path, size, mtime, category, root_path FROM file_inventory
+         WHERE (?1 = '' OR category = ?1)
+           AND (?2 = '' OR root_path = ?2)
+           AND (?3 = '' OR LOWER(path) LIKE ?3)
+         ORDER BY {order}
+         LIMIT ?4"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map(params![cat, root_path, like, limit], |row| {
+            Ok(InventoryFile {
+                path: row.get(0)?,
+                size: row.get(1)?,
+                mtime: row.get(2)?,
+                category: row.get(3)?,
+                root_path: row.get(4)?,
+            })
+        })?
+        .collect::<SqliteResult<Vec<_>>>()?;
+    Ok(rows)
+}
+
 // Public wrappers that use the global DB.
 
 pub fn replace_inventory_for_root(root: &str, rows: &[InventoryRow]) -> SqliteResult<()> {
@@ -846,6 +1018,30 @@ pub fn get_root_summaries() -> SqliteResult<Vec<RootStat>> {
     let db = get_db();
     let conn = db.lock().unwrap();
     get_root_summaries_on(&conn)
+}
+
+pub fn get_dashboard_insights() -> SqliteResult<DashboardInsights> {
+    let db = get_db();
+    let conn = db.lock().unwrap();
+    get_insights_on(&conn, now_epoch())
+}
+
+pub fn get_age_buckets() -> SqliteResult<Vec<AgeBucket>> {
+    let db = get_db();
+    let conn = db.lock().unwrap();
+    get_age_buckets_on(&conn, now_epoch())
+}
+
+pub fn get_inventory_files(
+    sort: &str,
+    category: Option<&str>,
+    root: Option<&str>,
+    query: Option<&str>,
+    limit: i64,
+) -> SqliteResult<Vec<InventoryFile>> {
+    let db = get_db();
+    let conn = db.lock().unwrap();
+    get_inventory_files_on(&conn, sort, category, root, query, limit)
 }
 
 // ---------------------------------------------------------------------------
@@ -1144,5 +1340,97 @@ mod tests {
         let corrupt = logs.iter().find(|l| l.path == "/corrupt-cleanup");
         assert!(corrupt.is_some(), "corrupt cleanup row should be returned with epoch fallback");
         assert_eq!(corrupt.unwrap().timestamp, Utc.timestamp_opt(0, 0).unwrap());
+    }
+
+    #[test]
+    fn insights_count_large_stale_same_size_and_other() {
+        let mut conn = mem_conn_with_inventory();
+        let now = 1_700_000_000;
+        let year = 365 * 86_400;
+        let rows = vec![
+            InventoryRow {
+                path: "/a/huge.mp4".into(),
+                size: LARGE_FILE_BYTES,
+                mtime: now,
+                category: "Videos".into(),
+            },
+            InventoryRow {
+                path: "/a/old.txt".into(),
+                size: 10,
+                mtime: now - year - 10,
+                category: "Documents".into(),
+            },
+            InventoryRow {
+                path: "/a/dup1.bin".into(),
+                size: 5000,
+                mtime: now,
+                category: "Other".into(),
+            },
+            InventoryRow {
+                path: "/a/dup2.bin".into(),
+                size: 5000,
+                mtime: now,
+                category: "Other".into(),
+            },
+        ];
+        replace_inventory_on(&mut conn, "/a", &rows).unwrap();
+
+        let insights = get_insights_on(&conn, now).unwrap();
+        assert_eq!(insights.large_files, 1);
+        assert_eq!(insights.large_bytes, LARGE_FILE_BYTES);
+        assert_eq!(insights.stale_files, 1);
+        assert_eq!(insights.stale_bytes, 10);
+        assert_eq!(insights.same_size_groups, 1);
+        assert_eq!(insights.same_size_extra_bytes, 5000);
+        assert_eq!(insights.other_files, 2);
+    }
+
+    #[test]
+    fn age_buckets_are_stable_and_ordered() {
+        let mut conn = mem_conn_with_inventory();
+        let now = 1_700_000_000;
+        let rows = vec![
+            InventoryRow { path: "/a/week.txt".into(), size: 1, mtime: now - 2 * 86_400, category: "Other".into() },
+            InventoryRow { path: "/a/month.txt".into(), size: 2, mtime: now - 20 * 86_400, category: "Other".into() },
+            InventoryRow { path: "/a/quarter.txt".into(), size: 3, mtime: now - 60 * 86_400, category: "Other".into() },
+            InventoryRow { path: "/a/year.txt".into(), size: 4, mtime: now - 200 * 86_400, category: "Other".into() },
+            InventoryRow { path: "/a/old.txt".into(), size: 5, mtime: now - 400 * 86_400, category: "Other".into() },
+        ];
+        replace_inventory_on(&mut conn, "/a", &rows).unwrap();
+        let buckets = get_age_buckets_on(&conn, now).unwrap();
+        let keys: Vec<&str> = buckets.iter().map(|b| b.bucket.as_str()).collect();
+        assert_eq!(keys, vec!["7d", "30d", "90d", "365d", "older"]);
+        assert_eq!(buckets.iter().map(|b| b.files).collect::<Vec<_>>(), vec![1, 1, 1, 1, 1]);
+        assert_eq!(buckets.iter().map(|b| b.bytes).collect::<Vec<_>>(), vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn inventory_files_filter_sort_and_query() {
+        let mut conn = mem_conn_with_inventory();
+        let rows = vec![
+            InventoryRow { path: "/docs/a.pdf".into(), size: 30, mtime: 3, category: "Documents".into() },
+            InventoryRow { path: "/docs/b.pdf".into(), size: 10, mtime: 9, category: "Documents".into() },
+            InventoryRow { path: "/pics/c.jpg".into(), size: 50, mtime: 1, category: "Images".into() },
+        ];
+        replace_inventory_on(&mut conn, "/docs", &rows[..2]).unwrap();
+        replace_inventory_on(&mut conn, "/pics", &rows[2..]).unwrap();
+
+        let by_size = get_inventory_files_on(&conn, "size", None, None, None, 10).unwrap();
+        assert_eq!(by_size.iter().map(|f| f.size).collect::<Vec<_>>(), vec![50, 30, 10]);
+
+        let docs = get_inventory_files_on(&conn, "size", Some("Documents"), None, None, 10).unwrap();
+        assert_eq!(docs.len(), 2);
+        assert!(docs.iter().all(|f| f.category == "Documents"));
+
+        let recent = get_inventory_files_on(&conn, "mtime", None, None, None, 1).unwrap();
+        assert_eq!(recent[0].path, "/docs/b.pdf");
+
+        let q = get_inventory_files_on(&conn, "size", None, None, Some("JPG"), 10).unwrap();
+        assert_eq!(q.len(), 1);
+        assert_eq!(q[0].path, "/pics/c.jpg");
+
+        let root = get_inventory_files_on(&conn, "size", None, Some("/pics"), None, 10).unwrap();
+        assert_eq!(root.len(), 1);
+        assert_eq!(root[0].root_path, "/pics");
     }
 }

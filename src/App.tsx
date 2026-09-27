@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { parseHash } from "./utils/paths";
 import { useTranslation } from "react-i18next";
 import { initI18n, SupportedLang } from "./i18n";
 import { useAppStore } from "./store/useAppStore";
@@ -32,7 +33,13 @@ function App() {
   const [ready, setReady] = useState(false);
   const { loadSettings, settings } = useAppStore();
 
-  const hash = window.location.hash.replace("#/", "") || "popup";
+  const [hash, setHash] = useState(() => parseHash().route);
+
+  useEffect(() => {
+    const onHash = () => setHash(parseHash().route);
+    window.addEventListener("hashchange", onHash);
+    return () => window.removeEventListener("hashchange", onHash);
+  }, []);
 
   useEffect(() => {
     async function boot() {
@@ -60,7 +67,6 @@ function App() {
 
     let actionListener: { unregister: () => Promise<void> } | null = null;
 
-    // Listen for notification action clicks centrally
     onAction((notification) => {
       const destFolder = (notification.extra as Record<string, unknown> | undefined)?.destFolder as string | undefined;
       if (destFolder) {
@@ -71,14 +77,10 @@ function App() {
       actionListener = listener;
     }).catch(console.error);
 
-    // When the popup window gains focus (e.g. after notification click brings app forward),
-    // check if there's a pending folder to open. This covers the case where the app window
-    // was already visible and single-instance handler didn't fire.
     const handleFocus = async () => {
       try {
         const folder = await invoke<string | null>("get_pending_open_folder_cmd");
         if (folder) {
-          // Open the folder in Explorer
           await invoke("open_folder_cmd", { path: folder }).catch(console.error);
         }
       } catch (e) {

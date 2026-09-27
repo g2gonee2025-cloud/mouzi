@@ -1,6 +1,6 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
+import { parseHash, navigateHash } from "../utils/paths";
 import { useTranslation } from "react-i18next";
-import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { Sparkles, ChevronLeft, History, Info } from "lucide-react";
 import { useCleanupStore } from "../store/useCleanupStore";
 import DuplicatesTab from "../components/cleanup/DuplicatesTab";
@@ -10,9 +10,23 @@ import HistoryPanel from "../components/cleanup/HistoryPanel";
 
 type Tab = "duplicates" | "large" | "stale" | "emptyDirs" | "history";
 
+function tabFromHash(): Tab {
+  const raw = parseHash().params.get("tab");
+  if (raw === "duplicates" || raw === "large" || raw === "stale" || raw === "emptyDirs" || raw === "history") {
+    return raw;
+  }
+  return "duplicates";
+}
+
 export default function Cleanup() {
   const { t } = useTranslation();
-  const [tab, setTab] = useState<Tab>("duplicates");
+  const [tab, setTab] = useState<Tab>(tabFromHash);
+
+  useEffect(() => {
+    const onHash = () => setTab(tabFromHash());
+    window.addEventListener("hashchange", onHash);
+    return () => window.removeEventListener("hashchange", onHash);
+  }, []);
   const hasAnyData = useCleanupStore((s) =>
     s.duplicates !== null ||
     s.largeFiles !== null ||
@@ -22,11 +36,7 @@ export default function Cleanup() {
   );
 
   const handleBack = () => {
-    if (window.history.length > 1) {
-      window.history.back();
-    } else {
-      getCurrentWebviewWindow().close().catch(console.error);
-    }
+    navigateHash("dashboard");
   };
 
   const tabs: { id: Tab; label: string }[] = [

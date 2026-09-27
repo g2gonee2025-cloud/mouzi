@@ -73,20 +73,10 @@ pub fn run() {
                     }
                 }
             }
-            // Bring popup window to focus
-            if let Some(window) = app.get_webview_window("popup") {
+            if let Some(window) = app.get_webview_window("app") {
                 let _ = window.show();
                 let _ = window.set_focus();
-            } else if let Some(window) = app.get_webview_window("settings") {
-                let _ = window.show();
-                let _ = window.set_focus();
-            } else if let Some(window) = app.get_webview_window("dashboard") {
-                let _ = window.show();
-                let _ = window.set_focus();
-            } else if let Some(window) = app.get_webview_window("cleanup") {
-                let _ = window.show();
-                let _ = window.set_focus();
-            } else if let Some(window) = app.get_webview_window("suggestions") {
+            } else if let Some(window) = app.get_webview_window("popup") {
                 let _ = window.show();
                 let _ = window.set_focus();
             }
@@ -142,6 +132,14 @@ pub fn run() {
                 tray::show_popup_window(&app_handle);
             }
 
+            // Dev: open the dashboard so `tauri dev` lands on the main surface.
+            #[cfg(debug_assertions)]
+            {
+                if std::env::var("MOUZI_OPEN").unwrap_or_else(|_| "dashboard".into()) != "none" {
+                    tray::show_dashboard_window(&app_handle);
+                }
+            }
+
             // Sync autostart with user settings
             if let Ok(settings) = db::get_settings() {
                 let auto_manager = app.autolaunch();
@@ -165,7 +163,6 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            greet,
             get_system_language,
             get_rules_cmd,
             add_rule_cmd,
@@ -208,6 +205,7 @@ pub fn run() {
             start_scan_cmd,
             is_scanning_cmd,
             get_dashboard_stats_cmd,
+            get_inventory_files_cmd,
             find_duplicates_cmd,
             find_large_files_cmd,
             find_stale_files_cmd,
