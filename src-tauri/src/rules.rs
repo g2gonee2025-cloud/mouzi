@@ -182,21 +182,9 @@ pub fn execute_rule(file_info: &FileInfo, rule: &Rule) -> Result<String, String>
     match rule.action.as_str() {
         "move" => {
             fs::create_dir_all(&dest).map_err(|e| e.to_string())?;
-            let new_path = dest.join(&file_info.name);
-            if new_path.exists() {
-                let stem = file_info
-                    .path
-                    .file_stem()
-                    .unwrap_or_default()
-                    .to_string_lossy();
-                let new_name = format!("{}_{}.{}", stem, Utc::now().timestamp(), file_info.extension);
-                let new_path = dest.join(&new_name);
-                move_file_cross_device(&file_info.path, &new_path).map_err(|e| e.to_string())?;
-                Ok(new_path.to_string_lossy().to_string())
-            } else {
-                move_file_cross_device(&file_info.path, &new_path).map_err(|e| e.to_string())?;
-                Ok(new_path.to_string_lossy().to_string())
-            }
+            let new_path = crate::safe_fs::unique_destination(&dest, &file_info.name);
+            move_file_cross_device(&file_info.path, &new_path).map_err(|e| e.to_string())?;
+            Ok(new_path.to_string_lossy().to_string())
         }
         "ignore" => Ok(file_info.path.to_string_lossy().to_string()),
         _ => Err(format!("Unknown action: {}", rule.action)),

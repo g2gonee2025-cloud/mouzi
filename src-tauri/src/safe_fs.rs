@@ -1,5 +1,4 @@
 use std::path::{Component, Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 /// The outcome of a safe file move operation.
 #[derive(Debug, Clone, PartialEq)]
@@ -63,23 +62,57 @@ pub fn is_within_any_root(path: &Path, roots: &[PathBuf]) -> bool {
 }
 
 /// Resolve the destination path, appending a timestamp suffix if `dest` exists.
-fn resolve_destination(dest: &Path) -> (PathBuf, MoveOutcome) {
-    if dest.exists() {
-        let stem = dest.file_stem().unwrap_or_default().to_string_lossy();
-        let ext = dest
-            .extension()
-            .map(|e| format!(".{}", e.to_string_lossy()))
-            .unwrap_or_default();
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let new_name = format!("{}_{}{}", stem, now, ext);
-        let new_path = dest.with_file_name(&new_name);
-        (new_path, MoveOutcome::MovedWithNewName(new_name))
-    } else {
-        (dest.to_path_buf(), MoveOutcome::Moved)
+/// Pick a name inside `dir` that is not already taken.
+///
+/// A second-resolution timestamp is not enough of a suffix: two files whose
+/// stems and extensions collide in the same folder within one second produce
+/// the same candidate, and the rename then replaces the first file outright
+/// rather than failing. Counting upwards until the name is free makes the
+/// result unique by construction rather than by luck.
+pub fn unique_destination(dir: &Path, file_name: &str) -> PathBuf {
+    let candidate = dir.join(file_name);
+    if !candidate.exists() {
+        return candidate;
     }
+    let source = Path::new(file_name);
+    let stem = source
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    let extension = source
+        .extension()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    // An extensionless file must not gain a trailing dot, which Windows rejects.
+    for attempt in 0..10_000u32 {
+        let name = if extension.is_empty() {
+            format!("{}_{}", stem, attempt)
+        } else {
+            format!("{}_{}.{}", stem, attempt, extension)
+        };
+        let candidate = dir.join(name);
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    candidate
+}
+
+fn resolve_destination(dest: &Path) -> (PathBuf, MoveOutcome) {
+    if !dest.exists() {
+        return (dest.to_path_buf(), MoveOutcome::Moved);
+    }
+    let parent = dest.parent().unwrap_or(dest);
+    let name = dest.file_name().unwrap_or_default().to_string_lossy().to_string();
+    let new_path = unique_destination(parent, &name);
+    let new_name = new_path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    (new_path, MoveOutcome::MovedWithNewName(new_name))
 }
 
 /// Copy `src` to `dest` and delete `src`.
@@ -259,6 +292,56 @@ mod tests {
             Path::new("C:/Users/Me/Documents/a.txt"),
             &[PathBuf::new()]
         ));
+    }
+
+    #[test]
+    fn unique_destination_keeps_a_free_name_unchanged() {
+        let dir = test_dir("unique_free");
+        let picked = unique_destination(&dir, "report.txt");
+        assert_eq!(picked, dir.join("report.txt"));
+    }
+
+    #[test]
+    fn unique_destination_suffixes_a_taken_name() {
+        let dir = test_dir("unique_taken");
+        fs::write(dir.join("report.txt"), b"original").unwrap();
+        let picked = unique_destination(&dir, "report.txt");
+        assert_ne!(picked, dir.join("report.txt"));
+        assert!(picked.starts_with(&dir));
+    }
+
+    /// The regression: a second collision inside the same call sequence used to
+    /// produce a name identical to the first, and the rename replaced the file
+    /// that had already been moved there.
+    #[test]
+    fn unique_destination_never_repeats_a_name_it_already_issued() {
+        let dir = test_dir("unique_repeat");
+        fs::write(dir.join("report.txt"), b"original").unwrap();
+        let first = unique_destination(&dir, "report.txt");
+        fs::write(&first, b"first move").unwrap();
+        let second = unique_destination(&dir, "report.txt");
+        assert_ne!(first, second, "two collisions produced the same name");
+        assert_eq!(fs::read(dir.join("report.txt")).unwrap(), b"original");
+        assert_eq!(fs::read(&first).unwrap(), b"first move");
+    }
+
+    #[test]
+    fn unique_destination_does_not_add_a_trailing_dot_to_an_extensionless_file() {
+        let dir = test_dir("unique_noext");
+        fs::write(dir.join("README"), b"original").unwrap();
+        let picked = unique_destination(&dir, "README");
+        let name = picked.file_name().unwrap().to_string_lossy().to_string();
+        assert!(!name.ends_with('.'), "got {:?}", name);
+    }
+
+    #[test]
+    fn unique_destination_finds_a_gap_in_an_existing_run_of_suffixes() {
+        let dir = test_dir("unique_gap");
+        fs::write(dir.join("a.txt"), b"x").unwrap();
+        fs::write(dir.join("a_0.txt"), b"x").unwrap();
+        fs::write(dir.join("a_2.txt"), b"x").unwrap();
+        let picked = unique_destination(&dir, "a.txt");
+        assert_eq!(picked, dir.join("a_1.txt"));
     }
 
     /// Helper: create a temporary test directory unique to this process.
