@@ -2366,3 +2366,1436 @@ that implementing D4 is not treated as a one-line change.
 **Scope of this pass.** 15 of the 21 audit reports absorbed, **6 outstanding**: dependency and build
 configuration, React routing, Zustand stores, dashboard components, i18n, and whole-stack performance.
 Section 1's executive summary now predates ten addenda and should be reconciled against them.
+
+## 17. Addendum - ninth pass: dependencies, build config, routing and performance
+
+Source: three read-only sub-agent reports (dependency/build config; routing and window mapping; whole-stack performance). No build, no run, no database access, no network. Every figure below is a static estimate unless stated otherwise.
+
+### 17.1 CRITICAL - C17: `open_folder_cmd` is a PowerShell injection sink reachable from 10 call sites
+
+**Where:** `src-tauri/src/commands.rs:328-337`; call sites `src/components/dashboard/StorageTreemap.tsx:42`, `src/components/dashboard/FileBrowser.tsx:81`, `src/components/cleanup/FileListTab.tsx:84`, `src/components/cleanup/HistoryPanel.tsx:18`, `src/pages/Settings.tsx:429`, `src/pages/Popup.tsx:123`, `src/pages/Popup.tsx:130`, `src/pages/Popup.tsx:265`, `src/App.tsx:73`, `src/App.tsx:84`
+
+```rust
+let win_path = path.replace('/', "\\");
+std::process::Command::new("powershell")
+    .args(["-NoProfile", "-NonInteractive", "-Command",
+           &format!("explorer '{}'", win_path)])
+    .spawn()
+```
+
+Rust's `.args()` does not invoke a shell, but PowerShell parses the `-Command` string itself. A path containing a single quote closes the quoted literal and the remainder executes as PowerShell. A file named `report'; IEX(...); '` inside a watched folder is sufficient. The `path` argument is overwhelmingly not user-typed: it originates from scanned paths and DB rows, so this is attacker-controlled filesystem content reaching a command interpreter.
+
+The app already grants `opener:allow-reveal-item-in-dir` and `opener:allow-open-path` (`src-tauri/capabilities/default.json:9-10`) and registers `tauri_plugin_opener::init()` (`src-tauri/src/lib.rs:42`), which is Tauri's sanctioned, ACL-mediated, scope-checked path for this operation. The frontend imports `@tauri-apps/plugin-opener` nowhere, so the project carries an unused plugin npm entry (`package.json:18`), two granted permissions, and a hand-rolled injection sink at the same time.
+
+Confidence: **High on the code defect** (read directly). **UNVERIFIED on exploitability end-to-end**: the agent did not execute it, and confirming the full chain requires the watcher to DB to UI path exercised live. Fix is `Command::new("explorer").arg(&path)` with no shell and no interpolation, or use the granted plugin. The `path.replace('/', "\\")` normalisation at `commands.rs:328` is also unnecessary; Explorer accepts forward slashes.
+
+### 17.2 CRITICAL - C18: the Duplicates tab deletes the file it renders as "Kept"
+
+**Where:** `src/components/cleanup/DuplicatesTab.tsx:20`, `:36`, `:102-109`, `:119`; `src/utils/cleanup.ts:33`, `:48-62`; guard at `src-tauri/src/cleanup.rs:314-322`
+
+`selected` initialises to `{}` (`:20`). The card renders `keepPath={selected[g.hash] ?? g.files[0]?.path}` (`:119`), so the UI paints `files[0]` with a green highlight and a "Kept" badge. The action builder `buildDuplicateActions` (`utils/cleanup.ts:48-62`) reads `const keepPath = keptByGroup[g.hash]`, which is `undefined` for every group, so `f.path !== keepPath` is true for every file and **every file in every group is pushed to `trash_duplicate`**, including the one displayed as kept. `keepPath: undefined` is dropped by `JSON.stringify`, so the Rust `Option<String>` is `None` and the keeper guard at `cleanup.rs:314-322` never engages.
+
+The confirm button count is computed the same way, so it honestly reads "Confirm (6)" for three 2-file groups, and the header `reclaimable` figure (`utils/cleanup.ts:33`) also assumes `files[0]` survives. The display, the reclaimable number and the action disagree. The user must click a radio in every group before confirming, or each group is wiped entirely.
+
+This is committed, tracked-and-clean code (`src/components/cleanup/**`), not part of the in-flight dashboard refactor, so it is a settled defect rather than work in progress. Confidence: **high**; the behaviour is fully determined by the source and needs no runtime.
+
+### 17.3 CRITICAL - C19: all 51 commands execute on the Tauri main thread, worst case ~77 s freeze
+
+**Where:** `src-tauri/src/commands.rs` (whole file), worst case `src-tauri/src/classify.rs:591`, `classify.rs:444-445`, `classify.rs:489`; the only correct case `commands.rs:543`
+
+Tauri v2 documentation, quoted verbatim in the report: *"Async commands are executed on a separate async task using `async_runtime::spawn`. Commands without the `_async_` keyword are executed on the main thread unless defined with `#[tauri::command(async)]`."* Mechanical enumeration of `commands.rs` yields `total #[tauri::command] = 51`, `total async fn commands = 0`, `total command(async) = 0`. Every one is a bare `pub fn` on the main thread.
+
+Refines the already-recorded "all commands are sync" finding: the sync-ness is not a style issue, it is a freeze. Worst cases, from source:
+
+| Command | Main-thread work | Worst case |
+|---|---|---|
+| `get_suggestions_cmd` `commands.rs:673` | `detect_provider()` probe plus up to 5 sequential Ollama round-trips | **~2 s + 5 x 15 s = ~77 s** |
+| `find_duplicates_cmd` `commands.rs:626` | hashes every same-size file, serially | minutes on a large tree |
+| `import_archive_cmd` `commands.rs:300` | full zip/tar extract plus full rules scan | tens of seconds |
+| `find_empty_dirs_cmd` `commands.rs:652` | recursive walk of every watched root | seconds |
+| `execute_cleanup_cmd` `commands.rs:661` | Recycle Bin shell op plus audit INSERT per file | scales with selection |
+| `undo_all_cmd` `commands.rs:224` | per-log file move plus autocommit UPDATE | scales with log count |
+| `get_dashboard_stats_cmd` `commands.rs:582` | 6 SQL queries, ~5-6 full passes over `file_inventory` | see 17.27 |
+
+`start_scan_cmd` (`commands.rs:543`) is the one command that gets it right: it `std::thread::spawn`s and returns immediately. D6's mandate ("`ureq` blocking in a spawned std thread") is therefore violated by `get_suggestions_cmd`, which spawns nothing.
+
+The compounding cross-module failure, which no single-module reviewer owns: `src/pages/Suggestions.tsx:80` registers `window.addEventListener("focus", handleFocus)` to `loadSuggestions()` to `get_suggestions_cmd`. Alt-tabbing to the Suggestions window while Ollama is slow hangs the whole app for up to ~77 s. Fix is mechanical: `#[tauri::command(async)]` on roughly 10 heavy commands, or `async fn` plus `spawn_blocking` on the body.
+
+### 17.4 HIGH - H37: the `app` window holds zero Tauri permissions; all event wiring in the workspace window is dead
+
+**Where:** `src-tauri/capabilities/default.json:5`; `src-tauri/src/tray.rs:171`, `:178`, `:181`, `:184-185`; `src-tauri/src/lib.rs:76`, `:131-133`, `:136-141`; dead listeners at `src/pages/Dashboard.tsx:52-58`, `src/store/useDashboardStore.ts:200`, `:207`, `src/App.tsx:63`
+
+`capabilities/default.json:5` declares `["main", "popup", "settings", "dashboard", "cleanup", "suggestions"]`. Four of those six labels (`settings`, `dashboard`, `cleanup`, `suggestions`) are **never created by any code path in the repo**; every `WebviewWindowBuilder` and `get_webview_window` call was grepped. The label actually created and reused by the tray is `app`. `"app"` appears in exactly two places, `tray.rs:171` and `tray.rs:178`.
+
+Refines the already-recorded ACL finding with the precise mechanism: `plugin:event|listen` is denied while all app commands still work, because app-defined commands bypass the ACL when no `src-tauri/permissions/` directory exists and `build.rs` is the bare three-line `tauri_build::build()` with no `AppManifest::commands`. Verified: `src-tauri/permissions` is absent and there is no app manifest. So the page renders, data loads, and only the events are dead, which is why the failure survives any check that stops at the command name.
+
+Exact failure strings, now documented rather than inferred: **release** `Command plugin:event|listen not allowed by ACL`; **dev** `event.listen not allowed. Permissions associated with this command: allow-listen, default`. Consequences: the dashboard progress bar (`:143-155`) can never appear, `scheduleRefreshAfterScan` (`useDashboardStore.ts:190-197`) never fires so the dashboard never auto-refreshes after a scan, and `file-organized` (`App.tsx:63`) never fires in the workspace window. Both `await listen(...)` chains lack `.catch()`, so the rejections are unhandled and invisible with no devtools in a release webview.
+
+No escape hatch via `webviews`: there is exactly one capability file and it has no `webviews` key, and `WebviewWindowBuilder::new` sets the webview label equal to the window label, so the webview label is also `app`. Zero permissions, unambiguously.
+
+Two facts for whoever fixes it. `"windows": ["*"]` is valid glob syntax and would have made this failure class structurally impossible. The fix is not purely additive: adding a `src-tauri/permissions/` dir or an `AppManifest` would stop app commands bypassing the ACL, at which point the `app` window loses all commands, not just the listeners. The capability fix and the app-ACL decision must be made together.
+
+### 17.5 HIGH - H38: no SQLite `PRAGMA` of any kind; ~2,000-3,000 fsyncs per scan
+
+**Where:** `src-tauri/src/db.rs:119-290` (`init_db`); the only `PRAGMA` in the whole crate is `PRAGMA table_info(settings)` at `db.rs:242`
+
+| Pragma | Current value | Consequence |
+|---|---|---|
+| `journal_mode` | `DELETE` (default) | every commit creates, writes and deletes a rollback journal file |
+| `synchronous` | `FULL` (default) | **~2-3 fsync per commit** |
+| `busy_timeout` | `0` | lock contention returns `SQLITE_BUSY` immediately; swallowed by `let _` at `cleanup.rs:119` and `commands.rs:762` |
+| `cache_size` | `-2000` (~2 MB default) | undersized for a multi-hundred-MB inventory |
+| `mmap_size` | `0` | every page read is a `pread` syscall |
+| `temp_store` | `DEFAULT` (file-backed) | `GROUP BY` / `ORDER BY` spills hit disk |
+
+The maths: 500k files in 500-row batches is 1,000 commits, and rollback-journal plus `synchronous=FULL` gives **~2,000-3,000 fsync per scan**. At a static-estimated 1 ms per fsync that is ~2-3 s of pure forced flush; at 5-10 ms (slower controller, or the app directory on a synchronised volume) it is 10-30 s. The journal `delete` also churns the directory MFT on the same volume being scanned. Three lines in `init_db` fix the bulk: `journal_mode=WAL`, `synchronous=NORMAL`, `busy_timeout=5000`. `busy_timeout` is a correctness fix as much as a performance one. Optional on the same lines: `cache_size = -20000` and `mmap_size = 268435456`, both pure reads, and 17.27 shows the dashboard is read-heavy.
+
+### 17.6 HIGH - H39: the two hottest dashboard queries degrade to full scan plus full sort of N rows to return 50
+
+**Where:** `src-tauri/src/db.rs:206` (`idx_file_inventory_size`), `db.rs:214` (`idx_file_inventory_mtime`), `db.rs:940` (`ORDER BY size DESC, path ASC`)
+
+`get_inventory_files_on` orders by `(size DESC, path ASC)` against an index on `size` **alone**. Because the index carries no `path` column, SQLite cannot produce rows in that order by scanning the index and must use a sorter, so the two "largest/recent files, limit 50" queries, which are the most frequent queries in the app, become a full table scan plus a full sort of N rows to return 50. Fix is one line each: make the indexes composite, `CREATE INDEX ... ON file_inventory(size, path)` and `(mtime, path)`. This converts a scan-and-sort of 500k rows into a bounded index range scan reading 50 entries, and costs nothing at write time.
+
+### 17.7 HIGH - H40: the 500 ms watcher loop is 120 wakeups per minute forever, with ~300,000 `PathBuf` clones per post-download window
+
+**Where:** `src-tauri/src/watcher.rs:54-66`, `:78-82`, `:240`; `src-tauri/src/rules.rs:207`; default at `src-tauri/src/db.rs:249`
+
+```rust
+loop {
+    std::thread::sleep(Duration::from_millis(500));   // watcher.rs:56
+    let ready: Vec<_> = guard.iter().filter(|p| now >= p.scheduled).cloned().collect();
+    guard.retain(|p| now < p.scheduled);              // watcher.rs:63-66
+```
+
+The loop never exits and never idles longer: 120 wakeups per minute for the entire life of the app. The cost is not the wakeup but two O(P) passes over the pending queue per tick, where P is the number of files dropped inside the grace period. `grace_period_seconds` defaults to **300 s** (`db.rs:249`), so after a burst of 500 downloaded files P is ~500 for five minutes, which is 600 ticks, and `ready = ...cloned()` performs **~500 `PathBuf` heap clones per tick, ~300,000 allocations per 5-minute window**, plus ~300,000 more `PathBuf` comparisons in `retain`. That is sustained user-visible CPU for five minutes after any ordinary download session.
+
+Separately, `watcher.rs:78-82` calls `get_watched_folders()` (`db.rs:413`: `get_db()` + mutex + `conn.prepare` + full `SELECT` + materialise) **once per file processed**, and `process_file` (`rules.rs:207`) calls `get_settings()` again. Each organised file costs at least two redundant DB round-trips readable once per batch tick. And `watcher.rs:240` calls `get_settings()` per file inside the startup scan, which itself runs on the main thread inside `.setup()` (`lib.rs:154-158` to `watch_folders`), so it blocks app launch for a folder that routinely holds hundreds of files.
+
+Net idle tally across the app: watcher 120/min always, popup 20/min after first open forever, scheduler 1/min always, plus three undebounced `focus` handlers of increasing weight. **~141 unconditional wakeups per minute**, with zero debouncing anywhere in the codebase except the 200 ms search debounce at `FileBrowser.tsx:57-60`.
+
+### 17.8 HIGH - H41: unbounded cleanup queries plus no virtualisation, from a user-typable threshold
+
+**Where:** `src-tauri/src/db.rs:1118` (`get_large_files_from_inventory`), `db.rs:1136` (`get_stale_files_from_inventory`), `src-tauri/src/cleanup.rs:288` (`walk_empty_dirs`), `cleanup.rs:153` (`find_duplicates`); rendered at `src/components/cleanup/FileListTab.tsx:172`, `DuplicatesTab.tsx:115`, `DuplicatesTab.tsx:156`, `EmptyDirsTab.tsx:117`; threshold input at `FileListTab.tsx:123`
+
+The dashboard FileBrowser is correctly capped (see 17.40). The Cleanup tabs are not capped anywhere: `WHERE size >= ?1 ORDER BY size DESC` and `WHERE mtime < ?1 ORDER BY mtime ASC` have no `LIMIT`, `walk_empty_dirs` is an unbounded recursive walk, and `find_duplicates` returns every group and every file in each. The frontend then renders all of it with `data.map(...)` and no virtualisation anywhere in the project (grep for `virtual`, `react-window`, `react-virtual`: zero hits).
+
+Failure mode: set the "large files" threshold to 1 MB on a media library and you get ~30,000 rows. One `invoke` returns roughly 3.6 MB of JSON at ~120 bytes per path, the webview `JSON.parse`s it, then React mounts 30,000 rows. The scroll container is bounded (`max-h-80 overflow-auto`, `FileListTab.tsx:171`); the DOM is not. Two reviewers would file this twice and neither would see it as one bug.
+
+### 17.9 HIGH - H42: ~9 stat-class syscalls and 3 full `.mouziignore` reads per file in the watcher path, against 1 in the scanner
+
+**Where:** `src-tauri/src/watcher.rs:263`, `:75`, `:186`, `:184`, `:194`; `src-tauri/src/rules.rs:12`, `:66`, `:86-94`, `:97`, `:100`, `:219`, `:262`; `src-tauri/src/ignore.rs:5-36`, `ignore.rs:7`, `ignore.rs:10`; correct pattern at `src-tauri/src/scan.rs:166`
+
+Both paths exist in the codebase, and they differ by roughly 9x. The scanner is at multiplier 1.0x (see 17.15). The watcher and rules path costs, per file: `path.is_file()` (1 stat), `should_ignore_file` `fs::metadata` (1 stat), `is_file_ignored_by_mouziignore` `path.exists()` (1 stat) then `fs::read_to_string` (open + read + close = 3), `exists()` + `is_file()` again (2 stats), `is_file_locked` exclusive `OpenOptions::open` (1 open + close), `is_file_ignored_by_mouziignore` **again** (4), `scan_file` (2 stats), `new_path.exists()` (1), `create_dir_all` on an existing dir (1), `fs::rename` (1).
+
+The headline is the `.mouziignore` re-read. `is_file_ignored_by_mouziignore` (`rules.rs:86-94`) calls `load_mouziignore` on every invocation, and `load_mouziignore` (`ignore.rs:5-36`) does an `exists()` then a full `read_to_string`. It is invoked at `watcher.rs:213`, `watcher.rs:265`, `rules.rs:219` and `rules.rs:262`, so **the same file's `.mouziignore` is opened and fully read 2-3 times per organise cycle, per file**. `scan.rs:166` shows the correct pattern: load once per root and pass `&patterns` down. Fix is to cache `load_mouziignore` per parent directory behind the existing `Arc<Mutex<...>>` state, invalidated on the existing file-change event.
+
+### 17.10 HIGH - H43: the popup polls every 3 s forever after the first open
+
+**Where:** `src/pages/Popup.tsx:91-93`; `src-tauri/src/tray.rs:70-72`; `src-tauri/src/commands.rs:433`; `src-tauri/src/watcher.rs:348`; `src-tauri/src/i18n.rs:8`
+
+```tsx
+const interval = setInterval(() => { getPendingFiles(); }, 3000);
+```
+
+`tray.rs:70-72` **reuses** an existing popup window via `show()` and never destroys it. Tauri `hide()` does not suspend a webview, and the `useEffect` cleanup only runs on unmount, so **this poll runs forever after the user opens the popup once**, including while the window is hidden and while the user is in a different window. 20 IPC round-trips per minute, each costing one `stat` per pending manual file (`manual.retain(|p| Path::new(p).exists())`), a full DB round-trip for `get_settings()` via `tray_lang(app)`, and a fresh 15-entry `HashMap` built from scratch by `TrayI18n::new(lang)` on every call. Fix: gate on `document.visibilityState` and cache `TrayI18n` in a `OnceCell` per language.
+
+### 17.11 HIGH - H44: a rejected `get_settings_cmd` leaves every window on a permanent loading screen
+
+**Where:** `src/store/useAppStore.ts:119-122` (`loadSettings`, no try/catch), `src/App.tsx:44-49` (`boot()` with no `.catch()`), `src/App.tsx:51-55` (effect returns early so `ready` stays false), `src/App.tsx:102-108` (pulsing "Mouzi..." rendered)
+
+On rejection: an unhandled promise rejection, invisible with no devtools; `settings` stays `null`; `ready` never becomes true; every window renders the pulsing "Mouzi..." splash **forever**. No error text, no retry, no way out except killing a tray app. `initI18n` failing at `:54` has the same terminal effect by a different path. The trigger is conditional (IPC or DB failure) but the code has no guard at all. Confidence: high on the path.
+
+### 17.12 HIGH - H45: "Accept all" is one unconfirmed click, pre-armed to create up to 100 global auto-organise rules
+
+**Where:** `src/pages/Suggestions.tsx:210` (pre-checked checkbox), `:219` (the button), `src/store/useSuggestionsStore.ts:43` (`createRuleDefault: true`), `:50` (`limit: 100`); `src-tauri/src/commands.rs:795-805` (`create_suggestion_rule`); `src-tauri/src/rules.rs:149-152` (`find_matching_rule`)
+
+Three compounding facts. First, the checkbox is pre-checked, so the bulk action is armed to install rules the user never opted into. Second, those rules are **global and enabled**: `create_suggestion_rule` inserts `enabled: true, priority: 10, action: "move", destination: category`, and `folder_id: 0` is **never read by the engine** (`find_matching_rule` matches on `enabled` plus extension/pattern only; `folder_id` appears nowhere in `rules.rs`). One click can therefore install rules that immediately act on new files in **every** watched folder, not just the one on screen. The checkbox label (`en.json:250`) reads "Create a rule from this acceptance", which sounds like a one-file side effect. Third, there is no confirmation dialog and no preview of the N moves, and the query limit is 100, so one click can mean up to 100 file moves plus up to 100 rule insertions. This is the substance of the plan's "always preview plus confirm for destructive or suggested actions" requirement.
+
+### 17.13 HIGH - H46: no ErrorBoundary anywhere in `src/`
+
+**Where:** `src/main.tsx:6-9` (mounts `<App/>` bare)
+
+Grep for `ErrorBoundary`, `componentDidCatch`, `window.onerror` returns nothing. Any render-time throw in any page unmounts the whole tree and leaves a blank white window with no message. In a desktop app with no devtools, every silent-`catch` path above terminates in either a blank window or an infinite spinner with nothing on screen. Confidence: high.
+
+### 17.14 HIGH - H47: decision D3 was not implemented as written, and the substitution is what breaks the ACL
+
+**Where:** `src-tauri/src/tray.rs:184-185` (1100x820 window labelled `app`), `tray.rs:81` (popup 300x420), `tray.rs:171-181`; D3 required a 1024x768 window labelled `dashboard`
+
+This corrects any earlier reading that the dashboard is a separate window with its own capability entry. D3 mandates a 1024x768 window labelled `dashboard`. Shipped instead is one window labelled `app` at 1100x820 multiplexing dashboard, cleanup, suggestions and settings by hash, with the popup remaining a 300x420 flyout. The design is arguably better, but it is a deviation from a locked decision, and the two designs are mutually exclusive: one window cannot both *be* the dashboard and host four routes. The capability list was updated to add `dashboard` while the code kept creating `app`, which is the mechanical cause of 17.4.
+
+The second half of D3, the settings link, does not exist: grepping `Settings.tsx` for `navigateHash|show_dashboard|dashboard` returns zero matches, and its only exit is `invoke("close_settings")` at `:327`. The tray menu item exists (`tray.rs:14`, `:31-33`) and is translated in all locales. `show_dashboard_cmd`, `show_cleanup_cmd` and `show_suggestions_cmd` do not exist; only `show_popup_cmd` (`commands.rs:428`) is registered (`lib.rs:197`). The frontend therefore cannot ask Rust to open the workspace window at all, only the tray can, and adding the link is impossible without a new command.
+
+### 17.15 HIGH - H48: `csp: null` with the app rendering attacker-controlled filenames, directly upstream of C17
+
+**Where:** `src-tauri/tauri.conf.json:25`; `tauri-utils-2.9.1/src/config.rs:2896-2901`, `:2911-2924`, `:2921-2922`; `tauri.conf.json:13`
+
+```json
+"security": { "csp": null }
+```
+
+`null` deserialises to `None`, so **no CSP is injected, in dev or in the built app**. `dangerous_disable_asset_csp_modification` defaults to off but is moot with no policy to modify. Tauri's own doc comment warns: *"Your application might be vulnerable to XSS attacks without this Tauri protection."*
+
+The agent rated this Medium. This addendum raises it to High on the evidence of 17.1: the app displays attacker-controlled filenames in the dashboard treemap, file browser, cleanup lists and rule hits, and C17 is a code-execution sink reached by clicking one of those filenames. React's default escaping means the CSP gap is not independently exploitable through the UI as read, so this is defence in depth rather than a live XSS, but there is **no defence in depth behind React**, and the practical consequence of an XSS in this app is command execution, not a defaced page. A workable policy is close to free given Tailwind: `default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'`, plus `devCsp` so HMR does not break.
+
+Compounding: `withGlobalTauri: true` (`tauri.conf.json:13`) with **zero consumers**. Grep of all of `src/` for `__TAURI__` returns no matches; the frontend exclusively uses `@tauri-apps/api` module imports. The global-injection mode attaches the entire Tauri API to `window` in all 6 windows, widening post-XSS surface for no benefit and inhibiting tree-shaking. Set to `false`.
+
+### 17.16 MEDIUM - H49: `ureq` compiles a full rustls stack that is 100% dead
+
+**Where:** `src-tauri/Cargo.toml:38`; `src-tauri/src/classify.rs:447`, `classify.rs:495`; vendored `ureq-2.12.1/Cargo.toml` (`default = ["tls", "gzip"]`, `tls = ["dep:webpki-roots", "dep:rustls", "dep:rustls-pki-types"]`)
+
+Both and only both `ureq` call sites are plaintext loopback: `http://localhost:11434/api/tags` and `/api/generate`. Reverse-resolving every dependency edge in `Cargo.lock` found `ureq 2.12.1` is the **only crate in the 486-crate graph that requires `rustls`**; nothing else reaches it, and `reqwest 0.13.3` (pulled in by Tauri) has no TLS backend enabled at all. Nine package entries exist solely because of the default `tls` feature: `rustls 0.23.43`, `webpki-roots 0.26.11` and `1.0.9` (a dupe pair, both compile), `rustls-webpki 0.103.15`, `rustls-pki-types 1.15.1`, `ring 0.17.14` (C/asm with a `cc` build script), `untrusted 0.9.0`, `subtle 2.6.1`, `zeroize 1.9.0`.
+
+One-line fix: `ureq = { version = "2", default-features = false }`. The `gzip` default is free, since `flate2` is already a direct dependency (`Cargo.toml:33`, used in `archive.rs`). Binary-size impact is an **estimate, not measured** (no build was permitted): roughly 2-3.5 MB of release binary on x86_64 MSVC, plus a C toolchain requirement in the build graph. Marked **UNVERIFIED** for the precise figure. Severity Medium rather than higher: no TLS handshake is ever attempted, so there is no exploitable path today, but it is unnecessary attack surface and it silently makes the crate *require* TLS the moment anyone points the Ollama adapter at a non-loopback host.
+
+### 17.17 MEDIUM - H50: the Rust toolchain floats; Node disagrees with the plan; pnpm and npm are both in play
+
+**Where:** absent `rust-toolchain.toml`, `rust-toolchain`, and `src-tauri/rust-toolchain.toml` (all three checked); absent `.nvmrc`, `.node-version`, `engines`, `packageManager`; `package-lock.json` committed (111,871 bytes), no `pnpm-lock.yaml`
+
+The plan states Rust 1.98.0 as a prerequisite and nothing in the repo enforces it. `Cargo.lock` v4 pins the lockfile format, not the compiler, so a build in six months gets whatever stable is current. Add a two-line `rust-toolchain.toml` with `channel = "1.98.0"`.
+
+The plan declares pnpm 11.23.0. On the audit machine `pnpm -v` returns command not found, `npm -v` is 11.17.0, and the committed lockfile is `package-lock.json`. A pnpm user would generate a second competing lockfile. The plan says Node 22.23.2; installed is v24.19.0, two majors apart, unrecorded and unenforced. Currently benign because every dependency resolves under 24, but nothing would have caught it. Pick one package manager and state it in `packageManager` or the plan.
+
+### 17.18 MEDIUM - H51: 4 npm advisories at CVSS 7.5, all dev-only, all already fixed inside the declared ranges
+
+**Where:** `vite 7.3.3` installed, declared `^7.0.4`; `postcss 8.5.14` installed, declared `^8.5.14`; transitive `browserslist`, `nanoid`, `esbuild`, `@babel/core`, `baseline-browser-mapping`
+
+`npm audit --json`: **7 vulnerabilities, 0 critical, 4 high, 1 moderate, 2 low, zero in a production dependency.** All 19 prod deps are clean; `npm audit --omit=dev` would report 0. The four at CVSS 7.5 with `AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N` are `GHSA-fx2h-pf6j-xcff` (vite `server.fs.deny` bypass via Windows alternate paths), `GHSA-r28c-9q8g-f849` (postcss), and two `browserslist` entries at `<=4.28.6`. The two vite ones matter more than their dev-only status suggests because both are **Windows-targeted** (alternate-path deny bypass, and NTLMv2 hash disclosure via UNC path) and the dev loop is vite on `localhost:1420` serving arbitrary watched-folder content. Every fix is already inside the declared range, so `npm update` alone resolves all seven; no manifest edit is required. Severity Medium: dev-machine file disclosure, not app exposure.
+
+Majors sitting behind, worth noting for a fork that plans to persist: `vite 7.3.3 -> 8.3.1`, `vitest 4.1.11 -> 5.0.2`, `@vitejs/plugin-react 4.7.0 -> 6.1.1`, `typescript 5.8.3 -> 7.0.2`, `lucide-react 1.14.0 -> 1.48.0` (34 minors). `typescript` is the only tilde in the manifest (`package.json:35`); everything else is caret.
+
+### 17.19 MEDIUM - H52: `tsc` never type-checks `vite.config.ts`, so the plan's own verification gate does not cover what it claims
+
+**Where:** `tsconfig.json:23-24` (`include: ["src"]`, `references: [{ "path": "./tsconfig.node.json" }]`); `package.json:8` (`"build": "tsc && vite build"`); `vite.config.ts:4`
+
+`tsconfig.node.json` has `composite: true` and `include: ["vite.config.ts"]`, but plain `tsc` does **not** build referenced projects; that needs `tsc -b`. So `vite.config.ts` is never type-checked by `npm run build`, which is the plan's §7 gate. This is why the `@ts-expect-error` at `vite.config.ts:4` has survived: nothing ever looks at that file. It is also a latent time bomb. `@types/node` is absent from both `package.json` and `node_modules`, which is the only reason `process` is untyped and the suppression is needed; adding `@types/node`, a routine thing to do, turns the `@ts-expect-error` into an error itself ("unused directive") and breaks the build. Correct fix: add `@types/node` and delete the suppression. Grep of all of `src/` for `@ts-expect-error|@ts-ignore|as any` returns **zero matches**, so the application code is clean and this is the only violation of the plan's §6 prohibition list.
+
+### 17.20 MEDIUM - H53: irreversibility is disclosed in the wrong place, and the Recycle Bin guarantee is unobservable
+
+**Where:** `src-tauri/src/cleanup.rs:391-394` (writes `undoable: false` for every row, with two identical match arms), `src/store/useCleanupStore.ts:18`, `src/components/cleanup/HistoryPanel.tsx:43`, `en.json:229`, `en.json:219`; `src-tauri/src/safe_fs.rs:99-104`; `cleanup.rs:360`; `cleanup.rs:331-335`
+
+Three related presentational defects. First, `undoable` exists as a DB column and a TS field and is **never read** by `HistoryPanel`, so the history list cannot tell the user that a given file is unrecoverable through either the app or the bin. Second, the one string that discloses irreversibility, `cleanup.historyEmptyDirs` = "Empty folder removals are not undoable." (`en.json:229`), is rendered **only in the History tab's empty state** (`HistoryPanel.tsx:43`), so the user is told precisely when there is nothing to be irreversible about. `EmptyDirsTab` has no consequence statement at all, and `remove_empty_dir` is `fs::remove_dir` (`cleanup.rs:360`), which bypasses the Recycle Bin entirely. The word "Trash" appears in the UI only as a `Trash2` lucide glyph and `cleanup.confirm` is literally "Confirm (N)".
+
+Third, and undercutting all of it: `safe_fs.rs:101-104` is a bare `trash::delete`. On Windows this goes through the shell file-operation API, which **can permanently delete when the bin is unavailable, disabled or over quota while returning success**. The code cannot distinguish that from a genuine bin deposit, and `CleanupOutcome{status:"ok"}` (`cleanup.rs:331-335`) is byte-identical in both cases, so `ResultsPanel`'s green "done: N" is not evidence of recoverability. The doc comment at `safe_fs.rs:99-100`, *"Returns an error if trashing is not supported on the current platform or if the operation fails"*, asserts an error-or-bin dichotomy the crate cannot honour on Windows: a comment that contradicts what the code can deliver. In fairness, the UI **makes no false Recycle Bin claim** (no key in `cleanup.*` or `dashboard.*` mentions one). Confidence: high on the code; the specific Windows fallback conditions are **UNVERIFIED** (not executed).
+
+### 17.21 MEDIUM - H54: scan state can wedge at "Scanning...", and a failed root emits no event at all
+
+**Where:** `src/store/useDashboardStore.ts:191`, `:215`; `src/pages/Dashboard.tsx:133-138`; `src-tauri/src/scan.rs:193`, `scan.rs:167-170`; `commands.rs:552`
+
+`useDashboardStore.ts:191` is the only place `isScanning: false` is set after a scan starts, and it is reached only if the `is_scanning_cmd` round-trip at `:215` resolves **after** the Rust thread's final `is_scanning.store(false)`. The final `scan-complete` is emitted from inside `scan_roots` (`scan.rs:193`), strictly before that store, so the outcome depends on IPC thread-pool scheduling. Miss it and the button stays disabled showing "Scanning..." with no timeout, no poll and no error. Separately, a root whose `clear_inventory_for_root` fails is `continue`d (`scan.rs:167-170`) **without emitting any event**, so `completedRoots` never reaches `rootCount` and the bar reads e.g. "1 / 3 folders" forever. Confidence: high on the code path, medium on triggering.
+
+Related: `scan.rs:167` clears a root's inventory **before** walking it, so any `refresh()` during a scan, such as the focus handler, shows a half-empty dashboard that looks like data loss. There is no scanning-state suppression of the stats view.
+
+### 17.22 MEDIUM - H55: silent error states on three pages that the user cannot distinguish from empty results
+
+**Where:** `src/store/useCleanupStore.ts:111-121` (`loadHistory`, no loading flag, empty `catch {}`), `src/components/cleanup/HistoryPanel.tsx:24`, `:40-45`; `src-tauri/src/commands.rs:677`; `src-tauri/src/classify.rs:568-570`; `src/pages/App.tsx:63` and `Dashboard.tsx:52-58` (missing `.catch()`)
+
+Three distinct presentations of the same class of defect. A failed history query is indistinguishable from an empty history: `loadHistory` has no `loading` flag and swallows its error in an empty `catch {}`, `history` stays `null`, `HistoryPanel.tsx:24` does `history ?? []` and `:40-45` renders `historyEmpty`, so there is no spinner, no error and no retry affordance beyond the Refresh button. A backend error on the suggestions path is invisible: `get_suggestions_cmd` returns `Ok(...)` unconditionally (`commands.rs:677`) and `classify.rs:568-570` does `Err(_) => return Vec::new()`, so a DB failure is presented as "No suggestions right now." And in the `app` window the two event-listener rejections (17.4) are unhandled with no devtools to surface them. Confidence: high on all three.
+
+### 17.23 MEDIUM - H56: suggestion rules are silently not created in the common case, with no field to report it
+
+**Where:** `src-tauri/src/commands.rs:781-793` (dedup early return), `commands.rs:680-687` (`AcceptOutcome` shape), `src-tauri/src/scan.rs:44-59`, `src-tauri/src/db.rs:333`; checkbox at `src/pages/Suggestions.tsx:210`
+
+`create_suggestion_rule`'s dedup check skips insertion when an enabled `move` rule already has the same destination and covers the extension. Concrete: `scan.rs:44-59` classifies `.exe` as `"Other"` so it is a suggestion candidate, the heuristic suggests `"Installers"`, and the default rule at `db.rs:333` is `("Installers", 4, ["exe","msi",...], "Installers")`, so destination matches and extension is covered, producing an early return with no rule and no message. The user watches a pre-checked box do nothing, silently. `AcceptOutcome` (`commands.rs:680-687`) has only `{path, status, message, dest}`, with no field for whether a rule was created, so no UI change can fix this without a backend change. Confidence: high.
+
+### 17.24 MEDIUM - H57: suggestion-driven moves are not suppressed for the watcher
+
+**Where:** `src-tauri/src/commands.rs:698-702` (`accept_suggestion_cmd`), `commands.rs:176-178` (`perform_undo` inserts into `AppState.ignored_files`)
+
+`perform_undo` deliberately inserts both paths into `AppState.ignored_files` so the watcher does not re-trigger on a restore. `accept_suggestion_cmd` takes neither `AppHandle` nor `State`, so it **structurally cannot** register the suppression, and it moves real files inside a watched root with the guard wide open. The asymmetry reads as an oversight rather than a decision. Confidence: medium (the watcher path was traced but not executed).
+
+### 17.25 MEDIUM - H58: an unrecognised hash silently renders the 300x420 popup flyout at 1100x820
+
+**Where:** `src/App.tsx:120-121` (fallthrough to `<Popup/>`), `src/utils/paths.ts:13-26`, `paths.ts:17`; test gap at `src/__tests__/dashboard.test.ts:22-49`
+
+`App.tsx:120-121` falls through to `<Popup/>` for any unrecognised hash. In the 1100x820 workspace window a typo renders the compact popup flyout stretched to full window size: no error, no console, no devtools, invisible by construction. Triggers are case sensitivity (`#/Dashboard`), a trailing slash (`#/dashboard/`), a stale fragment, or any `navigateHash` typo. `parseHash` has no allowlist and `paths.ts:17` defaults only when the hash is empty. `dashboard.test.ts:22-49` tests empty, `?`-query, no-query, `#/#/`, and extra keys but has **no case for an unknown route**, so nothing pins the fallthrough.
+
+Related: `InsightCards.tsx:8` types `onOpen` as `"large" | "stale" | "duplicates" | "suggestions"`, hand-duplicated against `tabFromHash`'s union at `Cleanup.tsx:15` with no shared type, and `tabFromHash` silently defaults to `"duplicates"` for an unrecognised tab. Latent, not live: the day the two lists drift, an insight card opens the Duplicates tab with no error.
+
+### 17.26 MEDIUM - H59: `set_cached_hash` is one autocommitted fsync-bearing transaction per file
+
+**Where:** `src-tauri/src/db.rs:1067-1074`; `db.rs:1054` (`conn.prepare` re-compiled per call); `db.rs:236` (PK), `db.rs:1055`
+
+The strategy is right and the mechanics are not. `hash_cache` has `PRIMARY KEY (path, size, mtime)` and `get_cached_hash` filters on all three columns, a perfect O(log n) index probe; D7's key design works and does hit on rescan, proven by the test at `cleanup.rs:590-641` (mtime-change invalidation). But `get_cached_hash` calls `conn.prepare(...)` on **every single call**, a full `sqlite3_prepare_v2` parse and codegen per file, so 100k same-size files means 100k re-compiles of identical SQL. The writes are worse: `set_cached_hash` is `conn.execute(...)` in **autocommit**, one implicit transaction per row, each paying the `synchronous=FULL` plus rollback-journal cost from 17.5. **100k cache writes is 100k fsync-bearing transactions**, a worse write-amplification defect than the inventory batch, which at least batches 500 at a time. Concurrency is nil: no `rayon`, no `thread::scope`, no `available_parallelism` anywhere in the codebase (zero hits), only 4 fixed `thread::spawn` sites (`watcher.rs:54`, `watcher.rs:146`, `scheduler.rs:36`, `commands.rs:543`). Hashing is serial, single-threaded and on the main thread.
+
+Fixes in value order: hoist the `prepare` into a cached `Statement`; batch `set_cached_hash` into the same 500-row transaction as the inventory, or at minimum wrap the dedup pass's cache writes in one transaction; size a hashing pool from `available_parallelism()`, since blake3 is pure CPU and embarrassingly parallel.
+
+### 17.27 MEDIUM - H60: ~6-7 full passes over `file_inventory` per dashboard refresh, undebounced, on every focus
+
+**Where:** `src-tauri/src/commands.rs:582-601`; `db.rs:790`, `db.rs:850-884`, `db.rs:820`, `db.rs:836`, `db.rs:892`, `db.rs:999-1033`; `src/pages/Dashboard.tsx:71`
+
+`get_dashboard_stats_cmd` issues 6 SQL statements, each taking the global mutex separately, so 6 lock/unlock cycles. Five of them are full passes over the whole table: `COUNT(*)`/`SUM`/`MAX` (full scan), four inside `get_insights_on` (two range scans, a `GROUP BY size` full scan plus temp B-tree, and a `category='Other'` count), and `GROUP BY` in each of `get_category_distribution_on`, `get_root_summaries_on` and `get_age_buckets_on`. For 500k rows at ~60 bytes that is ~30 MB of page reads per pass, **~180-210 MB of page reads per refresh** (static estimate). It fires on every window focus, every refresh button, every `R` keypress and every `scan-complete`, with no debounce.
+
+Credit where due: the **payload** is well bounded. 50 `InventoryFile` per list, capped at 50, plus 7 categories, ~5 roots and 5 age buckets, at ~120 bytes per absolute Windows path in JSON, so the two file lists are ~12 KB. The "50,000 path strings to render a summary" failure mode does not exist in the dashboard.
+
+### 17.28 MEDIUM - H61: no store selectors on five of six page hooks and no `React.memo` anywhere, so ~20,000 renders per 500k-file scan
+
+**Where:** `src/pages/Dashboard.tsx:29`, `src/pages/Popup.tsx:42`, `src/components/cleanup/DuplicatesTab.tsx:19`, `FileListTab.tsx:30`, `EmptyDirsTab.tsx:9`, `src/pages/Suggestions.tsx:52`; only `src/pages/Cleanup.tsx:30` uses a selector; `src/store/useDashboardStore.ts:200-205`; `src/components/dashboard/FileBrowser.tsx:64`, `Dashboard.tsx:268-269`
+
+In Zustand v5 calling `useXStore()` with no selector subscribes to the entire state object, so every `set()` re-renders the whole page subtree. The codebase is internally inconsistent: only `Cleanup.tsx:30` does it right. The compounding chain: `scan-progress` fires every 200 files (`scan.rs:14`, `:107`), `setState` creates a new state object, so `Dashboard` re-renders and all 8 children re-render, since no component uses `React.memo` (grep: zero hits). A 500k-file scan emits 2,500 progress events, hence **~20,000 component renders during one scan**, against a value that feeds one text node. Also `FileBrowser.tsx:64` lists `initialLargest`/`initialRecent` in its dependency array, and `stats` is a new object with new array identities on every `refresh()`, so the memo boundary is inert. `completedRoots` at `useDashboardStore.ts:210-212` is O(n²) but negligible at 1-5 roots.
+
+### 17.29 MEDIUM - H62: the `category` index has 7 distinct values and a TEXT key, and buys nothing
+
+**Where:** `src-tauri/src/db.rs:210`; consumers `db.rs:820`, `db.rs:871`, `db.rs:1186`; table `db.rs:190-200`, indexes `db.rs:201-216`
+
+`idx_file_inventory_category` is the only index on the table with a **TEXT** key, so it pays the widest key comparisons and the most page splits, and it costs one b-tree write per inserted row. It serves `GROUP BY category` over exactly 7 groups and `WHERE category='Other'`, both of which a full scan plus a 7-row temp B-tree handles more cheaply. It is the clearest waste in the index set; dropping it removes roughly 17% of the per-row write cost for essentially zero query regression. `idx_file_inventory_root` is borderline for the same reason (1-5 distinct values, used only by `DELETE ... WHERE root_path=?` at `db.rs:995`); measure before removing. **UNVERIFIED** whether SQLite's planner actually chooses the category index for the `GROUP BY` queries or silently prefers a full scan; an `EXPLAIN QUERY PLAN` would settle it and no database was opened.
+
+Net for reference: 5 index b-trees plus the table b-tree equals **6 b-tree writes per scanned file**.
+
+### 17.30 MEDIUM - H63: archive staging directories are never deleted on success, so disk growth is unbounded
+
+**Where:** `src-tauri/src/archive.rs:35-73` (staging dir creation), `archive.rs:29` (removal, error path only), `src-tauri/src/commands.rs:300-311`, `src-tauri/src/rules.rs:179`
+
+`archive.rs:35-73` creates `cache_dir/archive-imports/import-{pid}-{millis}-{attempt}` and the tree is removed **only on the error path** (`archive.rs:29`). On success, `import_archive_cmd` runs `manual_scan_folder` on the staging dir, which *moves* files into `<staging>/<Category>/` subfolders and never deletes the staging dir. Confirmed by grep: no `remove_dir_all` on the staging path outside `archive.rs:29`. Every archive import permanently leaves a fully populated, sorted copy of the archive on disk, so growth in the user's cache directory is unbounded over a year of imports.
+
+### 17.31 MEDIUM - H64: `collision_safe_path` is O(n squared) with a stat syscall per probe
+
+**Where:** `src-tauri/src/archive.rs:214-239`
+
+`collision_safe_path` linearly probes `dir.join("name (i).ext")` calling `candidate.exists()` per candidate and restarting the counter from 1 for every colliding entry. An archive with *n* same-named entries costs `1+2+...+n ≈ n²/2` `exists()` syscalls; a 5,000-file photo export with duplicate names gives ~12.5 M stat calls on the main thread. Niche trigger, genuine complexity defect.
+
+### 17.32 MEDIUM - H65: `start-mouzi.bat`, the double-clickable launcher, is untracked
+
+**Where:** `start-mouzi.bat` (untracked, 45 bytes); `package.json:7-12`; `tauri.conf.json:7`; `src-tauri/tauri.conf.json:31`
+
+`start-mouzi.bat` contains `@echo off`, `cd /d "%~dp0"`, `npm run tauri -- dev`, which is the correct command and `cd /d "%~dp0"` makes it location-independent. But `git ls-files` does not list it, so the one artifact that makes the app double-clickable, the primary deliverable of a personal-use desktop app, will not survive a fresh clone. Forks are supposed to be hygienic about exactly this. Commit it or note in the README that it is intentionally local. It is also a third spelling of the same command alongside `npm start` and `npm run tauri dev`.
+
+Related script-naming trap, same severity class: `package.json:7` `"dev": "vite"` starts Vite alone, so the page loads, React mounts and **every `invoke()` fails** because Tauri injects no IPC bridge into a plain browser tab; all 65 `invoke()` sites across 13 frontend files break silently. `package.json:11` `"start": "tauri dev"` is the only script that produces a working app. The inversion compounds, because `tauri.conf.json:7` sets `beforeDevCommand: "npm run dev"`, so `npm start` to `tauri dev` to Vite. The naming inverts the universal convention and neither the README nor the plan documents it. **UNVERIFIED** whether the README documents `npm run tauri dev` prominently, since the README was out of that agent's scope. Fix is to rename `start` and put a guard on `dev`.
+
+### 17.33 MEDIUM - H66: `bundle.targets: "all"` requires WiX for MSI, an undocumented clean-machine blocker
+
+**Where:** `src-tauri/tauri.conf.json:31`; `tauri.conf.json:44-46`, `:36`
+
+`targets: "all"` on a Windows-only, unsigned, no-store personal build will also attempt MSI, which needs the WiX toolset. WiX is not part of VS Build Tools and is not documented in the plan, so a clean machine following the plan exactly hits a `tauri build` failure here. **UNVERIFIED** (no `tauri build` was run). Fix: `"targets": ["nsis"]`. The macOS block (`infoPlist: "Info.plist"`, `icon.icns` in `bundle.icon`) is configuration for a platform the app can never target; the files exist so it will not error, but it can never be exercised.
+
+### 17.34 MEDIUM - H67: `website/` is 14.9 MB of Astro marketing site, fully tracked, including signing docs that contradict D1
+
+**Where:** `website/` (92 tracked files, 14.9 MB), `website/AnalyticsConsent.astro` (hardcoded Google Analytics ID `G-GMDTSE5DFS`), `website/building-a-trusted-release-pipeline.mdx`, `website/docs/0-1-6.mdx`, `website/package-lock.json`
+
+A complete independent Astro project with its own dependencies, blog MDX, docs collections, hero videos and image assets. For a personal-use, no-store, unsigned Windows desktop fork none of it ships, none of it builds, and it carries a second `package-lock.json` that will drift independently. It also contains the **upstream release and signing documentation**, which actively contradicts the fork's no-signing, no-store posture and could mislead a future reader. Deleting it is the largest single hygiene win available and is fully reversible.
+
+Related repo weight: `src-tauri/icons` is 57 tracked files with zero orphans, but roughly **39 of 57 files / ~1.05 MB are unreachable** for a Windows-only unsigned build (19 `android/`, 20 `ios/` including a 162 KB `AppIcon-512@2x.png`, 14 `Square*Logo.png` plus `StoreLogo.png` MSIX assets, and `icon.icns` at 393 KB, the single largest file in the set). Deletion is safe **only** if `icon.icns` is also dropped from `bundle.icon` and the `macOS` block removed, or `tauri build` errors on a missing icon.
+
+And five inherited CI workflows, four of which are dead or contradict D1: `build-macos-test.yml` (no macOS target), `test-appimage.yml` (no AppImage target), `signpath-test.yml` (tests code signing, which D1 excludes), plus `build.yml` and `rebuild-release-assets.yml` only partially relevant. The workflow bodies were not read, so whether they gate anything is **UNVERIFIED**, but `signpath-test.yml` existing at all in a no-signing fork will confuse the next person, and with no `rust-toolchain.toml` and no `.nvmrc` whatever they do is unpinned.
+
+### 17.35 LOW - H68: no `[profile.release]`, so no LTO and `codegen-units = 16`
+
+**Where:** `src-tauri/Cargo.toml:1-41` (entire file, no profile section); `Cargo.toml:10` (`crate-type = ["staticlib", "cdylib", "rlib"]`)
+
+Cargo defaults apply: `opt-level = 3`, `lto = false`, `codegen-units = 16`, `panic = "unwind"`, no strip. For a Tauri app bundling SQLite's C amalgamation, `lto = true` with `codegen-units = 1` is the standard recommendation and typically buys both a smaller binary and measurably faster SQLite hot paths. A 6-line profile block, zero risk.
+
+Build-time only, also flagged: `crate-type` builds the library as a Windows static library and a C dynamic library on every desktop build. Those two exist for mobile; the desktop `mouzi.exe` only needs `rlib`, and building them materially slows `cargo build` and `tauri build`. First build is a long cold compile of 486 crates, which the plan's half-day M0 estimate should account for.
+
+### 17.36 LOW - H69: 106 KB of locales bundled and no route code-splitting
+
+**Where:** `src/i18n/index.ts:3-12`; `src/pages/Settings.tsx` (46 KB source); measured from the committed `dist/`: `assets/index-*.js` **419.5 KB raw / 123.5 KB gzip**, `assets/index-*.css` 48.4 KB / 9.4 KB, `mouzilogo.png` 68.4 KB, `index.html` 0.5 KB / 0.3 KB, total `dist/` **536.6 KB**
+
+All 10 locales are statically imported, 106 KB of JSON measured, bundled for a user who needs exactly one; `i18next` supports lazy loading. Single JS chunk, no code splitting: four route surfaces (`Popup`, `Settings`, `Dashboard`, `Cleanup`, `Suggestions`) all land in one `index-*.js` that every window loads in full, so splitting on route would cut the initial parse for the popup, the surface that opens on every tray click. These are the only figures in this addendum read from actual bytes on disk; everything else is a static estimate.
+
+`lucide-react` is the largest single dependency and is imported per-icon (`Dashboard.tsx:18-25` pulls 8, `Suggestions.tsx:7-18` pulls 10). Modern `lucide-react` tree-shakes per icon, so the real cost is likely modest; the report flags it as a check, not a finding. No charting library: `StorageTreemap` and `CategoryBars` are hand-rolled divs, a genuinely good outcome for bundle size.
+
+### 17.37 LOW - H70: two unused Rust crates, a duplicated `windows` generation, and a pre-`OnceLock` dependency
+
+**Where:** `src-tauri/Cargo.toml:27` (`thiserror`), `:29` (`log`), `:26` (`once_cell`), `:36` (`trash`), `src-tauri/src/db.rs:7`; false-positive locals at `db.rs:453`, `classify.rs:326`, `rules.rs:232`, `safe_fs.rs:239`
+
+`thiserror` is unused: zero `use thiserror` and zero `#[derive(Error)]` across all 15 source files and `build.rs`; the codebase uses `Result<T, String>` throughout. `log` is unused, and this one initially looked used with 18 apparent hits, but every hit is a local variable named `log` of type `ActionLog`. Verified: 0 `log::error!`/`warn!`/`info!`/`debug!`/`trace!` invocations, 0 `use log`, 0 logger initialisation. The crate is linked and never called, and even if it were called nothing would emit, because the missing piece is a logger **initializer**, not the facade. Both are pre-existing upstream leftovers.
+
+`trash 3.3.1` is the **sole** reverse-dependent of `windows 0.44.0` in the entire graph, while Tauri already brings `windows 0.61.3`, so two incompatible `windows` generations compile side by side. It also unconditionally pulls `libc` and `scopeguard`. Not fixable without an upstream bump; **UNVERIFIED** whether trash 3.4 moved to `windows 0.61`. The three-way `dirs-sys` duplication (`0.3.7`, `0.4.1`, `0.5.0`) is **not** from `trash`: `dirs 4.0.0` comes from `auto-launch 0.5.0` (the autostart plugin's Linux backend) and the rest from `directories 5`. Pre-existing, not fork-introduced.
+
+`once_cell` has a single import at `db.rs:7` and 4 references; `std::sync::OnceLock` has been stable since Rust 1.70 and the project is on 1.98.
+
+### 17.38 LOW - H71: lockfile duplication census, caret surface, and the version that was never bumped
+
+**Where:** `Cargo.lock` (5,937 lines, format v4, **486 distinct crates, 43 crate names resolved at more than one version simultaneously**), `src-tauri/Cargo.toml:3`, `src-tauri/tauri.conf.json:4`
+
+`windows-sys` fans out to **6 coexisting versions** (`0.45.0`, `0.48.0`, `0.52.0`, `0.59.0`, `0.60.2`, `0.61.2`), `windows` at 2, `winnow` at 3, `hashbrown` at 4, `toml` at 3, `getrandom` at 3. Not all are real weight, since many are target-gated and never compiled on Windows, but the `windows-sys` fan-out is the one that costs compile time on the target platform.
+
+Structural caret risk, not UNVERIFIED: `rusqlite = "0.32"` and `notify = "7"` are carets on lines that have moved several minors, so a build with a stale `Cargo.lock` deleted, or any `cargo update`, silently moves across minors. The `tar = "=0.4.44"` and `zip = "=0.6.6"` exact pins (`Cargo.toml:34-35`, both with `default-features = false` and only `["deflate"]` on zip) show the author already learned this lesson for the two crates with actual advisories; it was not applied to the other 20 entries, nor to the three crates the elevate work added (`trash`, `blake3`, `ureq`, all carets at `:36-38`). `ureq 2.12.1` is 12 minors in and `trash 3.3.1` is 3 in; both warrant a tilde (`~2.12`, `~3.3`). **UNVERIFIED** whether newer releases exist on crates.io: offline, no registry query, no local `rustsec` advisory data, so **all Rust CVE exposure must be treated as unknown, not as clean**. Nothing in the tree is EOL by its own manifest.
+
+`tauri.conf.json:4` and `Cargo.toml:3` are both still `0.1.6`, the upstream tag, after 14 fork commits, 3 new windows, ~3,100 lines of new Rust and 3 new crates, with no fork marker in the manifest. A built `Mouzi.exe` reports `0.1.6` and is indistinguishable from upstream. Cosmetic for personal use; consider `0.2.0-elevate` plus a description bump. The README fork notice covers attribution, which is the part D1 required.
+
+### 17.39 LOW - H72: smaller mechanical defects
+
+**Where and detail:**
+
+- **Payload shape.** `src/store/useCleanupStore.ts:14` declares `prevPath: string | null`, but `CleanupAction` (`src-tauri/src/db.rs:77-87`) has no `#[serde(rename_all)]`, so it serialises `prev_path` and the field is always `undefined`. Not read by any UI today, so nothing breaks visibly, but the type is a lie and the column is unrecoverable.
+- **Wiring mismatch.** `src/pages/Dashboard.tsx:88` invokes `close_settings` from the dashboard window, where `Settings.tsx:327` has the same call correctly. Copy-paste; the dashboard's own close path is likely broken.
+- **Duplicate capability path.** `show_notification` (`Popup.tsx:114`) is an app-local command while `notification:allow-show` is also granted. Two paths to the same capability.
+- **Unused command.** `is_autostart_enabled_cmd` is registered (`commands.rs:406`, `lib.rs:184`) and never invoked. `useAppStore.setAutostart:132-140` only writes the DB setting and never reads real OS autostart state, so the Settings toggle can silently disagree with Windows.
+- **Dead window.** `tauri.conf.json:15-22` declares `main` at 800x600, `visible: false`, loading `/` with no hash, so `parseHash` yields `"popup"` and it renders `<Popup/>`. `lib.rs:76-82` never targets it. It boots, loads settings, and registers a listener for nothing. Cosmetic, but a stray `main` window would show popup UI at 800x600.
+- **Title never updates.** Only `show_app_window` sets it (`tray.rs:173`), so clicking "Settings" from the dashboard's empty state (`Dashboard.tsx:169`, `:197`) leaves the title reading "Mouzi Dashboard" above the Settings UI.
+- **Cleanup tab state is not in the URL.** The header History button (`Cleanup.tsx:66`) and the four tab buttons (`:80`) call `setTab` without writing the hash, while the hash is the only thing `Cleanup.tsx:14` reads on mount, so a `#/cleanup?tab=large` URL can sit behind a UI showing a different tab.
+- **`hasAnyData` includes `history`** (`Cleanup.tsx:30-36`), which `HistoryPanel` sets on mount, so visiting the History tab once suppresses the "Run a scan first" hint on every other tab even if no scan has ever run.
+- **Untranslated error strings.** `cleanup.noScanData` is dead in all locales (`en.json:202` plus 9 siblings); the role is played by the backend's hardcoded English `"No scan data - run a scan first"` (`commands.rs:628`, `:637`, `:646`, `:655`). So every cleanup error is untranslated in the non-English locales, and `find_*_cmd` and `execute_cleanup_cmd` return English-only text. Same class: `find_mouziignore` aside, `Suggestion` outcomes carry English-only messages.
+- **Locale count.** The plan says 10 locales; `i18n/index.ts:27` `SupportedLang` has 10 members and 10 resource entries, but there are **11** locale files on disk. This predates the fork work, since `i18n/index.ts` is unchanged.
+- **Dead constant.** `Dashboard.tsx:221` does `stats!.insights ?? EMPTY_INSIGHTS` while `insights` is a non-optional field of `DashboardStats` (`useDashboardStore.ts:53`), so the fallback is unreachable.
+- **Unreachable empty state.** `dashboard.neverScanned` (`en.json:146`) sits behind `hasData` (`Dashboard.tsx:183`, `:213-218`), which requires `totalFiles > 0`, so a never-scanned state never reaches it.
+- **`autoprefixer`** (`package.json:32`) is almost certainly dead: Tailwind 4 has a built-in Lightning CSS prefixer and does not use autoprefixer, and `postcss.config.js` only loads `@tailwindcss/postcss`. **UNVERIFIED** (the build was not run to confirm it is not picked up transitively).
+- **Accept results erased by focus.** `src/store/useSuggestionsStore.ts:47` sets `results: null` at the top of **every** `loadSuggestions`, combined with the focus handler at `Suggestions.tsx:75-82`, so any window refocus between accepting and reading the summary silently wipes it. During `acceptAll` (up to 100 sequential invokes) a single refocus clears results mid-loop; `applyAccept`'s `results: (state.results ?? []).concat(...)` at `:68` rebuilds from empty, so earlier per-item outcomes vanish from view while the moves still happened.
+- **Rename reported as success.** `move_file` returns `MovedWithNewName` for a name clash (`commands.rs:729-737`) and `accept_suggestion_cmd` reports it as plain `status:"ok"` with a suffixed `dest`. The user is told the file was moved, not that it was renamed. Accepts are logged to `action_logs` (`commands.rs:747-756`) so they are revertible via the popup's Undo, but the Suggestions page offers no undo, no link to it and no mention.
+- **Dead code comments.** `cleanup.rs:32-34` documents "Total reclaimable bytes if one copy of this group is kept" above `pub files: Vec<DuplicateFile>`, a list of files. `cleanup.rs:391-394` is a `match` with two identical arms that reads as if `remove_empty_dir` were a distinguished case; it is a no-op and is a candidate for `clippy::match_same_arms` under the plan's `-D warnings` gate. `useDashboardStore.ts:184` says "Event listeners (call once on mount)" but the module-level single-slot unlisten fields at `:186-187` make "call once" unenforceable under React StrictMode's double-mount (`main.tsx:7`). Accurate and worth keeping: `tray.rs:140-142` on the `#/#/` hash trap with its test at `:244-250`, `useSuggestionsStore.ts:58-59`, `useDashboardStore.ts:58-59`.
+
+### 17.40 REFUTED - checked and cleared, recorded so it is not re-raised
+
+Each of these was actively investigated and found clean. The convention of this audit is that a refuted claim is as valuable as a defect.
+
+- **Scanner syscall counts are optimal; the suspected `canonicalize` bug does not exist.** The audit brief flagged `read_dir` + `metadata` + `canonicalize` as the suspected per-entry syscall problem. Grep for `canonicalize` across all of `src-tauri/src` returns **zero hits**. `entry.file_type()` (`scan.rs:135`) costs **0 syscalls on Windows**, being derived from the `dwFileAttributes` that `FindFirstFileExW` already returned. Traversal is **exactly 1 metadata query per file plus ~1 per directory, multiplier 1.0x**. `MAX_DEPTH=128` (`scan.rs:17`) bounds recursion. This is correct code; no effort belongs here.
+- **Inventory write batching is correct.** 1 INSERT per scanned file, **0 UPDATEs** (`scan.rs:98`, `db.rs:769`); 1 transaction per **500** files (`INVENTORY_BATCH_SIZE = 500` at `db.rs:10`, opened `db.rs:762`, committed `db.rs:772`), so 500k files is 1,000 commits, not 500,000. The global `Mutex<Connection>` is **not** held during the walk (`scan.rs:116-124`, documented `scan.rs:160`). `INSERT OR REPLACE` (`db.rs:765`) is effectively a plain INSERT because `clear_inventory_for_root` runs first (`scan.rs:167`), so the REPLACE fallback costs nothing. Batching is right; only the commit *durability* is wrong (17.5).
+- **`FileBrowser` row bounding is correct, and the 50,000-row problem is not there.** The dashboard file browser is capped at 50/80 (`FileBrowser.tsx:48`) and `get_inventory_files_cmd` clamps to `.clamp(1, 200)` (`commands.rs:616`), and `get_dashboard_stats_cmd` caps each list at 50 (`commands.rs:585-586`). The dashboard's IPC payload is ~12 KB, not 50,000 path strings. The unbounded problem exists **only** in the Cleanup tabs (17.8). Do not conflate the two.- **No file is ever read entirely into a `Vec<u8>`.** The largest single buffer in the whole codebase is 64 KB: a stack `[u8; 64*1024]` at `cleanup.rs:76`, a heap `vec![0u8; 65536]` at `cleanup.rs:96`, `archive.rs` using `io::copy` (8 KB internal). The 4 GB-into-RAM scenario does not occur; its cost is sequential read plus CPU, and the sample-first design means it is only paid on a size-and-sample collision (`cleanup.rs:190-202`).
+- **No whole tree is held in RAM before insert.** `scan.rs` batches at 500 `InventoryRow` (`scan.rs:104`, `db.rs:10`) and flushes per batch (`scan.rs:116-124`).
+- **No resize listeners, no scroll handlers, no `requestAnimationFrame` loop anywhere** (grep: zero hits), and no polling interval in the dashboard. That axis is clean.
+- **No dead dependencies in `Cargo.toml`.** All 21 direct Rust dependencies are justified by a feature that exists in the code. The `thiserror` and `log` entries in 17.37 are the exception and are flagged there.
+- **No unused npm packages, with one exception.** All 10 `dependencies` and 11 `devDependencies` have live import sites, verified specifically: `@tauri-apps/plugin-dialog` at `Settings.tsx:5`, `@tauri-apps/plugin-notification` at `App.tsx:13`. The exception is `@tauri-apps/plugin-opener`, which has **zero import sites in `src/`** while its Rust half is registered (`lib.rs:42`) and its permissions are granted (`capabilities/default.json:9-10`), which is part of why 17.1 is avoidable.
+- **Zero `invoke` name, arity or payload mismatches.** Every one of the 65 `invoke()` sites across 13 frontend files was cross-checked against `commands.rs`: every command string resolves, every arity is correct, and every payload shape is right. `CleanupRequest` (`cleanup.rs:37-44`) carries `#[serde(rename_all="camelCase")]` plus explicit `keepPath`, matching `utils/cleanup.ts:18-22` exactly. The `trash_large`/`trash_stale`/`trash_duplicate`/`remove_empty_dir` strings are raw `String` values (`cleanup.rs:311`) so are not subject to any rename. Scan event payloads (`scan.rs:19-33`) match `ScanProgress`/`ScanComplete` (`useDashboardStore.ts:61-71`). `Suggestion` (`classify.rs:551-560`) matches the TS interface field for field. The two real defects in this area are structural, not naming: the ACL denial (17.4) and `prevPath` (17.39).
+- **No auto-apply path exists in Suggestions.** `applyAccept` is reachable from exactly two call sites, `acceptSuggestion` (`useSuggestionsStore.ts:75`, the ✓ button at `Suggestions.tsx:282`) and `acceptAll` (`:103`, the button at `:219`). No `useEffect`, no timer, no mount path, no focus path, no event handler applies a suggestion. The plan's "no auto-applied AI rules with no confirmation" constraint is satisfied in the literal sense; the real defect is that the *manual* bulk action is pre-armed (17.12).
+- **No popup/dashboard route crossover.** `main.tsx:6-9` mounts the same `<App/>` unconditionally in all three windows and the page is selected purely from `window.location.hash`, which Rust seeds: `WebviewUrl::App("/#/dashboard")` at creation (`tray.rs:181`) or `eval("window.location.hash = '#/dashboard'")` on an existing window (`tray.rs:172` via `workspace_fragment`/`location_hash_script`, `tray.rs:143-163`). The popup is stuck at `#/popup` and the workspace window at `#/dashboard`. No popup-shows-dashboard or dashboard-shows-popup mismatch on the paths the tray actually uses. There is no `getCurrentWindow()`, no `import.meta.env` branch and no env var anywhere in `src/`; the frontend does not need to distinguish windows.
+- **No route matches but renders nothing.** All six effective routes render a real component; there are no dangling `navigateHash` links. All 40 i18n keys used by the three pages exist in `en.json` with matching dot-path nesting.
+- **The UI makes no false Recycle Bin claim.** No key in `cleanup.*` or `dashboard.*` mentions it. That is the right call. The defect underneath is that the guarantee cannot be kept and is not observable (17.20).
+- **D4 holds.** `scan.rs:126-154` walks recursively from each root, skips symlinks and NTFS junctions (`scan.rs:62-63`, `:139-141`), honours `.mouziignore` (`:143-145`, `:166`), and is depth-capped at 128 (`:17`). Roots come only from `get_watched_folders()` (`commands.rs:524-529`); no whole-drive path exists.
+- **The hash cache design is right.** `hash_cache` has `PRIMARY KEY (path, size, mtime)` (`db.rs:236`) and `get_cached_hash` (`db.rs:1055`) filters on all three columns, a perfect index probe. It **does** hit on rescan, proven by the test at `cleanup.rs:590-641` (mtime-change invalidation). Only the mechanics are wrong (17.26).
+- **Two-phase dedup is genuinely good, and `blake3` was declared correctly.** `cleanup.rs:181-209` samples 64 KB first and computes a full hash only on a sample collision, so a large file is cheap unless it collides. `blake3 1.8.7` has `default = ["std"]` and nothing else: no `rayon`, no `mmap`, no `neon`, closure of only `arrayvec`, `cc`, `cfg-if`, `constant_time_eq`, `cpufeatures`. That matches the plan's D7 use exactly.
+- **`tar`/`zip`/`flate2` are used and correctly pinned.** `archive.rs:6-7`, `:252`, `:279`, `:293`, `:296` use all three, with `=0.4.44` and `=0.6.6` exact pins, `default-features = false`, and only `["deflate"]` on zip. This is the pattern the other 20 entries should follow. The test at `archive.rs:374` is named `zip-slip`, so zip-slip protection is being tested.
+- **`capabilities/default.json:5` was extended correctly, and the trap it represents was real.** The fork did extend the windows array, closing the plan's flagged CAPTURING anchor, and all 6 labels in it match the labels the plan intended. The defect is that the code then created a different label, not that the array was left stale (17.4, 17.14).
+- **D1 items are correct.** `identifier` is `cc.mouzi.app` (`tauri.conf.json:5`), matching D1 exactly; `productName` is `Mouzi` (`:3`); `devUrl` `http://localhost:1420` (`:8`) matches `vite.config.ts:11-12` with `strictPort: true`; `frontendDist` `../dist` (`:10`) resolves to the inspected directory; `installer.nsh` and `Info.plist` both exist; `app.trayIcon: null` (`:27`) with `tray-icon`/`image-png` features (`Cargo.toml:16`) is **correct, not a bug**, because `tray.rs:53` uses `app.default_window_icon()`.
+- **`Cargo.lock` is committed and in sync.** `git ls-files` confirms it; the `mouzi 0.1.6` lock entry lists exactly the 24 declared dependencies plus `tauri-build`, no drift. Format v4 needs Cargo 1.78 and the project is on 1.98.
+- **MSVC Build Tools 2022 are correctly installed.** `vswhere` reports `C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools` with `Microsoft.VisualStudio.Component.VC.Tools.x86.x64` present; `rustc 1.98.0 (88d9e12ae 2026-08-18)` and `cargo 1.98.0` match the plan. `link.exe` not being on the ambient PATH is expected outside a developer prompt and not a problem, since rustc finds the linker via the registry. This closes the plan's §6 open item definitively.
+- **`src-tauri/gen` is correctly gitignored.** 4 files, 5,664 lines on disk, but `git ls-files src-tauri/gen` returns nothing and `src-tauri/.gitignore:5` contains `/gen/schemas`. All 4 are `gen/schemas/*.json` generated by `tauri-build` for IDE autocompletion. `dist/`, `target/` and `node_modules/` are all correctly ignored too, verified with `git check-ignore -v`, and the `.gitignore` is well targeted for this app specifically (`*.db`, `*.db-journal`, `*.exe`, `*.msi`, `*.msix`, `scratch_*`, `/AGENTS.md`, `.kimi/`). `public/mouzilogo.png` (69,998 bytes) is a frontend asset served into `dist/`, correctly placed, not dead.
+- **Zero production npm advisories.** All 19 prod deps are clean; `npm audit --omit=dev` would report 0. All 7 findings are dev or transitive-dev (17.18).
+- **The `trash` XDG hypothesis is wrong.** The vendored `trash 3.3.1/Cargo.toml` shows `default = ["coinit_apartmentthreaded", "chrono"]`. No XDG and no Linux desktop-integration feature is default-enabled. The `objc`/`malloc_buf` entries under `trash` in `Cargo.lock` are macOS-target-gated **inside the crate**; `Cargo.lock` is platform-agnostic by design and records the union across all targets, so they are not compiled into a Windows binary. The same reasoning applies to the GTK/`webkit2gtk`/`x11`/`zbus` entries.
+- **The application source is free of every plan-prohibited construct.** Grep of all of `src/` for `@ts-expect-error|@ts-ignore|as any` returns zero matches, and there is no `todo!()`, `unimplemented!()` or empty catch in application code. The single `@ts-expect-error` violation is in build config (17.19). The empty `catch {}` at `useCleanupStore.ts:111-121` is a swallowed error, not a prohibited empty catch, and is filed as 17.22.
+
+### 17.41 Corrections to earlier recorded claims
+
+Three items in this pass correct or refine statements made elsewhere in the audit or in the agents' own working notes.
+
+1. **Corrects the claim that the capability mismatch may make the entire dashboard path unreachable.** The performance report recorded this as an out-of-scope blocker with the caveat "**UNVERIFIED** on whether `core:default` leaks through to unlisted windows (I am not certain of Tauri's exact default-window permission fallback semantics here)", and speculated that "the dashboard's `invoke` calls are rejected and the entire dashboard path may be unreachable." That speculation is **wrong**, and the routing report closes it: app-defined `#[tauri::command]`s are not ACL-checked unless the app opts into an app ACL manifest, and neither exists here. `src-tauri/permissions` is **absent** and `src-tauri/build.rs` is the bare three-line `tauri_build::build()` with no `Attributes::app_manifest(...).commands([...])`, so `has_app_manifest` is false and all handlers bypass the ACL in every window. The dashboard's `invoke` calls work. Only the event listeners die. This refines 17.4 rather than replacing it, and the practical severity of every performance finding below is unchanged: the code paths are reachable.
+2. **Command count: 51 versus 46, and the discrepancy is a counting difference, not a contradiction.** The performance report enumerated `total #[tauri::command] = 51` in `commands.rs`; the routing report refers to "all 46 handlers in `lib.rs:165-217`". These count different sets: the 51 are the command *declarations* in `commands.rs`, the 46 are the handlers *registered* in the `generate_handler!` list. The main-thread conclusion in 17.3 applies to all of them, since none is `async` and none uses `#[tauri::command(async)]`. The gap between the two numbers is **not** accounted for in either report and is left open (17.42).
+3. **Refines the Duplicates keeper defect with a scope correction.** 17.2 is stated as a settled defect in committed code. That is correct, and the routing report explicitly separates it from work in flight: `src/components/cleanup/**` and `src/store/useSuggestionsStore.ts` are tracked and clean, so 17.2, 17.12, 17.23 and 17.24 are settled, while findings in `src/pages/*.tsx`, `src/App.tsx`, `useDashboardStore.ts` and the new `src/utils/paths.ts` are uncommitted work in progress and should be read as gaps rather than regressions.
+
+### 17.42 What could not be determined, and why
+
+- **All Rust CVE exposure is unknown, not clean.** The agent had no offline index of newer crate releases, made no registry query, and found no local `rustsec` advisory data. It could not audit the Rust dependency tree for CVEs at all. Whether `trash >= 3.4` moved to `windows 0.61` is likewise **UNVERIFIED**. Nothing was run against crates.io.
+- **Every performance number in this addendum is a static estimate, not a measurement.** No build, no run, no directory traversal, no database access. The only figures read from actual bytes on disk are the `dist/` sizes (419.5 KB raw / 123.5 KB gzip JS, 48.4 KB / 9.4 KB CSS, 536.6 KB total) and the 106 KB of bundled locale JSON. Throughput, latency, fsync and syscall-rate figures are derived from first principles and code enumeration.
+- **Binary-size impact of dropping the dead TLS subtree is an estimate.** Roughly 2-3.5 MB on x86_64 MSVC, explicitly marked **UNVERIFIED** because no build was permitted.
+- **Two SQLite planner questions need `EXPLAIN QUERY PLAN` and were not run**, because no database was opened: whether the planner actually chooses `idx_file_inventory_category` for the `GROUP BY` queries or silently prefers a full scan (17.29), and the same question for the composite-index fix in 17.6.
+- **Whether `notify` 7's 2 s `poll_interval` is inert on Windows is UNVERIFIED.** On `ReadDirectoryChangesW` (kernel push) it should be, but if any path selects the `PollWatcher` fallback then a 2 s interval combined with `compare_contents(true)` means re-walking and checksumming the tree every 2 seconds, which would be catastrophic. Worth 10 minutes against the notify 7.0.0 source for the Windows backend's fallback conditions. `notify` 7.0.0 is also the oldest resolved dependency in the lockfile, worth a bump for the `Config` semantics alone.
+- **The exact Windows Recycle Bin fallback conditions are UNVERIFIED.** That `trash::delete` can permanently delete while returning `Ok` on Windows is read from the shell file-operation API's documented behaviour, not executed. High confidence on the code, unverified on the platform.
+- **Whether the CI workflow bodies gate anything is UNVERIFIED.** The five workflow files were enumerated and named but their bodies were out of scope.
+- **`autoprefixer` being dead is UNVERIFIED** without a build.
+- **Whether the README documents `npm run tauri dev` prominently is UNVERIFIED**, since the README was out of that agent's scope, so the `npm start` trap may be partially mitigated for anyone who reads it.
+- **`escapeValue` was not examined in this pass.** A grep for `escapeValue`, `escapeHtml`, `innerHTML` and `dangerouslySet` across all three transcripts returns zero matches, and none of the three agents covered the HTML-escaping helper. If the audit records a finding there, it comes from a different report; nothing was re-raised or re-verified here, and no conclusion about it should be drawn from this addendum.
+- **The 51-versus-46 command-count gap is unexplained**, as noted in 17.41.2. Neither report says which five declarations are not registered in `generate_handler!`, or whether the difference is plugins rather than app commands.
+- **Transcript 1's tail is intact** (874 lines, report complete through the summary table and the top-three-fixes list) and **transcript 3's tail is intact** (869 lines, complete through the confidence-and-method caveats). Transcript 2 is 1,171 lines and complete through its close-out. Nothing was lost to truncation, so nothing was dropped for that reason.
+
+### 17.43 Status
+
+The audit is now **21 of 21 reports absorbed and complete**. This addendum closes the ninth pass and the final three reports: dependency hygiene and build config, routing and window-to-route mapping, and cross-cutting performance. All three were read-only: no file in the project was created, edited, moved or deleted, no build, typecheck, run or database access occurred, and nothing was committed. Sections 1 through 16 stand as written; nothing in them is renumbered by this addendum, which introduces C17 through C19 and H37 through H72 only, and supersedes the capability-consequence speculation recorded in 17.41.1.
+
+## 18. Addendum - ninth pass: state layer, components and localisation
+
+Three read-only reports were absorbed here: the Zustand store layer (`src/store/**`),
+the component layer (`src/components/**` plus the 8 dashboard components), and
+i18n across the 10 locales. Each was read in full up to its truncation point.
+Byte sizes: 118,903 / 95,190 / 90,912.
+
+Numbering continues from the existing body: new Criticals are C17+, new Highs H37+.
+Where a finding refines or corrects an earlier section, the earlier section is named.
+
+---
+
+### 18.1 CROSS-REFERENCE - duplicates C18 in section 17: `DuplicatesTab` trashes the file it badges "Kept" (refines C1 / C8)
+
+**Where:** `src/components/cleanup/DuplicatesTab.tsx:20`, `:90`, `:95`, `:101-110`, `:119` · `src/utils/cleanup.ts:54`, `:56`, `:57` · `src-tauri/src/cleanup.rs:314`
+
+Independently re-derived by the component agent from source, not inherited.
+`selected` starts as `useState({})` (`DuplicatesTab.tsx:20`). The preview renders
+`keepPath={selected[g.hash] ?? g.files[0]?.path}` (`:119`) - a **fallback** - so
+`files[0]` gets the green keep highlight and a `t("cleanup.kept")` badge. The
+request builder at `utils/cleanup.ts:54` reads `keptByGroup[g.hash]` with **no
+fallback**, yielding `undefined`; `:56` evaluates `f.path !== undefined`, which is
+always true, so every file in every group is pushed; `:57` serialises
+`keepPath: undefined`, JSON drops the key, and Rust's guard
+`if let Some(ref keep) = action.keep_path` (`cleanup.rs:314`) becomes inert.
+
+Consequence: unless the user clicks a keep-radio in **every** group, 100% of
+duplicates reach the Recycle Bin, including the one labelled "Kept". The badge and
+the preview highlight both lie; only the confirm-label count (`:101-110`, which also
+uses bare `selected[g.hash]`) is truthful. Plan `:103` preview-to-confirm is
+violated because the preview renders a state that is not the one that executes.
+Confidence: high - the three load-bearing lines were quoted and are mutually
+consistent.
+
+Refines C1/C8 rather than restating them: the component transcript adds that the
+confirm button's count is truthful while the preview above it is not, so the two
+halves of the same dialog disagree with each other, and that Rust's optional-field
+guard is what silently absorbs the `undefined` rather than rejecting it.
+
+### 18.2 CRITICAL C20 - the `settings` IPC boundary is unsound, though it works today by accident
+
+**Where:** `src-tauri/src/db.rs:89-105` · `src-tauri/src/commands.rs:266-268` · `src/store/useAppStore.ts:34-43`, `:124-127`, `:45-53`
+
+`db::AppSettings` derives `Deserialize` with **zero** `#[serde(default)]` and zero
+`#[serde(skip)]` anywhere in `db.rs` (count = 0) and declares **14 required fields**,
+including non-Option `schedule_enabled: bool` and `schedule_times_per_day: i64`. The
+TypeScript `AppSettings` interface declares **8** - missing `schedule_enabled`,
+`schedule_times_per_day`, `schedule_time_1..4`. `update_settings_cmd` deserializes
+the JS object straight into that struct.
+
+The defect is real but does **not** currently break: `get_settings_cmd` returns all
+14, and every call site spreads the whole runtime object
+(`Settings.tsx:189, 199, 214, 795, 882`; `useAppStore.ts:137`), so the undeclared
+fields ride along. The break condition is any partial or `defaultSettings`-shaped
+payload, or a Rust migration adding a column - and `saveSettings` (`:124-127`) has no
+`catch`, so the failure would surface as an unhandled rejection, not an error message.
+`defaultSettings` (`:45-53`) is an 8-field object and is **dead code**, zero
+references. Confidence: high on the analysis. See 18.14 for the corrected form of
+this finding.
+
+### 18.3 HIGH H73 - `subscribeDashboardEvents` cleanup dereferences module state, not captured locals
+
+**Where:** `src/store/useDashboardStore.ts:186-188`, `:199-234`, `:231-232` · `src/main.tsx:7` · `src/pages/Dashboard.tsx:53-54`
+
+`scanProgressUnlisten` / `scanCompleteUnlisten` / `refreshTimer` are declared at
+**module scope** (`:186-188`). The subscribe function assigns them (`:199-234`) and
+returns a closure that dereferences *the module variables at call time* (`:231-232`)
+rather than the unlisten functions it just created. `main.tsx:7` wraps `<App/>` in
+`React.StrictMode`, so every Dashboard mount runs the effect, cleans up and re-runs,
+producing two overlapping `subscribeDashboardEvents()` calls. Whichever `listen()`
+resolves last owns the module variables; the other pair is never unregistered. In
+one resolution order the `cancelled` branch (`Dashboard.tsx:53-54`) tears down the
+**live** subscription, leaving the dashboard with no `scan-progress` /
+`scan-complete` handling plus a permanently leaked pair that still calls `setState`
+and `invoke("is_scanning_cmd")` on every event.
+
+Confidence: high on the defect. **Which resolution order wins is UNVERIFIED**
+without running it. A production build drops StrictMode's double-invoke, but the
+defect survives any remount-while-subscribe-in-flight, since the subscribe is
+`await`ed at `:200` / `:207`.
+
+### 18.4 CROSS-REFERENCE - duplicates H44 in section 17: `loadSettings` has no error path; one transient failure bricks the app
+
+**Where:** `src/store/useAppStore.ts:119-122` · `src/App.tsx:44-49`, `:52`, `:102-108`
+
+`loadSettings` awaits `invoke` with no `try/catch`. `App.tsx:44-49` `boot()` awaits it
+with no catch and no retry, `:52` gates i18n init on the result, and `:102-108`
+renders only the loading pulse until `ready`. A single SQLite or IPC error leaves
+`settings === null` permanently: the user stares at an animated "Loading..." with an
+unhandled rejection in the console and no way out short of a process restart.
+Confidence: high, the control flow is unambiguous.
+
+### 18.5 CONFIRMATION - extends H34 in section 15: the `file-organized` storm is unbatched; up to 4 listeners and ~7 IPC round-trips per organized file
+
+**Where:** `src/App.tsx:63-66` · `src/components/Popup.tsx:72-88` · `src-tauri/src/tray.rs:78`, `:181` · `src-tauri/src/watcher.rs:110-124`
+
+`App.tsx:63-66` calls `loadLogs()` + `loadStats()` per event, un-awaited, with no
+debounce and no in-flight guard. `Popup.tsx:72-88` registers a **second** listener
+for the same event and adds `getPendingFiles()`. Both files are loaded into both
+webviews, so one organized file produces up to 4 handler runs and ~7 invokes
+(`get_logs_cmd` x3, `get_stats_cmd` x3, `get_pending_files_cmd` x1). A 200-file drop
+yields ~1,400 IPC round-trips, ~800 `set()` calls and ~800 root re-renders, because
+`App.tsx:34` selects the whole store with no selector.
+
+The M5 exit criterion is satisfied for the dashboard only because
+`useDashboardStore` never listens to `file-organized` at all - so the dashboard never
+reflects organized files, and the inventory is only rebuilt by `scan_roots`
+(`scan.rs:163`); `watcher.rs:110-124` emits the event without touching
+`file_inventory`. Confidence: high.
+
+### 18.6 HIGH H74 - `role="img"` removes the storage ribbon's 7 interactive buttons from the accessibility tree
+
+**Where:** `src/components/dashboard/StorageRibbon.tsx:42-46`, `:51-62`, `:54`, `:84`
+
+`role="img"` sits on a container whose children are 7 interactive `<button>`s. Per
+ARIA, `role="img"` makes all descendants presentational, so every segment button
+leaves the accessibility tree, the `title` at `:54` never becomes an accessible
+name, and the buttons are unreachable. It is also invalid ARIA (interactive content
+inside `img`). The `aria-label` is `t("dashboard.storageDistribution")` - the chart's
+own title, conveying no data - so a screen-reader user learns nothing about the
+distribution. Confidence: high on the ARIA rule; the exact Chromium pruning is
+**UNVERIFIED** at runtime.
+
+### 18.7 HIGH H75 - `fr`, `it` and `uk` translate Undo as Cancel
+
+**Where:** `src/locales/fr.json`, `it.json`, `uk.json` keys `popup.undo` and `settings.history.undo` · rendered at `src/components/Popup.tsx:221` and `src/components/Settings.tsx:752`
+
+`popup.undo` = `Annuler` (fr), `Annulla` (it), `Скасувати` (uk). These are the
+standard words for *Cancel*, and each collapses onto that locale's `common.cancel`
+value exactly. de, es, pl, ru, vi and ja keep the two keys distinct. Detection is
+mechanical (exact-string collision between keys whose English differs) and
+unambiguous. Consequence: the Undo button in the tray popup and the visible Undo
+label in Settings to History read **"Cancel"** in three of ten locales. A user who
+reads "Cancel" will not undo a file move. This is a functional-UI defect, not
+cosmetic. Confidence: high on the string identity and high that the three words mean
+Cancel - they are not ambiguous.
+
+### 18.8 HIGH H76 - no plural forms exist in any locale; pl, ru and uk render wrong counts today
+
+**Where:** all 10 locale files (`_zero`/`_one`/`_two`/`_few`/`_many`/`_other` count = **0** in every one) · keys `popup.pendingFiles`, `notifications.cleaned`, `settings.rules.importSuccess`, `cleanup.confirm`, `settings.archive.importSuccess`, `dashboard.scanRoots`, `settings.scheduler.time` · call sites `Popup.tsx:116`, `:171`, `:300`, `DuplicatesTab.tsx:101`, `FileListTab.tsx:166`, `EmptyDirsTab.tsx:111`
+
+i18next 26.0.10 uses `pluralSeparator: '_'` and `Intl.PluralRules`. Measured category
+counts: pl, ru, uk need `one`/`few`/`many` (3-4 forms) and have 1; en, de, es, it, fr
+need 2 and have 1; **ja and vi need `other` only and are already correct - do not
+"fix" them.** Live failures: `ru` renders `3 файлов ожидает` where Russian requires
+`3 файла`; `1 файлов ожидает` where it requires `1 файл`. `pl`
+`Uporządkowano 2 plik(i)` is wrong for `few`. The `(s)` / `(i)` / `(ów)` hack in en,
+de, es and fr is the same defect wearing different clothes.
+
+This is a **data-only fix**: all 7 count-bearing call sites already pass `count`, so
+i18next already enters plural resolution and falls back to the base key. Adding the
+suffixed variants is a pure JSON addition with no code change. Confidence: high.
+
+### 18.9 HIGH H77 - the 7 category names are unlocalisable by construction, and no `categories` namespace exists
+
+**Where:** `src/locales/en.json` (no `categories` key in any of the 10 files; 0 matches for `Documents`/`Images`/`Other`/`Audio`/`Code`/`Videos`) · `src-tauri/src/scan.rs:51-58` · rendered raw at `StorageRibbon.tsx:54`, `:83`, `CategoryBars.tsx:59`, `FileBrowser.tsx:166`, `ActivityTimeline.tsx:37`, `Suggestions.tsx:251`, `:255`, `Popup.tsx:207`, `:244`, `Settings.tsx:720`
+
+The names arrive from Rust as English string literals and are printed untranslated at
+10 sites. Worst case is `StorageRibbon.tsx:36-40`, where the English category is
+interpolated *into* a translated sentence: a German user reads
+`Dokumente · 42 % von 1,2 GB` - one locale, two languages, one headline. In Russian
+the `<h2>` reads `Документы · 42% от 12.4 GB`. Severity Medium-High to High for a
+10-locale product; confidence: high.
+
+Two English couplings make any JSON-only fix insufficient. `Popup.tsx:22-31`
+`getIconForType()` selects icons by English substring (`includes("image")`,
+`includes("music")`, `includes("install")`), and `utils/dashboard.ts:13-15`
+`categoryColor()` keys on the same literals; localise the category and the icons and
+colours vanish. The correct shape is an enum token from Rust mapped to
+`t("categories.<token>")` in the frontend, with colour and icon lookup keyed on the
+token.
+
+Compounding this, `ActivityTimeline.file_type` is a **union of two incompatible
+vocabularies** so a categories fix alone will not fix it: the weekly-stats query
+(`db.rs:514`) groups `action_logs.file_type`, which is written both by `rules.rs:239`
+(`rule.name`, whose defaults at `db.rs:330-336` include `Installers`, `Music`,
+`Others`) and by `commands.rs:754` (`suggested_category`, the 7-value classifier
+set). `Music` coexists with `Audio` and `Others` with `Other`, so
+`ActivityTimeline.tsx:47` `categoryColor()` silently falls back to the `Other` colour
+for three real values. Any fix requires a **data migration**, not a JSON addition.
+
+### 18.10 HIGH H78 - `es.json` is missing the entire `settings.archive` subtree
+
+**Where:** `src/locales/es.json` - 212 leaf keys against en's 220, 229 total paths against 238, **8 leaf keys + 1 object node missing**; `settings.archive.{title, description, import, importing, importingShort, importSuccess, importError, openImportFolder}`
+
+`git status` shows `es.json` modified in this work, so the archive feature's Spanish
+strings were simply never written. `Settings.tsx:399-412` renders four of them, so a
+Spanish user sees the whole Import-archive card in English inside an otherwise-Spanish
+Settings page. `fallbackLng: 'en'` makes it silent. Confidence: high, mechanical.
+This is the only locale with a missing key; de, fr, it, ja, pl, ru, uk are all 220/220
+with 0 orphans and 0 type mismatches. `vi` is 224 leaf keys with **4 orphans**, all
+under `__translator_info__` (translator metadata, never rendered, no `t()` can reach
+them) - Low.
+
+### 18.11 HIGH H79 - roughly 130 backend error strings reach the UI verbatim, unlocalisable by i18next
+
+**Where:** `src-tauri/src/cleanup.rs:319`, `:327`, `:348`, `:357`, `:369`, `:376` · `src-tauri/src/safe_fs.rs:41`, `:49`, `:71`, `:86`, `:103` · 46 `.map_err(|e| e.to_string())` sites in `src-tauri/src/commands.rs` (lines 34-692) · plus `rules.rs:184,194,197,249,252`, `watcher.rs:180,314,318`, `cleanup.rs:154,228,238,289`, `scheduler.rs:51,103`, `ignore.rs:47`, `tray.rs:110` · rendered at `ResultsPanel.tsx:84`, `Suggestions.tsx:172`
+
+A Rust `Err(String)` is opaque to i18next. The 6 `CleanupOutcome.message` literals and
+5 `safe_fs` "Failed to..." strings become cleanup and undo messages shown raw, and
+the 46 `map_err` sites in `commands.rs` alone pass raw `rusqlite` / `std::io` text
+(`"no such table: rules"`, `"Access is denied. (os error 5)"`) into the store's
+`error` field, which 5 components render untranslated.
+
+Best single citation: `Settings.tsx:301`
+`t("settings.archive.importError", { error: String(e) })` where `archive.rs:102` is
+`Err("Unsupported archive format. Choose a .zip, .tgz, or .tar.gz file.")`. A
+Japanese user reads one sentence in two languages.
+
+The one correct pattern, recorded as the template for the fix: `ScanStarted.reason`
+(`commands.rs:512-517`) emits opaque tokens - `no_roots` (`:533`) and
+`already_running` (`:540`), `None` on success - and `useDashboardStore.ts:157,162` /
+`Dashboard.tsx:99-104` map them to `t("dashboard.scanNoRoots")` /
+`t("dashboard.scanAlready")`. The frontend mapping is complete. Every other backend
+string should be modelled that way.
+
+Two other user-visible English surfaces outside the webview: `watcher.rs:137`, `:139`,
+`:148`, `:166` build OS toasts and an event body in hardcoded English, and
+`db.rs:330-336` default rule destinations create real on-disk English directory names
+(`Images/`, `Documents/`, `Archives/`, `Installers/`, `Music/`, `Videos/`, `Others/`).
+`ignore.rs:42` also writes an English header into the user's own `.mouziignore` file.
+
+**The "~130 distinct user-facing English strings" figure is an order-of-magnitude
+estimate, not a verified tally.** It came from a delegated sweep whose final summary
+was truncated. The per-file, per-line citations above are the load-bearing part and
+were read directly.
+
+### 18.12 MEDIUM H80 - cross-store, cross-webview divergence: the same fact with independent writers
+
+**Where:** `src/store/useAppStore.ts:79`, `:157-160`, `:77`, `:147-150`, `:82` · `src/store/useDashboardStore.ts:92`, `:96`, `:129-138`, `:149-151` · `src/pages/Dashboard.tsx:150-152`, `:216`, `:264` · `src/components/Popup.tsx:234-256`
+
+Two webviews mount the same React app - `"popup"` (300x420, `tray.rs:78`) and
+`"app"` (1100x820, `tray.rs:181`) - so each duplicated fact exists **twice** as two
+independent store instances, reconciled only by the `file-organized` event, which
+updates `logs` / `stats` / `pendingFiles` and **not** `folders`, `rules`, `settings`,
+`schedule` or any dashboard, cleanup or suggestion field.
+
+Divergences that are reachable without any unusual sequence:
+
+- **Weekly organized counts.** `useAppStore.stats` and `useDashboardStore.weeklyStats`
+  both come from `get_stats_cmd` (`db.rs:510`). Click **Clear logs** in Settings and
+  `useAppStore.ts:237` empties copy A only: the popup's weekly-stats bars
+  (`Popup.tsx:234-256`) vanish while the dashboard's activity timeline
+  (`Dashboard.tsx:264`) keeps the pre-clear bars. **One click, two windows, same
+  source, disagreeing.**
+- **Root count, in the same window.** `Dashboard.tsx:216` renders
+  `stats.watchedRoots.length` and `Dashboard.tsx:150-152` renders
+  `useDashboardStore.rootCount`, which is written only inside `startScan`
+  (`useDashboardStore.ts:149-151`) and never invalidated. Add or pause a folder after
+  a scan and the two numbers differ on one screen.
+- **Theme across windows.** `loadSettings` runs once per webview at boot. Change the
+  theme in Settings and the popup window keeps the old theme until process restart,
+  because `App.tsx:59` `applyTheme` never re-fires there.
+- **Inventory totals are structurally stale.** `execute_cleanup` (`cleanup.rs:387-408`)
+  never touches `file_inventory`, so after trashing N files the dashboard's totals,
+  insights, age histogram and duplicate list still count them until the next scan.
+- **A popup open before a folder was added** runs `handleClean` (`Popup.tsx:105-106`)
+  against a stale `folders` array and never organizes into the new folder.
+
+Mechanism behind all of it: windows are hidden, not destroyed
+(`tray.rs:171-177`, `:194-197`), and **no `reset` action exists in any of the 4
+stores**, so state survives hide/show for the whole process lifetime.
+
+### 18.13 MEDIUM H81 - 10 of 11 store subscriptions are whole-store selections under Zustand v5
+
+**Where:** `src/App.tsx:34` (no selector, 2 fields) · `Settings.tsx:125` (24 fields) · `Settings.tsx:985` (1) · `Popup.tsx:54` (11) · `Dashboard.tsx:42` (12) · `Suggestions.tsx:66` (12) · `DuplicatesTab.tsx:19` (10) · `FileListTab.tsx:30` (10) · `EmptyDirsTab.tsx:10` (10) · `HistoryPanel.tsx:10` (2) · the one correct narrow selector is `Cleanup.tsx:30-36`
+
+Under Zustand v5 a whole-store selection re-renders on **any** `set()`. The single
+narrow selector proves the pattern was known. Worst sites: `Popup.tsx:54` re-renders
+unconditionally every 3 s forever because `useAppStore.ts:243` allocates a fresh
+`pendingFiles` array each tick (the interval **is** correctly cleared at
+`Popup.tsx:97`, so this is cost, not a leak); `Dashboard.tsx:42` re-renders the whole
+7-chart subtree plus `FileBrowser` on every `scan-progress`, which Rust emits once
+per 200 files (`scan.rs:14`, `:107`); `Suggestions.tsx:66` takes up to 200 full-page
+re-renders from `acceptAll` (`useSuggestionsStore.ts:97-110`).
+
+Compounding cascade: `Dashboard.tsx:267-269` passes `stats.largestFiles` /
+`recentFiles` into `FileBrowser`, which lists both in a `useEffect` dep array
+(`FileBrowser.tsx:64`), so every `loadStats()` produces new array identities,
+re-runs the effect, and re-issues `get_inventory_files_cmd` (`:43`) whenever a filter
+is active.
+
+### 18.14 CONFIRMATION - extends H25 in section 13: the "Undo status returned then discarded" finding, confirmed and generalised
+
+**Where:** `src/store/useAppStore.ts:174-188` · `src/components/Popup.tsx:219` · `src/components/Settings.tsx:749`, `:687` · `src-tauri/src/commands.rs:130`
+
+`undoAction` / `undoAll` return `UndoResult` / `UndoAllResult` with status
+`ok | collision | missing | failed` (`commands.rs:130`), and all three call sites
+throw the result away. A `failed` or `collision` undo is invisible: the row simply
+stops being undoable. This is the same class as 18.17 - the backend produces a
+per-item status contract that the frontend has no rendering path for - and it is
+recorded here so the two are fixed together.
+
+### 18.15 MEDIUM H82 - swallowed errors that turn into silent data loss or silent failure
+
+**Where:** `src/store/useAppStore.ts:249-256`, `:258-261` · `Settings.tsx:135`, `:164-168`, `:230-236` · `Settings.tsx:995` · `Settings.tsx:233-235`, `:959`
+
+- `getSchedule` catches and only `console.error`s, leaving `schedule: null`.
+  `Settings.tsx:135` seeds the editor from `defaultSchedule()` and `:164-168` syncs
+  only when `schedule` is truthy; `handleSaveSchedule` (`:230-236`) then calls
+  `updateSchedule(localSchedule)` unconditionally, so `useAppStore.ts:258-261` writes
+  the defaults **over the user's real schedule**. A swallowed read error becomes a
+  silent destructive write.
+- `Settings.tsx:995` is worse than an empty catch: it converts a failed read into the
+  user-facing message "No ignore rules yet."
+- `Settings.tsx:233-235` shows nothing at all; clicking Save on the scheduler
+  (`Settings.tsx:959`) that fails at `:233` produces no feedback. Across
+  `src/components/**` there are **10** swallow-only catches
+  (`HistoryPanel.tsx:19-21`, `FileListTab.tsx:85-87`, `Popup.tsx:131-133`, `:266-268`,
+  `Settings.tsx:233-235`, `:731-733`, `:1023-105`, `About.tsx:18`); 3 more in
+  `Settings.tsx:248-251`, `:269-272`, `:298-303` are correctly handled and excluded.
+
+### 18.16 MEDIUM H83 - un-awaited, re-throwing store actions produce unhandled rejections and no feedback
+
+**Where:** `src/store/useAppStore.ts:194-197`, `:204-207`, `:214-217` · `Settings.tsx:172`, `:454`, `:467`, `:809`, `:883` · `Popup.tsx:103-119`, `:83`
+
+`addFolder` / `removeFolder` / `updateFolderMode` catch, log, then **re-throw**; the
+handlers never catch. `Settings.tsx:467` `onClick={() => f.id && removeFolder(f.id)}`
+means **a folder removal that fails is completely silent**; `:454` is the same for a
+mode change, `:172` awaits without `try`, `:809` and `:883` are floating promises.
+`Popup.tsx:103-119` `handleClean` awaits `scanFolder` in a loop with no try/catch, so
+a mid-loop rejection discards the "Cleaned N files" toast for folders that *were*
+processed. Also `Popup.tsx:83`: a 30 s `setTimeout` per `file-organized` event with no
+ref and no cleanup, so N events leave N pending timers, and a second event dismisses
+the newer toast early.
+
+### 18.17 MEDIUM H84 - `applyAccept` removes a suggestion even when the move failed
+
+**Where:** `src/store/useSuggestionsStore.ts:60-70` · `src-tauri/src/commands.rs:684`
+
+After the invoke resolves, the item is unconditionally filtered out of the list and
+the outcome appended to `results`, with no branch on `outcome.status`
+(`"ok" | "missing" | "failed"`). A failed accept makes the row disappear; the only
+trace is a red dot in the results banner, and clicking "back to list" shows it gone.
+The agent explicitly ruled out optimistic-update framing - the write happens **after**
+the invoke resolves - and rated it Medium rather than High on that basis, calling it
+an unconditional success-shaped mutation on a failure path. Confidence: high.
+
+### 18.18 MEDIUM H85 - storage ribbon floor inflates the bar, and the legend contradicts it
+
+**Where:** `src/components/dashboard/StorageRibbon.tsx:58`, `:84` · `src/index.css:142-149`, `:155` · `StorageTreemap.tsx:79` · `CategoryBars.tsx:69` · `ActivityTimeline.tsx:46`
+
+Four components, three different minimum-segment floors: `Math.max(pct, 1)%` in the
+treemap and category bars, `Math.max(pct, 4)%` in the timeline, and
+`Math.max(pct, 1.2)%` **plus** `min-width: 3px` in the ribbon. The ribbon is
+`display:flex` with per-segment width percentages inside `overflow:hidden`, so with 7
+categories each floored at 1.2% plus ~0.32% of 3px inflates the bar by up to ~10
+percentage points of visual width, while the legend at `:84` prints the true `pct%`.
+**The bar and its own legend disagree, and small categories are drawn larger than
+they are.** A zero-byte category or watched root also draws a visible bar. The floors
+are a deliberate visibility hack, but nothing in the UI discloses it.
+
+For contrast, the other end of this file is right: `AgeHistogram` and
+`ActivityTimeline` normalise against `max`, not `sum`, which is the correct choice for
+a histogram, and the ribbon's `filter()` at `:20` is the only correct zero-size
+handling in the folder (it drops `bytes > 0` out).
+
+### 18.19 MEDIUM H86 - 7 hardcoded hex category colours bypass the token system; 2 fail contrast in dark mode
+
+**Where:** `src/utils/dashboard.ts:1-9` · `CategoryBars.tsx:57`, `:70` · `StorageRibbon.tsx:59`, `:81` · `ActivityTimeline.tsx:47` · `FileBrowser.tsx:165` · `src/index.css:23-31` (`--color-surface-dark: #171412`)
+
+`CATEGORY_COLORS` is 7 hex values applied via inline `style={{backgroundColor}}` in 6
+places, so the entire categorical colour scale is theme-invariant. In dark mode two
+of the seven fail WCAG 1.4.11 (3:1 for graphical objects): **Videos `#6b4f3a`
+~2.5:1** and **Code `#3d5a4c` ~2.5:1**, hand-computed from the sRGB relative-luminance
+formula - **treat the arithmetic as approximate, the failure is not marginal**. In
+light mode the same colours are ~6.7:1 and pass.
+
+Same class: `FileBrowser.tsx:107`, `:114` - `text-white` on `bg-primary` fails in
+**both** themes, ~2.1:1 on light-mode `#f59e0b` and ~1.7:1 on dark-mode `#fbbf24`,
+against a 4.5:1 AA requirement at 10-12px. And 12 lines of light-only colour classes
+with no `dark:` variant sit directly beside copies that do have them
+(`ResultsPanel.tsx:43`, `:46`, `:49`; `Settings.tsx:419`, `:421`, `:422`, `:531`,
+`:532`, `:468`, `:670`, `:697`; `Popup.tsx:299`); `index.css:81`, `:103` draw
+`border: 2px solid white` on the slider thumb.
+
+### 18.20 MEDIUM H87 - accessibility: unnamed controls, unassociated labels, no keyboard path to two interactive surfaces
+
+**Where:** `Settings.tsx:325-332`, `:466-471`, `:662-667`, `:668-673` · `DuplicatesTab.tsx:168-177` · `Popup.tsx:262-273` · 11 unassociated labels at `Settings.tsx:381, 452, 545, 553, 567, 581, 589, 771, 792, 830, 840, 924, 946, 1039, 1082` and `FileListTab.tsx:114` · `Settings.tsx:540-626`
+
+- **5 real `<button>`s with no accessible name** (icon-only, no `title`, no
+  `aria-label`): back (`:325-332`), **delete watched folder** (`:466-471`), edit rule
+  (`:662-667`), **delete rule** (`:668-673`), and the keep-this-copy radio
+  (`DuplicatesTab.tsx:168-177`), whose only child `{isKept && <Check/>}` renders
+  *nothing* when unselected - so by default every keep-radio announces as an empty
+  button. It is also single-select within a group with no `role="radio"` and no
+  `aria-checked`. Sharp detail: `en.json:27 settings.folders.remove` and
+  `en.json:51 settings.rules.delete` **already exist and are never used** - the fix is
+  two attributes.
+- `Popup.tsx:262-273` is `role="button"` with **no `tabIndex` and no `onKeyDown`**,
+  so it is unreachable by keyboard; it fires on `onPointerDown` (so right-click
+  triggers it) and nests a real `<button>` (`:279`) inside a `role="button"`.
+- **11 unassociated labels and 0 `htmlFor` in the entire scope** - labels are
+  siblings, not wrappers. The grace-period `<input type="range">` (`Settings.tsx:830`)
+  has no label, no `aria-label` and no `aria-valuetext`. 4 controls are correct
+  (`EmptyDirsTab.tsx:94`, `FileListTab.tsx:149`, `Settings.tsx:520`, `:600`).
+- **No dialogs exist**, so `role="dialog"`, `aria-modal`, focus trap and Escape are
+  all zero. The rule editor (`Settings.tsx:540-626`) behaves like a modal: appears
+  over the list, no focus moved in, no Escape, 5 inputs injected mid-tab-order.
+- Charts have no text alternative beyond titles - no `aria-label` describing values on
+  `AgeHistogram` (`title=` at `:46` only), `CategoryBars`, `StorageTreemap` or
+  `ActivityTimeline`; no table or summary fallback.
+- Only `Settings.tsx:654` has a designed `focus-visible` ring. `index.css:133`, `:164`
+  add one for checkboxes and ribbon segments, nothing for buttons.
+
+**0 instances of the clickable-`<div>` anti-pattern** - every actionable control in all
+16 components is a real `<button>` or `<input>`. The design system is sound there.
+
+### 18.21 MEDIUM H88 - 15 keys are translated into all 10 locales but never referenced
+
+**Where:** `suggestions.currentFolder`, `suggestions.suggested`, `settings.rules.delete`, `settings.folders.remove`, `settings.rules.action`, `settings.general.telemetry`, `cleanup.noScanData`, `dashboard.activityTimeline`, `app.tagline`, `popup.settings`, `popup.cleanManual`, `settings.folders.silent`, `settings.folders.suggest`, `settings.general.gracePeriodCustom`
+
+The localisation work was done and the UI never wired it. The two that matter most
+are a11y defects: `settings.folders.remove` and `settings.rules.delete` exist in all
+10 locales while `Settings.tsx:466-471` and `:668-673` render bare icon buttons.
+`Settings.tsx:652` is the one place that does build an `aria-label` from `t()`,
+proving the pattern was known and then not applied. `dashboard.activityTimeline`
+(`Organized this week`) is an exact duplicate of the used
+`dashboard.organizedThisWeek`; `cleanup.noScanData` near-duplicates the used
+`cleanup.scanFirstHint`.
+
+### 18.22 MEDIUM H89 - system-locale detection exists in Rust and is never used by the frontend
+
+**Where:** `src/App.tsx:53` · `src-tauri/src/commands.rs:17-18`, `:19-29` · `src-tauri/src/tray.rs:62-66` · `src-tauri/src/i18n.rs:113` · `src-tauri/src/tray.rs:119-120`
+
+`App.tsx:53` is the only source of the app language:
+`const lang = (settings.language || "en") as SupportedLang`, reading the DB column
+(`db.rs:165`, default `'en'`). It never consults the OS - no `navigator.language`, no
+`navigator.languages`, no Tauri `getLocale()` anywhere in `src/`. The Rust side *does*
+detect it (`commands.rs:17-18` `sys_locale::get_locale()`, crate `sys-locale = "0.3"`,
+`Cargo.toml:30`) but feeds it **only to the tray** (`tray.rs:62-66`).
+
+Net effect on Windows: a German-, Russian- or Ukrainian-Windows user gets **English**
+until they find Settings to General to Language manually. A second, smaller gap:
+`i18n.rs:113` defines a full `vi` block but `commands.rs:19-29`
+`get_system_language()` has no `"vi"` arm and falls through to `_ => "en"`, so
+Vietnamese can only be reached by manual selection. This is the single
+highest-leverage change in the i18n report.
+
+### 18.23 MEDIUM H90 - path handling: `parentDir` returns a drive-relative path, and 3 copies disagree
+
+**Where:** `src/utils/paths.ts:8-11` · `src/components/Settings.tsx:80-86` · `src/components/Popup.tsx:33-38` · `src-tauri/src/commands.rs:328`
+
+One function, three private copies, three different guards (`i > 0`,
+`lastSlash <= 0`, `=== -1`). All three return **`"C:"` for `C:\file.txt`**, not
+`"C:\"` - drive-*relative*, so Windows resolves it against the process's per-drive
+current directory rather than the drive root. The guard inconsistency means a
+slash-free `"file.txt"` returns the file itself, and `open_folder_cmd` then opens a
+file where a folder was intended. Confidence: high.
+
+Benign and worth recording so nobody re-raises it: `commands.rs:328` does
+`path.replace('/', "\\")`, so the frontend's forward-slash reformatting and the
+`//server/share` UNC form are corrected downstream - accidentally, not by design.
+
+### 18.24 MEDIUM H91 - 10 path render sites truncate with no tooltip; 3 sites with no truncation can blow out row height
+
+**Where:** `EmptyDirsTab.tsx:129` (worst) · `FileListTab.tsx:187`, `:189` · `HistoryPanel.tsx:71`, `:73` · `ResultsPanel.tsx:78`, `:80` · `Settings.tsx:447` · and un-truncated: `Settings.tsx:719-721`, `ResultsPanel.tsx:83-86`, `Settings.tsx:644`
+
+A 300-450 character path is silently cut with no way to recover the tail.
+`EmptyDirsTab.tsx:129` is the sharpest case: in a file organiser whose whole job is
+naming empty directories it shows about 40 characters with no `title`, no copy, no
+expand. Two sites are correct - `DuplicatesTab.tsx:178-179` has `title={f.path}` and
+`Popup.tsx:203-205` has `title={log.file_name}`.
+
+A long path does **not** wrap and blow out the layout at the truncating sites:
+`truncate` implies `white-space:nowrap` and the containers scroll (`max-h-80` plus
+`overflow-auto` at `HistoryPanel.tsx:49`, `ResultsPanel.tsx:55`,
+`EmptyDirsTab.tsx:116`, `FileListTab.tsx:171`). The failure is the opposite - the path
+is *invisible*, not wrapped. The genuinely dangerous sites are the three with no
+truncation, no `break-all` and no `min-w-0` ancestor:
+`Settings.tsx:719-721` (`{log.destination_path}` in a plain `<div>`, which stretches
+the flex row at `:712-756` and pushes Undo off-screen),
+`ResultsPanel.tsx:83-86` (`r.message`, which embeds the full `C:\...` path from
+`cleanup.rs:339`), and `Settings.tsx:644`. The 4 error banners render `String(e)` from
+Rust with no `break-all` either.
+
+Two translated sentences handle paths badly: `Popup.tsx:290`
+`t("popup.openFolder", { folder: ... })` renders inside `truncate` with no `title`
+(`:289`), so the ellipsis eats the path - the only useful part. `Popup.tsx:277`
+`t("popup.organized", { file: toast.file })` has the opposite problem: no truncation,
+so a long filename wraps and squeezes the dismiss button in the `justify-between` row
+at `:274`.
+
+### 18.25 MEDIUM H92 - silent 50-row cap on the largest and recent listings, with a silent jump to 80
+
+**Where:** `src-tauri/src/commands.rs:585-586` · `src/components/dashboard/FileBrowser.tsx:48`, `:101`, `:151`
+
+`largest_files` and `recent_files` are hardcoded to 50 and are not parametrised.
+Unfiltered, `FileBrowser` shows 50 rows; the moment the user types a query or picks a
+filter it switches to `get_inventory_files_cmd` with `limit: 80`
+(`FileBrowser.tsx:48`, clamped 1..200 at `commands.rs:616`). The UI never says
+"showing 50 of N", so a user with 4,000 files cannot distinguish "only 50 large files
+exist" from "here are 50 of 4,000" - and the count changes from 50 to 80 on the first
+keystroke. A storage dashboard that under-reports without saying so is worse than one
+that admits a cap.
+
+### 18.26 MEDIUM H93 - `Settings.tsx` carries 39 hardcoded literals beside 87 `t()` calls
+
+**Where:** `src/components/Settings.tsx:1104-1107`, `:737`, `:241`, `:258`, `:279`, `:42-50`, `:720`, `:466`, `:672` · `src/components/Popup.tsx:214`, `:167` · `src/utils/format.ts:8`, `:9`, `:10`, `:18`
+
+Across the 8 non-dashboard components: **39 rendered hardcoded literals - 22
+unambiguously English, 10 language endonyms, 7 punctuation or glyphs.** The 4 cleanup
+tabs plus `ResultsPanel` are effectively 100% translated (29 `t()`, 0 English
+strings). Worst groups:
+
+- `Settings.tsx:1104-1107`, the 4 `.mouziignore` tip bodies - **the single largest
+  cluster of untranslated prose in the app**, and the `settings.ignore.tips` header
+  directly above them at `:1101` *is* translated, so a Japanese user reads a
+  translated "Tips:" followed by four English sentences.
+- `title="Open folder"` x2 (`:737`, `Popup.tsx:214`) while `en.json:231`
+  `cleanup.openFolder` already exists and is translated in all 10 locales.
+- `formatDuration`'s `"0s"` / `${h}h` / `${m}m` / `${s}s` (`:42-50`), all rendered at
+  `:827`, locale-incorrect for de/fr/ru/uk, sitting three lines below the translated
+  `t("settings.general.gracePeriod")`.
+- Native-dialog filter names `"JSON"` x2 and `"Archives"` (`:241`, `:258`, `:279`)
+  while every result branch in the same handlers is translated. This one is an
+  **architectural gap**, not an oversight: `filters[].name` is handed to the Windows
+  open/save dialog and is outside the webview, so i18next cannot reach it.
+- `utils/format.ts:18` `toFixed(2)` always emits a **period** decimal separator. A
+  French, German or Russian user sees `1.50 MB` where `Intl.NumberFormat` would give
+  `1,50 MB`. `formatBytes` never touches i18n.
+- Hardcoded `%`, `·` and `→` outside translation at 20 sites. German and French
+  require a non-breaking space before `%`; CJK locales generally use no space at all.
+
+At least 15 of the 22 English strings have a translated sibling within about 10 lines,
+so the pattern is known and inconsistently applied.
+
+### 18.27 MEDIUM H94 - preview and confirm is unimplemented for 8 of 12 destructive actions
+
+**Where:** `Popup.tsx:161` (Clean Now) · `Settings.tsx:695` (Clear History), `:686` (Revert All), `:466`, `:668` · **0 occurrences of `confirm()` or `alert()` in `src/**`**
+
+Worst first. `Popup.tsx:161` "Clean Now" is the flagship action: it moves files,
+shows only an aggregate count, and **no per-file preview exists anywhere**. Then
+`Settings.tsx:695` "Clear History", which destroys the undo trail and is therefore
+irreversible for the user while styled like a harmless action. Then one-click
+unconfirmed: delete watched folder (`:466`), delete rule (`:668`), Revert All (`:686`).
+The 3 cleanup tabs do have preview + checkbox + confirm, and `FileListTab` /
+`EmptyDirsTab` correctly guard with `disabled={store.busy || checked.size === 0}`;
+`DuplicatesTab:95` guards on `busy` only.
+
+### 18.28 MEDIUM H95 - two count sites bypass i18next entirely and cannot be fixed in JSON
+
+**Where:** `src/components/cleanup/DuplicatesTab.tsx:90` · `FileListTab.tsx:156` · `EmptyDirsTab.tsx:101`
+
+`DuplicatesTab.tsx:90` renders `{groups.length} {t("cleanup.groupCount")}` - a bare
+count plus a plural-unsafe label ("3 groups"). `FileListTab.tsx:156` and
+`EmptyDirsTab.tsx:101` render `{t("cleanup.selectAll")} ({data.length})` - a bare
+parenthesised numeral with no noun, which reads acceptably in most languages but is
+not localisable and is meaningless to a screen reader. Unlike 18.8 these cannot be
+fixed by adding JSON variants; the call sites need `t(key, { count })`.
+
+### 18.29 MEDIUM H96 - 2 index-based keys on lists that provably mutate
+
+**Where:** `src/components/Settings.tsx:942` (list whose length changes at `:924-935`) · `Settings.tsx:1066` (on `patterns`, which splices at `:1004` and `:1010`)
+
+Both are currently invisible because the rows hold no internal state and every field
+is controlled. 11 of 13 keys in scope are stable, and every one of the 8 dashboard
+components uses a domain key (`item.path`, `item.category`, `file.path`,
+`bucket.bucket`, `card.key`, `item.file_type`). All three viz components re-sort on
+data change via `useMemo` (`StorageTreemap.tsx:24`, `CategoryBars.tsx:21`,
+`ActivityTimeline.tsx:12`), so **index keys would have corrupted the rendering and did
+not** - a check that passed, recorded so it is not re-run.
+
+Two effect defects in the same file: `Settings.tsx:153-161` is a self-fighting
+write-back effect that rewrites the state the handler just wrote (type `3600` into the
+seconds field and it silently becomes `1` with the unit flipping to Hours
+mid-keystroke), and `Settings.tsx:991-999` is an uncancelled async race on folder
+switch.
+
+### 18.30 LOW H97 - an N-root scan triggers N+1 full dashboard re-fetches against a table being written
+
+**Where:** `src/store/useDashboardStore.ts:207-224`, `:219` · `src-tauri/src/scan.rs:193`, `:120` · `src-tauri/src/commands.rs:582`
+
+Each `scan-complete` calls `refresh()` immediately while `is_scanning_cmd` is still
+true, and Rust emits one per root. A 4-root scan means 4 immediate plus 1 trailing
+`get_dashboard_stats_cmd` (itself 6 queries including two 50-row listings and the
+insights computation) plus 5 `get_stats_cmd`. Because `append_inventory_batch` writes
+`file_inventory` **during** the walk, the intermediate reads see a partially
+populated table and the dashboard visibly counts up. Each refresh also produces fresh
+`largestFiles` / `recentFiles` arrays, re-triggering the `FileBrowser` effect (18.13).
+
+### 18.31 LOW H98 - stale `scanReason` leaves a permanent "a scan is already running" banner
+
+**Where:** `src/store/useDashboardStore.ts:190-197`, `:174-181`, `:157` · `src/pages/Dashboard.tsx:163`
+
+`scheduleRefreshAfterScan` sets `{isScanning:false, scanProgress:null}` but omits
+`scanReason`; `syncScanState` omits it too. `Dashboard.tsx:163` renders the banner
+whenever `reasonMessage && !isScanning`, so a `"already_running"` reason set at `:157`
+leaves "a scan is already running" on screen permanently after that scan has finished.
+
+### 18.32 LOW H99 - orphaned backend function and a mis-naming pair, after the `LargestFiles` deletion
+
+**Where:** `src-tauri/src/db.rs:1005`, `:1008`, `:1267` · `src-tauri/src/scan.rs:297` · `src/components/dashboard/StorageTreemap.tsx` · `ActivityTimeline.tsx` · `en.json:153`
+
+`LargestFiles.tsx` is deleted and its import and JSX removed in the same uncommitted
+pass, with **zero references remaining anywhere** in `src/` or `dist/`. M2's "largest
+files" requirement is still met, by `FileBrowser.tsx:101`, which renders
+`t("dashboard.largestFiles")` as its heading in the default `mode === "size"`, seeded
+from `initialLargest` -> `stats.largestFiles`. Two orphans remain, both Low and both
+defects of naming rather than behaviour:
+
+- `db.rs:1005 get_largest_files` now has **no production caller** - only its own
+  wrapper (`:1008`), a test (`scan.rs:297`) and `db.rs:1267`. The dashboard gets
+  largest files from `get_inventory_files("size", ..., 50)` at `commands.rs:585`.
+- `ActivityTimeline` is not a timeline: `db.rs:510-521` returns `GROUP BY file_type`
+  over 7 days of `action_logs`, a per-type count with **no time axis**, though the
+  data source is right. `StorageTreemap` is not a treemap: it groups by the stored
+  `root_path` column (`db.rs:836`) and the backend performs **no path parsing at all**
+  (zero hits for `dir_of|dirname|parent_of|rsplit` across all 15 files in
+  `src-tauri/src/`), so it is a per-watched-root bar list. Both are met-but-understated
+  against M2's wording, not defects.
+
+### 18.33 LOW H100 - `en.json:187 "filterBy": "{{name}}"` is untranslatable by construction and overloaded
+
+**Where:** `src/locales/en.json:187` · `src/components/dashboard/FileBrowser.tsx:136`, `:141`
+
+The value is literally `{{name}}` with no surrounding text, so
+`t("dashboard.filterBy", …)` renders a bare `Documents` or `Downloads` pill whose
+meaning rests entirely on visual chrome, and **a translator has nothing to
+translate**. It is also reused for two different nouns - category at `:136`, root
+folder at `:141` - with no way for a locale to word them differently. This is an
+i18n *modelling* defect, not a missed string. Confidence: high.
+
+### 18.34 LOW H101 - `FileBrowser` renders the app tagline as its loading state
+
+**Where:** `src/components/dashboard/FileBrowser.tsx:148` · `src/locales/en.json:5`
+
+`t("app.loading")` resolves to `"Mouzi..."` - the splash and tagline string, not a
+loading indicator. The user sees "Mouzi..." under the file list while searching. The
+key exists; it is the wrong key.
+
+### 18.35 LOW H102 - remaining mechanical store and component defects
+
+**Where and detail:**
+
+- `Dashboard.tsx:188-194` - the empty-state "Scan now" button has no `disabled` prop
+  (the header button at `:131-139` does). Rust's `AtomicBool` guard
+  (`commands.rs:537`) absorbs the duplicates, but `startScan` has no in-flight guard
+  in the store.
+- `useSuggestionsStore.ts:115` - `dismissAll` omits `error: null`, asymmetric with
+  `acceptAll` at `:100`; `:100` in turn omits `results: null` (which
+  `loadSuggestions:47` does set), so a stale banner persists and new outcomes append
+  to the old array.
+- `useSuggestionsStore.ts:9` - `source: "heuristic" | "ollama" | "learned"` against
+  `classify.rs:558` `pub source: String`. The `invoke<Suggestion[]>` assertion is
+  unchecked and the renderers widen it back to `string` (`Suggestions.tsx:24`, `:37`),
+  so the union buys nothing.
+- `useAppStore.ts:65` - `status: string; // 'ok' | 'collision' | 'missing' | 'failed'`:
+  a literal union was available, and the comment omits `cross-device`, which the plan
+  mandates.
+- `useAppStore.ts:5`, `:17`, `:24`, `:35` - `id?: number` on records the backend always
+  returns with an id, forcing the non-null assertions at `Popup.tsx:209`, `:219` and
+  `Settings.tsx:749`.
+- `useAppStore.ts:81` + `db.rs:538-573` - `settings` and `schedule` are two store
+  fields describing **one** DB row, fetched by two commands at two moments with no
+  transactional pairing, so they can describe different DB states.
+- `useDashboardStore.ts:191` vs `Dashboard.tsx:263`, `:271-272` - defensive `?? []` /
+  `?? EMPTY_INSIGHTS` on fields the Rust struct (`commands.rs:568-578`) always
+  populates. The store already has the correct type; the redundancy signals distrust
+  in a type the compiler already checks.
+- `FileBrowser.tsx:66-77` - the `/` shortcut is a global, window-scoped focus steal
+  with no notion of the dashboard being the active view. It does correctly bail on
+  `INPUT`/`TEXTAREA`/`SELECT` and does clean up.
+- `FileBrowser.tsx:91` - a 1,400 ms `setCopied(null)` `setTimeout` is never stored or
+  cleared; rapid clicking stacks timers and unmount leaves a pending `setState`.
+- `FileBrowser.tsx:123-129` - the search input has **no accessible name**: placeholder
+  only, no `<label>`, no `aria-label`, and a placeholder disappears on first keystroke.
+- `FileBrowser.tsx:181`, `:189` - row actions are hover-only
+  (`opacity-0 group-hover:opacity-100`). `focus:opacity-100` covers keyboard, but
+  there is no hover on touch or pen, and the hit target is `p-1` plus a 12px icon
+  ~= 20x20 CSS px, below the WCAG 2.2 24x24 minimum.
+- `FileBrowser.tsx:64` - the debounce effect depends on `initialLargest` /
+  `initialRecent`. The arrays have stable identity and the effect writes local
+  `files` state, not the store, so **no re-render loop today**. It would become one if
+  the page ever passed a derived array. **Flagged as latent, UNVERIFIED as a live
+  bug.**
+- `AgeHistogram.tsx:12-18`, `:46`, `:50` - builds a `Record<string,string>` of labels
+  on every render and indexes it with `bucket.bucket`. `AGE_BUCKETS` is `as const`
+  (`dashboard.ts:11`) so the 5 keys always hit, but the lookup is untyped and an
+  unrecognised bucket id renders an empty label.
+- `StorageRibbon.tsx:19-20` - unmemoised while all three siblings use `useMemo`. At
+  most 7 categories there is no measurable cost; noted only for folder consistency.
+- `DuplicatesTab.tsx:20` - the duplicate "keep" choice is keyed by `g.hash` and is
+  never pruned when `handleResultsDone` (`:42-46`) re-runs `findDuplicates`, so a
+  stale key can silently apply to a new group. **UNVERIFIED** (depends on hash
+  stability across rescans). Related to 18.1 but a distinct, lower-severity mechanism.
+- `App.tsx:51-55` - `initI18n` is re-run on every settings write, because the effect
+  depends on the whole `settings` object. Toggling the theme, autostart or the grace
+  period all re-initialise i18next. Redundant, and the async race could in principle
+  leave the language stale. Should key on `settings.language` alone.
+- `Cleanup.tsx:77` - `tabs.slice(0, 4).map((t) => …)` shadows the `useTranslation()`
+  `t` from `Cleanup.tsx:22`. Benign today (only `t.label` is read) but a live trap.
+- `src/utils/format.ts:7-19` - `formatBytes` is 1024-based but labels `KB/MB/GB`, SI
+  labels on binary math. Matches Windows Explorer, so informational.
+- `src/index.css:81`, `:103` plus 10 sites using `text-[10px]`
+  (`HistoryPanel.tsx:72`, `:76`; `DuplicatesTab.tsx:145`, `:185`;
+  `ResultsPanel.tsx:79`, `:83`; `FileListTab.tsx:188`, `:195`;
+  `Settings.tsx:449`, `:461`, `:638`; `FileBrowser.tsx:39`, `:46`, `:49`, `:170`,
+  `:175`, `:182`; `StorageTreemap.tsx:82`) - layout computed at 10 CSS px, so the
+  metadata line competes with the 12px filename above it while carrying less
+  information. All 48 fixed sizes are CSS px inside WebView2 and scale with the OS;
+  **no fixed-pixel geometry was found to break at 125%/150% or at 1024x768.**
+- `src-tauri/src/tray.rs:119-120` builds the fully-translated `organized` message then
+  emits `app.emit("show-notification", …)` - **no listener for `show-notification`
+  exists in `src/`.** The one completely localised end-to-end message reaches nothing.
+  This negative claim comes from a delegated grep that was not independently re-run;
+  the same applies to the `file-organized` -> `Popup.tsx:72` path. Neither is
+  load-bearing.
+- 5 backend commands are registered but never invoked from `src/`:
+  `get_system_language`, `initialize_defaults_cmd`, `refresh_watcher_cmd`,
+  `show_popup_cmd`, `is_autostart_enabled_cmd`.
+- `src-tauri/src/classify.rs:493-528` - the 7 Ollama error strings are silently dropped
+  at `classify.rs:645` (`if let Ok(Some(ai_cat)) = provider.classify(&filename)`), so
+  they do not reach the UI today, but they are `Err` values on the public
+  `AiProvider` trait and will leak the moment a caller propagates them.
+- `vite.config.ts:4` `// @ts-expect-error process is a nodejs global` - outside
+  `src/components` but inside the build config; plan section 6 bans it absolutely. The
+  fix is `@types/node`.
+
+### 18.36 REFUTED - the four new dashboard components are wired, not orphaned
+
+Recorded so nobody re-raises it. All four are imported and rendered, with no dynamic
+`import()`, no `lazy()`, no barrel `index.ts`, no Tailwind safelist, and no
+per-file `tsconfig` entry - all imports are static:
+
+| Component | Import | Render |
+|---|---|---|
+| `StorageRibbon` | `Dashboard.tsx:10` | `:206` |
+| `InsightCards` | `Dashboard.tsx:15` | `:220` |
+| `AgeHistogram` | `Dashboard.tsx:14` | `:263` |
+| `FileBrowser` | `Dashboard.tsx:16` | `:267` |
+
+`tsconfig.json:19` `noUnusedLocals: true` plus `package.json:8` `"build": "tsc && ..."`
+means an unused import cannot survive a build, so "imported but never rendered" is
+ruled out structurally as well as empirically. The wire-graph was verified twice,
+independently: 18 matches in 5 files, `LargestFiles` zero occurrences anywhere in
+`src/`. In the reverse direction, all 8 imports resolve to files on disk, every prop
+traces to a real fetch (7 from `get_dashboard_stats_cmd` at
+`useDashboardStore.ts:122`, 1 from `get_stats_cmd` at `:131`), and all 8 frontend
+`invoke` names resolve to a real `#[tauri::command]` - **0 unmatched**. The untracked
+status of the four files is a commit-hygiene issue, not dead code.
+
+### 18.37 REFUTED - no placeholder or fake data shipped anywhere
+
+Repo-wide grep over `src/` for `TODO|FIXME|mock|dummy|sample|fake|hardcoded|demo|stub|XXX|HACK`
+returns **5 hits, all false positives** - the Spanish word *todo* ("all") in
+`es.json:63, 167, 199, 230, 231`. Zero real markers. No fabricated rows, no
+estimated values, no sample datasets. The one hardcoded data path,
+`EMPTY_INSIGHTS` (`useDashboardStore.ts:78-86`), is a zero-filled **fallback**, not
+fake data. Every number rendered by the 8 dashboard components traces to a real
+backend value: `commands.rs:582-599` and `db.rs:818-848` for the storage views,
+`db.rs:886-928` for the real `mtime` age bucketing, `db.rs:510-521` for the
+`action_logs` count over 7 days, real `file_inventory` rows for `FileBrowser`.
+`utils/dashboard.ts:1-9` `CATEGORY_COLORS` and `:11` `AGE_BUCKETS` are display
+constants, not data. The "placeholder data in a dashboard" High finding does not
+occur. Confidence: high.
+
+### 18.38 REFUTED - translation quality is real, not a mechanical copy
+
+The M5 "mechanical copy" concern does not apply. Byte-identical leaf values against
+`en`: de 11/220 (5.0%), es 7/212 (3.3%), fr 16/220 (7.3%), it 8/220 (3.6%),
+ja 7/220 (3.2%), pl 6/220 (2.7%), ru 7/220 (3.2%), uk 6/220 (2.7%), vi 6/220 (2.7%).
+**No locale is anywhere near "90% untranslated English" - the worst is fr at 7.3%.**
+Charset profile corroborates: 100% of de/es/fr/it/pl/vi values contain the expected
+script; ja 213/220 (96.8%), ru 213/220, uk 214/220, and every non-conforming value in
+those three is a brand name, a path, or `{{name}}`. Length ratio translated/en:
+de 1.31, es 1.29, fr 1.31, it 1.28, pl 1.22, ru 1.25, uk 1.23, vi 1.13, ja 0.61 -
+all consistent with genuine translation, CJK naturally shorter. Sampled prose is
+unambiguously translated: `settings.about.description` is a real three-sentence
+translation in all 10.
+
+**The honest limit of the method, stated so it is not over-read:** byte-identity is a
+weak signal in Germanic and Romance languages. German `Name`, `Version`, `System`,
+`Dashboard` and French `Action`, `Destination`, `Mode`, `Extensions`, `Minutes` are
+all correct words and are false positives of the heuristic. The agent flagged only
+the cases where the evidence is unambiguous (a key collapsing onto a sibling key with
+different English) and marked the rest as needing a native speaker - see 18.44.
+
+The remaining translation defects are 18.7 (a genuine mistranslation the heuristic
+*did* catch), 18.10 (a missing subtree) and 18.8 (no plural forms), plus low-severity
+over-collapse: fr/it/uk reuse one string for `settings.ignore.title` and
+`suggestions.dismiss`; ja reuses `提案` for `settings.folders.suggest`,
+`dashboard.openSuggestions`, `suggestions.title` and `suggestions.suggested`; vi
+reuses `Mẫu` for `settings.rules.pattern` and `settings.ignore.patterns`, losing the
+plural; ru reuses `Раз в день` for the label `settings.scheduler.timesPerDay` and the
+value `settings.scheduler.once`; it and pl append a `(regex)` suffix to
+`settings.rules.pattern` that `en` does not have. Nuance loss, not breakage.
+
+### 18.39 REFUTED - `escapeValue: false` is not an XSS risk, and there is no raw-HTML sink
+
+`src/i18n/index.ts:29-38` sets `interpolation: { escapeValue: false }` (at `:35`).
+**This is correct, not a vulnerability.** i18next's own documentation recommends
+`false` for React, because React escapes text children; the setting only matters when
+the result is injected as raw HTML. Verified: **0 occurrences of
+`dangerouslySetInnerHTML` and 0 of `innerHTML` in `src/**`** (independently
+confirmed from the component side - 0 in all 16 components). Every `t()` result lands
+in a JSX text child, so the brief's XSS premise does not hold for this codebase. All
+245 `t()` call sites pass plain values; no React-node interpolation is used anywhere.
+Recorded as a correction to any earlier section that flags `escapeValue: false` as a
+finding.
+
+### 18.40 REFUTED - every `t()` key referenced in code exists in the base locale
+
+**0 of 245 static `t()` call sites across 19 files reference a key absent from
+`en.json`.** No raw dotted key can be rendered by a typo. All ~30 keys used by the 8
+dashboard components were checked individually against `en.json:140-190` and all
+exist. The only dynamic call site is `FileListTab.tsx:142 t(emptyKey)`, fed only
+`cleanup.noLargeFiles` and `cleanup.noStaleFiles` - both exist. All 21
+components and pages correctly import and call `useTranslation()`; 0 components are
+missing the hook. Two `t()` keys are *misused* rather than missing
+(`FileBrowser.tsx:148` -> `app.loading`, 18.34; `en.json:187 filterBy` is
+untranslatable, 18.33), and 15 translated keys are unreferenced (18.21), but no
+referenced key is absent.
+
+This is currently latent rather than live: a key missing from all 10 locales would
+render as the **raw dotted key string** with no console output and no written
+artefact, because `debug` is unset (`false`) and `saveMissing` is unset (`false`).
+Verified against the i18next 26.0.10 source in `node_modules`: `resolve()` returns the
+key itself when nothing matches. There is therefore no automated drift detector -
+the exact safety net the "en.json first" workflow needed. The `es` archive gap
+(18.10) is the live demonstration of silent fallback.
+
+### 18.41 REFUTED - placeholder integrity is clean, exhaustively
+
+13 keys carry interpolation; **0 defects across 9 non-English locales x 13 keys = 117
+comparisons.** No missing, extra, renamed, duplicated or reordered placeholder; no
+unbalanced `{{`/`}}`; no malformed braces in any of the 10 files. Placeholder **order**
+matches English everywhere. Order-identity is fine for the Slavic data actually
+present - `uk popup.pendingFiles` is `Очікує файлів: {{count}}`, correctly
+front-loading the noun and moving the placeholder to the end - but it will need
+per-locale reordering once plural forms are added (18.8).
+
+The 13 keys are `popup.organized` (`file`), `popup.openFolder` (`folder`),
+`popup.pendingFiles` (`count`), `notifications.cleaned` (`count`),
+`settings.rules.importSuccess` (`count`), `settings.archive.importSuccess`
+(`extracted`, `count`; 9 locales, es missing), `settings.archive.importError`
+(`error`; 9 locales), `settings.scheduler.time` (`number`),
+`dashboard.filterBy` (`name`), `dashboard.lead` (`category`, `percent`, `size`),
+`dashboard.scanRoots` (`done`, `total`), `cleanup.confirm` (`count`),
+`cleanup.reclaimable` (`size`). All 10 files are valid JSON, UTF-8, no BOM, LF line
+endings, trailing newline, **zero type mismatches, zero brace-balance errors, zero
+empty values.**
+
+### 18.42 REFUTED - the camelCase type-contract claim does not hold as a live defect
+
+**Correction to the "Rust struct missing `#[serde(rename_all = "camelCase")]`" line of
+inquiry.** Every camelCase-to-snake_case conversion on the invoke boundary was checked
+against the Rust signatures and all of them check out: `accept_suggestion_cmd`
+`{suggestedCategory}` -> `suggested_category`; `find_large_files_cmd` `{minBytes}` ->
+`min_bytes`; `load_mouziignore_cmd` `{folderPath}` -> `folder_path`;
+`CleanupRequest.keep_path` under `rename_all = "camelCase"` (`cleanup.rs:38-44`) <-
+`keepPath`; and `DashboardStats`, `ScanProgress`, `ScanComplete`, `ScanStarted`,
+`UndoResult` and `AcceptOutcome` all sit under `rename_all = "camelCase"` and match
+their TypeScript interfaces field for field. `useDashboardStore.ts:150`
+`f.mode !== "paused"` correctly matches `FOLDER_MODE_PAUSED = "paused"` (`db.rs:18`,
+used via `is_folder_paused_mode` at `commands.rs:527`).
+`get_inventory_files_cmd`'s `""`-for-`None` substitution
+(`FileBrowser.tsx:45-46`) is correctly filtered at `commands.rs:613-615`.
+
+**The one real contract defect is the 14-vs-8 field mismatch in 18.2, and it is
+currently harmless** - the app works only because `get_settings_cmd` returns all 14
+fields and every call site spreads the whole runtime object. An earlier reading of
+this finding, which concluded that `saveSettings` always throws and that the theme
+cannot be changed, is **wrong** and should not be carried into the audit. The
+underlying fragility stands and is recorded at 18.2 with its exact break condition.
+
+### 18.43 REFUTED - no destructive path in the state layer is an un-rolled-back optimistic update
+
+Recorded so the High finding is not re-raised. `executeCleanup`
+(`useCleanupStore.ts:97-109`) and `acceptSuggestion` / `applyAccept` are strictly
+pessimistic - every `set()` follows a resolved `invoke`. `cleanup.rs:387-408` is
+per-item with `ok | failed | skipped` and never aborts a batch. **There is no
+finding of the "files marked deleted that are not" shape in the store layer.** The
+nearest relative is `applyAccept` (18.17), which is an unconditional
+success-shaped mutation *after* the await, rated Medium for that reason.
+
+Also cleared:
+
+- `await` in a non-async function: none. Every async store action is `async`.
+- Loading flags stuck on throw: none. All four `useCleanupStore` finders and both
+  `useDashboardStore` loaders use `catch { set({ loading/isLoading: false, error }) }`;
+  `useAppStore.scanFolder` uses `try/finally` (`:164-171`); `useSuggestionsStore` uses
+  `try/finally` (`:78-80`, `:93-94`) plus unconditional trailing
+  `set({busy:false})` (`:109`, `:127`).
+- Polling interval leaks: none. Exactly one interval exists, `Popup.tsx:91`, and it
+  **is** cleared at `:97`. `App.tsx` has none. `FileBrowser.tsx:32`, `:57-63` uses a
+  debounce that is also cleared.
+- Stale closures in event handlers: none. `App.tsx:64-65`, `Popup.tsx:84-86` and
+  `useDashboardStore.ts:209` all use `getState()` or functional `set`;
+  `Dashboard.tsx:81` and the focus handler are memoised on stable store actions.
+- Conditional hooks: none. Every `use*` precedes the early returns at
+  `StorageTreemap.tsx:29`, `CategoryBars.tsx:26`, `StorageRibbon.tsx:22`,
+  `ActivityTimeline.tsx:17`, `FileBrowser.tsx:151`. No `invoke` in any render body,
+  no `setState` during render, no `ResizeObserver` or interval leaks. All 4
+  listeners and timers that exist are cleaned (`FileBrowser.tsx:62`, `:76`).
+- Banned constructs in `src/store/**`: **zero `as any`, zero `@ts-ignore`, zero
+  `@ts-expect-error`.** Across all of `src` there is exactly one `any`:
+  `Popup.tsx:72` `(event: any)` on the `file-organized` payload, which makes
+  `payload?.success`, `destination_folder` and `file` at `:74-80` entirely unchecked.
+  The only other cast is in a test (`__tests__/dashboard.test.ts:53`). In
+  `src/components/**`: 0 `as any`, 0 `@ts-ignore` / `@ts-expect-error`, 0
+  `todo!()` / `unimplemented!()` / `let _ =`.
+- Persistence: **no `localStorage`, no `sessionStorage`, no `zustand/persist`, no
+  Tauri store** - grep for all four returns zero hits in `src/`. Persistence is
+  SQLite only, and `settings` is a column-per-field row (`db.rs:163-170`), not a
+  JSON blob, so the "persisted blob read without a schema check crashes after a
+  downgrade" risk **does not apply**. `CREATE TABLE IF NOT EXISTS` plus defaults mean
+  additive migrations get DB defaults.
+- Bar charts do **not** divide by the visible sum. `percentOf(part, total)`
+  (`utils/dashboard.ts:36-39`) is called with the caller-supplied `totalBytes`, and
+  `Dashboard.tsx:208`, `:250` and `:256` all pass `stats!.totalBytes` - a
+  whole-inventory scalar from `db.rs:788-800`. Verified first-hand after the agent
+  flagged that this had been inferred rather than read. Division by zero, empty,
+  single-category and zero-size states are all handled: `percentOf` returns 0 for
+  `total <= 0 || part <= 0` (`dashboard.ts:37`), and the five components each bail or
+  clamp (`StorageTreemap.tsx:29`, `CategoryBars.tsx:26`, `StorageRibbon.tsx:22`,
+  `ActivityTimeline.tsx:17`, `AgeHistogram.tsx:23-24` via `Math.max(…, 1)`).
+- No `confirm()`, `alert()` or `window.prompt` anywhere in `src/**`. No
+  `dangerouslySetInnerHTML` or `innerHTML` anywhere in `src/**`. Zero
+  `!important` in `src/components`. Exactly one inline `style={{}}` -
+  `Popup.tsx:248` `width: ${pct}%` - which does not fight Tailwind, since that element
+  carries `h-full bg-primary rounded-full` and no width class. The dashboard
+  components' inline styles are all dynamic `width` / `height` / `backgroundColor` /
+  `opacity` that no utility can express.
+- The Tailwind 4 CSS-first theming architecture is sound: no `tailwind.config.*`,
+  `postcss.config.js:3 @tailwindcss/postcss`, tokens in `index.css:3-11` (`@theme`)
+  indirection to `:root` (`:13-21`) and `.dark` (`:23-31`), `.dark` live via
+  `App.tsx:17-20` and `:22-27`. All 8 dashboard components use semantic tokens
+  (`bg-surface-dark`, `text-text`, `border-border`) and so follow both themes with
+  **zero** `dark:` variants. The colour leak is the narrow 7-hex case in 18.19.
+- `FileBrowser` is read-only: toggle sort, debounced search, per-row copy-path and
+  open-containing-folder. **No select-all, no checkboxes, no bulk action, no
+  drag-and-drop, no delete, no move**, so nothing is pre-armed and the plan's
+  preview-to-confirm constraint is not engaged by this component.
+- The i18n language switcher works: `Settings.tsx:186-190` awaits
+  `i18n.changeLanguage(lang)` then persists, and `changeLanguage` emits
+  `languageChanged`, which react-i18next's `useTranslation` subscribes to, so all 19
+  components re-render. The value is also written.
+- `returnObjects` and `returnNull` are both correctly unset (`false` in v26). No key
+  is used as an object and 0 leaves in any of the 10 files are `null` or empty, so
+  there is no misconfiguration.
+
+### 18.44 What the three reports could not determine
+
+- **Translation correctness is not mechanically decidable.** All structural figures
+  (key parity, placeholders, byte-identity, charset, length ratios, brace balance,
+  unused keys) are exact, from parsed JSON and scripted comparison. Judgements of
+  quality are not. Marked **UNVERIFIED, needs a native speaker**: `ru
+  settings.rules.pattern` = `"Pattern"` (most likely genuinely untranslated; Russian
+  would be `Шаблон`/`Маска`; flagged medium-high confidence but not proven), `vi
+  suggestions.source.heuristic` = `"Heuristic"` (a possible accepted loanword), the
+  German du/Sie register in `settings.folders.modeDesc` and
+  `settings.ignore.description`, and whether `es` targets es-ES or es-419
+  (`es.json` uses `Agregar`, Latin-American, while the switcher offers plain
+  `Español`). Also undecidable: whether any of the ~30 byte-identical values in
+  German, French, Italian, Polish, Russian and Ukrainian are genuine translation
+  errors rather than correct cognates. **No translation-quality defect is asserted
+  in this section beyond 18.7, where the evidence is an exact string collision
+  between two keys whose English differs.**
+- **No runtime.** No build, no app launch, no IPC, no database. Consequences:
+  which `subscribeDashboardEvents` resolution order wins (18.3); whether Chromium
+  actually prunes the ribbon's buttons from the accessibility tree (18.6); whether
+  the `lg:` breakpoint is ever reached (below); whether the file-listing commands
+  are deduplicated server-side; and all i18n runtime claims, which were derived from
+  the i18next 26.0.10 source in `node_modules` and from reading the React tree rather
+  than observed.
+- **The `lg:` breakpoint is UNVERIFIED and unresolved.** `StatCards.tsx:44` and
+  `InsightCards.tsx:54` use `grid-cols-2 lg:grid-cols-4`, and `Dashboard.tsx:247`
+  and `:262` use `grid-cols-1 lg:grid-cols-2`, so `lg:` (min-width 1024px) gates
+  **four** layout decisions. `tauri.conf.json:16-19` declares exactly one window,
+  `label: "main", width: 800, height: 600` - **there is no `dashboard` window in the
+  config.** If the 1024x768 window is created at runtime via `WebviewWindowBuilder`
+  the layouts are correct; if it reuses this config, `lg:` can never apply and all
+  four layouts are dead. Either way a breakpoint sitting exactly on a fixed window
+  width makes the layout flip on scrollbar presence. **Which window config is
+  actually used was not determined.** The component agent also reported no runtime
+  `ResizeObserver` or interval leaks in the folder, which is consistent with either
+  answer.
+- **`HistoryPanel.tsx:63 key={log.id}` may be a null key for every row.**
+  `useCleanupStore.ts:11` types the cleanup-log id as `number | null`; if
+  `get_cleanup_logs_cmd` does not always populate `id`, the key is null throughout.
+  Not determined - the Rust query was not re-read.
+- **`FileBrowser.tsx:64` debounce dependency** (18.35) is latent today and marked
+  UNVERIFIED as a live bug.
+- **`DuplicatesTab.tsx:20` stale `g.hash` keys** (18.35) depend on hash stability
+  across rescans, which was not established. **UNVERIFIED.**
+- **Truncation.** All three transcripts end mid-work after their reports were
+  delivered; each agent's final report is complete, but the reasoning tails contain
+  material past the point where the reports were written. Anything asserted only in
+  those tails was dropped rather than guessed at. In the i18n report the delegated
+  Rust sweep's summary section was itself truncated, which is why the "~130 strings"
+  figure in 18.11 is an estimate.
+- **Two delegated negative claims were not independently re-run** and are flagged
+  where cited: the absence of a `show-notification` listener for `tray.rs:119-120`,
+  and the `file-organized` -> `Popup.tsx:72` path (18.35). Neither is load-bearing
+  for any severity assignment in this section. The Rust-side i18n details in 18.11
+  and 18.22 come from a delegated read-only sweep and are cited as reported; the
+  per-line citations are solid but were not personally re-read by that agent.
+
+### 18.45 Completeness
+
+**All 21 of 21 reports are now absorbed. The audit is complete.** This section closes
+the last three: the state layer (`src/store/**`, 4 stores), the component layer
+(`src/components/**`, 16 components plus the 8 dashboard components), and i18n across
+the 10 locales. The three reports are read-only and produced no project changes: no
+file was created, edited, moved or deleted, no `npm`, `cargo`, `tauri` or test command
+was run, and no database was opened. Nothing outside
+`%TEMP%\opencode\sec18-frontend-state.md` was created or modified, and nothing was
+committed to git.
