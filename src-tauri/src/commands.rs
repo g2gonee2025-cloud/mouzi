@@ -218,7 +218,7 @@ fn perform_undo(
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn undo_action_cmd(id: i64, state: tauri::State<AppState>) -> Result<UndoResult, String> {
     let db = get_db();
     let conn = db.lock().unwrap();
@@ -234,7 +234,7 @@ pub fn undo_action_cmd(id: i64, state: tauri::State<AppState>) -> Result<UndoRes
     perform_undo(&conn, &mut ignored, id, source, dest)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn undo_all_cmd(state: tauri::State<AppState>) -> Result<UndoAllResult, String> {
     let logs = crate::db::get_undoable_logs().map_err(|e| e.to_string())?;
     let db = get_db();
@@ -310,7 +310,7 @@ pub struct ArchiveImportSummary {
     pub results: Vec<(String, String, String)>,
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn import_archive_cmd(path: String) -> Result<ArchiveImportSummary, String> {
     let extraction = crate::archive::extract_archive(Path::new(&path))?;
     let staging_path = extraction.staging_dir.to_string_lossy().to_string();
@@ -443,7 +443,7 @@ pub fn show_popup_cmd(app: AppHandle) {
 }
 
 /// Return files detected in manual-mode folders that are waiting for Clean Now.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_pending_files_cmd(
     state: tauri::State<AppState>,
 ) -> Result<Vec<(String, String)>, String> {
@@ -591,7 +591,7 @@ pub struct DashboardStats {
 }
 
 /// Aggregate stats for the dashboard view.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_dashboard_stats_cmd() -> Result<DashboardStats, String> {
     let stats = get_inventory_stats().map_err(|e| e.to_string())?;
     let category_breakdown = get_category_distribution().map_err(|e| e.to_string())?;
@@ -614,7 +614,7 @@ pub fn get_dashboard_stats_cmd() -> Result<DashboardStats, String> {
 }
 
 /// Browse inventory files with optional category, root, and name filters.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_inventory_files_cmd(
     sort: Option<String>,
     category: Option<String>,
@@ -635,7 +635,7 @@ pub fn get_inventory_files_cmd(
 // ---------------------------------------------------------------------------
 
 /// Find duplicate files across the scanned inventory.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn find_duplicates_cmd() -> Result<Vec<crate::cleanup::DuplicateGroup>, String> {
     if !crate::cleanup::has_inventory() {
         return Err("No scan data — run a scan first".to_string());
@@ -662,7 +662,7 @@ pub fn find_stale_files_cmd(days: i64) -> Result<Vec<crate::cleanup::CleanupFile
 }
 
 /// Find deepest empty directories under watched roots.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn find_empty_dirs_cmd() -> Result<Vec<String>, String> {
     if !crate::cleanup::has_inventory() {
         return Err("No scan data — run a scan first".to_string());
@@ -671,7 +671,7 @@ pub fn find_empty_dirs_cmd() -> Result<Vec<String>, String> {
 }
 
 /// Execute a batch of cleanup actions (trash files / remove empty dirs).
-#[tauri::command]
+#[tauri::command(async)]
 pub fn execute_cleanup_cmd(
     actions: Vec<crate::cleanup::CleanupRequest>,
 ) -> Result<Vec<crate::cleanup::CleanupOutcome>, String> {
@@ -683,7 +683,7 @@ pub fn execute_cleanup_cmd(
 // ---------------------------------------------------------------------------
 
 /// Get category suggestions for unclassified files in the inventory.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_suggestions_cmd(limit: i64) -> Result<Vec<crate::classify::Suggestion>, String> {
     let provider = crate::classify::detect_provider();
     let limit = limit.clamp(1, 200) as usize;
