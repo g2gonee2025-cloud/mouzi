@@ -615,3 +615,298 @@ tracked and should be ignored. `package.json` still names the package `mouzi` at
 which is correct under D8's "keep mouzi branding" but worth a conscious decision. The debug
 binary `mouzi.exe` (27.3 MB) sits in `src-tauri/target/debug` and is untracked. An untracked
 `start-mouzi.bat` runs `npm run tauri -- dev`.
+
+---
+
+## 11. Addendum - sixth pass: panic reachability and destructive-surface UX
+
+This pass is additive. Nothing above it is edited, including section 9, whose junction claim is
+corrected rather than rewritten (11.11). Findings are grouped by the surface that makes them
+reachable, not by severity alone, because in most cases the severity comes from the surface.
+
+---
+
+### 11.1 CRITICAL C6 - there is no confirmation dialog anywhere in the frontend
+
+A grep across all of `src/` returns **zero** `confirm()` and **zero** `alert()` calls. This is the
+finding. The individual call sites below are its consequences, not five separate bugs, and they
+should be fixed as one change: a single confirmation primitive, applied to every destructive
+control.
+
+- `src/components/cleanup/DuplicatesTab.tsx:96` - the red destructive button is wired straight to
+  the trash action. The label says "confirm"; there is no confirm step. Two clicks from
+  destruction after one "Find duplicates".
+- `src/pages/Settings.tsx:687` - `undoAll()`, one click, no confirmation, no result display.
+  Reverses every un-undone move in the entire history, potentially thousands of files, creating
+  timestamp-suffixed duplicates. It is styled as a **neutral bordered button**, visually
+  indistinguishable from a preferences toggle. This is the mirror image of the armed-by-default
+  cleanup defect and is arguably more dangerous, because users open Settings expecting only
+  preferences.
+- `src/pages/Settings.tsx:696` - `clearLogs()`, one click, no confirmation. Destroys the only
+  record of what the app did to the user's files, which is the audit trail decision D5 depends
+  on. Irreversible.
+- `src/pages/Settings.tsx:669` - `deleteRule(r.id)`, one click, no confirmation, no undo. It is
+  the third of three identical-looking icon buttons; only a red tint on a 14px icon separates it
+  from the harmless enable/disable toggle immediately to its left.
+- `src/pages/Suggestions.tsx:218-225` - "Accept all" bulk-moves every suggested file on one
+  click, with no preview and no count.
+
+---
+
+### 11.2 CRITICAL C7 - "Clean now" moves real files on one click, with no preview
+
+`src/components/Popup.tsx:103-119` (`handleClean`) and `:161-168` (the button, primary-coloured
+and the most prominent element in the primary window). It loops every active watched folder
+calling `scanFolder(path)`, which invokes `scan_folder_cmd` -> `manual_scan_folder` ->
+`process_file` -> rule match -> `fs::rename`. No confirmation, no preview of which files or
+where, no count. The outcome is reported only afterwards, as a green toast.
+
+Two amplifiers:
+
+- If no folder is configured, `handleClean` falls back to `get_downloads_folder()`. A fresh
+  install's first click of the primary button starts operating on the user's real Downloads.
+- `manual_scan_folder` passes `bypass_grace: true` (`src-tauri/src/rules.rs:266`), so files that
+  are seconds old, and possibly still being written or still downloading, are moved.
+  `is_file_locked` catches genuinely locked files, but an in-progress write that is not locked,
+  or a partial `.crdownload`, is fair game.
+
+Separately: `src-tauri/src/commands.rs` `scan_folder_cmd` performs no containment check on the
+supplied path, so a path that is not a registered watched root is still scanned and organised.
+
+---
+
+### 11.3 HIGH H11 - second-resolution collision suffix silently overwrites, in BOTH move implementations
+
+Two independent implementations build a suffixed name on collision, and both use whole-second
+resolution while checking only whether the **original** destination exists, never whether the
+**suffixed** name already exists.
+
+- `src-tauri/src/safe_fs.rs` `resolve_destination` - `SystemTime::now().as_secs()`.
+- `src-tauri/src/rules.rs:186-199` - `Utc::now().timestamp()`, and this one checks nothing at
+  all on the suffixed path.
+
+`std::fs::rename` on Windows uses `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING`, so it
+silently overwrites. Two files mapping to the same destination within the same second means the
+second replaces the first.
+
+Reachable from the most prominent button in the app: `manual_scan_folder` processes a whole
+folder in one pass, so two `image.jpg` from different subdirectories entering the same category
+folder in the same batch overwrite each other. **This is a data-loss path independent of every
+other finding in this document.**
+
+---
+
+### 11.4 HIGH H12 - integer overflow in `find_stale_files`, reachable from the frontend
+
+`src-tauri/src/cleanup.rs:237` computes `now - days * 86_400`, where `days: i64` arrives from the
+frontend and is clamped only with `.max(1)`. At `days = 1e15` the multiplication exceeds
+`i64::MAX` (9.22e18). A debug build panics. **A Tauri release build has `overflow-checks` off by
+default, so it wraps** to a negative cutoff, and every file in the inventory is reported as
+stale. The user is shown a preview in which everything is stale, and confirming it trashes
+everything. Any negative value below roughly -1e14 reaches the same state from the other
+direction.
+
+---
+
+### 11.5 HIGH H13 - reachable panic in the watcher from a negative grace period
+
+`src-tauri/src/watcher.rs:240-242` and `:295-297` compute `settings.grace_period_seconds as u64`.
+The value is set by `update_settings_cmd` from a whole frontend settings object with **no clamp
+and no validation**. `-1 as u64` is 18,446,744,073,709,551,615, and
+`Instant::now() + Duration::from_secs(that)` panics on overflow.
+
+The panic occurs on the notify event thread, so silent-mode auto-organisation dies with no
+user-visible error and no recovery short of restarting the app. Note the asymmetry: the sibling
+check in `rules.rs:24` is guarded by an early `grace_seconds <= 0` return, so only the watcher
+path is exposed.
+
+---
+
+### 11.6 HIGH H14 - the audit write is discarded on the move path, so a move can have no undo record
+
+`src-tauri/src/rules.rs:242` `let _ = log_action(&log);` runs **after** the file has already been
+moved. If the insert fails, the error is discarded, the file is moved, and no undo row exists.
+
+The same pattern appears four times in `src-tauri/src/commands.rs` at `:747` (`log_action` after
+`accept_suggestion_cmd`'s move), `:762` (`update_inventory_category`), `:763`
+(`clear_dismissed_suggestion`) and `:795` (`add_rule`), and once at
+`src-tauri/src/cleanup.rs:395` (`insert_cleanup_action`, after the file is already trashed).
+
+This is the exact `let _` anti-pattern that commit `1d6d27e` claims to have eliminated, and it
+survives in the code that commit touched. Concretely: when a user checks "create rule" on a
+suggestion and the rule insert fails, the UI shows a green accepted state and no rule exists.
+
+---
+
+### 11.7 HIGH H15 - the "auto-applied AI rules" deferral is deployed as the default behaviour
+
+The work plan's deferred-scope list explicitly excludes auto-applied AI rules. The mechanism is
+live and pre-armed:
+
+- `src/store/useSuggestionsStore.ts:43` `createRuleDefault: true`
+- `src/pages/Suggestions.tsx:210` the checkbox is rendered pre-checked
+- `src-tauri/src/commands.rs:769+` `create_suggestion_rule` inserts a rule with `enabled: true`,
+  `action: "move"`, priority 10
+
+So one click on a green check mark both moves the file and creates a standing, enabled,
+unattended rule for that extension.
+
+Two further problems. The AI-created rule is invisible on the Suggestions page, so the user has
+no way to know one was created except by hunting through Settings -> Rules. And `folder_id: 0` is
+written, whose semantics are not established anywhere in the crate. **UNVERIFIED**: the agent
+that raised the `folder_id` point did not trace how `folder_id` is consumed by rule matching.
+
+---
+
+### 11.8 HIGH H16 - the `undoAll` enablement gate reads 50 rows while the command applies to all of them
+
+`src/store/useAppStore.ts` `loadLogs` requests `limit: 50`, and `Settings.tsx` computes the
+button's `disabled` state from that 50-row array via `logs.every(log => log.undone)`. The backing
+query `get_undoable_logs()` in `src-tauri/src/db.rs` has **no limit**.
+
+So if the most recent 50 actions are all undone but older ones are not, the button is disabled
+and those files can never be reverted. The converse also holds: enabled when it should be
+disabled. A destructive control whose availability is computed from a subset of the data it acts
+on.
+
+---
+
+### 11.9 HIGH H17 - command injection via PowerShell string interpolation in `open_folder_cmd`
+
+`src-tauri/src/commands.rs:334` builds `format!("explorer '{}'", win_path)` and passes it to a
+PowerShell invocation. A filename containing a single quote breaks out of the quoting. The path
+originates from the inventory or `action_logs`, so a file named `foo'; <command>; '.txt` created
+in any watched folder is stored, then interpolated when the user clicks "open folder" on it.
+
+The same function's `http://` branch means a file named `http://example.com` would be handed to
+`start` and opened in the default browser. Local-only and low practical severity, but it is a
+genuine CWE-78 and it is one interpolation away from being a remote one.
+
+**UNVERIFIED**: the exact quoting behaviour of the PowerShell invocation. The agent read the
+format string and did not execute it.
+
+---
+
+### 11.10 HIGH H18 - the plan's clippy gate catches none of the panics, and would likely fail on style lints instead
+
+The work plan's verification gate is `cargo clippy -- -D warnings`. That runs the default lint
+groups only. Every panic path found in this pass - roughly 44 `db.lock().unwrap()` calls,
+`get_db().expect("Database not initialized")`, the `Instant` overflow - lives in
+`clippy::restriction` or `clippy::pedantic` lints (`unwrap_used`, `expect_used`, `panic`), which
+are **not enabled by default**. The gate that is supposed to catch panics catches none of them.
+
+Meanwhile several default-on lints would probably fire on this codebase: `manual_unwrap_or`
+(`cleanup.rs:62`, `rules.rs:129`), `manual_strip` (`db.rs:301`), `manual_unwrap_or_default`
+(`commands.rs:112`), `uninlined_format_args` (version-dependent; it has moved between the `style`
+and `pedantic` groups across releases, so no verdict is asserted here), and possibly
+`collapsible_else_if`, `needless_return` and `doc_comment_continuation`.
+
+**Present this as an asymmetry in the gate, not as a list of confirmed lint failures: the agent
+did not run clippy.** `db.rs` `undo_action` also appears to be dead code, since `commands.rs`
+calls `perform_undo` directly, which would trip `dead_code`.
+
+---
+
+### 11.11 CORRECTION to section 9 - junctions and volume mount points are NOT skipped
+
+Section 9 records, on the strength of the scanner audit, that reparse points are correctly skipped
+and that there is no junction escape. **That is too strong and must be corrected.**
+`src-tauri/src/scan.rs:139-141` tests `ft.is_symlink() || ft.is_symlink_dir()`. On Windows
+`FileTypeExt::is_symlink()` is true for any `FILE_ATTRIBUTE_REPARSE_POINT`, but
+`is_symlink_dir()` is true only for `IO_REPARSE_TAG_SYMLINK` carrying the DIRECTORY attribute. A
+**junction or a volume mount point is `IO_REPARSE_TAG_MOUNT_POINT`**, so it is not matched by
+`is_symlink_dir()`. The doc comment at `scan.rs:62-64` claims the check covers "NTFS junctions";
+that claim is wrong.
+
+Consequences, bounded but real. `MAX_DEPTH = 128` prevents an infinite loop, so this is not a
+hang. But a junction to another volume is descended into and its files are attributed to the
+wrong `root_path`, and a junction pointing at an ancestor causes the same subtree to be re-walked
+up to the depth limit.
+
+**UNVERIFIED**: the exact Windows reparse-tag semantics. The reasoning is from documented tag
+values; no junction was created to test it.
+
+This is an error in an earlier section of this document, not a new defect, and it is recorded as
+such.
+
+---
+
+### 11.12 Also newly recorded
+
+- **Silent partial failure reported as success.** `src-tauri/src/rules.rs:274-277` catches
+  per-file errors with `eprintln!` and returns `Ok(results)` containing only the successes.
+  `Popup.handleClean` then reports "cleaned N" in a green toast. Fifty failures out of two hundred
+  is indistinguishable from complete success. This directly violates the plan's hard constraint
+  that every destructive command return per-item status and never a bare `Result<()>` for a
+  multi-file operation.
+- **A silently skipped rule.** `src-tauri/src/rules.rs:127-129` turns an invalid `Regex::new`
+  into `.unwrap_or(false)`, so a malformed pattern means the rule silently never matches while
+  still appearing correctly configured in the UI. `find_matching_rule` at `:149-152` additionally
+  re-queries all rules per file event and recompiles every pattern per rule per event, with no
+  cache.
+- **Unreadable metadata is treated as "old enough".** `src-tauri/src/rules.rs:17-29`
+  `check_grace_period` returns `true` on any metadata error, so a file whose mtime cannot be read
+  is organised immediately. The unsafe direction.
+- **`is_file_locked` conflates three conditions.** `src-tauri/src/rules.rs:11-13` treats a
+  permission-denied file, a read-only file and a nonexistent file all as "locked", and skips each
+  silently with no log entry.
+- **A mode switch can report success while doing nothing.**
+  `src-tauri/src/commands.rs:108` `let _ = watcher.refresh(app.clone())` inside
+  `update_folder_mode_cmd` discards the error and the command still returns `Ok(())`, so switching
+  a folder to silent mode can silently fail to register the watch.
+- **A disconnected drive is skipped silently.** `src-tauri/src/watcher.rs:194-197` logs to
+  stderr and continues. The dashboard continues to present that root's stale inventory totals.
+  This is the same "silent success" class as the `oldDownloads` bug in the file-dashboard audit.
+- **The multi-file notification is not actionable.** The Windows toast for a batch of more than
+  one file says only "Organized N files", with no filenames, destinations or rule names, and
+  clicking it opens the destination folder of the **last** file only. A forty-file batch spread
+  across categories tells the user nothing they can act on or undo.
+- **A latent catastrophic fallback, currently unreachable.**
+  `src-tauri/src/commands.rs:361-367` `get_downloads_folder` falls back to the literal string
+  `"C:/Users"` when `UserDirs` has no download directory. `initialize_defaults_cmd` would then
+  register the entire user profile tree as a **silent** watched root with default rules, and the
+  watcher would move files out of every profile on the machine. It is unreachable today only
+  because `initialize_defaults_cmd` is registered at `lib.rs:190` and never called from the
+  frontend. Both halves are recorded: the fallback is real, the reason it is currently harmless
+  is an unreferenced function.
+- **No first-run onboarding exists.** Because that command is never called, a fresh install has
+  no watched folder and no rules, and "Clean now" defaults to the Downloads folder with zero
+  rules, so nothing matches. The most prominent button in the app does nothing on a fresh
+  install, and there is no path forward except hunting through Settings. This is a product gap,
+  and it is the only reason the previous item is currently harmless.
+- **The empty-directory sweep only removes leaves.** For `root/a/b/c` all empty, only `c` is
+  removed and `a/b` remain, so the UI's "empty folders" promise needs repeated sweeps. The doc
+  comment's stated rationale, avoiding cascades, is accurate; the functional gap is the finding.
+- **Deadlock-adjacent lock hold across real filesystem moves.**
+  `src-tauri/src/commands.rs:227` `undo_all_cmd` holds the global database mutex **and** the
+  `ignored_files` mutex across N real filesystem moves, while the watcher's notify callback takes
+  that same `ignored_files` lock on every event. The callback stalls, the OS notification buffer
+  backs up, events arrive after the 30-second suppression window expires, and a freshly
+  restored file is treated as new user activity and moved straight back with its log row already
+  marked `undone = 1`. Confidence on the mechanism is high from the code; confidence that the
+  race is being hit in practice is **medium**, because it needs a large batch.
+- **`db.rs` `undo_action` appears to have no callers.**
+
+---
+
+### 11.13 Recorded as sound, so the counts are not inflated
+
+- The Ollama integration cannot inject a traversal: `src-tauri/src/classify.rs:525` validates
+  model output against an allowlist of known category names. A model returning
+  `{"category": 42}` yields an `Err`, not a panic, because the parse path is entirely
+  `serde_json::Value` with `.get().and_then(as_str)` and `ok_or_else`, with no `unwrap`, no
+  indexing and no `derive(Deserialize)`.
+- AI is never a hard dependency. Seven distinct failure paths in the classify flow all degrade to
+  the heuristic result, and `get_suggestions_cmd` never returns `Err`.
+- The zip-slip defence in `src-tauri/src/archive.rs:188` `ensure_safe_relative_path` is correct,
+  and the flattening `collision_safe_path` is tested.
+- `find_empty_dirs`'s read-error path returns "not empty", so a permission-denied subtree errs
+  toward **not** deleting. That is the safe direction and is recorded as a positive.
+- `commands.rs` contains five raw SQL statements, all `?1`-parameterised, and `db.rs` has exactly
+  one `format!`-interpolated SQL string whose single hole is filled from a two-arm hardcoded
+  whitelist. **No SQL injection anywhere in the crate.**
+
+---
+
+**Scope of this pass.** 9 of the 21 audit reports. No executive summary is added or amended: the
+summary in section 1 predates these findings, and a later pass should reconcile it.
