@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// The outcome of a safe file move operation.
@@ -8,6 +8,58 @@ pub enum MoveOutcome {
     Moved,
     /// File was moved but renamed to avoid collision (new name provided).
     MovedWithNewName(String),
+}
+
+/// Collapse `.` and `..` without touching the filesystem. `canonicalize` is
+/// deliberately not used: it fails on paths that do not exist and would resolve
+/// a link to its target, which can sit outside the root the caller checked.
+fn normalize_lexically(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            // pop() does nothing once the prefix and root are consumed, so a
+            // run of `..` cannot climb above the drive.
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
+}
+
+/// Whether `path` lies inside one of `roots`.
+///
+/// Compares components rather than testing a string prefix: a prefix test would
+/// let `C:\Users\Me` match `C:\Users\Melissa`, and a `..` segment would let a
+/// path leave its root while still beginning with it. Comparison is
+/// case-insensitive because Windows paths are.
+pub fn is_within_any_root(path: &Path, roots: &[PathBuf]) -> bool {
+    let target = normalize_lexically(path);
+    roots.iter().any(|root| {
+        let root = normalize_lexically(root);
+        // An empty root would vacuously contain everything.
+        if root.as_os_str().is_empty() {
+            return false;
+        }
+        let mut root_components = root.components();
+        let mut target_components = target.components();
+        loop {
+            match (root_components.next(), target_components.next()) {
+                (None, _) => return true,
+                (Some(_), None) => return false,
+                (Some(root_component), Some(target_component)) => {
+                    if !root_component
+                        .as_os_str()
+                        .eq_ignore_ascii_case(target_component.as_os_str())
+                    {
+                        return false;
+                    }
+                }
+            }
+        }
+    })
 }
 
 /// Resolve the destination path, appending a timestamp suffix if `dest` exists.
@@ -107,6 +159,107 @@ pub fn delete_to_trash(path: &Path) -> Result<(), String> {
 mod tests {
     use super::*;
     use std::fs;
+
+    fn root() -> Vec<PathBuf> {
+        vec![PathBuf::from("C:/Users/Me/Documents")]
+    }
+
+    #[test]
+    fn accepts_a_file_directly_inside_a_root() {
+        assert!(is_within_any_root(
+            Path::new("C:/Users/Me/Documents/a.txt"),
+            &root()
+        ));
+    }
+
+    #[test]
+    fn accepts_a_nested_file_inside_a_root() {
+        assert!(is_within_any_root(
+            Path::new("C:/Users/Me/Documents/deep/nested/a.txt"),
+            &root()
+        ));
+    }
+
+    #[test]
+    fn accepts_the_root_itself() {
+        assert!(is_within_any_root(
+            Path::new("C:/Users/Me/Documents"),
+            &root()
+        ));
+    }
+
+    #[test]
+    fn rejects_a_sibling_whose_name_shares_the_root_prefix() {
+        assert!(!is_within_any_root(
+            Path::new("C:/Users/Me/DocumentsArchive/a.txt"),
+            &root()
+        ));
+    }
+
+    #[test]
+    fn rejects_parent_traversal_that_leaves_the_root() {
+        assert!(!is_within_any_root(
+            Path::new("C:/Users/Me/Documents/../Secrets/a.txt"),
+            &root()
+        ));
+    }
+
+    #[test]
+    fn accepts_parent_traversal_that_stays_inside_the_root() {
+        assert!(is_within_any_root(
+            Path::new("C:/Users/Me/Documents/sub/../a.txt"),
+            &root()
+        ));
+    }
+
+    #[test]
+    fn rejects_parent_traversal_that_climbs_above_the_drive() {
+        assert!(!is_within_any_root(
+            Path::new("C:/Users/Me/Documents/../../../../a.txt"),
+            &root()
+        ));
+    }
+
+    #[test]
+    fn compares_case_insensitively() {
+        assert!(is_within_any_root(
+            Path::new("c:/users/me/DOCUMENTS/a.txt"),
+            &root()
+        ));
+    }
+
+    #[test]
+    fn accepts_when_any_one_root_contains_the_path() {
+        let roots = vec![
+            PathBuf::from("C:/Users/Me/Pictures"),
+            PathBuf::from("C:/Users/Me/Documents"),
+        ];
+        assert!(is_within_any_root(
+            Path::new("C:/Users/Me/Documents/a.txt"),
+            &roots
+        ));
+    }
+
+    #[test]
+    fn rejects_a_path_outside_every_root() {
+        assert!(!is_within_any_root(Path::new("C:/Windows/System32/a.dll"), &root()));
+    }
+
+    #[test]
+    fn rejects_everything_when_there_are_no_roots() {
+        assert!(!is_within_any_root(
+            Path::new("C:/Users/Me/Documents/a.txt"),
+            &[]
+        ));
+    }
+
+    #[test]
+    fn rejects_everything_when_a_root_is_empty() {
+        assert!(!is_within_any_root(
+            Path::new("C:/Users/Me/Documents/a.txt"),
+            &[PathBuf::new()]
+        ));
+    }
 
     /// Helper: create a temporary test directory unique to this process.
     fn test_dir(name: &str) -> PathBuf {

@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Files larger than this are hashed on a 64 KB sample first (if the 64 KB
@@ -385,13 +385,28 @@ fn execute_one(action: &CleanupRequest) -> CleanupOutcome {
 /// Empty-dir removals are marked as not undoable (trash deletions are not
 /// app-undoable either — the Recycle Bin provides native restore).
 pub fn execute_cleanup(actions: &[CleanupRequest]) -> Vec<CleanupOutcome> {
+    let roots: Vec<PathBuf> = db::get_watched_folders()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|folder| PathBuf::from(folder.path))
+        .collect();
+
     let mut outcomes = Vec::with_capacity(actions.len());
     for action in actions {
-        let outcome = execute_one(action);
-        let undoable = match action.kind.as_str() {
-            "remove_empty_dir" => false,
-            _ => false,
+        // Nothing outside a watched folder may be destroyed. These paths arrive
+        // from the frontend, and app-defined commands are callable from every
+        // window, so without this check the command can name any path on the
+        // machine. An empty or unreadable folder list authorises nothing.
+        let outcome = if safe_fs::is_within_any_root(Path::new(&action.path), &roots) {
+            execute_one(action)
+        } else {
+            CleanupOutcome {
+                path: action.path.clone(),
+                status: "skipped".to_string(),
+                message: Some("Outside every watched folder".to_string()),
+            }
         };
+        let undoable = false;
         let _ = db::insert_cleanup_action(&db::CleanupAction {
             id: None,
             timestamp: Utc::now(),
