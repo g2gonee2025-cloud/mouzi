@@ -2108,3 +2108,261 @@ re-establishment.
 
 **Scope of this pass.** 1 of the 21 audit reports, 15 of 21 absorbed in total. Section 1's executive
 summary now predates nine addenda and should be reconciled against them.
+
+---
+
+## 16. Addendum - eleventh pass: the watcher, and the recursion trap
+
+The watcher report. Its central finding is structural rather than a single defect, and it changes how
+the two most-cited upstream anchors must be read. Five of the seven Tauri-threading claims in this
+section were checked against the `tauri-docs` source for the pinned 2.11.1 rather than assumed.
+
+**Correction to the absorbed count.** Sections 14 and 15 each said "15 of 21"; the true figure after
+this section is **15 of 21 reports absorbed, 6 outstanding**. The earlier count double-counted the
+orchestrator's own verifications as reports.
+
+### 16.1 CRITICAL C14 - the self-trigger guard covers undo and nothing else, and it leaks an entry per undo
+
+`state.ignored_files` is the map that stops the watcher's own file moves from being re-processed. It
+has exactly **two** write sites, both in the undo path: `commands.rs:219` and `commands.rs:228`.
+Verified by enumerating writers across the whole crate. **Nothing else writes to it.** In particular:
+
+| Operation | Inserts into `ignored_files`? |
+|---|---|
+| `perform_undo` / `undo_all_cmd` | **yes** (`commands.rs:219`, `:228`) |
+| `process_file` - the watcher's own auto-organise move | no |
+| `accept_suggestion_cmd` - the AI suggestion accept flow | no |
+| `execute_cleanup` - Recycle Bin deletes and empty-dir removal | no |
+| `manual_scan_folder` - scheduled clean, tray "Clean Now", archive import | no |
+
+So plan M1's "watcher suppression for restore ops" was implemented for the one path that was easiest,
+and the four paths that move files on a schedule or in bulk were left unsuppressed. This is survivable
+today for a reason given in 16.2, and it stops being survivable the moment recursion lands.
+
+**The leak is separate and unconditional.** `watcher.rs:217-222` removes an entry only when an event
+for that path arrives *after* it has expired:
+
+```rust
+if let Some(&instant) = ignore_guard.get(&path_str) {
+    if Instant::now().duration_since(instant) < Duration::from_secs(IGNORE_DURATION_SECS) {
+        continue;
+    }
+    ignore_guard.remove(&path_str);
+}
+```
+
+For an undo, the restored file generates exactly one event, and it arrives within the 30-second
+window - so the handler takes the `continue` branch, the entry is **not** removed, and no further
+event ever arrives for that path. The destination half is worse: it is a subfolder, so a non-recursive
+watch never sees it at all. **Every undo therefore leaves two permanent entries in a map that nothing
+ever prunes.** In an application designed to sit in the tray all day this is an unbounded map, and it
+is the same map that gates correctness.
+
+### 16.2 CRITICAL C15 - the non-recursive watch is load-bearing, so fixing it as specified would create an infinite organise loop
+
+`watcher.rs:317` still reads `RecursiveMode::NonRecursive`. **Verified by git history: the only change
+ever made to `watcher.rs` in this fork is `IGNORE_DURATION_SECS` from 5 to 30.** The recursion line and
+the whole ignore-check block are verbatim upstream.
+
+Plan D4 requires the watcher to be recursive within watched roots, and the plan's own M3 note
+acknowledges the gap - "empty-folder sweep, recursive awareness needed, watcher is non-recursive". The
+scanner was made recursive. The watcher was not.
+
+**The consequence is the opposite of what the plan assumes.** With a non-recursive watch, an organise
+move from `Downloads/report.pdf` to `Downloads/Documents/report.pdf` is invisible to the watcher: the
+removal of `report.pdf` is skipped because `path.is_file()` is now false, and the creation of the
+`Documents` subfolder is skipped for the same reason. **The non-recursion is the only thing preventing
+self-retrigger.** Verified through the full event path rather than assumed.
+
+If D4 is implemented as written - recursive watch, no new suppression - then every organise move
+becomes visible, is not in `ignored_files` (16.1), and re-queues itself. The grace period is 300
+seconds, so the loop is one file every five minutes rather than instantly, but it never terminates and
+it is silent. **D4 cannot be implemented safely without first extending the suppression to
+`process_file`, `accept_suggestion_cmd`, `execute_cleanup` and `manual_scan_folder`, and making the
+suppression batch-aware rather than a fixed per-path time window.** These two findings are one finding.
+
+### 16.3 CRITICAL C16 - `undo_all` on an accumulated log table is an unbounded mass restore that freezes the app and silently loses file events
+
+`action_logs` grows without bound; the only prune is a user-initiated `clear_logs_cmd`. After a few
+months of a tray app auto-organising, it holds thousands of rows. `undo_all_cmd` (`commands.rs:226-242`)
+moves **every** `undone = 0` row back, and for the whole batch it holds **the global database mutex
+and the `ignored_files` mutex**, doing filesystem I/O per row.
+
+Four distinct failures compound:
+
+1. **The UI freezes.** `undo_all_cmd` is a synchronous command, and Tauri runs synchronous commands on
+   the main thread - confirmed against `tauri-docs` `calling-rust.mdx`: *"Commands without the
+   `async` keyword are executed on the main thread unless defined with `#[tauri::command(async)]`"*,
+   and the crate contains zero `async fn`. So the window is unresponsive for the entire mass restore.
+2. **File events are silently lost.** The notify event handler needs the `ignored_files` mutex
+   (`watcher.rs:268`), which `undo_all_cmd` holds for the whole batch. notify's event thread is pinned
+   for the duration, and on Windows the OS directory-change notification buffer can overflow while it
+   is blocked - at which point `ReadDirectoryChangesW` fails and the dropped notifications are **not
+   redelivered**. The practical effect is that the watcher silently stops organising a folder until
+   the application restarts. Mechanism is documented Windows behaviour; whether it has already
+   occurred on this machine is **UNVERIFIED**.
+3. **The database mutex is held across filesystem I/O**, so the watcher's per-file
+   `get_watched_folders()`, the notify handler's per-event `get_settings()`, the scheduler and the
+   scanner all stall for the whole batch.
+4. **Cross-device batches exceed the 30-second suppression window, and the app then undoes its own
+   undo.** For same-volume local moves the 30 seconds is sufficient - roughly 0.1-0.5 ms per row, so
+   even 5,000 rows complete inside it, and this is worth stating plainly rather than assuming. But a
+   cross-device restore performs a full `std::fs::copy` per row through
+   `copy_delete_fallback`; a few hundred megabytes over SMB or USB runs to tens of seconds. Once
+   past 30 seconds, a restored file's event is no longer suppressed, so it is re-queued, and 300
+   seconds later `process_file` moves **the just-restored file straight back** into its category
+   folder - with a fresh `action_logs` row recording the move, and the original row already marked
+   `undone = 1`. The user's undo is reverted by the application itself.
+
+### 16.4 HIGH H35 - the initial scan is quadratic, does three filesystem syscalls and a database query per file, and runs on the main thread during startup
+
+`watcher.rs:208-252` is the initial scan. It is called from `lib.rs:157` inside `.setup()`, which Tauri
+runs on the main thread, and again from `add_folder_cmd`, `remove_folder_cmd`,
+`update_folder_mode_cmd` and `refresh_watcher_cmd` - all synchronous commands, therefore also the main
+thread. Per file it performs:
+
+- `pending.guard.retain(|x| x.path != path)` - a **linear scan** (`watcher.rs:243-248`, `:298-304`), so
+  the whole pass is **O(F squared)** in file count, with a `PathBuf` string comparison per element.
+- `db::get_settings()` - a mutex acquisition plus a 14-column query, **per file**
+  (`watcher.rs:240`, `:295`).
+- `is_file_ignored_by_mouziignore` - which calls `load_mouziignore` per file
+  (`ignore.rs:6-10`), doing a `Path::exists()` **and** a `fs::read_to_string` of `.mouziignore`
+  **from disk, every time**.
+- `should_ignore_file` - an `fs::metadata` per file (`rules.rs:66`).
+
+For a watched folder of 5,000 files that is roughly 15,000 synchronous filesystem syscalls and 5,000
+SQLite queries before the window appears. The application looks hung on startup, proportionally to the
+size of the watched folders. `refresh()` also calls `self.watchers.clear()` and then re-walks **every**
+folder, so adding one watched folder re-queues every file in every other folder and resets each file's
+300-second grace timer.
+
+**A lost-file race.** The initial scan completes **before** `watcher.watch()` is called
+(`watcher.rs:208-252` then `:259-320`). A file created in that window is seen by neither, and there is
+no rescan. The window is the duration of the read pass over all preceding folders - hundreds of
+milliseconds to seconds on a multi-root setup. A file downloaded into that gap is **silently never
+organised**.
+
+### 16.5 HIGH H36 - `find_duplicates_cmd` hashes the whole inventory on the main thread, taking the global mutex per file
+
+`find_duplicates_cmd` (`commands.rs:625`) is synchronous, so it runs on the main thread. It calls
+`cleanup::find_duplicates`, which reads every same-size candidate and hashes **full file contents**
+with blake3 (`cleanup.rs:75-86`, `:92-108`). Each file's cache lookup and store takes the single global
+database mutex (`db::get_db()` is one `Arc<Mutex<Connection>>`). So the main thread spends an unbounded
+period reading file contents while repeatedly locking the one connection the rest of the application
+needs. On a large inventory with many same-size groups this is minutes of frozen UI plus total database
+starvation. This is the single worst main-thread offender found in the audit.
+
+`execute_cleanup_cmd` (`commands.rs:661`) has the same shape for a shorter period: `trash::delete` is a
+blocking COM call of roughly 10-50 ms per file, and each `remove_empty_dir` re-runs the full recursive
+directory walk (`cleanup.rs:352`) - all on the main thread. Trashing 500 duplicates freezes the window
+for seconds to minutes.
+
+`get_dashboard_stats_cmd` (`commands.rs:581`) is also synchronous and issues **seven separate queries**,
+each independently re-locking the global mutex, two of which are full-table `GROUP BY` aggregates over
+`file_inventory`. Combined with H34 - where the dashboard reloads on every `file-organized` event - one
+organised file can cost seven mutex acquisitions and two full-table aggregates on the main thread.
+
+### 16.6 MEDIUM M45 - the suppression entry is inserted after the move, not before it
+
+`perform_undo` calls `move_file` first (`commands.rs:174`) and only then inserts both paths into
+`ignored_files` (`commands.rs:177-178`, `:189-190`). The filesystem change therefore happens before the
+guard entry exists, so the notify handler can read the map before the writer populates it.
+
+For `undo_all_cmd` the window is closed in practice, because the command holds the `ignored_files`
+mutex for the whole batch and the handler blocks on it at `watcher.rs:268` - the mutex accidentally
+provides the ordering. For a **single** `undo_action_cmd` there is no such protection, and the handler
+performs its own `fs::metadata` and `.mouziignore` reads before reaching the lookup, so the writer
+almost always wins. The likelihood becomes non-trivial when that handler's syscalls are slow - a network
+share, a cold spin-up, or CPU contention. The fix is to insert before the move, which is strictly
+safer and costs nothing. Confidence: the ordering is objectively wrong; practical exploitability is
+low and conditional.
+
+### 16.7 MEDIUM M46 - the capability file lists a window label the tray never creates
+
+`capabilities/default.json:5` lists `["main", "popup", "settings", "dashboard", "cleanup",
+"suggestions"]`. `tray.rs:172` and `tray.rs:179` build the workspace window with the label **`app`**.
+So `dashboard` is in the list but is never a window label, and the label that *is* used is not in the
+list. This is the same root cause as C3 and C13, observed from the watcher's side: the capability file
+was updated to match the *plan's* window model rather than the *code's*. **Runtime impact UNVERIFIED**
+- the application was not run, and it is possible that a second capability file or a remote-URL match
+covers it. What is certain is the mismatch.
+
+### 16.8 MEDIUM M47 - absolute rule destinations are live, and the migration that would remove them is dead code
+
+`execute_rule` (`rules.rs:174-180`) explicitly honours absolute rule destinations for backward
+compatibility. `db::migrate_rules_to_relative` (`db.rs:296`) exists to convert them, and is **defined
+but never called** - the only occurrence of the name in the crate is its own definition.
+`add_rule_cmd` and `update_rule_cmd` (`commands.rs:37-46`) validate nothing, so a user can type an
+absolute destination into the rules form.
+
+Combined with the unvalidated `add_folder_cmd` (C5), this produces a reproducible wrong behaviour: with
+`Downloads` and `Documents` both watched and a rule whose destination is the absolute path
+`C:\Users\<name>\Documents`, an organised PDF re-appears as a top-level entry in the `Documents` watch,
+is not in `ignored_files`, is re-queued, and 300 seconds later `process_file` resolves the destination
+to the file's own location. `fs::rename(x, x)` returns success on Windows, so a **bogus
+`action_logs` row with `source == destination` is written and a `file-organized` success event is
+emitted** for a file that was not organised. It does not loop infinitely - a same-path rename raises no
+filesystem event - but it repeats on every `refresh()` and every application start, and the file stays
+misfiled forever. A second latent hazard in the same function: `get_downloads_folder` falls back to
+`"C:/Users"` (`commands.rs:363`) when the platform API returns nothing, i.e. a whole user profile.
+
+### 16.9 MEDIUM M48 - D4 remains unguarded at the input layer, which is survivable only because of C15
+
+`add_folder_cmd(app, path: String, mode)` accepts an arbitrary string with no drive-root rejection, no
+containment check and no depth budget, and calls `create_dir_all` on it before storing it. Today the
+blast radius is bounded by the non-recursive watch, which limits damage to the top level of whatever
+root was entered. **The moment D4 recursion lands, an unvalidated `C:\` becomes a whole-drive
+recursive watch whose default behaviour is to move the user's files into category subfolders on a
+300-second timer.** The input validation and the recursion change must ship together. Recorded here so
+that implementing D4 is not treated as a one-line change.
+
+### 16.10 LOW
+
+- **`ignored_files` is keyed on absolute path strings.** A casing difference between what
+  `action_logs.source_path` stored and what notify reports would silently defeat the guard on a
+  case-insensitive filesystem. Not observed; **UNVERIFIED**.
+- **No `Drop` for `FolderWatcher`, no join, and `handle` is write-only.** The watcher processing thread
+  (`watcher.rs:54`) and the scheduler thread (`scheduler.rs:36`) are detached, loop forever with no
+  shutdown signal, and are never joined. `app.exit(0)` terminates the process without waiting, so the
+  OS reclaims everything and the practical impact is nil - but there is no clean shutdown path, and the
+  `RecommendedWatcher` handles are only released if `AppState` is dropped, which `process::exit` prevents.
+- **`import_archive_cmd` organises files inside the cache staging directory**
+  (`%LOCALAPPDATA%\mouzi\cache\archive-imports\import-*`) and returns that path; the organised files are
+  never moved to a real destination. Not a watcher defect, noted because it is a move path with no
+  suppression - harmless only because the staging directory is not a watched root.
+
+### 16.11 Recorded as sound, so the counts above are not inflated
+
+- **The grace period is a correct per-path debounce.** Every event for a path does
+  `retain(|x| x.path != path)` then `push`, rescheduling that path to `now + grace`. Five thousand
+  events across five thousand distinct files produce five thousand pending entries and **one** process
+  pass, not five thousand. The storm question is therefore answered at the watcher level; what remains
+  open is the one-emit-per-file *downstream* cost recorded as H34.
+- **Intra-root relative moves do not re-trigger**, verified through the event path rather than assumed,
+  and the reason is exactly the non-recursion in C15.
+- **`start_scan_cmd` correctly spawns a thread** (`commands.rs:543`), so the scanner is off the main
+  thread - unlike the watcher, the dedup finder, the cleanup executor and both undo commands.
+- **The `.mouziignore` read error path returns `(false, [])`** (`ignore.rs`), which errs toward *not*
+  treating a file as ignored, so an unreadable ignore file cannot cause a skip. Recorded so the finding
+  count is not inflated.
+- **Zero `async fn` in the entire Rust backend**, confirmed again by enumeration. This is the third
+  independent route by which C12 has been corroborated.
+
+### 16.12 What this section changes about the earlier conclusions
+
+- **C15 inverts the reading of two plan anchors.** D4's "make the watcher recursive" and M3's "the
+  watcher is non-recursive" were recorded as a missing feature. It is a **trap**: implementing D4 as
+  written produces a silent infinite re-organise loop, because the suppression that would prevent it
+  exists only for undo (C14).
+- **H21's "no CI runs any test" gains a second reason to matter.** A CI job that ran `cargo test` would
+  not have caught any of this: every finding here is in code with no test, and the two that are tested
+  (`safe_fs.rs:199`, `rules.rs:288`) test the wrong thing (H19).
+- **C12 is corroborated a third time**, and H36 names the worst single instance of it.
+- **The upstream-defect tally in section 2 is revised.** The watcher was previously listed as
+  "non-recursive, untouched". It is untouched, and that is worse than it sounds.
+
+---
+
+**Scope of this pass.** 15 of the 21 audit reports absorbed, **6 outstanding**: dependency and build
+configuration, React routing, Zustand stores, dashboard components, i18n, and whole-stack performance.
+Section 1's executive summary now predates ten addenda and should be reconciled against them.
