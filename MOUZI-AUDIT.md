@@ -910,3 +910,298 @@ such.
 
 **Scope of this pass.** 9 of the 21 audit reports. No executive summary is added or amended: the
 summary in section 1 predates these findings, and a later pass should reconcile it.
+
+---
+
+## 12. Addendum - seventh pass: test trustworthiness
+
+The previous pass asked whether the code can panic. This pass asks a narrower and more uncomfortable
+question: whether the tests would notice. It read every test in the repository, both the 32 vitest
+cases and the 57 `#[test]` functions, and traced each one to the production symbol it claims to
+cover. The answer is that the suite is broad and shallow. One new Critical and six new Highs follow.
+
+### 12.1 CRITICAL C8 - C1 is worse than recorded: the frontend guard AND the backend guard both fail, and a passing test locks the behaviour in
+
+Section 2's C1 records that `buildDuplicateActions` with an empty keeper map trashes every copy
+including the one the UI badges as kept. This pass traced the full chain and it is worse in two
+specific ways that section 2 does not state.
+
+**The display default and the action builder read different values.**
+`src/components/cleanup/DuplicatesTab.tsx:119` renders the keeper as
+`selected[g.hash] ?? g.files[0]?.path`, so the UI always shows the first file badged green as "kept"
+even when the user has selected nothing. But `buildDuplicateActions(groups, selected)` at
+`DuplicatesTab.tsx:36` is handed the **raw** `selected` map, which never receives that `??` default.
+So `keepPath` is `undefined`, `f.path !== undefined` is true for every file, and every file in
+every group is queued.
+
+**The backend guard cannot catch it either.** Because `keepPath` is `undefined`, `JSON.stringify`
+omits the key entirely, so Rust deserialises `Option<String>` as `None`, and the `keep_path`
+self-reference check at `src-tauri/src/cleanup.rs:314-322` is skipped for the same reason. The two
+independent safety mechanisms, one in the frontend and one in the backend, are disabled by the *same*
+missing value. There is no layer at which the keeper survives.
+
+**The button label is honest; the green badge is the lie.** The confirm-button count at
+`DuplicatesTab.tsx:102-110` filters on `f.path !== selected[g.hash]`, which with an empty map counts
+**all** files, so the label says the true total. The user therefore sees a red button reading
+"Confirm N" and, directly above it, one file per group badged green as kept. The count and the badge
+contradict each other, and the badge is the one that produces the false sense of safety.
+
+**A passing test enshrines it.** `src/__tests__/cleanup.test.ts:59-64` calls
+`buildDuplicateActions([a], {})` on a two-file group and asserts `toHaveLength(2)`, that is, it
+asserts that both copies are queued for trashing when no keeper is chosen. This is not a missing
+test. It is a test that would fail if the bug were fixed, so it actively resists the fix. Contrast
+the sibling test at `:48-57`, which passes an explicit keeper map and is a correct test of the
+intended path.
+
+**The generalisable lesson.** Where a default is applied for *display* but not for *action*, the two
+must be shown to be the same value, and a destructive default needs a test that asserts the safe
+outcome rather than the observed one.
+
+### 12.2 HIGH H19 - the two cross-device tests both test nothing, and the plan required one
+
+The work plan's M1 exit criteria explicitly require "unit tests for move-back fixtures (collision,
+missing-dir, cross-device)". Two tests appear to satisfy the third. Neither does.
+
+- `src-tauri/src/rules.rs:288` `test_move_file_cross_device` creates a source and a destination
+  **both under `std::env::temp_dir()`**, on the same filesystem, so `fs::rename` succeeds and the
+  fallback branch is never taken. The test name asserts coverage that does not exist. This test is
+  inherited unchanged from the upstream baseline, so the plan inherited the false assurance along
+  with it.
+- `src-tauri/src/safe_fs.rs:199` `test_move_file_copy_delete_fallback` calls `copy_delete_fallback`
+  **directly**, bypassing the detection logic that decides when the fallback applies. A comment in
+  the test admits a cross-device failure cannot be provoked in a unit test.
+
+Net: the cross-device detection branch in both `rules.rs::move_file_cross_device` and
+`safe_fs.rs::move_file` has **zero** coverage, while two green test names imply otherwise. This is
+the same shape as C1, a test that creates confidence without creating safety.
+
+### 12.3 HIGH H20 - the five Ollama parser tests test a copy of the parser, not the parser
+
+`src-tauri/src/classify.rs:807-828` defines a **test-local** function `parse_ollama_response` that
+re-implements the parsing logic living inline inside `OllamaProvider::classify` at
+`classify.rs:504-529`. The five tests at `classify.rs:830-866` exercise the copy.
+
+The two versions have already **drifted**, which is the proof: the copy's error strings are
+`"JSON parse failed"` and `"Missing response field"`, while production emits
+`"Ollama response parse failed"` and `"Ollama response missing 'response' field"`. The production
+parser could be deleted outright and all five tests would stay green. Copy-paste drift between a
+function and its test double is invisible to CI by construction.
+
+Two further gaps in the same area:
+
+- `OllamaProvider::is_available()` at `classify.rs:452-455` is `#[cfg(test)] { false }`, so the
+  entire ureq detection path is **compiled out** under `cargo test`. No break in the real detection
+  code can be caught by the test suite.
+- No test calls `detect_provider()`, and **no mock `AiProvider` exists**; the only two
+  implementations are `HeuristicProvider` and `OllamaProvider`. The plan's M4 criterion, "Ollama-absent
+  path degrades gracefully, simulated via mock provider", is therefore **absent**.
+  `test_suggestions_empty_without_inventory` at `classify.rs:1003-1010` is not a substitute: it
+  passes `HeuristicProvider` against an empty inventory, so the classify path is never entered and
+  the fallback branch is never exercised. It would pass if the fallback were deleted.
+
+### 12.4 HIGH H21 - no CI runs any test
+
+The repository has five GitHub workflow files, all inherited from upstream. Every one is a release,
+build, or AppImage-signing pipeline. **None of them runs `cargo test`, `npm test`, or
+`cargo clippy`.** The only checks are "the build succeeded" and "the AppImage installs".
+
+Worse, `origin` is `https://github.com/hsr88/mouzi.git`, the public upstream, so a fork has no CI of
+its own at all: these workflow files live in the upstream repository, and the signing jobs depend on
+upstream secrets the user does not have.
+
+Net: **89 tests, of which zero are executed automatically by anything.** Every regression discussed
+in this document would land silently. This is the single highest-leverage fix in the entire audit,
+because it is cheap and it converts all the other findings from "known" to "caught".
+
+### 12.5 HIGH H22 - the watched-root boundary is enforced on one of four cleanup queries, and by no test
+
+The work plan's D4 states that cleanup must stay within watched roots and never operate on whole
+drives. Section 2's C5 records that the *scanner* does not enforce this. This pass found the same
+boundary is also missing on the *query* side, which is the side that matters for deletion.
+
+`src-tauri/src/cleanup.rs` has four finders. Only one respects the boundary:
+
+- `find_duplicates` calls `db::get_inventory_size_groups()` - **no root parameter**
+- `find_large_files` calls `db::get_large_files_from_inventory(min_bytes)` - **no root parameter**
+- `find_stale_files` calls `db::get_stale_files_from_inventory(cutoff)` - **no root parameter**
+- `find_empty_dirs` calls `db::get_watched_folders()` and filters on `enabled` plus pause mode - the
+  only one that does
+
+The signatures are at `src-tauri/src/db.rs:1090`, `:1114` and `:1132`. `file_inventory` rows are never
+pruned when a root is un-watched (section 2's C7), so after a user removes a folder from settings, its
+entire inventory remains and all of its files stay eligible for trashing by three of the four
+finders. `execute_one` re-checks only that the path exists and that it is not the keeper, it never
+re-validates containment.
+
+**There is no test of the boundary behaviour of any of the four finders.** Note the honest
+mitigating detail: scanning itself is root-scoped, so rows only enter the table through a deliberate
+scan, and the exposure requires un-watching a folder after scanning it. That is a common sequence,
+not an exotic one.
+
+### 12.6 HIGH H23 - `commands.rs` has no test module at all, and the M1 rewrite made it testable and then did not test it
+
+`src-tauri/src/commands.rs` contains **zero** `#[cfg(test)]` blocks. The fourteen test modules in the
+crate are in cleanup, ignore, classify, tray, archive, db, scan, rules and safe_fs.
+
+The sharpest instance: `perform_undo` at `commands.rs:142-205` is the entire M1 rewrite, the per-item
+status contract, the collision suffix, the missing-parent-directory recreation, the `undone = 1`
+write, and the watcher `ignored` map insertion that suppresses the self-trigger. It was
+**deliberately refactored to accept `&rusqlite::Connection` and `&mut HashMap<String, Instant>`
+instead of reaching for globals**, which is exactly the seam you would create in order to test it.
+The seam was built and then left unused. This is the highest-risk function in the codebase, it moves
+real user files and mutates the audit database, and it has no test.
+
+`execute_one` at `cleanup.rs:307-379`, the destructive core that decides between trash,
+skip-the-keeper, skip-if-missing, and remove-directory-with-recheck, is likewise untested, as is
+`execute_cleanup` at `:387`. So the preview-then-confirm-then-trash-then-audit chain that M3 exists
+to deliver has no test on its execution half. Only `walk_empty_dirs`, the read-only discovery step,
+is covered.
+
+### 12.7 HIGH H24 - two divergent status vocabularies exist, and neither is the one the plan specified
+
+The plan's D5 mandates per-item status `ok | collision | missing | cross-device | failed` for undo.
+The code delivers a different set twice over:
+
+- `commands.rs:130` documents `pub status: String, // "ok" | "collision" | "missing" | "failed"`.
+  `cross-device` is **never constructed anywhere in the crate**, so the fifth state does not exist.
+- `src/utils/cleanup.ts:26` declares a completely different contract for `CleanupOutcome`: `"ok" |
+  "failed" | "skipped"`, matching what `cleanup.rs` actually produces.
+
+No test pins either vocabulary, and nothing checks that the two agree, so they can drift further
+without consequence.
+
+Compounding it, the `undoable` flag is structurally dead. `cleanup.rs:391-394` is a `match` whose two
+arms are both `false`, so `undoable` is always false. Consequently `db.rs:651`'s
+`UPDATE cleanup_actions SET undoable = 0, status = 'undone'` is unreachable, and **no `undo_cleanup`
+function exists at all**. The cleanup audit trail therefore has no restore path in the app, consistent
+with D5's decision that Recycle Bin restore is native, but the schema advertises a capability the
+code does not have. `HistoryPanel.tsx` renders no undo affordance, correctly.
+
+### 12.8 Medium findings
+
+- **The plan's test baseline number is wrong.** D9 states the Rust baseline is 6 tests. The actual
+  baseline at the merge-base commit is **11** `#[test]` functions (archive 5, ignore 5, rules 1). The
+  plan's M0 exit criterion "verify `cargo test` (6 tests)" therefore could never have been satisfied
+  as written. Current totals: **57 Rust + 32 vitest = 89**, so +46 Rust tests were added rather than
+  the 6 the plan implies.
+- **A vacuous test.** `src/__tests__/cleanup.test.ts:40-44` is named "does not mutate the input" but
+  sorts a **one-element** array. An in-place sort of one element is undetectable, so the test passes
+  whether or not `sortGroups` mutates its argument. It cannot fail for the property it names.
+- **A self-referential assertion.** `src/__tests__/dashboard.test.ts:96` reads
+  `expect(categoryColor("Unknown")).toBe(categoryColor("Other"))`. It compares the function against
+  itself, and would pass even if `categoryColor` returned a constant for every input. The adjacent
+  assertion at `:95` pinning `"#6b4f3a` is a genuine test by comparison.
+- **A Windows-only test.** `src-tauri/src/cleanup.rs:696` asserts `leaves == vec!["sub1\\sub2"]` with a
+  hard-coded backslash separator. `cargo test` is not portable and would fail on Linux or macOS,
+  despite the crate containing Linux-specific `EXDEV` handling elsewhere.
+- **Leftover temp directories on panic.** `safe_fs.rs` and `cleanup.rs` tests delete their temp trees
+  at the **end of the test body** rather than in a `Drop` guard, so any failing assertion leaves files
+  behind in `%TEMP%`. The `test_dir` helper does clear the directory on entry, which limits
+  accumulation to one run's worth.
+- **Conditional coverage presented as green.** `src-tauri/src/scan.rs:244` creates a directory
+  symlink to exercise the cycle guard, but on Windows that needs Developer Mode; when the privilege is
+  absent it prints a note and **the symlink assertions never run**, yet the test still passes. The
+  cycle-guard code is untested on a default Windows install and CI reports success.
+- **Global-count coupling between tests.** Several tests assert on whole-table counts:
+  `scan.rs:305` asserts `total_files == 5`, and `classify.rs:1003` requires `file_inventory` to be
+  completely empty. They share one file-backed database at `%TEMP%/mouzi-db-<pid>`
+  (`db.rs:1223-1229`) serialised only by a `TEST_DB_LOCK` mutex. A panic in one test leaves rows
+  behind and breaks whichever test runs next, so the suite is order-dependent and will produce
+  confusing failures rather than honest ones.
+- **A test that cannot detect a broken feature.** `safe_fs.rs:232-253` `test_delete_to_trash_temp_file`
+  swallows the error branch with `eprintln!` and still passes, so a completely non-functional Recycle
+  Bin path is invisible to the suite. This is C4, the `trash` crate may permanently delete when the
+  bin cannot accept an item, meeting a test that structurally cannot notice.
+- **Reclaimable bytes is implemented twice.** `cleanup.rs:214-218` computes it in Rust as
+  `files[0].size * (len - 1)`, while `src/utils/cleanup.ts` sums per-file sizes in TypeScript. The
+  vitest suite covers only the TypeScript half, so nothing detects the two diverging. Both are live:
+  `DuplicatesTab.tsx` imports the TypeScript version while the authoritative groups come from Rust.
+- **No coverage tooling exists.** `@vitest/coverage` is not a dependency and `vite.config.ts` has no
+  `test` block at all, so vitest runs on pure defaults. Nothing measures coverage and no threshold is
+  enforced. The one positive: `tsconfig.json` has `"include": ["src"]`, so the test files **are**
+  type-checked by `npm run build`.
+
+### 12.9 Required-versus-present, the plan's six mandated test categories
+
+| # | Mandated category | Verdict | Evidence |
+|---|--------------------|---------|----------|
+| 1 | classifier pure functions | **present, genuinely good** | 19 tests in `classify.rs` covering extension, token, case-insensitivity, `extract_tokens` |
+| 2 | dedup size-prefilter and cache invalidation | **present, genuine** | `cleanup.rs:439`, `:494`, `:538`, `:590` |
+| 3 | undo move-back fixtures | **partial** | collision and missing-parent at `safe_fs::move_file`; cross-device absent (H19); command layer absent (H23) |
+| 4 | migration idempotency, `init_db` twice | **absent and unwritable as specified** | no such test; `sync::OnceCell` makes a second in-process call return `Err` |
+| 5 | trash send on temp files only | **present but unable to fail** | `safe_fs.rs:232-253` swallows the error branch with `eprintln!` |
+| 6 | Ollama-absent graceful degradation | **absent** | no mock provider, no `detect_provider()` test, detection compiled out under `cfg(test)` (H20) |
+
+A caveat on the first row, since several of those tests are weaker than they look:
+`test_suggest_by_filename_token` asserts `conf >= 0.80` for `Screenshot_2024-08-24.png`, which the
+`png` extension alone satisfies, so token scoring is never actually exercised.
+
+The second row is the strongest test work in the repository. `cleanup.rs:590` in particular would
+fail if the cache keyed on path and size without mtime. Its limit is that it never probes the
+same-second mtime case, a real modification between scans, a short read, or a mid-hash write.
+
+On row 4, this is a plan defect and not only an implementation gap. `init_db` uses a
+`sync::OnceCell`, so a second in-process call returns `Err`, meaning `assert!(init_db(dir).is_ok())`
+would fail by design. Cross-process it is idempotent, but nothing tests either property.
+
+### 12.10 How many tests would survive a deliberate break
+
+**The method.** For each test: if the production function it targets were deleted outright, would the
+test go red?
+
+- **TypeScript, 32 cases.** `format.test.ts` 11 of 11 genuine. `dashboard.test.ts` 12 of 13, the
+  self-referential `categoryColor` comparison being the exception. `cleanup.test.ts` 7 of 8, the
+  one-element mutation test being the exception, though it would still fail if the function threw or
+  returned undefined. So **30 of 32**.
+- **Rust, 57 tests.** The great majority call real functions on real temp files and would fail
+  correctly. The exceptions are: the five Ollama parse tests, which test a copy (H20); the two
+  cross-device tests, which never reach the branch they name (H19); the empty-dirs test, which is
+  Windows-only; the trash test, which cannot fail; and the scan test, whose symlink assertions are
+  conditional. So roughly **46 of 57**.
+- **Combined: about 76 of 89 would catch a break in what they name.** That sounds reassuring and is
+  not. The failures that matter most are precisely the ones no test is looking for: `commands.rs` has
+  no tests at all, so the undo path, the destructive `execute_one`, and every status-contract claim
+  are uncovered; and the tests that do cover the destructive frontend helper assert the **buggy**
+  behaviour.
+
+Coverage is broad and shallow. Nothing in the suite would fail if `perform_undo` were deleted, if
+`execute_one` were deleted, or if the Ollama parser were deleted.
+
+### 12.11 Recorded as sound
+
+- `init_test_db` at `db.rs:1223-1229` uses a file-backed database at `%TEMP%/mouzi-db-<pid>`. **No
+  test touches the real application database.** The temp path is keyed by process id, so there is no
+  cross-run contamination.
+- `archive.rs` carries the five upstream baseline tests, and `zip_slip_entries_are_rejected` is a real
+  security assertion: it checks that a traversal entry did not create a file outside the extraction
+  root.
+- `ignore.rs` gates its case-sensitivity tests properly with `#[cfg(windows)]` and
+  `#[cfg(not(windows))]`, and both call the real function. These are model tests.
+- `tray.rs:227-243` tests `location_hash_script` against script-injection inputs, stripping quotes and
+  newlines. Genuine, and the only security-focused frontend test in the repository.
+- The `safe_fs::move_file` tests for normal move, collision suffix, and missing-parent-directory are
+  real and would fail correctly.
+- Deleting `src/__tests__/smoke.test.ts` is a **contract deviation, not a coverage loss.** The
+  deleted file asserted `expect(1+1).toBe(2)` and proved only that the runner starts. Three remaining
+  test files exercise the same runner, the same config path, and the same include glob, so a broken
+  runner fails in all of them. Record this as a low-severity deviation from the plan's literal wording
+  and explicitly do not inflate it.
+- No `.only`, `.skip`, or `.todo` appears in any test file, and no `#[ignore]` appears in the Rust
+  suite. Nothing is silently disabled.
+
+### 12.12 What this section implies for the Criticals already recorded
+
+- Fixing C1 or C8 will **break** `cleanup.test.ts:59-64`, which asserts the destructive default. That
+  test must be rewritten in the same change, or the fix will be reverted by someone who trusts a green
+  suite. This coupling is the practical reason the test audit matters more than its finding count
+  suggests.
+- H21 means every other fix in this document is a one-time manual correction. Nothing prevents the
+  same defects returning.
+- H23 and H22 together mean the two most dangerous functions in the crate, `perform_undo` and
+  `execute_one`, are both untested **and** both reachable with paths the app never validated. Those
+  two facts compound.
+
+---
+
+**Scope of this pass.** 10 of the 21 audit reports. No executive summary is added or amended: the
+summary in section 1 predates these findings, and a later pass should reconcile it.
