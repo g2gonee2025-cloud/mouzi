@@ -49,6 +49,7 @@ impl FolderWatcher {
         let pending = self.pending.clone();
         let handle = app_handle.clone();
         let pending_open_folder = self.pending_open_folder.clone();
+        let ignored_files = self.ignored_files.clone();
 
         // Spawn a thread that processes pending files after a delay
         let handle_thread = std::thread::spawn(move || {
@@ -65,6 +66,16 @@ impl FolderWatcher {
                     guard.retain(|p| now < p.scheduled);
                     ready.into_iter().map(|p| p.path).collect()
                 };
+
+                // Expired entries used to be dropped only when an event happened
+                // to arrive for that exact path after the window closed. An undo
+                // produces a single event inside the window, so those entries
+                // were never revisited and the map grew for the life of the app.
+                {
+                    let mut ignored = ignored_files.lock().unwrap();
+                    let horizon = Duration::from_secs(IGNORE_DURATION_SECS);
+                    ignored.retain(|_, instant| now.duration_since(*instant) < horizon);
+                }
 
                 let mut organized_count = 0;
                 let mut last_file_name = String::new();
