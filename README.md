@@ -106,12 +106,12 @@ Runs against the inventory, and each action is recorded:
 
 | Action | Effect |
 |--------|--------|
-| `trash_duplicate` | Sends duplicate files to the Recycle Bin |
-| `trash_large` | Sends large files to the Recycle Bin |
-| `trash_stale` | Sends stale files to the Recycle Bin |
+| `trash_duplicate` | Moves duplicate files to the Recycle Bin, where Windows can accept them |
+| `trash_large` | Moves large files to the Recycle Bin, where Windows can accept them |
+| `trash_stale` | Moves stale files to the Recycle Bin, where Windows can accept them |
 | `remove_empty_dir` | Removes directories left empty once files are gone |
 
-Deletions go through the `trash` crate (`src-tauri/src/safe_fs.rs:186`), so on Windows they land in the Recycle Bin rather than being removed permanently. Empty-directory removals are not undoable, because trash deletions are not logged for restore (`src-tauri/src/cleanup.rs:385`).
+Deletions go through the `trash` crate (`src-tauri/src/safe_fs.rs:186`), so on Windows they go to the Recycle Bin and you can put them back - but only while the Recycle Bin can accept the item. If the bin is full, the item is too large, or the folder is on a network drive, Windows deletes it permanently instead, and Mouzi is not told. Empty-directory removals are not undoable, because trash deletions are not logged for restore (`src-tauri/src/cleanup.rs:385`).
 
 ### Google Takeout import
 - Imports `.zip`, `.tgz`, and `.tar.gz` archives
@@ -422,7 +422,7 @@ Use History and Undo. Undo works from the action log, so do not clear history fi
 
 **A deletion went to the wrong place**
 
-Cleanup uses the Recycle Bin on Windows, so the file should be recoverable from it. Empty-directory removals are the exception: they are removed outright and are not undoable.
+Cleanup uses the Recycle Bin on Windows, so the file should be recoverable from it - unless Windows could not accept the item, in which case it was removed permanently and nothing in Mouzi records that. Empty-directory removals are the exception: they are removed outright and are not undoable.
 
 **The popup does not appear when I click the tray icon**
 
