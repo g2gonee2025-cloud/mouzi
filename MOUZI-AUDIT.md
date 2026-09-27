@@ -1676,3 +1676,191 @@ repetition.
 **Scope of this pass.** 3 of the 21 audit reports, 13 of 21 absorbed in total. No executive summary is
 added or amended: the summary in section 1 predates all seven addenda, and a reconciliation pass
 should reconcile it.
+
+---
+
+## 14. Addendum - ninth pass: fork hygiene, and the main-thread surface
+
+The fork-hygiene report. Its most consequential claim was checked directly rather than accepted, and
+checking it made the finding substantially worse than reported. Two findings in this section were
+verified by the orchestrator with a script over the source, not read from a report.
+
+### 14.1 CRITICAL C11 - the fork has no remote of its own, so `git push` targets the public upstream
+
+**Verified directly.** `git remote -v` reports a single remote:
+
+```
+origin  https://github.com/hsr88/mouzi.git (fetch)
+origin  https://github.com/hsr88/mouzi.git (push)
+```
+
+`git remote get-url --push origin` returns `https://github.com/hsr88/mouzi.git`. There is no
+`origin`/`upstream` split. The correct configuration for a fork is `origin` pointing at the forker's
+own repository and `upstream` pointing at `hsr88/mouzi`; here the only remote is the 828-star upstream
+project, which this fork's author does not own, and it is configured as the **push** target.
+
+At the time of writing there are **5 commits on `wip/workspace-window` that the upstream does not
+have** (the 14 elevate commits, one work-in-progress commit, and four audit-document commits), plus
+a 16.5 MB offline bundle in the temp directory. All of it is local-only right now, which is the
+correct state. The hazard is that `git push` with no arguments is the single most ordinary git
+command, it is what any reasonable person runs first when they want to back work up, and in this
+repository it resolves to writing to a stranger's repository. GitHub would reject it, so the
+realistic outcome is a confusing failure rather than damage - but the failure mode depends on whose
+credentials happen to be configured, and the correct fix is one command.
+
+Plan D1 required fork hygiene as part of the personal-use quality bar. Attribution, licensing, the
+app identifier and the fork notice are all in place (14.8). The remote configuration is the one
+piece of D1 that is load-bearing and absent.
+
+**Fix:** create the fork's own repository, then `git remote rename origin upstream` and add
+`origin` pointing at it. Do this before any further work, not after.
+
+### 14.2 CRITICAL C12 - all 50 commands are synchronous, so the entire IPC surface runs on the main thread
+
+The source report flagged four slow commands. **I enumerated all 50 `#[tauri::command]` declarations
+in `commands.rs` and every one is `pub fn`, not `pub async fn`. There is no
+`#[tauri::command(async)]` attribute anywhere in the crate.** Per Tauri's own v2 documentation, a
+command declared without `async` is executed on the main thread unless explicitly marked
+`#[tauri::command(async)]`.
+
+The consequence is therefore not "four slow commands". It is that **every command the frontend can
+invoke executes on the thread that owns the window, the tray, and the watcher.** The full list, as
+enumerated:
+
+```
+get_system_language  get_rules_cmd  add_rule_cmd  update_rule_cmd  delete_rule_cmd
+get_folders_cmd  add_folder_cmd  remove_folder_cmd  update_folder_mode_cmd  get_logs_cmd
+get_stats_cmd  undo_action_cmd  undo_all_cmd  get_cleanup_logs_cmd  get_version_cmd
+get_settings_cmd  update_settings_cmd  clear_logs_cmd  scan_folder_cmd  import_archive_cmd
+open_folder_cmd  get_downloads_folder  initialize_defaults_cmd  close_popup  close_settings
+show_notification  enable_autostart_cmd  disable_autostart_cmd  is_autostart_enabled_cmd
+load_mouziignore_cmd  save_mouziignore_cmd  get_pending_open_folder_cmd  show_popup_cmd
+get_pending_files_cmd  refresh_watcher_cmd  get_schedule_cmd  update_schedule_cmd
+export_rules_cmd  import_rules_cmd  start_scan_cmd  is_scanning_cmd
+get_dashboard_stats_cmd  get_inventory_files_cmd  find_duplicates_cmd  find_large_files_cmd
+find_stale_files_cmd  find_empty_dirs_cmd  execute_cleanup_cmd  get_suggestions_cmd
+dismiss_suggestion_cmd  accept_suggestion_cmd
+```
+
+The ones that matter most are not the four the report named:
+
+- `execute_cleanup_cmd` - performs real file moves, and it is the command the entire safety argument
+  in sections 2 and 11 depends on.
+- `get_dashboard_stats_cmd` - 11 SQL statements over a 1M-row inventory.
+- `import_archive_cmd` - extracts an archive, writing files to disk.
+- `accept_suggestion_cmd` - moves a file into a new directory.
+- `find_duplicates_cmd` - hashes file contents.
+- `undo_all_cmd` - moves N files back, holding the global database mutex across the whole batch.
+
+There are exactly **four `thread::spawn` sites in the entire crate**, and only **one** of them is
+inside a command: `start_scan_cmd` at `commands.rs:543`. The other three are the watcher
+(`watcher.rs:54`, `watcher.rs:146`) and the scheduler (`scheduler.rs:36`), all long-lived by design.
+So the scanner is the only operation in the application that was given a thread, and every other
+operation shares the main one.
+
+This refines and widens the earlier D6 finding. D6 was recorded as "the Ollama path blocks the main
+thread for up to 75 seconds", which is true and was the correct finding at the time. The wider
+statement is that the application has no off-main-thread command path at all, so *every* slow
+operation degrades the UI rather than just the AI one. Confidence: high on the enumeration, which
+is mechanical; high on the consequence, which follows from Tauri's documented behaviour.
+
+### 14.3 HIGH H29 - two inherited release workflows would publish the fork's binaries under the upstream's product name and app id
+
+`tauri.conf.json` sets `productName: "Mouzi"` and `identifier: "cc.mouzi.app"`, and `package.json`
+carries `version: "0.1.6"`, all inherited from upstream. Five GitHub workflows are inherited
+byte-identical, and **two of them are tag-triggered signing and release workflows** that reference
+`secrets.SIGNPATH_API_TOKEN` and build a `releaseName` of `Mouzi ${{ github.ref_name }} (macOS test)`.
+
+While `origin` is the upstream (C11) and no tag is ever pushed here, these workflows are dead code.
+The moment a tag is pushed, a fork user's Windows build is published under the upstream's product
+name and application identifier, signed with a certificate they do not hold. Plan D1 explicitly
+excluded installer signing and store distribution; these workflows are the exact thing D1 ruled out,
+inherited unchanged. The honest reading is that D1's exclusion was honoured in the code and not in
+the automation.
+
+### 14.4 HIGH H30 - SECURITY.md reports vulnerabilities to the upstream and promises a release policy the fork does not have
+
+`SECURITY.md` is byte-identical to upstream, including its instruction to report privately through
+`hsr88/mouzi`'s security advisories. The fork adds a large new file-touching attack surface that
+the upstream policy does not contemplate: archive extraction and its zip-slip defences, file moves
+and cross-device copies, Recycle Bin integration with the silent-permanent-delete behaviour recorded
+in C4, and direct SQLite writes driven by frontend-supplied paths (C2). Reporting any of those to
+the upstream maintainer is both wrong and, in practice, a disclosure to a third party.
+
+`SECURITY.md:7` also states that updates are provided for the latest released version. That is false
+for the fork: plan D1 forbids an updater, no fork release exists, and the version was never bumped
+(C9).
+
+### 14.5 HIGH H31 - plan D3 is a full non-implementation, and C3 is a symptom rather than a defect
+
+Recorded as a refinement of an earlier finding. Plan D3 mandated a new 1024x768 window labelled
+`dashboard`. The shipped application has **one** runtime window, labelled `app`, sized 1100x820,
+built at `tray.rs:178-186`; the dashboard, cleanup, suggestions and settings surfaces are hash
+routes inside it. Meanwhile `capabilities/default.json:5` still lists `dashboard`, `cleanup` and
+`suggestions` as window labels, and **none of those labels ever exists at runtime**.
+
+This means C3 - the missing `"app"` entry that breaks the Tauri capability ACL - is better
+described as a *symptom* of an abandoned window model than as a one-line omission. The capability
+file describes a design that was dropped; the ACL breaks because the file and the code disagree
+about what a window is. Fixing the one line restores the dialog permissions, but the deeper issue
+is that a plan decision was abandoned without the surrounding configuration being updated.
+
+### 14.6 MEDIUM M40 - the plan's six mandated test categories, and its baseline count is wrong
+
+| # | Category | Status |
+|---|---|---|
+| 1 | classifier pure functions | **PRESENT** - 19 tests, `classify.rs:688-804` |
+| 2 | dedup size-prefilter and cache invalidation | **PRESENT** - `cleanup.rs:439,537,589` |
+| 3 | undo move-back fixtures | **PARTIAL** - collision `safe_fs.rs:141` and missing-parent `safe_fs.rs:180` are covered; the cross-device branch at `safe_fs.rs:80-82` is not, because `safe_fs.rs:199` calls `copy_delete_fallback` directly and never reaches the detection (H19) |
+| 4 | migration idempotency (`init_db` twice) | **ABSENT, and structurally impossible to write as specified** - `init_test_db` guards on `if DB.get().is_none()`, so the second call is a no-op and the assertion the plan describes cannot be made |
+| 5 | trash to the Recycle Bin on temp files | **PRESENT BUT VACUOUS** - `safe_fs.rs:232` swallows its `Err` branch, so the test passes whether or not the trash path works |
+| 6 | Ollama-absent behaviour via a mock provider | **ABSENT** - no mock provider exists anywhere in the crate, so `detect_provider` is never exercised (H20) |
+
+Two of six are absent and a third is vacuous. The plan also records the upstream baseline as 6 tests;
+the actual count at the merge-base commit `c4eac33` is **11**. The plan's own baseline number is
+wrong in the conservative direction, which is worth recording so nobody "corrects" a real regression
+back to a plan figure.
+
+### 14.7 LOW
+
+- **`FUNDING.yml` still routes to the upstream author's ko-fi.** Defensible, since taking someone's
+  donations for your own fork would be worse, but it means the fork's README carries a donation link
+  to a stranger. Low, and no change is recommended.
+- **No `git` branch protection and no remote means no backup beyond the local bundle.** Covered by
+  C11 rather than repeated here.
+
+### 14.8 Recorded as sound, so the counts above are not inflated
+
+- `LICENSE.md`, `CODE_OF_CONDUCT.md`, `SECURITY.md` and `CONTRIBUTING.md` are **byte-identical to
+  upstream**. For an MIT fork that is correct: the licence must not be edited, and the code of
+  conduct and contributing guide are upstream's to maintain. The MIT notice is intact and the fork
+  notice is prominent at `README.md:3`, crediting upstream, stating MIT, and identifying the work as
+  a personal fork.
+- The application identifier `cc.mouzi.app` is preserved (`tauri.conf.json:5`), satisfying D1's
+  explicit requirement to keep it.
+- All four new Rust modules - `scan.rs`, `cleanup.rs`, `safe_fs.rs`, `classify.rs` - are free of
+  Tauri dependencies, satisfying plan section 6. They are testable in isolation, which is why 57 of
+  the tests exist at all.
+- `useDashboardStore` imports only the `WatchedFolder` *type* from `useAppStore`, a type-only import
+  that is erased at compile time. M2's "dashboard state stays local" mandate is honoured in substance
+  even though a global store still exists.
+- All ten locales carry the dashboard, cleanup and suggestions keys, satisfying M5.
+- The `scan-progress` and `scan-complete` event listeners exist, satisfying M2's notification
+  requirement, and the scanner's `PROGRESS_EVERY` emission rate is not a storm (H11 in section 11
+  already measured this).
+
+### 14.9 What this section changes about the earlier conclusions
+
+- **C3 is reclassified** from "a missing string in a JSON file" to "an abandoned window model that
+  left its configuration behind" (14.5). The one-line fix is still correct; the framing is not.
+- **The D6 finding is widened** from one blocking command to the whole IPC surface (14.2). Any
+  estimate of UI responsiveness that assumed a command off the main thread was wrong.
+- **Two new Criticals are added that no earlier section covered:** the push target (14.1) and the
+  main-thread surface (14.2). C11 is the more urgent of the two in practice, because it is a live
+  misconfiguration rather than a latent defect, and it is fixed by one command.
+
+---
+
+**Scope of this pass.** 1 of the 21 audit reports, 14 of 21 absorbed in total, plus two findings
+verified directly by the orchestrator. Section 1's executive summary now predates eight addenda and
+should be reconciled against them.
