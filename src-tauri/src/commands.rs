@@ -56,7 +56,21 @@ pub fn get_folders_cmd() -> Result<Vec<WatchedFolder>, String> {
 
 #[tauri::command]
 pub fn add_folder_cmd(app: tauri::AppHandle, path: String, mode: String) -> Result<i64, String> {
-    let _ = std::fs::create_dir_all(&path);
+    if !is_valid_folder_mode(&mode) {
+        return Err(format!("Invalid folder mode: {}", mode));
+    }
+    let folder = std::path::Path::new(&path);
+    if !folder.is_absolute() {
+        return Err(format!("Path must be absolute: {}", path));
+    }
+    // A drive or filesystem root has no parent. Watching one would make the
+    // scanner walk the entire volume, which the design rules out.
+    if folder.parent().is_none() {
+        return Err(format!("Refusing to watch a whole drive: {}", path));
+    }
+    if !folder.is_dir() {
+        return Err(format!("Not an existing folder: {}", path));
+    }
     let id = add_watched_folder(&path, &mode).map_err(|e| e.to_string())?;
     if let Some(state) = app.try_state::<crate::AppState>() {
         let mut watcher = state.watcher.lock().unwrap();
