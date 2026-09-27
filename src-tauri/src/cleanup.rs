@@ -51,6 +51,41 @@ pub struct CleanupOutcome {
     pub message: Option<String>,
 }
 
+const PERMANENTLY_DELETED_MESSAGE: &str = "Deleted permanently — Windows did not put this in the \
+                                         Recycle Bin, so it cannot be restored";
+const UNVERIFIED_MESSAGE: &str = "The Recycle Bin could not be read to confirm this one, so \
+                                  whether it can be undone is unknown";
+
+impl CleanupOutcome {
+    /// Fold an observed Recycle Bin verdict into this outcome.
+    ///
+    /// `status` stays inside the three values `src/utils/cleanup.ts` declares as
+    /// a closed union, because `ResultsPanel` counts and colours on exactly
+    /// "ok" | "failed" | "skipped"; a fourth value would be counted in no bucket
+    /// and drawn as "skipped". The two cases that matter therefore travel in
+    /// `message`, which the panel does render under every status.
+    fn apply_trash_verdict(&mut self, verdict: safe_fs::TrashVerdict) {
+        match verdict {
+            safe_fs::TrashVerdict::InRecycleBin => {}
+            safe_fs::TrashVerdict::PermanentlyDeleted => {
+                // Counted as failed rather than ok. "ok" is what the user reads
+                // as recoverable, and this file is not recoverable; under-counting
+                // successes is the safe direction for a data-loss report.
+                self.status = "failed".to_string();
+                self.message = Some(PERMANENTLY_DELETED_MESSAGE.to_string());
+            }
+            safe_fs::TrashVerdict::Unverified => {
+                // Left as ok, with the caveat spelled out. The call succeeded and
+                // there is no evidence it did not; reporting a missing reading as
+                // a failure would cry wolf on a cleanup that in all likelihood
+                // worked. The un-recoverable case above is the one that must
+                // never be counted as a success.
+                self.message = Some(UNVERIFIED_MESSAGE.to_string());
+            }
+        }
+    }
+}
+
 /// Re-export the DB LargestFile type so callers don't need to import db.
 pub use db::LargestFile as CleanupFile;
 
@@ -304,7 +339,24 @@ pub fn find_empty_dirs() -> Result<Vec<String>, String> {
 // Cleanup execution
 // ---------------------------------------------------------------------------
 
-fn execute_one(action: &CleanupRequest) -> CleanupOutcome {
+/// The action kinds whose payload ends up in the Recycle Bin, and so whose
+/// outcome the bin snapshot gets a vote on. Must list every kind `execute_one`
+/// trashes: a kind missing here gets no snapshot and every file in its batch is
+/// reported unverified.
+fn is_trash_kind(kind: &str) -> bool {
+    matches!(kind, "trash_duplicate" | "trash_large" | "trash_stale")
+}
+
+/// One action's result, plus whether the Recycle Bin has to arbitrate it.
+struct ExecutedOne {
+    outcome: CleanupOutcome,
+    /// True only when `trash::delete` returned `Ok`. Its unit return value says
+    /// nothing about whether Windows used the bin, so these are exactly the
+    /// items a before/after snapshot has to rule on.
+    trash_call_succeeded: bool,
+}
+
+fn execute_one(action: &CleanupRequest) -> ExecutedOne {
     let path = &action.path;
     let path_obj = Path::new(path);
 
@@ -313,67 +365,94 @@ fn execute_one(action: &CleanupRequest) -> CleanupOutcome {
             // Guard: if this file is marked as the keeper, skip it.
             if let Some(ref keep) = action.keep_path {
                 if keep == path {
-                    return CleanupOutcome {
-                        path: path.clone(),
-                        status: "skipped".to_string(),
-                        message: Some("Kept file".to_string()),
+                    return ExecutedOne {
+                        outcome: CleanupOutcome {
+                            path: path.clone(),
+                            status: "skipped".to_string(),
+                            message: Some("Kept file".to_string()),
+                        },
+                        trash_call_succeeded: false,
                     };
                 }
             }
             if !path_obj.exists() {
-                return CleanupOutcome {
-                    path: path.clone(),
-                    status: "skipped".to_string(),
-                    message: Some("File not found".to_string()),
+                return ExecutedOne {
+                    outcome: CleanupOutcome {
+                        path: path.clone(),
+                        status: "skipped".to_string(),
+                        message: Some("File not found".to_string()),
+                    },
+                    trash_call_succeeded: false,
                 };
             }
-            match safe_fs::delete_to_trash(path_obj) {
-                Ok(()) => CleanupOutcome {
-                    path: path.clone(),
-                    status: "ok".to_string(),
-                    message: None,
+            return match safe_fs::delete_to_trash(path_obj) {
+                Ok(()) => ExecutedOne {
+                    outcome: CleanupOutcome {
+                        path: path.clone(),
+                        status: "ok".to_string(),
+                        message: None,
+                    },
+                    trash_call_succeeded: true,
                 },
-                Err(e) => CleanupOutcome {
-                    path: path.clone(),
-                    status: "failed".to_string(),
-                    message: Some(e),
+                Err(e) => ExecutedOne {
+                    outcome: CleanupOutcome {
+                        path: path.clone(),
+                        status: "failed".to_string(),
+                        message: Some(e),
+                    },
+                    trash_call_succeeded: false,
                 },
-            }
+            };
         }
         "remove_empty_dir" => {
             if !path_obj.exists() {
-                return CleanupOutcome {
-                    path: path.clone(),
-                    status: "skipped".to_string(),
-                    message: Some("Directory not found".to_string()),
+                return ExecutedOne {
+                    outcome: CleanupOutcome {
+                        path: path.clone(),
+                        status: "skipped".to_string(),
+                        message: Some("Directory not found".to_string()),
+                    },
+                    trash_call_succeeded: false,
                 };
             }
             // Recheck: the dir must still be empty (no files at any depth).
             let (has_files, _) = walk_empty_dirs(path_obj);
             if has_files {
-                return CleanupOutcome {
-                    path: path.clone(),
-                    status: "skipped".to_string(),
-                    message: Some("Directory not empty".to_string()),
+                return ExecutedOne {
+                    outcome: CleanupOutcome {
+                        path: path.clone(),
+                        status: "skipped".to_string(),
+                        message: Some("Directory not empty".to_string()),
+                    },
+                    trash_call_succeeded: false,
                 };
             }
-            match fs::remove_dir(path_obj) {
-                Ok(()) => CleanupOutcome {
-                    path: path.clone(),
-                    status: "ok".to_string(),
-                    message: None,
+            return match fs::remove_dir(path_obj) {
+                Ok(()) => ExecutedOne {
+                    outcome: CleanupOutcome {
+                        path: path.clone(),
+                        status: "ok".to_string(),
+                        message: None,
+                    },
+                    trash_call_succeeded: false,
                 },
-                Err(e) => CleanupOutcome {
-                    path: path.clone(),
-                    status: "failed".to_string(),
-                    message: Some(format!("Failed to remove directory: {}", e)),
+                Err(e) => ExecutedOne {
+                    outcome: CleanupOutcome {
+                        path: path.clone(),
+                        status: "failed".to_string(),
+                        message: Some(format!("Failed to remove directory: {}", e)),
+                    },
+                    trash_call_succeeded: false,
                 },
-            }
+            };
         }
-        other => CleanupOutcome {
-            path: path.clone(),
-            status: "failed".to_string(),
-            message: Some(format!("Unknown cleanup action kind: {}", other)),
+        other => ExecutedOne {
+            outcome: CleanupOutcome {
+                path: path.clone(),
+                status: "failed".to_string(),
+                message: Some(format!("Unknown cleanup action kind: {}", other)),
+            },
+            trash_call_succeeded: false,
         },
     }
 }
@@ -391,21 +470,64 @@ pub fn execute_cleanup(actions: &[CleanupRequest]) -> Vec<CleanupOutcome> {
         .map(|folder| PathBuf::from(folder.path))
         .collect();
 
-    let mut outcomes = Vec::with_capacity(actions.len());
-    for action in actions {
+    // One reading either side of the whole batch, never one per file: listing
+    // the bin walks every trashed item on the machine, so a per-file reading
+    // makes a large cleanup quadratic. A batch with no trash action in it never
+    // touches the bin at all.
+    let before = if actions.iter().any(|a| is_trash_kind(&a.kind)) {
+        Some(safe_fs::trash_snapshot())
+    } else {
+        None
+    };
+
+    let mut results = Vec::with_capacity(actions.len());
+    // Indices into `results` whose `trash::delete` call succeeded, so the bin
+    // still has to say whether the file is recoverable.
+    let mut awaiting_verdict: Vec<usize> = Vec::new();
+    for (index, action) in actions.iter().enumerate() {
         // Nothing outside a watched folder may be destroyed. These paths arrive
         // from the frontend, and app-defined commands are callable from every
         // window, so without this check the command can name any path on the
         // machine. An empty or unreadable folder list authorises nothing.
-        let outcome = if safe_fs::is_within_any_root(Path::new(&action.path), &roots) {
+        let executed = if safe_fs::is_within_any_root(Path::new(&action.path), &roots) {
             execute_one(action)
         } else {
-            CleanupOutcome {
-                path: action.path.clone(),
-                status: "skipped".to_string(),
-                message: Some("Outside every watched folder".to_string()),
+            ExecutedOne {
+                outcome: CleanupOutcome {
+                    path: action.path.clone(),
+                    status: "skipped".to_string(),
+                    message: Some("Outside every watched folder".to_string()),
+                },
+                trash_call_succeeded: false,
             }
         };
+        if executed.trash_call_succeeded {
+            awaiting_verdict.push(index);
+        }
+        results.push(executed.outcome);
+    }
+
+    match before {
+        Some(before) if !awaiting_verdict.is_empty() => {
+            let after = safe_fs::trash_snapshot();
+            let attempted: Vec<PathBuf> = awaiting_verdict
+                .iter()
+                .map(|&i| PathBuf::from(&actions[i].path))
+                .collect();
+            for (position, verdict) in awaiting_verdict
+                .iter()
+                .zip(safe_fs::classify_trash_outcomes(&before, &after, &attempted))
+            {
+                results[*position].apply_trash_verdict(verdict);
+            }
+        }
+        _ => {}
+    }
+
+    // The audit rows are written only once the verdict is known, so a file that
+    // Windows deleted permanently is not recorded in the history as a success.
+    let mut outcomes = Vec::with_capacity(results.len());
+    for (action, outcome) in actions.iter().zip(results) {
         let undoable = false;
         let _ = db::insert_cleanup_action(&db::CleanupAction {
             id: None,
@@ -796,5 +918,64 @@ mod tests {
 
         db::clear_inventory_for_root(&root_str).unwrap();
         fs::remove_dir_all(&root).ok();
+    }
+
+    // ── Recycle Bin verdict → outcome mapping ──────────────────
+    //
+    // Pure: no DB, no filesystem, so these cannot interfere with the shared
+    // test database the other modules in this crate share.
+
+    fn outcome_with_verdict(verdict: safe_fs::TrashVerdict) -> CleanupOutcome {
+        let mut outcome = CleanupOutcome {
+            path: "C:/Users/Me/victim.txt".to_string(),
+            status: "ok".to_string(),
+            message: None,
+        };
+        outcome.apply_trash_verdict(verdict);
+        outcome
+    }
+
+    /// The invariant the frontend depends on: only these three values exist, so
+    /// every result is counted in exactly one `ResultsPanel` bucket.
+    fn assert_status_is_in_the_frontend_vocabulary(outcome: &CleanupOutcome) {
+        assert!(
+            matches!(outcome.status.as_str(), "ok" | "failed" | "skipped"),
+            "status {:?} is outside the union declared in src/utils/cleanup.ts",
+            outcome.status
+        );
+    }
+
+    #[test]
+    fn a_file_found_in_the_bin_stays_a_plain_success() {
+        let outcome = outcome_with_verdict(safe_fs::TrashVerdict::InRecycleBin);
+        assert_status_is_in_the_frontend_vocabulary(&outcome);
+        assert_eq!(outcome.status, "ok");
+        assert_eq!(outcome.message, None);
+    }
+
+    /// The defect: this file is gone forever, so it must not be counted as a
+    /// success anywhere the frontend reads status.
+    #[test]
+    fn a_permanently_deleted_file_is_never_reported_as_ok() {
+        let outcome = outcome_with_verdict(safe_fs::TrashVerdict::PermanentlyDeleted);
+        assert_status_is_in_the_frontend_vocabulary(&outcome);
+        assert_eq!(outcome.status, "failed");
+        assert_eq!(outcome.message.as_deref(), Some(PERMANENTLY_DELETED_MESSAGE));
+    }
+
+    #[test]
+    fn an_unverified_file_keeps_its_success_but_carries_the_caveat() {
+        let outcome = outcome_with_verdict(safe_fs::TrashVerdict::Unverified);
+        assert_status_is_in_the_frontend_vocabulary(&outcome);
+        assert_eq!(outcome.status, "ok");
+        assert_eq!(outcome.message.as_deref(), Some(UNVERIFIED_MESSAGE));
+    }
+
+    #[test]
+    fn every_trash_kind_is_covered_by_the_snapshot_gate() {
+        for kind in ["trash_duplicate", "trash_large", "trash_stale"] {
+            assert!(is_trash_kind(kind), "{} must take a bin reading", kind);
+        }
+        assert!(!is_trash_kind("remove_empty_dir"));
     }
 }
