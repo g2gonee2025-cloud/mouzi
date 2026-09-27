@@ -4,7 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { FolderOpen } from "lucide-react";
 import { formatBytes } from "../../utils/format";
 import { fileName } from "../../utils/paths";
-import { percentOf } from "../../utils/dashboard";
+import { formatShare, percentOf } from "../../utils/dashboard";
 
 interface StorageTreemapProps {
   data: Array<{ path: string; files: number; bytes: number }>;
@@ -64,19 +64,20 @@ export default function StorageTreemap({
                 <button
                   type="button"
                   className="flex-1 min-w-0 text-left"
+                  aria-pressed={isOn}
                   onClick={() => onSelect?.(isOn ? null : item.path)}
                   title={item.path}
                 >
                   <div className="flex items-center justify-between text-xs mb-1 gap-2">
                     <span className="text-text font-medium truncate">{label}</span>
                     <span className="text-text-muted tabular-nums shrink-0">
-                      {Math.round(pct)}% · {formatBytes(item.bytes)}
+                      {formatShare(pct)} · {formatBytes(item.bytes)}
                     </span>
                   </div>
                   <div className="h-1.5 bg-border rounded-full overflow-hidden">
                     <div
                       className="h-full rounded-full bg-primary"
-                      style={{ width: `${Math.max(pct, 1)}%` }}
+                      style={{ width: `${pct}%` }}
                     />
                   </div>
                   <div className="text-[10px] text-text-muted mt-1 truncate">
@@ -86,10 +87,11 @@ export default function StorageTreemap({
                 <button
                   type="button"
                   onClick={() => openRoot(item.path)}
-                  className="p-1 rounded text-text-muted hover:text-text hover:bg-border shrink-0"
+                  aria-label={`${t("dashboard.openFolder")}: ${label}`}
+                  className="inline-flex items-center justify-center w-6 h-6 rounded text-text-muted hover:text-text hover:bg-border shrink-0 focus-visible:outline-2 focus-visible:outline-primary focus-visible:outline-offset-1"
                   title={t("dashboard.openFolder")}
                 >
-                  <FolderOpen size={13} />
+                  <FolderOpen size={13} aria-hidden="true" />
                 </button>
               </div>
             </div>

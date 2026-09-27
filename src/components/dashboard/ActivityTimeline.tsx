@@ -1,6 +1,6 @@
 import { useMemo } from "react";
 import { useTranslation } from "react-i18next";
-import { categoryColor } from "../../utils/dashboard";
+import { categoryClass, percentOf } from "../../utils/dashboard";
 
 interface ActivityTimelineProps {
   data: Array<{ file_type: string; count: number }>;
@@ -30,7 +30,7 @@ export default function ActivityTimeline({ data }: ActivityTimelineProps) {
       <h3 className="text-sm font-semibold text-text mb-3">{t("dashboard.organizedThisWeek")}</h3>
       <div className="space-y-2">
         {data.map((item) => {
-          const pct = (item.count / maxCount) * 100;
+          const pct = percentOf(item.count, maxCount);
           return (
             <div key={item.file_type}>
               <div className="flex items-center justify-between text-xs mb-1">
@@ -41,11 +41,8 @@ export default function ActivityTimeline({ data }: ActivityTimelineProps) {
               </div>
               <div className="h-1.5 bg-border rounded-full overflow-hidden">
                 <div
-                  className="h-full rounded-full"
-                  style={{
-                    width: `${Math.max(pct, 4)}%`,
-                    backgroundColor: categoryColor(item.file_type),
-                  }}
+                  className={`h-full rounded-full ${categoryClass(item.file_type)}`}
+                  style={{ width: `${pct}%` }}
                 />
               </div>
             </div>

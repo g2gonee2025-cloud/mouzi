@@ -1,4 +1,4 @@
-import { useState, useCallback } from "react";
+import { useState, useCallback, useMemo } from "react";
 import { useTranslation } from "react-i18next";
 import { useCleanupStore } from "../../store/useCleanupStore";
 import { formatBytes, formatTimestamp } from "../../utils/format";
@@ -6,6 +6,7 @@ import type { CleanupFile, CleanupRequest } from "../../utils/cleanup";
 import { Search, Trash2, ExternalLink } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import ResultsPanel from "./ResultsPanel";
+import ConfirmDialog, { type ConfirmRequest } from "./ConfirmDialog";
 
 interface FileListTabProps {
   kind: "large" | "stale";
@@ -17,6 +18,8 @@ interface FileListTabProps {
   hint: string;
   /** Translation key for the empty state. */
   emptyKey: string;
+  /** Operation name shown as the dialog title and confirm-button label. */
+  operationKey: string;
 }
 
 export default function FileListTab({
@@ -25,15 +28,26 @@ export default function FileListTab({
   findLabel,
   hint,
   emptyKey,
+  operationKey,
 }: FileListTabProps) {
   const { t } = useTranslation();
   const store = useCleanupStore();
   const [threshold, setThreshold] = useState(defaultThreshold);
   const [checked, setChecked] = useState<Set<string>>(new Set());
   const [showResults, setShowResults] = useState(false);
+  const [pending, setPending] = useState<ConfirmRequest | null>(null);
 
   const data: CleanupFile[] | null =
     kind === "large" ? store.largeFiles : store.staleFiles;
+
+  const checkedFiles = useMemo(
+    () => (data ?? []).filter((f) => checked.has(f.path)),
+    [data, checked],
+  );
+  const checkedBytes = useMemo(
+    () => checkedFiles.reduce((sum, f) => sum + f.size, 0),
+    [checkedFiles],
+  );
 
   const handleFind = () => {
     if (kind === "large") {
@@ -64,13 +78,25 @@ export default function FileListTab({
     }
   }, [data, checked]);
 
-  const handleConfirm = async () => {
+  const runCleanup = async () => {
     const actions: CleanupRequest[] = Array.from(checked).map((path) => ({
       kind: kind === "large" ? "trash_large" : "trash_stale",
       path,
     }));
     await store.executeCleanup(actions);
     setShowResults(true);
+  };
+
+  const handleConfirm = () => {
+    if (checked.size === 0) return;
+    setPending({
+      title: t(operationKey),
+      count: checkedFiles.length,
+      bytes: checkedBytes,
+      notice: "trash",
+      preview: checkedFiles.map((f) => f.path),
+      onConfirm: runCleanup,
+    });
   };
 
   const handleResultsDone = () => {
@@ -208,6 +234,10 @@ export default function FileListTab({
             </div>
           </div>
         </>
+      )}
+
+      {pending && (
+        <ConfirmDialog {...pending} onClose={() => setPending(null)} />
       )}
     </div>
   );

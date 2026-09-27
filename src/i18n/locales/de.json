@@ -254,5 +254,50 @@
     "missing": "Datei existiert nicht mehr",
     "resultsTitle": "Ergebnisse",
     "backToList": "Zurück zur Liste"
+  },
+  "confirm": {
+    "impactItems": "{{count}} Element",
+    "impactItems_one": "{{count}} Element",
+    "impactItems_other": "{{count}} Elemente",
+    "impactAtLeast": "Mindestens {{count}} Element",
+    "impactAtLeast_one": "Mindestens {{count}} Element",
+    "impactAtLeast_other": "Mindestens {{count}} Elemente",
+    "more": "+{{count}} weitere",
+    "more_one": "+{{count}} weitere",
+    "more_other": "+{{count}} weitere",
+    "impactBytes": "Gesamtgröße: {{size}}",
+    "bytesUnknown": "Die genaue Gesamtgröße ist erst nach dem Start des Laufs bekannt.",
+    "trashNotice": "Entfernte Dateien landen im Papierkorb und lassen sich zurückholen – aber nur, solange der Papierkorb die Datei aufnehmen kann. Ist der Papierkorb voll, ist die Datei zu groß oder liegt der Ordner auf einem Netzwerklaufwerk, löscht Windows sie endgültig, ohne Mouzi darüber zu informieren.",
+    "moveNotice": "Dateien werden verschoben, nicht gelöscht, es geht also nichts verloren. Du kannst es im Verlauf rückgängig machen – solange der Verlauf nicht gelöscht wurde.",
+    "permanentNotice": "Das lässt sich nicht rückgängig machen. Es gibt keine Kopie im Papierkorb und keine Möglichkeit, die Datei wiederherzustellen.",
+    "typedPrompt": "Gib {{word}} ein, um zu bestätigen.",
+    "typedMismatch": "Das stimmt nicht überein.",
+    "working": "Wird ausgeführt…",
+    "failed": "Das hat nicht geklappt: {{error}}",
+    "word": "LÖSCHEN",
+    "op": {
+      "cleanNow": "Dateien jetzt verschieben",
+      "acceptAll": "Alle Vorschläge annehmen",
+      "undoAll": "Alle Aktionen rückgängig machen",
+      "clearHistory": "Verlauf löschen",
+      "removeFolder": "Ordner nicht mehr beobachten",
+      "deleteRule": "Diese Regel löschen",
+      "trashDuplicates": "Doppelte Kopien löschen",
+      "trashLarge": "Große Dateien löschen",
+      "trashStale": "Veraltete Dateien löschen",
+      "removeEmptyDirs": "Leere Ordner löschen"
+    },
+    "note": {
+      "cleanNow": "Jede Datei in den überwachten Ordnern, die auf deine Regeln passt, wird sofort verschoben – ohne die Karenzzeit abzuwarten.",
+      "removeFolder": "Mouzi beobachtet diesen Ordner nicht mehr. Bereits verschobene Dateien bleiben, wo sie sind.",
+      "deleteRule": "Künftige Dateien werden von dieser Regel nicht mehr sortiert.",
+      "undoAll": "Einträge, die bereits rückgängig gemacht wurden, werden übersprungen.",
+      "acceptAllRules": "{{count}} neue Regel wird erstellt und eingeschaltet",
+      "acceptAllRules_one": "{{count}} neue Regel wird erstellt und eingeschaltet",
+      "acceptAllRules_other": "{{count}} neue Regeln werden erstellt und eingeschaltet",
+      "clearHistory": "{{count}} Verlaufseintrag wird gelöscht, und jede Möglichkeit zum Rückgängigmachen geht mit verloren",
+      "clearHistory_one": "{{count}} Verlaufseintrag wird gelöscht, und jede Möglichkeit zum Rückgängigmachen geht mit verloren",
+      "clearHistory_other": "{{count}} Verlaufseinträge werden gelöscht, und jede Möglichkeit zum Rückgängigmachen geht mit verloren"
+    }
   }
 }

@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { fileName, parentDir, parseHash, navigateHash } from "../utils/paths";
-import { leadCategory, percentOf, categoryColor } from "../utils/dashboard";
+import { leadCategory, percentOf, categoryClass, formatShare, CATEGORY_CLASSES } from "../utils/dashboard";
 
 describe("fileName / parentDir", () => {
   it("splits Windows paths", () => {
@@ -16,6 +16,23 @@ describe("fileName / parentDir", () => {
   it("returns the path itself when there is no parent", () => {
     expect(fileName("readme")).toBe("readme");
     expect(parentDir("readme")).toBe("readme");
+  });
+
+  it("keeps the separator on a drive root so Explorer opens the root", () => {
+    expect(parentDir("C:\\photo.jpg")).toBe("C:\\");
+    expect(parentDir("D:/photo.jpg")).toBe("D:/");
+    expect(parentDir("C:\\Users\\me\\photo.jpg")).toBe("C:\\Users\\me");
+  });
+
+  it("resolves a posix root parent", () => {
+    expect(parentDir("/photo.jpg")).toBe("/");
+  });
+
+  it("ignores a trailing separator instead of returning an empty name", () => {
+    expect(fileName("C:\\Users\\me\\")).toBe("me");
+    expect(fileName("C:/Users/me/")).toBe("me");
+    expect(fileName("photos/")).toBe("photos");
+    expect(fileName("C:\\")).toBe("C:");
   });
 });
 
@@ -83,7 +100,7 @@ describe("leadCategory", () => {
   });
 });
 
-describe("percentOf / categoryColor", () => {
+describe("percentOf / categoryClass", () => {
   it("clamps percent", () => {
     expect(percentOf(0, 100)).toBe(0);
     expect(percentOf(50, 100)).toBe(50);
@@ -92,7 +109,29 @@ describe("percentOf / categoryColor", () => {
   });
 
   it("falls back to Other for unknown categories", () => {
-    expect(categoryColor("Videos")).toBe("#6b4f3a");
-    expect(categoryColor("Unknown")).toBe(categoryColor("Other"));
+    expect(categoryClass("Videos")).toBe("bg-cat-videos");
+    expect(categoryClass("Unknown")).toBe(categoryClass("Other"));
+  });
+
+  it("resolves category colours through theme utilities, not hardcoded hexes", () => {
+    for (const name of Object.keys(CATEGORY_CLASSES)) {
+      expect(categoryClass(name)).toMatch(/^bg-cat-[a-z]+$/);
+    }
+  });
+});
+
+describe("formatShare", () => {
+  it("rounds normally above the half-point", () => {
+    expect(formatShare(50)).toBe("50%");
+    expect(formatShare(99.6)).toBe("100%");
+  });
+
+  it("does not report a real share as a flat 0%", () => {
+    expect(formatShare(0.2)).toBe("<1%");
+    expect(formatShare(0.49)).toBe("<1%");
+  });
+
+  it("still reports a genuine zero as 0%", () => {
+    expect(formatShare(0)).toBe("0%");
   });
 });

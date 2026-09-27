@@ -1,0 +1,63 @@
+# Build check for this fork. Deliberately narrow:
+#   - Windows only: the only platform this fork targets.
+#   - Unsigned, no installers published, no updater, no store distribution.
+#   - No `secrets.*` reference of any kind, and read-only token permissions.
+#   - No `tags:` trigger, so a `git push --tags` can never start a release.
+#
+# Upstream (hsr88/mouzi) shipped five workflows here. Two of them signed
+# binaries through SignPath using secrets.SIGNPATH_API_TOKEN and published
+# GitHub Releases named after the upstream product ("Mouzi <tag>") when a
+# version tag was pushed. This fork keeps the upstream product name and the
+# upstream app identifier (cc.mouzi.app) while making no releases at all, so a
+# tag-triggered release would publish the upstream's product under the
+# upstream's identity. Those five workflows were deleted rather than disabled.
+# Do not reintroduce signing, publishing or release steps without an explicit
+# decision about this fork's distribution model.
+
+name: CI (Windows, unsigned)
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Typecheck and build unsigned app
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      # `tsc -b` so that tsconfig.node.json, and therefore vite.config.ts, is
+      # typechecked too. Plain `tsc` ignores project references and would
+      # leave the build config unchecked.
+      - name: Typecheck app and build config
+        run: npx tsc -b
+
+      - name: Build frontend
+        run: npx vite build
+
+      # --no-bundle builds the executable without producing installers, so
+      # nothing distributable is generated or uploaded.
+      - name: Build app executable, unsigned
+        run: npm run tauri build -- --no-bundle --ci

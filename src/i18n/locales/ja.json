@@ -254,5 +254,40 @@
     "missing": "ファイルはもう存在しません",
     "resultsTitle": "結果",
     "backToList": "リストに戻る"
+  },
+  "confirm": {
+    "impactItems": "{{count}} 件",
+    "impactAtLeast": "少なくとも {{count}} 件",
+    "more": "ほか {{count}} 件",
+    "impactBytes": "合計サイズ: {{size}}",
+    "bytesUnknown": "正確な合計は実行を開始してはじめて判明します。",
+    "trashNotice": "削除したファイルはごみ箱に入るため、元に戻せます。ただし、ごみ箱がその項目を受け入れられる場合に限ります。ごみ箱が一杯の場合、項目が大きすぎる場合、またはフォルダーがネットワークドライブ上にある場合は、Windows が恒久的に削除します。そのまま Mouzi には通知されません。",
+    "moveNotice": "ファイルは削除されるのではなく移動されるため、ディスク上のものが失われることはありません。履歴を消去するまでは、履歴から取り消せます。",
+    "permanentNotice": "この操作は取り消せません。ごみ箱に控えは残らず、復元する手段もありません。",
+    "typedPrompt": "確認するには「{{word}}」と入力してください。",
+    "typedMismatch": "一致しません。",
+    "working": "処理中…",
+    "failed": "失敗しました: {{error}}",
+    "word": "削除",
+    "op": {
+      "cleanNow": "今すぐファイルを移動",
+      "acceptAll": "すべての提案を受け入れる",
+      "undoAll": "すべての操作を元に戻す",
+      "clearHistory": "履歴を消去",
+      "removeFolder": "このフォルダーの監視を停止",
+      "deleteRule": "このルールを削除",
+      "trashDuplicates": "重複コピーを削除",
+      "trashLarge": "大きなファイルを削除",
+      "trashStale": "古いファイルを削除",
+      "removeEmptyDirs": "空のフォルダーを削除"
+    },
+    "note": {
+      "cleanNow": "監視中のフォルダーでルールに一致するファイルは、猶予期間を待たずにすぐ移動されます。",
+      "removeFolder": "Mouzi はこのフォルダーの監視を停止します。移動済みのファイルはそのまま残ります。",
+      "deleteRule": "このルールで今後のファイルが整理されなくなります。",
+      "undoAll": "すでに取り消済みの項目はスキップされます。",
+      "acceptAllRules": "{{count}} 件の新ルールが作成され、有効になります",
+      "clearHistory": "履歴 {{count}} 件が消去され、すべての取り消し機能が失われます"
+    }
   }
 }

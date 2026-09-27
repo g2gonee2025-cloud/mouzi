@@ -254,5 +254,50 @@
     "missing": "File no longer exists",
     "resultsTitle": "Results",
     "backToList": "Back to list"
+  },
+  "confirm": {
+    "impactItems": "{{count}} item",
+    "impactItems_one": "{{count}} item",
+    "impactItems_other": "{{count}} items",
+    "impactAtLeast": "At least {{count}} item",
+    "impactAtLeast_one": "At least {{count}} item",
+    "impactAtLeast_other": "At least {{count}} items",
+    "more": "+{{count}} more",
+    "more_one": "+{{count}} more",
+    "more_other": "+{{count}} more",
+    "impactBytes": "Total size: {{size}}",
+    "bytesUnknown": "The exact total is not known until the run starts.",
+    "trashNotice": "Removed files go to the Recycle Bin, so you can put them back - but only while the Recycle Bin can accept the item. If the bin is full, the item is too large, or the folder is on a network drive, Windows deletes it permanently instead, and Mouzi is not told.",
+    "moveNotice": "Files are moved, not deleted, so nothing leaves your disks. You can reverse this from History - until the history is cleared.",
+    "permanentNotice": "This cannot be undone. There is no Recycle Bin copy and no way to recover it.",
+    "typedPrompt": "Type {{word}} to confirm.",
+    "typedMismatch": "That does not match.",
+    "working": "Working…",
+    "failed": "That did not work: {{error}}",
+    "word": "DELETE",
+    "op": {
+      "cleanNow": "Move files now",
+      "acceptAll": "Accept all suggestions",
+      "undoAll": "Restore all actions",
+      "clearHistory": "Clear history",
+      "removeFolder": "Stop watching this folder",
+      "deleteRule": "Delete this rule",
+      "trashDuplicates": "Delete duplicate copies",
+      "trashLarge": "Delete large files",
+      "trashStale": "Delete stale files",
+      "removeEmptyDirs": "Delete empty folders"
+    },
+    "note": {
+      "cleanNow": "Every file in the watched folders that matches your rules is moved right now, without waiting for the grace period.",
+      "removeFolder": "Mouzi stops watching this folder. Files already moved stay where they are.",
+      "deleteRule": "Future files will no longer be sorted by this rule.",
+      "undoAll": "Entries that are already undone are skipped.",
+      "acceptAllRules": "{{count}} new rule will be created and switched on",
+      "acceptAllRules_one": "{{count}} new rule will be created and switched on",
+      "acceptAllRules_other": "{{count}} new rules will be created and switched on",
+      "clearHistory": "{{count}} history entry will be erased, and every Undo goes with it",
+      "clearHistory_one": "{{count}} history entry will be erased, and every Undo goes with it",
+      "clearHistory_other": "{{count}} history entries will be erased, and every Undo goes with it"
+    }
   }
 }

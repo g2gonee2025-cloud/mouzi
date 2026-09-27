@@ -1,9 +1,10 @@
 import { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { useAppStore, Rule, ScheduleSettings } from "../store/useAppStore";
+import { useAppStore, Rule, ScheduleSettings, WatchedFolder } from "../store/useAppStore";
 import { invoke } from "@tauri-apps/api/core";
 import { save, open } from "@tauri-apps/plugin-dialog";
 import About from "./About";
+import ConfirmDialog, { type ConfirmRequest } from "./cleanup/ConfirmDialog";
 import {
   Folder,
   FolderOpen,
@@ -141,6 +142,7 @@ export default function Settings() {
     stagingPath?: string;
   } | null>(null);
   const [isImportingArchive, setIsImportingArchive] = useState(false);
+  const [pending, setPending] = useState<ConfirmRequest | null>(null);
 
   useEffect(() => {
     loadRules();
@@ -181,6 +183,56 @@ export default function Settings() {
       await addRule(editingRule);
     }
     setEditingRule(null);
+  };
+
+  const askRemoveFolder = (folder: WatchedFolder) => {
+    if (folder.id === undefined) return;
+    setPending({
+      title: t("confirm.op.removeFolder"),
+      count: 1,
+      notice: "permanent",
+      note: t("confirm.note.removeFolder"),
+      onConfirm: () => removeFolder(folder.id!),
+    });
+  };
+
+  const askDeleteRule = (rule: Rule) => {
+    if (rule.id === undefined) return;
+    setPending({
+      title: t("confirm.op.deleteRule"),
+      count: 1,
+      notice: "permanent",
+      note: t("confirm.note.deleteRule"),
+      onConfirm: () => deleteRule(rule.id!),
+    });
+  };
+
+  const askUndoAll = () => {
+    const restorable = logs.filter((log) => !log.undone).length;
+    if (restorable === 0) return;
+    setPending({
+      title: t("confirm.op.undoAll"),
+      count: restorable,
+      notice: "move",
+      note: t("confirm.note.undoAll"),
+      onConfirm: async () => {
+        await undoAll();
+      },
+    });
+  };
+
+  // `clear_logs_cmd` is an unconditional DELETE FROM action_logs, so this takes
+  // the undo trail with it - every Undo button in the app reads from the same
+  // table. Undoing history and deleting it are not the same verb.
+  const askClearLogs = () => {
+    if (logs.length === 0) return;
+    setPending({
+      title: t("confirm.op.clearHistory"),
+      count: logs.length,
+      notice: "permanent",
+      note: t("confirm.note.clearHistory", { count: logs.length }),
+      onConfirm: () => clearLogs(),
+    });
   };
 
   const handleChangeLanguage = async (lang: string) => {
@@ -464,8 +516,9 @@ export default function Settings() {
                     </div>
                   </div>
                   <button
-                    onClick={() => f.id && removeFolder(f.id)}
+                    onClick={() => askRemoveFolder(f)}
                     className="p-1.5 rounded-md text-red-500 hover:bg-red-50 shrink-0"
+                    title={t("confirm.op.removeFolder")}
                   >
                     <Trash2 size={14} />
                   </button>
@@ -666,8 +719,9 @@ export default function Settings() {
                       <Save size={14} />
                     </button>
                     <button
-                      onClick={() => r.id && deleteRule(r.id)}
+                      onClick={() => askDeleteRule(r)}
                       className="p-1.5 rounded-md text-red-500 hover:bg-red-50"
+                      title={t("confirm.op.deleteRule")}
                     >
                       <Trash2 size={14} />
                     </button>
@@ -684,16 +738,16 @@ export default function Settings() {
               <h2 className="text-lg font-semibold">{t("settings.history.title")}</h2>
               <div className="flex items-center gap-2">
                 <button
-                  onClick={async () => { await undoAll(); }}
+                  onClick={askUndoAll}
                   disabled={logs.length === 0 || logs.every((log) => log.undone)}
                   title={logs.length === 0 || logs.every((log) => log.undone) ? t("settings.history.revertAllDisabled") : undefined}
-                  className="flex items-center gap-1.5 rounded-md border border-border px-3 py-2 text-sm text-text hover:bg-surface-dark disabled:opacity-50 disabled:cursor-not-allowed"
+                  className="flex items-center gap-1.5 rounded-md border border-amber-300 px-3 py-2 text-sm text-amber-700 hover:bg-amber-50 disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                   <RotateCcw size={14} />
                   {t("settings.history.revertAll")}
                 </button>
                 <button
-                  onClick={clearLogs}
+                  onClick={askClearLogs}
                   className="flex items-center gap-1.5 rounded-md border border-red-200 px-3 py-2 text-sm text-red-600 hover:bg-red-50"
                 >
                   <Trash2 size={14} />
@@ -976,6 +1030,10 @@ export default function Settings() {
           <About />
         )}
       </div>
+
+      {pending && (
+        <ConfirmDialog {...pending} onClose={() => setPending(null)} />
+      )}
     </div>
   );
 }

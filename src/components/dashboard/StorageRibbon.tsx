@@ -1,6 +1,6 @@
 import { useTranslation } from "react-i18next";
 import { formatBytes } from "../../utils/format";
-import { categoryColor, leadCategory, percentOf, type CategoryShare } from "../../utils/dashboard";
+import { categoryClass, formatShare, leadCategory, percentOf, type CategoryShare } from "../../utils/dashboard";
 
 interface StorageRibbonProps {
   data: CategoryShare[];
@@ -39,24 +39,28 @@ export default function StorageRibbon({
           size: formatBytes(totalBytes),
         })}
       </h2>
+      {/* Not role="img": that role makes every descendant presentational,
+          which hid these real, focusable buttons from screen readers. */}
       <div
         className="storage-ribbon"
-        role="img"
+        role="group"
         aria-label={t("dashboard.storageDistribution")}
       >
         {sorted.map((item) => {
           const pct = percentOf(item.bytes, totalBytes);
           const isOn = selected === item.category;
+          const share = formatShare(pct);
           return (
             <button
               key={item.category}
               type="button"
-              title={`${item.category} · ${Math.round(pct)}% · ${formatBytes(item.bytes)}`}
+              aria-pressed={isOn}
+              aria-label={`${item.category} · ${share} · ${formatBytes(item.bytes)}`}
+              title={`${item.category} · ${share} · ${formatBytes(item.bytes)}`}
               onClick={() => onSelect?.(item.category)}
-              className="storage-ribbon-seg"
+              className={`storage-ribbon-seg ${categoryClass(item.category)}`}
               style={{
-                width: `${Math.max(pct, 1.2)}%`,
-                backgroundColor: categoryColor(item.category),
+                width: `${pct}%`,
                 opacity: selected && !isOn ? 0.45 : 1,
               }}
             />
@@ -65,23 +69,24 @@ export default function StorageRibbon({
       </div>
       <div className="flex flex-wrap gap-x-4 gap-y-1.5 mt-3">
         {sorted.map((item) => {
-          const pct = Math.round(percentOf(item.bytes, totalBytes));
+          const share = formatShare(percentOf(item.bytes, totalBytes));
           const isOn = selected === item.category;
           return (
             <button
               key={item.category}
               type="button"
+              aria-pressed={isOn}
               onClick={() => onSelect?.(item.category)}
               className={`flex items-center gap-1.5 text-xs rounded-md px-1 -mx-1 py-0.5 transition-colors ${
                 isOn ? "bg-border text-text" : "text-text-muted hover:text-text"
               }`}
             >
               <span
-                className="inline-block w-2 h-2 rounded-[2px]"
-                style={{ backgroundColor: categoryColor(item.category) }}
+                className={`inline-block w-2 h-2 rounded-[2px] ${categoryClass(item.category)}`}
+                aria-hidden="true"
               />
               <span className="font-medium text-text">{item.category}</span>
-              <span>{pct}%</span>
+              <span>{share}</span>
             </button>
           );
         })}

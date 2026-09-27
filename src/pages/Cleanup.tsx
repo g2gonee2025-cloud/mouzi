@@ -106,6 +106,7 @@ export default function Cleanup() {
             findLabel={t("cleanup.findLarge")}
             hint={t("cleanup.largeHint")}
             emptyKey="cleanup.noLargeFiles"
+            operationKey="confirm.op.trashLarge"
           />
         )}
         {tab === "stale" && (
@@ -115,6 +116,7 @@ export default function Cleanup() {
             findLabel={t("cleanup.findStale")}
             hint={t("cleanup.staleHint")}
             emptyKey="cleanup.noStaleFiles"
+            operationKey="confirm.op.trashStale"
           />
         )}
         {tab === "emptyDirs" && <EmptyDirsTab />}

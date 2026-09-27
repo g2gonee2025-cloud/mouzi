@@ -4,12 +4,14 @@ import { useCleanupStore } from "../../store/useCleanupStore";
 import type { CleanupRequest } from "../../utils/cleanup";
 import { Search, Trash2, FolderX } from "lucide-react";
 import ResultsPanel from "./ResultsPanel";
+import ConfirmDialog, { type ConfirmRequest } from "./ConfirmDialog";
 
 export default function EmptyDirsTab() {
   const { t } = useTranslation();
   const store = useCleanupStore();
   const [checked, setChecked] = useState<Set<string>>(new Set());
   const [showResults, setShowResults] = useState(false);
+  const [pending, setPending] = useState<ConfirmRequest | null>(null);
 
   const handleFind = () => {
     store.findEmptyDirs();
@@ -35,13 +37,26 @@ export default function EmptyDirsTab() {
     }
   }, [store.emptyDirs, checked]);
 
-  const handleConfirm = async () => {
+  const runCleanup = async () => {
     const actions: CleanupRequest[] = Array.from(checked).map((path) => ({
       kind: "remove_empty_dir",
       path,
     }));
     await store.executeCleanup(actions);
     setShowResults(true);
+  };
+
+  const handleConfirm = () => {
+    if (checked.size === 0) return;
+    setPending({
+      title: t("confirm.op.removeEmptyDirs"),
+      count: checked.size,
+      // `remove_empty_dir` is a bare `fs::remove_dir`, not a trash: there is no
+      // byte figure to quote and no Recycle Bin copy to fall back on.
+      notice: "permanent",
+      preview: Array.from(checked),
+      onConfirm: runCleanup,
+    });
   };
 
   const handleResultsDone = () => {
@@ -132,6 +147,10 @@ export default function EmptyDirsTab() {
             </div>
           </div>
         </>
+      )}
+
+      {pending && (
+        <ConfirmDialog {...pending} onClose={() => setPending(null)} />
       )}
     </div>
   );

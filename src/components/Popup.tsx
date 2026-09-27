@@ -18,6 +18,7 @@ import {
 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import ConfirmDialog, { type ConfirmRequest } from "./cleanup/ConfirmDialog";
 
 function getIconForType(typeName: string) {
   const lower = typeName.toLowerCase();
@@ -61,6 +62,7 @@ export default function Popup() {
     destination: string;
     destination_folder: string;
   } | null>(null);
+  const [pending, setPending] = useState<ConfirmRequest | null>(null);
 
   useEffect(() => {
     loadLogs();
@@ -118,6 +120,20 @@ export default function Popup() {
     }
   };
 
+  // `scan_folder_cmd` walks the whole folder rather than just draining the
+  // queue, so a 0 count is not a no-op and must not disable the button; the
+  // queue is only a floor on what the scan will find.
+  const handleCleanClick = () => {
+    setPending({
+      title: t("confirm.op.cleanNow"),
+      count: pendingFiles.length,
+      countIsExact: false,
+      notice: "move",
+      note: t("confirm.note.cleanNow"),
+      onConfirm: handleClean,
+    });
+  };
+
   const handleOpenDownloads = async () => {
     const downloads = folders[0]?.path || (await invoke<string>("get_downloads_folder"));
     await invoke("open_folder_cmd", { path: downloads });
@@ -159,7 +175,7 @@ export default function Popup() {
       {/* Actions */}
       <div className="p-3 space-y-2">
         <button
-          onClick={handleClean}
+          onClick={handleCleanClick}
           disabled={isLoading}
           className="w-full flex items-center justify-center gap-2 rounded-lg bg-primary px-3 py-2.5 text-sm font-medium text-white hover:bg-primary-hover transition-colors disabled:opacity-60"
         >
@@ -300,6 +316,10 @@ export default function Popup() {
             {t("notifications.cleaned", { count: scanResults.length })}
           </div>
         </div>
+      )}
+
+      {pending && (
+        <ConfirmDialog {...pending} onClose={() => setPending(null)} />
       )}
     </div>
   );

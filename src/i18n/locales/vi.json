@@ -260,5 +260,40 @@
     "missing": "Tệp không còn tồn tại",
     "resultsTitle": "Kết quả",
     "backToList": "Quay lại danh sách"
+  },
+  "confirm": {
+    "impactItems": "{{count}} mục",
+    "impactAtLeast": "Ít nhất {{count}} mục",
+    "more": "+{{count}} mục nữa",
+    "impactBytes": "Tổng dung lượng: {{size}}",
+    "bytesUnknown": "Tổng chính xác chỉ biết được sau khi bắt đầu chạy.",
+    "trashNotice": "Tệp đã xóa sẽ vào Thùng rác và có thể khôi phục lại, nhưng chỉ khi Thùng rác còn nhận được mục đó. Nếu Thùng rác đầy, mục đó quá lớn, hoặc thư mục nằm trên ổ mạng, Windows sẽ xóa vĩnh viễn mà không báo cho Mouzi.",
+    "moveNotice": "Các tệp được di chuyển chứ không bị xóa, nên không có gì mất khỏi ổ đĩa của bạn. Bạn có thể hoàn tác từ Lịch sử, cho tới khi lịch sử bị xóa.",
+    "permanentNotice": "Không thể hoàn tác. Không có bản sao trong Thùng rác và cũng không có cách khôi phục.",
+    "typedPrompt": "Nhập {{word}} để xác nhận.",
+    "typedMismatch": "Chưa khớp.",
+    "working": "Đang xử lý…",
+    "failed": "Không thực hiện được: {{error}}",
+    "word": "XÓA",
+    "op": {
+      "cleanNow": "Di chuyển tệp ngay",
+      "acceptAll": "Chấp nhận mọi gợi ý",
+      "undoAll": "Hoàn tác mọi thao tác",
+      "clearHistory": "Xóa lịch sử",
+      "removeFolder": "Ngừng theo dõi thư mục này",
+      "deleteRule": "Xóa quy tắc này",
+      "trashDuplicates": "Xóa các bản trùng lặp",
+      "trashLarge": "Xóa tệp dung lượng lớn",
+      "trashStale": "Xóa tệp cũ",
+      "removeEmptyDirs": "Xóa thư mục rỗng"
+    },
+    "note": {
+      "cleanNow": "Mọi tệp trong các thư mục đang theo dõi khớp với quy tắc của bạn sẽ được di chuyển ngay lập tức, không chờ thời gian chờ.",
+      "removeFolder": "Mouzi sẽ ngừng theo dõi thư mục này. Các tệp đã di chuyển vẫn nằm ở chỗ cũ.",
+      "deleteRule": "Từ nay quy tắc này sẽ không còn sắp xếp tệp mới.",
+      "undoAll": "Các mục đã hoàn tác trước đó sẽ được bỏ qua.",
+      "acceptAllRules": "Sẽ tạo và bật {{count}} quy tắc mới",
+      "clearHistory": "{{count}} mục lịch sử sẽ bị xóa, và mọi khả năng hoàn tác cũng mất theo"
+    }
   }
 }

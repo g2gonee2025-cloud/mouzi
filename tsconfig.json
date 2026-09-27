@@ -18,7 +18,11 @@
     "strict": true,
     "noUnusedLocals": true,
     "noUnusedParameters": true,
-    "noFallthroughCasesInSwitch": true
+    "noFallthroughCasesInSwitch": true,
+
+    /* Redirect build mode's incremental state out of the repo root; the
+       project's .gitignore does not cover *.tsbuildinfo. */
+    "tsBuildInfoFile": "./node_modules/.tmp/tsconfig-app.tsbuildinfo"
   },
   "include": ["src"],
   "references": [{ "path": "./tsconfig.node.json" }]

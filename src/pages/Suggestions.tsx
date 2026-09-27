@@ -14,6 +14,7 @@ import {
   CheckSquare,
   XSquare,
 } from "lucide-react";
+import ConfirmDialog, { type ConfirmRequest } from "../components/cleanup/ConfirmDialog";
 
 function confidenceColor(conf: number): string {
   if (conf >= 0.7) return "text-green-600 dark:text-green-400";
@@ -66,6 +67,7 @@ export default function Suggestions() {
   } = useSuggestionsStore();
 
   const [createRule, setCreateRule] = useState(createRuleDefault);
+  const [pending, setPending] = useState<ConfirmRequest | null>(null);
 
   useEffect(() => {
     loadSuggestions();
@@ -83,6 +85,27 @@ export default function Suggestions() {
 
   const handleClose = () => {
     navigateHash("dashboard");
+  };
+
+  const runAcceptAll = async () => {
+    await acceptAll(createRule);
+  };
+
+  // `createRule` is pre-checked, so one click used to move every file AND leave
+  // behind a permanent enabled rule per file. The dialog states both outcomes
+  // and lets the rule half be called out even when the box is unticked.
+  const handleAcceptAllClick = () => {
+    if (suggestions.length === 0) return;
+    setPending({
+      title: t("confirm.op.acceptAll"),
+      count: suggestions.length,
+      notice: "move",
+      note: createRule
+        ? t("confirm.note.acceptAllRules", { count: suggestions.length })
+        : undefined,
+      preview: suggestions.map((s) => s.path),
+      onConfirm: runAcceptAll,
+    });
   };
 
   return (
@@ -216,7 +239,7 @@ export default function Suggestions() {
               </div>
               <div className="flex items-center gap-2">
                 <button
-                  onClick={() => acceptAll(createRule)}
+                  onClick={handleAcceptAllClick}
                   disabled={busy}
                   className="flex items-center gap-1 rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-white hover:bg-primary-hover transition-colors disabled:opacity-50"
                 >
@@ -235,8 +258,7 @@ export default function Suggestions() {
             </div>
 
             {/* Suggestion cards */}
-            <div className="space-y-2">
-              {suggestions.map((s) => (
+            <div className="space-y-2">              {suggestions.map((s) => (
                 <div
                   key={s.path}
                   className="rounded-lg border border-border bg-surface-dark p-3 flex items-start gap-3"
@@ -301,6 +323,10 @@ export default function Suggestions() {
           </>
         )}
       </div>
+
+      {pending && (
+        <ConfirmDialog {...pending} onClose={() => setPending(null)} />
+      )}
     </div>
   );
 }

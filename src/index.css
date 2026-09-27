@@ -3,31 +3,66 @@
 @theme {
   --color-primary: var(--color-primary-val);
   --color-primary-hover: var(--color-primary-hover-val);
+  --color-on-primary: var(--color-on-primary-val);
   --color-surface: var(--color-surface-val);
   --color-surface-dark: var(--color-surface-dark-val);
   --color-border: var(--color-border-val);
   --color-text: var(--color-text-val);
   --color-text-muted: var(--color-text-muted-val);
+
+  /* Category palette. The seven names mirror the Rust `categorize()`
+     arms in src-tauri/src/scan.rs and must stay in sync with it. */
+  --color-cat-documents: var(--color-cat-documents-val);
+  --color-cat-images: var(--color-cat-images-val);
+  --color-cat-videos: var(--color-cat-videos-val);
+  --color-cat-audio: var(--color-cat-audio-val);
+  --color-cat-archives: var(--color-cat-archives-val);
+  --color-cat-code: var(--color-cat-code-val);
+  --color-cat-other: var(--color-cat-other-val);
 }
 
 :root {
   --color-primary-val: #f59e0b;
   --color-primary-hover-val: #fb7185;
+  /* Amber is a light hue in both schemes, so the only legible ink on top
+     of it is a near-black. Measured: 8.14:1 on light primary, 10.48:1 on
+     dark primary. White text here scored 2.15:1 / 1.67:1. */
+  --color-on-primary-val: #1c1917;
   --color-surface-val: #ffffff;
   --color-surface-dark-val: #f5f2ed;
   --color-border-val: #e7e2da;
   --color-text-val: #1c1917;
   --color-text-muted-val: #8c7f70;
+
+  /* Every value clears 3:1 against both light surfaces (#ffffff 5.02-11.86:1,
+     #f5f2ed 4.50-10.62:1) so swatches and bars stay legible as graphics. */
+  --color-cat-documents-val: #8a6a2f;
+  --color-cat-images-val: #a8552a;
+  --color-cat-videos-val: #4a3222;
+  --color-cat-audio-val: #5c3d20;
+  --color-cat-archives-val: #6f4520;
+  --color-cat-code-val: #22402f;
+  --color-cat-other-val: #5c544b;
 }
 
 .dark {
   --color-primary-val: #fbbf24;
   --color-primary-hover-val: #fb7185;
+  --color-on-primary-val: #1c1917;
   --color-surface-val: #0a0a0a;
   --color-surface-dark-val: #171412;
   --color-border-val: #2a2622;
   --color-text-val: #f5f0ec;
   --color-text-muted-val: #8a7e75;
+
+  /* Lifted for the dark surfaces: 6.84-10.74:1 against #0a0a0a / #171412. */
+  --color-cat-documents-val: #e3b878;
+  --color-cat-images-val: #f0a56b;
+  --color-cat-videos-val: #c19a7c;
+  --color-cat-audio-val: #d1a06a;
+  --color-cat-archives-val: #e0b483;
+  --color-cat-code-val: #7fc9a4;
+  --color-cat-other-val: #a89c92;
 }
 
 html,
@@ -152,7 +187,9 @@ input[type="checkbox"]:focus-visible {
   height: 100%;
   border: 0;
   padding: 0;
-  min-width: 3px;
+  /* One hairline, not a data claim. A 3px minimum inflated a sub-1% category
+     by up to ~10 points; 1px only guarantees a non-zero segment paints. */
+  min-width: 1px;
   cursor: pointer;
   transition: opacity 0.15s ease, filter 0.15s ease;
 }

@@ -42,7 +42,7 @@ export default function AgeHistogram({ data }: AgeHistogramProps) {
                 <div className="w-full h-24 bg-border/60 rounded-sm flex items-end overflow-hidden">
                   <div
                     className="w-full bg-primary rounded-sm"
-                    style={{ height: `${Math.max(h, bucket.files > 0 ? 4 : 0)}%` }}
+                    style={{ height: `${h}%` }}
                     title={`${labels[bucket.bucket]} · ${bucket.files.toLocaleString()} · ${formatBytes(bucket.bytes)}`}
                   />
                 </div>

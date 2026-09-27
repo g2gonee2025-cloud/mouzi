@@ -4,7 +4,14 @@
     "skipLibCheck": true,
     "module": "ESNext",
     "moduleResolution": "bundler",
-    "allowSyntheticDefaultImports": true
+    "allowSyntheticDefaultImports": true,
+
+    /* A composite project must emit, so `tsc -b` writes output for this file.
+       Keep it inside the gitignored node_modules/.tmp instead of the repo
+       root: an emitted `vite.config.js` next to `vite.config.ts` would take
+       priority in Vite's config-file lookup and silently shadow the source. */
+    "outDir": "./node_modules/.tmp/tsconfig-node-out",
+    "tsBuildInfoFile": "./node_modules/.tmp/tsconfig-node.tsbuildinfo"
   },
   "include": ["vite.config.ts"]
 }

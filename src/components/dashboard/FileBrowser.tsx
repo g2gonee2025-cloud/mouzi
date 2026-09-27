@@ -4,7 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { Copy, ExternalLink, Search } from "lucide-react";
 import { formatBytes, formatTimestamp } from "../../utils/format";
 import { fileName, parentDir } from "../../utils/paths";
-import { categoryColor } from "../../utils/dashboard";
+import { categoryClass } from "../../utils/dashboard";
 import type { InventoryFile } from "../../store/useDashboardStore";
 
 interface FileBrowserProps {
@@ -104,27 +104,31 @@ export default function FileBrowser({
           <button
             type="button"
             onClick={() => setMode("size")}
-            className={`px-2.5 py-1 ${mode === "size" ? "bg-primary text-white" : "text-text-muted hover:text-text"}`}
+            aria-pressed={mode === "size"}
+            className={`px-2.5 py-1 ${mode === "size" ? "bg-primary text-on-primary" : "text-text-muted hover:text-text"}`}
           >
             {t("dashboard.largestFiles")}
           </button>
           <button
             type="button"
             onClick={() => setMode("mtime")}
-            className={`px-2.5 py-1 ${mode === "mtime" ? "bg-primary text-white" : "text-text-muted hover:text-text"}`}
+            aria-pressed={mode === "mtime"}
+            className={`px-2.5 py-1 ${mode === "mtime" ? "bg-primary text-on-primary" : "text-text-muted hover:text-text"}`}
           >
             {t("dashboard.recentFiles")}
           </button>
         </div>
       </div>
 
-      <div className="relative mb-3">
+      <div className="relative mb-3" role="search">
         <Search size={13} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-text-muted" />
         <input
           ref={searchRef}
+          type="search"
           value={query}
           onChange={(e) => setQuery(e.target.value)}
           placeholder={t("dashboard.searchFiles")}
+          aria-label={t("dashboard.searchFiles")}
           className="w-full rounded-md border border-border bg-surface pl-8 pr-3 py-1.5 text-sm text-text placeholder:text-text-muted focus:outline-none focus:border-primary"
         />
       </div>
@@ -145,7 +149,9 @@ export default function FileBrowser({
       )}
 
       {loading && (
-        <div className="text-xs text-text-muted mb-2">{t("app.loading")}</div>
+        <div className="text-xs text-text-muted mb-2" role="status" aria-live="polite">
+          {t("dashboard.loadingFiles")}
+        </div>
       )}
 
       {files.length === 0 ? (
@@ -161,8 +167,7 @@ export default function FileBrowser({
             >
               <div className="flex items-center gap-2 min-w-0 flex-1">
                 <span
-                  className="w-1.5 h-1.5 rounded-full shrink-0"
-                  style={{ backgroundColor: categoryColor(file.category) }}
+                  className={`w-1.5 h-1.5 rounded-full shrink-0 ${categoryClass(file.category)}`}
                   title={file.category}
                 />
                 <div className="min-w-0">
@@ -178,18 +183,22 @@ export default function FileBrowser({
                 <button
                   type="button"
                   onClick={() => handleCopy(file.path)}
-                  className="p-1 rounded text-text-muted hover:text-text hover:bg-border opacity-0 group-hover:opacity-100 focus:opacity-100 transition-all"
+                  aria-label={
+                    copied === file.path ? t("dashboard.copied") : t("dashboard.copyPath")
+                  }
+                  className="inline-flex items-center justify-center w-6 h-6 shrink-0 rounded text-text-muted hover:text-text hover:bg-border opacity-0 group-hover:opacity-100 focus-visible:opacity-100 pointer-coarse:opacity-100 focus-visible:outline-2 focus-visible:outline-primary focus-visible:outline-offset-1 transition-opacity"
                   title={copied === file.path ? t("dashboard.copied") : t("dashboard.copyPath")}
                 >
-                  <Copy size={12} />
+                  <Copy size={12} aria-hidden="true" />
                 </button>
                 <button
                   type="button"
                   onClick={() => handleOpen(file.path)}
-                  className="p-1 rounded text-text-muted hover:text-text hover:bg-border opacity-0 group-hover:opacity-100 focus:opacity-100 transition-all"
+                  aria-label={t("dashboard.openFolder")}
+                  className="inline-flex items-center justify-center w-6 h-6 shrink-0 rounded text-text-muted hover:text-text hover:bg-border opacity-0 group-hover:opacity-100 focus-visible:opacity-100 pointer-coarse:opacity-100 focus-visible:outline-2 focus-visible:outline-primary focus-visible:outline-offset-1 transition-opacity"
                   title={t("dashboard.openFolder")}
                 >
-                  <ExternalLink size={12} />
+                  <ExternalLink size={12} aria-hidden="true" />
                 </button>
               </div>
             </div>

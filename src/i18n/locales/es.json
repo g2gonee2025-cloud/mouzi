@@ -118,6 +118,16 @@
       "twice": "Dos veces al día",
       "thrice": "3 veces al día",
       "fourTimes": "4 veces al día"
+    },
+    "archive": {
+      "title": "Importar archivo",
+      "description": "Elige un archivo .zip, .tgz o .tar.gz de Google Takeout. Mouzi lo extrae, aplana de forma segura los nombres anidados duplicados y ejecuta tus reglas.",
+      "import": "Importar archivo",
+      "importing": "Importando el archivo...",
+      "importingShort": "Importando...",
+      "importSuccess": "Se extrajeron {{extracted}} archivo(s) y se organizaron {{count}} archivo(s).",
+      "importError": "No se pudo importar el archivo: {{error}}",
+      "openImportFolder": "Abrir la carpeta de importación"
     }
   },
   "notifications": {
@@ -244,5 +254,55 @@
     "missing": "El archivo ya no existe",
     "resultsTitle": "Resultados",
     "backToList": "Volver a la lista"
+  },
+  "confirm": {
+    "impactItems": "{{count}} elemento",
+    "impactItems_one": "{{count}} elemento",
+    "impactItems_other": "{{count}} elementos",
+    "impactItems_many": "{{count}} elementos",
+    "impactAtLeast": "Al menos {{count}} elemento",
+    "impactAtLeast_one": "Al menos {{count}} elemento",
+    "impactAtLeast_other": "Al menos {{count}} elementos",
+    "impactAtLeast_many": "Al menos {{count}} elementos",
+    "more": "+{{count}} más",
+    "more_one": "+{{count}} más",
+    "more_other": "+{{count}} más",
+    "more_many": "+{{count}} más",
+    "impactBytes": "Tamaño total: {{size}}",
+    "bytesUnknown": "El total exacto no se conoce hasta que empieza la operación.",
+    "trashNotice": "Los archivos eliminados van a la Papelera y puedes recuperarlos, pero solo mientras la Papelera pueda aceptar el elemento. Si la Papelera está llena, el elemento es demasiado grande o la carpeta está en una unidad de red, Windows lo elimina de forma permanente sin avisar a Mouzi.",
+    "moveNotice": "Los archivos se mueven, no se eliminan, así que nada desaparece de tus discos. Puedes revertirlo desde el Historial, hasta que se borre el historial.",
+    "permanentNotice": "Esto no se puede deshacer. No hay copia en la Papelera ni forma de recuperarlo.",
+    "typedPrompt": "Escribe {{word}} para confirmar.",
+    "typedMismatch": "No coincide.",
+    "working": "Trabajando…",
+    "failed": "No se pudo completar: {{error}}",
+    "word": "ELIMINAR",
+    "op": {
+      "cleanNow": "Mover los archivos ahora",
+      "acceptAll": "Aceptar todas las sugerencias",
+      "undoAll": "Revertir todas las acciones",
+      "clearHistory": "Borrar el historial",
+      "removeFolder": "Dejar de vigilar esta carpeta",
+      "deleteRule": "Eliminar esta regla",
+      "trashDuplicates": "Eliminar las copias duplicadas",
+      "trashLarge": "Eliminar los archivos grandes",
+      "trashStale": "Eliminar los archivos antiguos",
+      "removeEmptyDirs": "Eliminar las carpetas vacías"
+    },
+    "note": {
+      "cleanNow": "Ahora se mueve de inmediato cualquier archivo de las carpetas vigiladas que coincida con tus reglas, sin esperar el periodo de gracia.",
+      "removeFolder": "Mouzi dejará de vigilar esta carpeta. Los archivos ya movidos se quedan donde están.",
+      "deleteRule": "Esta regla ya no ordenará los archivos futuros.",
+      "undoAll": "Las entradas ya revertidas se omiten.",
+      "acceptAllRules": "Se creará y activará {{count}} regla nueva",
+      "acceptAllRules_one": "Se creará y activará {{count}} regla nueva",
+      "acceptAllRules_other": "Se crearán y activarán {{count}} reglas nuevas",
+      "acceptAllRules_many": "Se crearán y activarán {{count}} reglas nuevas",
+      "clearHistory": "Se borrará {{count}} entrada del historial y se perderá toda opción de deshacer",
+      "clearHistory_one": "Se borrará {{count}} entrada del historial y se perderá toda opción de deshacer",
+      "clearHistory_other": "Se borrarán {{count}} entradas del historial y se perderá toda opción de deshacer",
+      "clearHistory_many": "Se borrarán {{count}} entradas del historial y se perderá toda opción de deshacer"
+    }
   }
 }

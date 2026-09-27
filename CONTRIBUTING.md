@@ -47,10 +47,16 @@ Mouzi aims to remain lightweight, local-first, and easy to understand. Features 
 ### Running Mouzi locally
 
 ```bash
-git clone https://github.com/hsr88/mouzi.git
+git clone https://github.com/g2gonee2025-cloud/mouzi.git
 cd mouzi
 npm install
 npm run tauri dev
+```
+
+The upstream project is `https://github.com/hsr88/mouzi`. If you need it for reference, add it as a second remote rather than replacing `origin`:
+
+```bash
+git remote add upstream https://github.com/hsr88/mouzi.git
 ```
 
 ### Creating a production build

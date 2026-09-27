@@ -14,12 +14,14 @@ import {
 } from "../../utils/cleanup";
 import { Search, Trash2, Check } from "lucide-react";
 import ResultsPanel from "./ResultsPanel";
+import ConfirmDialog, { type ConfirmRequest } from "./ConfirmDialog";
 
 export default function DuplicatesTab() {
   const { t } = useTranslation();
   const store = useCleanupStore();
   const [selected, setSelected] = useState<Record<string, string>>({});
   const [showResults, setShowResults] = useState(false);
+  const [pending, setPending] = useState<ConfirmRequest | null>(null);
 
   const groups = useMemo(
     () => (store.duplicates ? sortGroups(store.duplicates) : []),
@@ -34,15 +36,40 @@ export default function DuplicatesTab() {
     [groups, selected],
   );
 
+  // Summed off `actions`, never off `reclaimableBytes(groups)`: if the two ever
+  // disagreed the dialog would quote one number and the backend act on another.
+  const selectedBytes = useMemo(() => {
+    const doomed = new Set(actions.map((a) => a.path));
+    let total = 0;
+    for (const g of groups) {
+      for (const f of g.files) {
+        if (doomed.has(f.path)) total += f.size;
+      }
+    }
+    return total;
+  }, [actions, groups]);
+
   const handleFind = () => store.findDuplicates();
 
   const handleKeep = (hash: string, path: string) => {
     setSelected((prev) => ({ ...prev, [hash]: path }));
   };
 
-  const handleConfirm = async () => {
+  const runCleanup = async () => {
     await store.executeCleanup(actions);
     setShowResults(true);
+  };
+
+  const handleConfirm = () => {
+    if (actions.length === 0) return;
+    setPending({
+      title: t("confirm.op.trashDuplicates"),
+      count: actions.length,
+      bytes: selectedBytes,
+      notice: "trash",
+      preview: actions.map((a) => a.path),
+      onConfirm: runCleanup,
+    });
   };
 
   // When results come back, refresh the list
@@ -122,6 +149,10 @@ export default function DuplicatesTab() {
             ))}
           </div>
         </>
+      )}
+
+      {pending && (
+        <ConfirmDialog {...pending} onClose={() => setPending(null)} />
       )}
     </div>
   );
