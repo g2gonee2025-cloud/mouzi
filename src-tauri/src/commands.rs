@@ -5,8 +5,10 @@ use crate::safe_fs::{move_file, MoveOutcome};
 use crate::scan::{self, ScanEvent};
 use crate::AppState;
 use serde::Serialize;
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_autostart::ManagerExt;
@@ -135,7 +137,19 @@ pub fn get_stats_cmd() -> Result<Vec<(String, i64)>, String> {
 }
 
 // ---------------------------------------------------------------------------
-// Undo helpers
+// Undo
+//
+// The database is one global connection behind one mutex. Holding it while the
+// filesystem is touched stalls every other database caller, and stalls the
+// watcher's `notify` callback, which takes the same `ignored_files` lock on
+// every event — so events arrive after the 30 s suppression window has closed,
+// and a freshly restored file is read as new user activity, queued, and moved
+// straight back after the grace period with its log row already marked undone.
+// The app undoes its own undo. Do not hoist either lock back over the loop.
+//
+// Phase 1 reads the candidate rows under the DB lock and releases it; phase 2
+// does the moves holding neither lock, after arming the whole batch's
+// suppression window; phase 3 writes each row's outcome under a short lock.
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize)]
@@ -153,110 +167,265 @@ pub struct UndoAllResult {
     pub results: Vec<UndoResult>,
 }
 
-fn perform_undo(
-    conn: &rusqlite::Connection,
-    ignored: &mut std::collections::HashMap<String, Instant>,
+/// The watcher's self-suppression guards, shared with `AppState`.
+type IgnoredFiles = Arc<Mutex<HashMap<String, Instant>>>;
+
+/// One `action_logs` row, copied out of the database in phase 1.
+struct UndoTarget {
     id: i64,
     source: String,
     dest: Option<String>,
-) -> Result<UndoResult, String> {
-    let dest_path = match dest {
-        Some(ref d) if !d.is_empty() => std::path::Path::new(d),
-        _ => {
-            conn.execute("UPDATE action_logs SET undone=1 WHERE id=?1", [id])
-                .map_err(|e| e.to_string())?;
-            return Ok(UndoResult {
-                status: "missing".to_string(),
-                message: None,
-                restored_to: None,
-            });
-        }
+}
+
+/// What phase 2 intends to do with a target, decided while holding no lock.
+enum UndoPlan {
+    /// Nothing to move back: no destination was recorded, or the file is no
+    /// longer where the action left it.
+    Gone,
+    /// Move `dest` back onto `source`.
+    Restore { dest: PathBuf, source: String },
+}
+
+/// What the filesystem half of an undo produced, before the database is told.
+enum UndoMove {
+    /// The file is back. `actual` is where it landed, which differs from
+    /// `source` when a collision forced a new name.
+    Restored { actual: String, status: &'static str },
+    Gone,
+    Failed(String),
+}
+
+fn lock_ignored(ignored_files: &IgnoredFiles) -> Result<MutexGuard<'_, HashMap<String, Instant>>, String> {
+    ignored_files
+        .lock()
+        .map_err(|_| "Watcher self-suppression list is poisoned".to_string())
+}
+
+/// Open the watcher's self-suppression window for `paths`.
+///
+/// Callers arm before the rename, never after: the watcher can deliver the
+/// event for a restore the moment the move returns, and an event that arrives
+/// before its guard exists is indistinguishable from the user creating a file.
+fn arm_suppression(ignored_files: &IgnoredFiles, paths: &[String]) -> Result<(), String> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let now = Instant::now();
+    let mut ignored = lock_ignored(ignored_files)?;
+    for path in paths {
+        ignored.insert(path.clone(), now);
+    }
+    Ok(())
+}
+
+/// Decide what has to happen for one target. `Path::exists` is a stat, so this
+/// needs no lock and does no database work.
+fn plan_undo(target: &UndoTarget) -> UndoPlan {
+    let dest = match target.dest.as_deref() {
+        Some(dest) if !dest.is_empty() => PathBuf::from(dest),
+        _ => return UndoPlan::Gone,
     };
-
-    if !dest_path.exists() {
-        conn.execute("UPDATE action_logs SET undone=1 WHERE id=?1", [id])
-            .map_err(|e| e.to_string())?;
-        return Ok(UndoResult {
-            status: "missing".to_string(),
-            message: None,
-            restored_to: None,
-        });
+    if !dest.exists() {
+        return UndoPlan::Gone;
     }
-
-    let src_path = std::path::Path::new(&source);
-
-    match move_file(dest_path, src_path) {
-        Ok(MoveOutcome::Moved) => {
-            // The watcher must ignore both the path the file left and the path it landed on.
-            ignored.insert(dest_path.to_string_lossy().to_string(), Instant::now());
-            ignored.insert(source.clone(), Instant::now());
-            conn.execute("UPDATE action_logs SET undone=1 WHERE id=?1", [id])
-                .map_err(|e| e.to_string())?;
-            Ok(UndoResult {
-                status: "ok".to_string(),
-                message: None,
-                restored_to: Some(source),
-            })
-        }
-        Ok(MoveOutcome::MovedWithNewName(name)) => {
-            let restored = src_path.with_file_name(&name).to_string_lossy().to_string();
-            ignored.insert(dest_path.to_string_lossy().to_string(), Instant::now());
-            ignored.insert(restored.clone(), Instant::now());
-            conn.execute("UPDATE action_logs SET undone=1 WHERE id=?1", [id])
-                .map_err(|e| e.to_string())?;
-            Ok(UndoResult {
-                status: "collision".to_string(),
-                message: None,
-                restored_to: Some(restored),
-            })
-        }
-        Err(e) => Ok(UndoResult {
-            status: "failed".to_string(),
-            message: Some(e),
-            restored_to: None,
-        }),
+    UndoPlan::Restore {
+        dest,
+        source: target.source.clone(),
     }
 }
 
-#[tauri::command(async)]
-pub fn undo_action_cmd(id: i64, state: tauri::State<AppState>) -> Result<UndoResult, String> {
-    let db = get_db();
-    let conn = db.lock().unwrap();
-    let (source, dest): (String, Option<String>) = conn
-        .query_row(
-            "SELECT source_path, destination_path FROM action_logs WHERE id=?1 AND undone=0",
-            [id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .map_err(|e| format!("No undoable action found for id={}: {}", id, e))?;
-
-    let mut ignored = state.ignored_files.lock().unwrap();
-    perform_undo(&conn, &mut ignored, id, source, dest)
+/// The filesystem half of an undo. Takes no lock of any kind: the caller has
+/// armed suppression already and writes the log row afterwards.
+fn execute_undo_move(plan: &UndoPlan) -> UndoMove {
+    let (dest, source) = match plan {
+        UndoPlan::Gone => return UndoMove::Gone,
+        UndoPlan::Restore { dest, source } => (dest.as_path(), source.as_str()),
+    };
+    let source_path = Path::new(source);
+    match move_file(dest, source_path) {
+        Ok(MoveOutcome::Moved) => UndoMove::Restored {
+            actual: source.to_string(),
+            status: "ok",
+        },
+        Ok(MoveOutcome::MovedWithNewName(name)) => UndoMove::Restored {
+            actual: source_path
+                .with_file_name(&name)
+                .to_string_lossy()
+                .to_string(),
+            status: "collision",
+        },
+        Err(e) => UndoMove::Failed(e),
+    }
 }
 
-#[tauri::command(async)]
-pub fn undo_all_cmd(state: tauri::State<AppState>) -> Result<UndoAllResult, String> {
-    let logs = crate::db::get_undoable_logs().map_err(|e| e.to_string())?;
-    let db = get_db();
-    let conn = db.lock().unwrap();
-    let mut ignored = state.ignored_files.lock().unwrap();
+/// Phases 2c and 3 for one planned undo: move with no lock held, arm any path
+/// the move revealed, then record the outcome under a short lock.
+fn finish_undo(
+    target: &UndoTarget,
+    plan: &UndoPlan,
+    ignored_files: &IgnoredFiles,
+) -> UndoResult {
+    notify_move_observer();
+    let moved = execute_undo_move(plan);
 
-    let mut results = Vec::with_capacity(logs.len());
-    for (id, source, dest) in logs {
-        match perform_undo(&conn, &mut ignored, id, source, dest) {
-            Ok(r) => results.push(r),
-            Err(e) => {
-                results.push(UndoResult {
-                    status: "failed".to_string(),
-                    message: Some(e),
-                    restored_to: None,
-                });
+    // A collision renames the file, so the path the watcher will report is not
+    // knowable until the move has run. Arm it the moment it exists.
+    if let UndoMove::Restored { actual, .. } = &moved {
+        if actual != &target.source {
+            if let Err(e) = arm_suppression(ignored_files, std::slice::from_ref(actual)) {
+                return failed_undo(e);
             }
         }
     }
 
+    record_undo(target.id, &moved).unwrap_or_else(|e| failed_undo(e))
+}
+
+/// Phase 3: one short lock acquisition per row, after its move has finished.
+fn record_undo(id: i64, moved: &UndoMove) -> Result<UndoResult, String> {
+    let result = match moved {
+        UndoMove::Restored { actual, status } => UndoResult {
+            status: (*status).to_string(),
+            message: None,
+            restored_to: Some(actual.clone()),
+        },
+        // A row whose file is already gone is still marked undone and reported
+        // as a success. That has always been this command's behaviour; the
+        // audit recorded it separately and it is deliberately unchanged here.
+        UndoMove::Gone => UndoResult {
+            status: "missing".to_string(),
+            message: None,
+            restored_to: None,
+        },
+        UndoMove::Failed(e) => UndoResult {
+            status: "failed".to_string(),
+            message: Some(e.clone()),
+            restored_to: None,
+        },
+    };
+
+    if matches!(moved, UndoMove::Restored { .. } | UndoMove::Gone) {
+        let conn = lock_db()?;
+        conn.execute("UPDATE action_logs SET undone=1 WHERE id=?1", [id])
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(result)
+}
+
+fn failed_undo(message: String) -> UndoResult {
+    UndoResult {
+        status: "failed".to_string(),
+        message: Some(message),
+        restored_to: None,
+    }
+}
+
+fn read_undo_target(id: i64) -> Result<UndoTarget, String> {
+    let conn = lock_db()?;
+    conn.query_row(
+        "SELECT source_path, destination_path FROM action_logs WHERE id=?1 AND undone=0",
+        [id],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+    )
+    .map(|(source, dest)| UndoTarget { id, source, dest })
+    .map_err(|e| format!("No undoable action found for id={}: {}", id, e))
+}
+
+fn undo_action_with(id: i64, ignored_files: &IgnoredFiles) -> Result<UndoResult, String> {
+    // Phase 1 — read the row, then let the lock go.
+    let target = read_undo_target(id)?;
+    let plan = plan_undo(&target);
+
+    // Phase 2 — arm before the move. This path used to insert its guard after
+    // the rename, so a fast watcher event could arrive while the restored file
+    // still looked brand new.
+    if let UndoPlan::Restore { dest, source } = &plan {
+        arm_suppression(
+            ignored_files,
+            &[dest.to_string_lossy().to_string(), source.clone()],
+        )?;
+    }
+
+    // Phases 2c and 3.
+    Ok(finish_undo(&target, &plan, ignored_files))
+}
+
+fn undo_all_with(ignored_files: &IgnoredFiles) -> Result<UndoAllResult, String> {
+    // Phase 1 — read the candidates. The callee takes the DB lock and releases
+    // it before returning.
+    let targets: Vec<UndoTarget> = crate::db::get_undoable_logs()
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .map(|(id, source, dest)| UndoTarget { id, source, dest })
+        .collect();
+
+    // Phase 2a — decide what each row needs, holding nothing.
+    let plans: Vec<UndoPlan> = targets.iter().map(plan_undo).collect();
+
+    // Phase 2b — arm the whole batch before the first rename, so every path is
+    // covered up front instead of one at a time as the moves land.
+    let mut armed: Vec<String> = Vec::with_capacity(plans.len() * 2);
+    for plan in &plans {
+        if let UndoPlan::Restore { dest, source } = plan {
+            armed.push(dest.to_string_lossy().to_string());
+            armed.push(source.clone());
+        }
+    }
+    arm_suppression(ignored_files, &armed)?;
+
+    // Phase 2c + 3 — move, then record, one row at a time in input order.
+    let mut results = Vec::with_capacity(targets.len());
+    for (target, plan) in targets.iter().zip(plans) {
+        results.push(finish_undo(target, &plan, ignored_files));
+    }
+
+    // "missing" has always counted towards `count`. Separate audit finding,
+    // deliberately unchanged.
     let count = results.iter().filter(|r| r.status != "failed").count();
     Ok(UndoAllResult { count, results })
+}
+
+/// Test-only hook, run immediately before each rename with no lock held.
+///
+/// The concurrency tests read the lock state from inside the undo loop rather
+/// than from another thread racing it, so the assertion lands on the exact
+/// moment the filesystem work begins instead of an arbitrary one. That is the
+/// only way to test the property without depending on how long a rename takes.
+#[cfg(test)]
+type MoveObserver = Arc<dyn Fn() + Send + Sync>;
+
+#[cfg(test)]
+static MOVE_OBSERVER: Mutex<Option<MoveObserver>> = Mutex::new(None);
+
+#[cfg(test)]
+fn set_move_observer(observer: Option<MoveObserver>) -> Option<MoveObserver> {
+    let mut slot = MOVE_OBSERVER.lock().unwrap_or_else(|p| p.into_inner());
+    std::mem::replace(&mut *slot, observer)
+}
+
+#[cfg(test)]
+fn notify_move_observer() {
+    let observer = MOVE_OBSERVER
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone();
+    if let Some(observer) = observer {
+        observer();
+    }
+}
+
+#[cfg(not(test))]
+#[inline]
+fn notify_move_observer() {}
+
+#[tauri::command(async)]
+pub fn undo_action_cmd(id: i64, state: tauri::State<AppState>) -> Result<UndoResult, String> {
+    undo_action_with(id, &state.ignored_files)
+}
+
+#[tauri::command(async)]
+pub fn undo_all_cmd(state: tauri::State<AppState>) -> Result<UndoAllResult, String> {
+    undo_all_with(&state.ignored_files)
 }
 
 #[tauri::command]
@@ -816,4 +985,401 @@ fn create_suggestion_rule(file_name: &str, category: &str) {
         action: "move".to_string(),
         folder_id: 0,
     });
+}
+
+#[cfg(test)]
+mod undo_tests {
+    use super::*;
+    use crate::db::{get_db, init_test_db, lock_db, serialise_test_db};
+    use std::sync::atomic::AtomicBool;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    /// Empties `action_logs`. Reports rather than unwraps so `UndoFixture::drop`
+    /// can use it while the test is already unwinding.
+    fn clear_logs() -> Result<(), String> {
+        lock_db()?
+            .execute("DELETE FROM action_logs", [])
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    /// Everything one undo test puts on disk: the shared-database lock, a
+    /// private temp tree, and the `action_logs` rows it writes.
+    ///
+    /// The lock is held for the test's whole body, so `Drop` still runs inside
+    /// the critical section and cannot interleave with another module's fixture.
+    /// Cleanup on drop is the point: the batch query is "every row with
+    /// undone = 0", so the ~200 rows a failed test would leave behind would be
+    /// swept into the next test's batch and counted against its assertions.
+    struct UndoFixture {
+        _serialised: MutexGuard<'static, ()>,
+        root: PathBuf,
+    }
+
+    impl UndoFixture {
+        fn new(name: &str) -> Self {
+            let serialised = serialise_test_db();
+            init_test_db();
+            // Rows another module left behind would decide what this batch
+            // contains, so the fixture owns the whole table while it runs.
+            clear_logs().expect("clear action_logs");
+
+            let root = std::env::temp_dir()
+                .join(format!("mouzi-undo-{}-{}", name, std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).expect("create test root");
+            UndoFixture { _serialised: serialised, root }
+        }
+
+        fn root(&self) -> &Path {
+            &self.root
+        }
+    }
+
+    impl Drop for UndoFixture {
+        fn drop(&mut self) {
+            // Reported, never unwrapped: a second panic while the test is
+            // unwinding would abort the binary and lose every other result.
+            if let Err(e) = clear_logs() {
+                eprintln!("undo test fixture: action_logs not cleared: {e}");
+            }
+            if let Err(e) = std::fs::remove_dir_all(&self.root) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    eprintln!("undo test fixture: {} not removed: {e}", self.root.display());
+                }
+            }
+        }
+    }
+
+    /// Puts the previous observer back when the test ends, panic or not. The
+    /// observer is process-global, and one left installed would fire inside the
+    /// next test's moves and fill its samples with foreign events.
+    struct ObserverReset(Option<MoveObserver>);
+
+    impl Drop for ObserverReset {
+        fn drop(&mut self) {
+            set_move_observer(self.0.take());
+        }
+    }
+
+    fn insert_log(timestamp: &str, source: &str, dest: Option<&str>) -> i64 {
+        let conn = lock_db().expect("lock db");
+        conn.execute(
+            "INSERT INTO action_logs (timestamp, source_path, destination_path, action, file_name, file_type, undone)
+             VALUES (?1, ?2, ?3, 'move', 'f.undocheck', 'Other', 0)",
+            rusqlite::params![timestamp, source, dest],
+        )
+        .expect("insert log");
+        conn.last_insert_rowid()
+    }
+
+    fn undone_of(source: &str) -> i64 {
+        let conn = lock_db().expect("lock db");
+        conn.query_row(
+            "SELECT undone FROM action_logs WHERE source_path = ?1",
+            [source],
+            |row| row.get(0),
+        )
+        .expect("log row")
+    }
+
+    fn ignored_files() -> IgnoredFiles {
+        Arc::new(Mutex::new(HashMap::new()))
+    }
+
+    /// Put a file where a logged move left it, and return (source, dest).
+    fn stage(root: &Path, name: &str) -> (String, String) {
+        let source = root.join("in").join(name);
+        let dest = root.join("out").join(name);
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        std::fs::write(&dest, b"payload").unwrap();
+        (
+            source.to_string_lossy().into_owned(),
+            dest.to_string_lossy().into_owned(),
+        )
+    }
+
+    /// Log `source -> dest` at a timestamp that fixes its position in the
+    /// `ORDER BY timestamp DESC` batch.
+    fn log_at(rank: u32, source: &str, dest: Option<&str>) {
+        insert_log(&format!("2026-01-01T00:00:{rank:02}Z"), source, dest);
+    }
+
+    /// A hook that records which paths are already guarded the instant the
+    /// first rename is about to run, and does nothing on later moves.
+    fn snapshot_guard_on_first_move(
+        ignored: &IgnoredFiles,
+        into: &Arc<Mutex<Vec<String>>>,
+    ) -> Option<MoveObserver> {
+        let fired = Arc::new(AtomicBool::new(false));
+        let into = into.clone();
+        let ignored = ignored.clone();
+        set_move_observer(Some(Arc::new(move || {
+            if fired.swap(true, Ordering::SeqCst) {
+                return;
+            }
+            let mut guarded = ignored.lock().unwrap().keys().cloned().collect::<Vec<_>>();
+            guarded.sort();
+            *into.lock().unwrap() = guarded;
+        })))
+    }
+
+    #[test]
+    fn undo_batch_holds_neither_lock_while_it_moves_a_file() {
+        let fixture = UndoFixture::new("locks");
+        let root = fixture.root();
+        let ignored = ignored_files();
+        for rank in 0..3 {
+            let (source, dest) = stage(root, &format!("a{rank}.undocheck"));
+            log_at(rank, &source, Some(&dest));
+        }
+
+        let samples = Arc::new(Mutex::new(Vec::new()));
+        let observer_samples = samples.clone();
+        let observer_ignored = ignored.clone();
+        let _observer = ObserverReset(set_move_observer(Some(Arc::new(move || {
+            let db_free = get_db().try_lock().is_ok();
+            let watcher_free = observer_ignored.try_lock().is_ok();
+            observer_samples.lock().unwrap().push((db_free, watcher_free));
+        }))));
+
+        let outcome = undo_all_with(&ignored);
+
+        let outcome = outcome.expect("undo_all_with");
+        assert_eq!(outcome.results.len(), 3);
+        assert!(outcome.results.iter().all(|r| r.status == "ok"), "{:?}", outcome.results);
+
+        let samples = samples.lock().unwrap();
+        assert_eq!(samples.len(), 3, "the hook must run once per move");
+        for (db_free, watcher_free) in samples.iter() {
+            assert!(*db_free, "the global DB mutex was held while a file was being moved");
+            assert!(*watcher_free, "the watcher suppression mutex was held while a file was being moved");
+        }
+    }
+
+    /// The regression the three-phase split exists for: the old batch owned the
+    /// DB mutex across every move, so a reader on another thread — the
+    /// scanner's 500-row flush, the dashboard's stat queries — could not get in
+    /// until the batch was already over.
+    #[test]
+    fn a_reader_on_another_thread_reaches_the_database_during_an_undo_batch() {
+        let fixture = UndoFixture::new("concurrent");
+        let root = fixture.root();
+        let ignored = ignored_files();
+        for rank in 0..200u32 {
+            let (source, dest) = stage(root, &format!("b{rank}.undocheck"));
+            insert_log(
+                &format!("2026-01-01T00:00:{rank:03}Z"),
+                &source,
+                Some(&dest),
+            );
+        }
+
+        // The batch parks inside its first move and only then releases the
+        // reader, so the reader is guaranteed to be competing for the database
+        // while a rename is in flight.
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let (got_tx, got_rx) = mpsc::channel::<bool>();
+        let got_rx = Mutex::new(got_rx);
+        let batch_done = Arc::new(AtomicBool::new(false));
+        let handshake = Arc::new(Mutex::new(Vec::new()));
+
+        let reader_db = get_db();
+        let reader_done = batch_done.clone();
+        let reader = std::thread::spawn(move || {
+            // Bounded, so a batch that never reaches a move fails the test
+            // instead of hanging it.
+            if go_rx.recv_timeout(Duration::from_secs(30)).is_err() {
+                return;
+            }
+            let conn = reader_db.lock().expect("db lock");
+            let batch_was_still_running = !reader_done.load(Ordering::SeqCst);
+            drop(conn);
+            let _ = got_tx.send(batch_was_still_running);
+        });
+
+        let fired = Arc::new(AtomicBool::new(false));
+        let _observer = ObserverReset(set_move_observer(Some({
+            let fired = fired.clone();
+            let go_tx = go_tx.clone();
+            let handshake = handshake.clone();
+            Arc::new(move || {
+                if fired.swap(true, Ordering::SeqCst) {
+                    return;
+                }
+                go_tx.send(()).expect("the reader is waiting");
+                let reached = got_rx.lock().unwrap().recv_timeout(Duration::from_secs(10)).ok();
+                handshake.lock().unwrap().push(reached);
+            })
+        })));
+
+        let batch_ignored = ignored.clone();
+        let batch_done = batch_done.clone();
+        let batch = std::thread::spawn(move || {
+            let result = undo_all_with(&batch_ignored);
+            batch_done.store(true, Ordering::SeqCst);
+            result
+        });
+
+        let outcome = batch.join().expect("the undo batch thread panicked");
+        reader.join().expect("the reader thread panicked");
+
+        let outcome = outcome.expect("undo_all_with");
+        assert_eq!(outcome.count, 200);
+        assert!(outcome.results.iter().all(|r| r.status == "ok"));
+
+        let handshake = handshake.lock().unwrap();
+        assert_eq!(handshake.len(), 1, "the handshake runs once, on the first move");
+        assert!(
+            handshake[0].is_some(),
+            "a reader on another thread could not reach the database during a move"
+        );
+        assert!(
+            handshake[0].unwrap(),
+            "the reader only reached the database after the batch had finished"
+        );
+    }
+
+    /// The old batch armed each path after its own move, so a watcher event
+    /// racing a later row found no guard at all.
+    #[test]
+    fn undo_batch_arms_every_path_before_the_first_move() {
+        let fixture = UndoFixture::new("armed");
+        let root = fixture.root();
+        let ignored = ignored_files();
+        let mut sources = Vec::new();
+        for rank in 0..4 {
+            let (source, dest) = stage(root, &format!("c{rank}.undocheck"));
+            log_at(rank, &source, Some(&dest));
+            sources.push(source);
+        }
+
+        let at_first_move = Arc::new(Mutex::new(Vec::new()));
+        let _observer = ObserverReset(snapshot_guard_on_first_move(&ignored, &at_first_move));
+
+        let outcome = undo_all_with(&ignored);
+
+        assert_eq!(outcome.expect("undo_all_with").count, 4);
+
+        let guarded = at_first_move.lock().unwrap();
+        assert_eq!(
+            guarded.len(),
+            8,
+            "both paths of all four rows must be guarded before the first rename: {guarded:?}"
+        );
+        for source in &sources {
+            assert!(
+                guarded.contains(source),
+                "{source} had no guard when the first rename ran"
+            );
+        }
+    }
+
+    /// The single-undo path inserted its guard after the rename, so a fast
+    /// watcher event could arrive while the restored file still looked new.
+    #[test]
+    fn single_undo_arms_the_guard_before_the_move() {
+        let fixture = UndoFixture::new("single_arm");
+        let root = fixture.root();
+        let ignored = ignored_files();
+        let (source, dest) = stage(root, "d0.undocheck");
+        let id = insert_log("2026-01-01T00:00:00Z", &source, Some(&dest));
+
+        let at_first_move = Arc::new(Mutex::new(Vec::new()));
+        let _observer = ObserverReset(snapshot_guard_on_first_move(&ignored, &at_first_move));
+
+        let outcome = undo_action_with(id, &ignored);
+
+        let outcome = outcome.expect("undo_action_with");
+        assert_eq!(outcome.status, "ok");
+        assert_eq!(outcome.restored_to.as_deref(), Some(source.as_str()));
+        assert!(Path::new(&source).exists(), "the file should be back");
+        assert_eq!(undone_of(&source), 1);
+
+        let guarded = at_first_move.lock().unwrap();
+        assert!(
+            guarded.contains(&source),
+            "the restored path had no guard when the rename ran: {guarded:?}"
+        );
+        assert!(
+            guarded.contains(&dest),
+            "the path the file left had no guard when the rename ran: {guarded:?}"
+        );
+    }
+
+    /// Pins the frontend contract: one result per input row, in the order the
+    /// batch query returned them, with the four status values unchanged.
+    #[test]
+    fn undo_all_reports_one_result_per_row_in_input_order() {
+        let fixture = UndoFixture::new("statuses");
+        let root = fixture.root();
+        let ignored = ignored_files();
+
+        // 0: a plain restore.
+        let (source0, dest0) = stage(root, "e0.undocheck");
+        log_at(0, &source0, Some(&dest0));
+
+        // 1: something already occupies the source, so the restore is renamed.
+        let (source1, dest1) = stage(root, "e1.undocheck");
+        std::fs::write(&source1, b"in the way").unwrap();
+        log_at(1, &source1, Some(&dest1));
+
+        // 2: a destination was recorded but the file is no longer there.
+        let source2 = root.join("in").join("e2.undocheck");
+        let source2 = source2.to_string_lossy().into_owned();
+        let dest2 = root.join("out").join("e2.undocheck");
+        let dest2 = dest2.to_string_lossy().into_owned();
+        log_at(2, &source2, Some(&dest2));
+
+        // 3: no destination was ever recorded.
+        let source3 = root.join("in").join("e3.undocheck");
+        let source3 = source3.to_string_lossy().into_owned();
+        log_at(3, &source3, None);
+
+        // 4: a plain file sits where the source's parent has to be, so
+        // move_file cannot create the parents and reports a real failure.
+        let blocker = root.join("in").join("blocker");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        let dest4 = root.join("out").join("e4.undocheck");
+        let source4 = blocker.join("e4.undocheck").to_string_lossy().into_owned();
+        let dest4_str = dest4.to_string_lossy().into_owned();
+        std::fs::write(&dest4, b"payload").unwrap();
+        log_at(4, &source4, Some(&dest4_str));
+
+        let outcome = undo_all_with(&ignored).expect("undo_all_with");
+
+        // The batch query is ORDER BY timestamp DESC, so rank 4 comes first.
+        let statuses: Vec<&str> = outcome.results.iter().map(|r| r.status.as_str()).collect();
+        assert_eq!(statuses, vec!["failed", "missing", "missing", "collision", "ok"]);
+        assert_eq!(outcome.count, 4, "only a failure is excluded from count");
+
+        let restored: Vec<Option<&str>> = outcome
+            .results
+            .iter()
+            .map(|r| r.restored_to.as_deref())
+            .collect();
+        assert_eq!(restored[4], Some(source0.as_str()));
+        assert!(restored[3].unwrap().ends_with("e1_0.undocheck"), "{restored:?}");
+        assert!(Path::new(&source1).exists(), "the file that was in the way must survive");
+        assert!(!Path::new(&dest1).exists(), "the restored file must leave its organised location");
+        assert!(dest4.exists(), "a failed move must leave the file alone");
+
+        // A failure is the one outcome that does not mark the row undone.
+        assert_eq!(undone_of(&source4), 0);
+        assert_eq!(undone_of(&source0), 1);
+        assert_eq!(undone_of(&source2), 1);
+        assert_eq!(undone_of(&source3), 1);
+
+        // The suffixed name is only knowable after the move, so it is armed
+        // then — the path the watcher will actually report.
+        {
+            let guarded = ignored.lock().unwrap();
+            assert!(
+                guarded.contains_key(restored[3].unwrap()),
+                "the collision's new name was never guarded"
+            );
+        }
+    }
 }

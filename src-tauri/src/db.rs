@@ -2,7 +2,7 @@ use chrono::{DateTime, TimeZone, Utc};
 use rusqlite::{params, Connection, Result as SqliteResult};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 use once_cell::sync::OnceCell;
 
@@ -291,6 +291,20 @@ pub fn init_db(app_dir: PathBuf) -> SqliteResult<()> {
 
 pub fn get_db() -> Arc<Mutex<Connection>> {
     DB.get().expect("Database not initialized").clone()
+}
+
+/// Acquire the global connection for one short piece of work.
+///
+/// A poisoned mutex means another thread panicked while holding the lock; that
+/// is a real error to report, not a reason to panic this thread as well, so
+/// this never unwraps. Never hold the guard across filesystem work: every
+/// other database caller is blocked while it is alive.
+pub fn lock_db() -> Result<MutexGuard<'static, Connection>, String> {
+    let db = DB
+        .get()
+        .ok_or_else(|| "Database not initialized".to_string())?;
+    db.lock()
+        .map_err(|_| "Database lock is poisoned".to_string())
 }
 
 pub fn migrate_rules_to_relative() -> SqliteResult<()> {
@@ -1217,12 +1231,31 @@ pub fn update_inventory_category(path: &str, category: &str) -> SqliteResult<()>
 #[cfg(test)]
 pub static TEST_DB_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Take `TEST_DB_LOCK` for the whole body of a DB-touching test.
+///
+/// Every holder of this lock is a test, so poisoning carries no information
+/// about production behaviour — it only records that some *other* test failed
+/// its assertions while holding it. Unwrapping would turn that one real failure
+/// into a cascade of unrelated "poisoned lock" failures in modules that never
+/// touched the broken test, which is how a single bad assertion used to hide
+/// behind five others.
+#[cfg(test)]
+pub fn serialise_test_db() -> MutexGuard<'static, ()> {
+    TEST_DB_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Initialise the global DB if it has not been set yet.  Idempotent so
 /// multiple test modules can call it without panicking.
 #[cfg(test)]
 pub fn init_test_db() {
     if DB.get().is_none() {
         let dir = std::env::temp_dir().join(format!("mouzi-db-{}", std::process::id()));
+        // PIDs are reused, and a directory left behind by an earlier test
+        // process would hand this one its rows — the suite shares state through
+        // this file, so a stale database is a stale fixture.
+        let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::create_dir_all(&dir);
         let _ = init_db(dir);
     }
@@ -1237,6 +1270,42 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         create_file_inventory_table(&conn).unwrap();
         conn
+    }
+
+    fn remove_action_log(id: i64) -> Result<(), String> {
+        lock_db()?
+            .execute("DELETE FROM action_logs WHERE id=?1", [id])
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    fn remove_cleanup_log(id: i64) -> Result<(), String> {
+        lock_db()?
+            .execute("DELETE FROM cleanup_actions WHERE id=?1", [id])
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    /// A row one of these tests inserted, removed when the test ends however it
+    /// ends. Every module reads the same database, so a row left behind by a
+    /// failed test silently becomes the next module's fixture.
+    struct LogRow {
+        id: i64,
+        table: &'static str,
+        remove: fn(i64) -> Result<(), String>,
+    }
+
+    impl Drop for LogRow {
+        fn drop(&mut self) {
+            // Reported rather than unwrapped: this runs while the test may
+            // already be panicking, and a second panic would abort the binary.
+            if let Err(e) = (self.remove)(self.id) {
+                eprintln!(
+                    "test fixture: could not remove {} row {}: {e}",
+                    self.table, self.id
+                );
+            }
+        }
     }
 
     #[test]
@@ -1310,15 +1379,18 @@ mod tests {
 
     #[test]
     fn recent_logs_survives_corrupt_timestamp() {
-        let _guard = TEST_DB_LOCK.lock().unwrap();
+        let _guard = serialise_test_db();
         init_test_db();
-        let db = get_db();
-        let conn = db.lock().unwrap();
-        conn.execute(
-            "INSERT INTO action_logs (timestamp, source_path, destination_path, action, file_name, file_type, undone) VALUES ('not-a-date', '/corrupt-test', '/dst', 'move', 'f.txt', 'text', 0)",
-            [],
-        ).unwrap();
-        drop(conn);
+        let id = {
+            let conn = lock_db().unwrap();
+            conn.execute(
+                "INSERT INTO action_logs (timestamp, source_path, destination_path, action, file_name, file_type, undone) VALUES ('not-a-date', '/corrupt-test', '/dst', 'move', 'f.txt', 'text', 0)",
+                [],
+            )
+            .unwrap();
+            conn.last_insert_rowid()
+        };
+        let _row = LogRow { id, table: "action_logs", remove: remove_action_log };
         let logs = get_recent_logs(100).unwrap();
         let corrupt = logs.iter().find(|l| l.source_path == "/corrupt-test");
         assert!(corrupt.is_some(), "corrupt row should be returned with epoch fallback");
@@ -1327,15 +1399,18 @@ mod tests {
 
     #[test]
     fn cleanup_logs_survives_corrupt_timestamp() {
-        let _guard = TEST_DB_LOCK.lock().unwrap();
+        let _guard = serialise_test_db();
         init_test_db();
-        let db = get_db();
-        let conn = db.lock().unwrap();
-        conn.execute(
-            "INSERT INTO cleanup_actions (timestamp, path, prev_path, dest, action, status, undoable) VALUES ('not-a-date', '/corrupt-cleanup', '/prev', '/dest', 'delete', 'ok', 0)",
-            [],
-        ).unwrap();
-        drop(conn);
+        let id = {
+            let conn = lock_db().unwrap();
+            conn.execute(
+                "INSERT INTO cleanup_actions (timestamp, path, prev_path, dest, action, status, undoable) VALUES ('not-a-date', '/corrupt-cleanup', '/prev', '/dest', 'delete', 'ok', 0)",
+                [],
+            )
+            .unwrap();
+            conn.last_insert_rowid()
+        };
+        let _row = LogRow { id, table: "cleanup_actions", remove: remove_cleanup_log };
         let logs = get_cleanup_logs(100).unwrap();
         let corrupt = logs.iter().find(|l| l.path == "/corrupt-cleanup");
         assert!(corrupt.is_some(), "corrupt cleanup row should be returned with epoch fallback");

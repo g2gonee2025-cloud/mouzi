@@ -213,6 +213,36 @@ mod tests {
         dir
     }
 
+    /// Drops the scanned tree and the inventory rows it produced, however the
+    /// test ends. The inventory assertions below read global totals, so rows
+    /// another module's failed test left behind would be counted as this
+    /// fixture's.
+    struct ScanFixture {
+        root: PathBuf,
+    }
+
+    impl ScanFixture {
+        fn new(name: &str) -> Self {
+            ScanFixture { root: temp_root(name) }
+        }
+    }
+
+    impl Drop for ScanFixture {
+        fn drop(&mut self) {
+            let root = self.root.to_string_lossy().into_owned();
+            // Reported, not unwrapped: a test that is already panicking must
+            // not turn a cleanup problem into a second panic.
+            if let Err(e) = db::clear_inventory_for_root(&root) {
+                eprintln!("test fixture: inventory for {root} not cleared: {e}");
+            }
+            if let Err(e) = fs::remove_dir_all(&self.root) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    eprintln!("test fixture: {} not removed: {e}", self.root.display());
+                }
+            }
+        }
+    }
+
     #[test]
     fn categorize_all_categories_case_insensitive() {
         assert_eq!(categorize("report.pdf"), "Documents");
@@ -242,8 +272,9 @@ mod tests {
 
     #[test]
     fn scan_roots_fixture_populates_inventory() {
-        let _guard = db::TEST_DB_LOCK.lock().unwrap();
-        let root = temp_root("fixture");
+        let _guard = db::serialise_test_db();
+        let fixture = ScanFixture::new("fixture");
+        let root = fixture.root.clone();
         fs::create_dir_all(root.join("sub").join("deep")).unwrap();
         fs::write(root.join("a.txt"), "hello").unwrap();
         fs::write(root.join("sub").join("b.jpg"), "imgdata").unwrap();
@@ -267,6 +298,14 @@ mod tests {
 
         // Idempotent init — shared with other test modules.
         db::init_test_db();
+
+        // Every assertion below reads a global total, so the fixture starts
+        // from a known-empty table. Several modules scan into it, and a module
+        // that failed part way through leaves its own roots behind.
+        db::lock_db()
+            .unwrap()
+            .execute("DELETE FROM file_inventory", [])
+            .unwrap();
 
         let summaries = scan_roots(&[root_str.clone()], |_| {});
         if !symlink_created {
