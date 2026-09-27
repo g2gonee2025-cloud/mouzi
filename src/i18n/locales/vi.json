@@ -295,5 +295,18 @@
       "acceptAllRules": "Sẽ tạo và bật {{count}} quy tắc mới",
       "clearHistory": "{{count}} mục lịch sử sẽ bị xóa, và mọi khả năng hoàn tác cũng mất theo"
     }
+  },
+  "undo": {
+    "ok": "Đã khôi phục",
+    "collision": "Đã khôi phục với tên khác",
+    "missing": "Không tìm thấy tệp - chưa được khôi phục",
+    "failed": "Không thể hoàn tác thao tác này",
+    "restoredTo": "Hiện ở {{path}}",
+    "reason": "Lý do: {{message}}",
+    "noId": "Mục lịch sử này không có id nên không thể hoàn tác",
+    "allRestored": "Đã khôi phục {{count}} tệp",
+    "allCollision": "{{count}} tệp đã được khôi phục với tên khác",
+    "allMissing": "{{count}} tệp không tìm thấy và không được khôi phục",
+    "allFailed": "Không khôi phục được {{count}} tệp"
   }
 }

@@ -289,5 +289,18 @@
       "acceptAllRules": "{{count}} 件の新ルールが作成され、有効になります",
       "clearHistory": "履歴 {{count}} 件が消去され、すべての取り消し機能が失われます"
     }
+  },
+  "undo": {
+    "ok": "復元しました",
+    "collision": "別の名前で復元しました",
+    "missing": "ファイルが見つかりませんでした。復元されていません",
+    "failed": "この操作を取り消せませんでした",
+    "restoredTo": "現在地: {{path}}",
+    "reason": "理由: {{message}}",
+    "noId": "この履歴には ID がないため、取り消せません",
+    "allRestored": "{{count}} 件を復元しました",
+    "allCollision": "{{count}} 件を別の名前で復元しました",
+    "allMissing": "{{count}} 件が見つからず、復元されませんでした",
+    "allFailed": "{{count}} 件を復元できませんでした"
   }
 }

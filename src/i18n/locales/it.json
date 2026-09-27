@@ -304,5 +304,30 @@
       "clearHistory_other": "Verranno cancellate {{count}} voci della cronologia, e con esse ogni possibilità di annullamento",
       "clearHistory_many": "Verranno cancellate {{count}} voci della cronologia, e con esse ogni possibilità di annullamento"
     }
+  },
+  "undo": {
+    "ok": "Ripristinato",
+    "collision": "Ripristinato con un altro nome",
+    "missing": "File non trovato: non è stato ripristinato",
+    "failed": "Impossibile annullare questa azione",
+    "restoredTo": "Ora in {{path}}",
+    "reason": "Motivo: {{message}}",
+    "noId": "Questa voce di cronologia non ha un id, quindi non può essere annullata",
+    "allRestored": "{{count}} file ripristinato/i",
+    "allRestored_one": "{{count}} file ripristinato",
+    "allRestored_other": "{{count}} file ripristinati",
+    "allRestored_many": "{{count}} file ripristinati",
+    "allCollision": "{{count}} file ripristinato/i con un altro nome",
+    "allCollision_one": "{{count}} file ripristinato con un altro nome",
+    "allCollision_other": "{{count}} file ripristinati con un altro nome",
+    "allCollision_many": "{{count}} file ripristinati con un altro nome",
+    "allMissing": "{{count}} file non trovato/i e non ripristinato/i",
+    "allMissing_one": "{{count}} file non trovato e non ripristinato",
+    "allMissing_other": "{{count}} file non trovati e non ripristinati",
+    "allMissing_many": "{{count}} file non trovati e non ripristinati",
+    "allFailed": "{{count}} file non ripristinato/i",
+    "allFailed_one": "{{count}} file non ripristinato",
+    "allFailed_other": "{{count}} file non ripristinati",
+    "allFailed_many": "{{count}} file non ripristinati"
   }
 }

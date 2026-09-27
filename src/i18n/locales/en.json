@@ -299,5 +299,26 @@
       "clearHistory_one": "{{count}} history entry will be erased, and every Undo goes with it",
       "clearHistory_other": "{{count}} history entries will be erased, and every Undo goes with it"
     }
+  },
+  "undo": {
+    "ok": "Restored",
+    "collision": "Restored under a different name",
+    "missing": "File not found - it was not restored",
+    "failed": "Could not undo this action",
+    "restoredTo": "Now at {{path}}",
+    "reason": "Reason: {{message}}",
+    "noId": "This history entry has no id, so it cannot be undone",
+    "allRestored": "{{count}} file(s) restored",
+    "allRestored_one": "{{count}} file restored",
+    "allRestored_other": "{{count}} files restored",
+    "allCollision": "{{count}} file(s) restored under a different name",
+    "allCollision_one": "{{count}} file restored under a different name",
+    "allCollision_other": "{{count}} files restored under a different name",
+    "allMissing": "{{count}} file(s) could not be found and were not restored",
+    "allMissing_one": "{{count}} file could not be found and was not restored",
+    "allMissing_other": "{{count}} files could not be found and were not restored",
+    "allFailed": "{{count}} file(s) could not be restored",
+    "allFailed_one": "{{count}} file could not be restored",
+    "allFailed_other": "{{count}} files could not be restored"
   }
 }

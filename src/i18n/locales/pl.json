@@ -304,5 +304,30 @@
       "clearHistory_few": "Zostaną usunięte {{count}} wpisy historii, a wraz z nimi każda możliwość cofnięcia",
       "clearHistory_many": "Zostanie usuniętych {{count}} wpisów historii, a wraz z nimi każda możliwość cofnięcia"
     }
+  },
+  "undo": {
+    "ok": "Przywrócono",
+    "collision": "Przywrócono pod inną nazwą",
+    "missing": "Nie znaleziono pliku - nie został przywrócony",
+    "failed": "Nie udało się cofnąć tego działania",
+    "restoredTo": "Teraz w {{path}}",
+    "reason": "Powód: {{message}}",
+    "noId": "Ten wpis historii nie ma identyfikatora, więc nie można go cofnąć",
+    "allRestored": "Przywrócono {{count}} plików",
+    "allRestored_one": "Przywrócono {{count}} plik",
+    "allRestored_few": "Przywrócono {{count}} pliki",
+    "allRestored_many": "Przywrócono {{count}} plików",
+    "allCollision": "Przywrócono {{count}} plików pod inną nazwą",
+    "allCollision_one": "Przywrócono {{count}} plik pod inną nazwą",
+    "allCollision_few": "Przywrócono {{count}} pliki pod inną nazwą",
+    "allCollision_many": "Przywrócono {{count}} plików pod inną nazwą",
+    "allMissing": "Nie znaleziono {{count}} plików i nie przywrócono ich",
+    "allMissing_one": "Nie znaleziono {{count}} pliku i nie przywrócono go",
+    "allMissing_few": "Nie znaleziono {{count}} plików i nie przywrócono ich",
+    "allMissing_many": "Nie znaleziono {{count}} plików i nie przywrócono ich",
+    "allFailed": "Nie udało się przywrócić {{count}} plików",
+    "allFailed_one": "Nie udało się przywrócić {{count}} pliku",
+    "allFailed_few": "Nie udało się przywrócić {{count}} plików",
+    "allFailed_many": "Nie udało się przywrócić {{count}} plików"
   }
 }

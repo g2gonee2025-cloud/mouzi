@@ -304,5 +304,30 @@
       "clearHistory_other": "{{count}} entrées d'historique seront effacées, et toute possibilité d'annulation disparaît avec",
       "clearHistory_many": "{{count}} entrées d'historique seront effacées, et toute possibilité d'annulation disparaît avec"
     }
+  },
+  "undo": {
+    "ok": "Restauré",
+    "collision": "Restauré sous un autre nom",
+    "missing": "Fichier introuvable - non restauré",
+    "failed": "Impossible d'annuler cette action",
+    "restoredTo": "Désormais dans {{path}}",
+    "reason": "Motif : {{message}}",
+    "noId": "Cette entrée d'historique n'a pas d'identifiant, elle ne peut donc pas être annulée",
+    "allRestored": "{{count}} fichier(s) restauré(s)",
+    "allRestored_one": "{{count}} fichier restauré",
+    "allRestored_other": "{{count}} fichiers restaurés",
+    "allRestored_many": "{{count}} fichiers restaurés",
+    "allCollision": "{{count}} fichier(s) restauré(s) sous un autre nom",
+    "allCollision_one": "{{count}} fichier restauré sous un autre nom",
+    "allCollision_other": "{{count}} fichiers restaurés sous un autre nom",
+    "allCollision_many": "{{count}} fichiers restaurés sous un autre nom",
+    "allMissing": "{{count}} fichier(s) introuvable(s), non restauré(s)",
+    "allMissing_one": "{{count}} fichier introuvable, non restauré",
+    "allMissing_other": "{{count}} fichiers introuvables, non restaurés",
+    "allMissing_many": "{{count}} fichiers introuvables, non restaurés",
+    "allFailed": "{{count}} fichier(s) non restauré(s)",
+    "allFailed_one": "{{count}} fichier non restauré",
+    "allFailed_other": "{{count}} fichiers non restaurés",
+    "allFailed_many": "{{count}} fichiers non restaurés"
   }
 }

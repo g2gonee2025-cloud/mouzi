@@ -6,6 +6,12 @@ import { save, open } from "@tauri-apps/plugin-dialog";
 import About from "./About";
 import ConfirmDialog, { type ConfirmRequest } from "./cleanup/ConfirmDialog";
 import {
+  UNDO_TONE_CLASS,
+  undoAllNotices,
+  undoNotice,
+  type UndoNotice,
+} from "../utils/undo";
+import {
   Folder,
   FolderOpen,
   List,
@@ -143,6 +149,15 @@ export default function Settings() {
   } | null>(null);
   const [isImportingArchive, setIsImportingArchive] = useState(false);
   const [pending, setPending] = useState<ConfirmRequest | null>(null);
+  const [undoToast, setUndoToast] = useState<UndoNotice[] | null>(null);
+
+  // 8s, not the 3s the export/import toasts use: a `collision` line ends in a
+  // filesystem path, and 3s cuts it off before it can be read or copied.
+  useEffect(() => {
+    if (!undoToast) return;
+    const timer = setTimeout(() => setUndoToast(null), 8000);
+    return () => clearTimeout(timer);
+  }, [undoToast]);
 
   useEffect(() => {
     loadRules();
@@ -207,6 +222,28 @@ export default function Settings() {
     });
   };
 
+  /**
+   * `undo_action_cmd` reports four outcomes but the row below re-renders from
+   * the database, which only knows whether `undone` was flipped. A `missing`
+   * source - an unmounted drive, a deleted folder - flips that flag without
+   * moving the file, so the badge would go green for a file that is still in
+   * its organised location. Reading the status is what keeps that honest.
+   */
+  const handleUndo = async (id: number | undefined) => {
+    if (id === undefined) {
+      setUndoToast([{ tone: "error", key: "undo.noId" }]);
+      return;
+    }
+    try {
+      setUndoToast(undoNotice(await undoAction(id)));
+    } catch (e) {
+      console.error("Undo failed:", e);
+      setUndoToast([
+        { tone: "error", key: "confirm.failed", values: { error: String(e) } },
+      ]);
+    }
+  };
+
   const askUndoAll = () => {
     const restorable = logs.filter((log) => !log.undone).length;
     if (restorable === 0) return;
@@ -215,8 +252,11 @@ export default function Settings() {
       count: restorable,
       notice: "move",
       note: t("confirm.note.undoAll"),
+      // `undoAllNotices` rebuilds the restored count from `results` rather than
+      // reading `UndoAllResult.count`, which the backend fills with every
+      // non-`failed` row and therefore counts `missing` ones too.
       onConfirm: async () => {
-        await undoAll();
+        setUndoToast(undoAllNotices(await undoAll()));
       },
     });
   };
@@ -755,6 +795,18 @@ export default function Settings() {
                 </button>
               </div>
             </div>
+            {undoToast && (
+              <div role="status" aria-live="polite" className="space-y-1">
+                {undoToast.map((notice) => (
+                  <div
+                    key={notice.key}
+                    className={`rounded-md px-3 py-2 text-xs ${UNDO_TONE_CLASS[notice.tone]}`}
+                  >
+                    {t(notice.key, notice.values)}
+                  </div>
+                ))}
+              </div>
+            )}
             {logs.length === 0 ? (
               <div className="flex flex-col items-center justify-center py-12 text-text-muted">
                 <Inbox size={48} className="mb-3 opacity-50" />
@@ -800,7 +852,7 @@ export default function Settings() {
                         </span>
                       ) : (
                         <button
-                          onClick={() => log.id && undoAction(log.id)}
+                          onClick={() => void handleUndo(log.id)}
                           className="text-xs text-primary hover:underline"
                         >
                           {t("settings.history.undo")}

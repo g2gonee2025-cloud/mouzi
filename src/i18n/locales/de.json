@@ -299,5 +299,26 @@
       "clearHistory_one": "{{count}} Verlaufseintrag wird gelöscht, und jede Möglichkeit zum Rückgängigmachen geht mit verloren",
       "clearHistory_other": "{{count}} Verlaufseinträge werden gelöscht, und jede Möglichkeit zum Rückgängigmachen geht mit verloren"
     }
+  },
+  "undo": {
+    "ok": "Wiederhergestellt",
+    "collision": "Unter anderem Namen wiederhergestellt",
+    "missing": "Datei nicht gefunden - nicht wiederhergestellt",
+    "failed": "Diese Aktion konnte nicht rückgängig gemacht werden",
+    "restoredTo": "Jetzt unter {{path}}",
+    "reason": "Grund: {{message}}",
+    "noId": "Dieser Verlaufseintrag hat keine ID und kann nicht rückgängig gemacht werden",
+    "allRestored": "{{count}} Datei(en) wiederhergestellt",
+    "allRestored_one": "{{count}} Datei wiederhergestellt",
+    "allRestored_other": "{{count}} Dateien wiederhergestellt",
+    "allCollision": "{{count}} Datei(en) unter anderem Namen wiederhergestellt",
+    "allCollision_one": "{{count}} Datei unter anderem Namen wiederhergestellt",
+    "allCollision_other": "{{count}} Dateien unter anderem Namen wiederhergestellt",
+    "allMissing": "{{count}} Datei(en) nicht gefunden und nicht wiederhergestellt",
+    "allMissing_one": "{{count}} Datei nicht gefunden und nicht wiederhergestellt",
+    "allMissing_other": "{{count}} Dateien nicht gefunden und nicht wiederhergestellt",
+    "allFailed": "{{count}} Datei(en) konnte nicht wiederhergestellt werden",
+    "allFailed_one": "{{count}} Datei konnte nicht wiederhergestellt werden",
+    "allFailed_other": "{{count}} Dateien konnten nicht wiederhergestellt werden"
   }
 }

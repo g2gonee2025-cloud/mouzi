@@ -304,5 +304,30 @@
       "clearHistory_other": "Se borrarán {{count}} entradas del historial y se perderá toda opción de deshacer",
       "clearHistory_many": "Se borrarán {{count}} entradas del historial y se perderá toda opción de deshacer"
     }
+  },
+  "undo": {
+    "ok": "Restaurado",
+    "collision": "Restaurado con otro nombre",
+    "missing": "Archivo no encontrado: no se restauró",
+    "failed": "No se pudo deshacer esta acción",
+    "restoredTo": "Ahora en {{path}}",
+    "reason": "Motivo: {{message}}",
+    "noId": "Esta entrada del historial no tiene id, así que no se puede deshacer",
+    "allRestored": "{{count}} archivo(s) restaurado(s)",
+    "allRestored_one": "{{count}} archivo restaurado",
+    "allRestored_other": "{{count}} archivos restaurados",
+    "allRestored_many": "{{count}} archivos restaurados",
+    "allCollision": "{{count}} archivo(s) restaurado(s) con otro nombre",
+    "allCollision_one": "{{count}} archivo restaurado con otro nombre",
+    "allCollision_other": "{{count}} archivos restaurados con otro nombre",
+    "allCollision_many": "{{count}} archivos restaurados con otro nombre",
+    "allMissing": "{{count}} archivo(s) no encontrado(s) y sin restaurar",
+    "allMissing_one": "{{count}} archivo no encontrado y sin restaurar",
+    "allMissing_other": "{{count}} archivos no encontrados y sin restaurar",
+    "allMissing_many": "{{count}} archivos no encontrados y sin restaurar",
+    "allFailed": "{{count}} archivo(s) no restaurado(s)",
+    "allFailed_one": "{{count}} archivo no restaurado",
+    "allFailed_other": "{{count}} archivos no restaurados",
+    "allFailed_many": "{{count}} archivos no restaurados"
   }
 }

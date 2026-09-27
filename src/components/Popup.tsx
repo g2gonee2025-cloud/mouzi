@@ -19,6 +19,7 @@ import {
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import ConfirmDialog, { type ConfirmRequest } from "./cleanup/ConfirmDialog";
+import { UNDO_TONE_CLASS, undoNotice, type UndoNotice } from "../utils/undo";
 
 function getIconForType(typeName: string) {
   const lower = typeName.toLowerCase();
@@ -63,6 +64,15 @@ export default function Popup() {
     destination_folder: string;
   } | null>(null);
   const [pending, setPending] = useState<ConfirmRequest | null>(null);
+  const [undoToast, setUndoToast] = useState<UndoNotice[] | null>(null);
+
+  // 8s, not the 3s the other popups use: a `collision` line ends in a
+  // filesystem path, and 3s cuts it off before it can be read or copied.
+  useEffect(() => {
+    if (!undoToast) return;
+    const timer = setTimeout(() => setUndoToast(null), 8000);
+    return () => clearTimeout(timer);
+  }, [undoToast]);
 
   useEffect(() => {
     loadLogs();
@@ -153,6 +163,27 @@ export default function Popup() {
     invoke("close_popup");
   };
 
+  /**
+   * `undo_action_cmd` is a no-op on the row when the source is gone, yet the
+   * backend still flips `undone`, so the row below re-renders as a finished
+   * item. Reading the status here is the only thing that stops a file which is
+   * still sitting in its organised folder being reported as restored.
+   */
+  const handleUndo = async (id: number | undefined) => {
+    if (id === undefined) {
+      setUndoToast([{ tone: "error", key: "undo.noId" }]);
+      return;
+    }
+    try {
+      setUndoToast(undoNotice(await undoAction(id)));
+    } catch (e) {
+      console.error("Undo failed:", e);
+      setUndoToast([
+        { tone: "error", key: "confirm.failed", values: { error: String(e) } },
+      ]);
+    }
+  };
+
   const totalStats = stats.reduce((sum, s) => sum + s.count, 0);
 
   return (
@@ -232,7 +263,7 @@ export default function Popup() {
                       <FolderOpen size={12} />
                     </button>
                     <button
-                      onClick={() => undoAction(log.id!)}
+                      onClick={() => void handleUndo(log.id)}
                       className="p-1 rounded hover:bg-border text-text-muted hover:text-text"
                       title={t("popup.undo")}
                     >
@@ -306,6 +337,26 @@ export default function Popup() {
               {t("popup.openFolder", { folder: toast.destination_folder })}
             </div>
           </div>
+        </div>
+      )}
+
+      {/* Pinned near the bottom of the tray, where the rows themselves offer no
+          correction: a `missing` undo just makes the row's Undo button vanish,
+          which looks exactly like a file that went home. */}
+      {undoToast && (
+        <div
+          role="status"
+          aria-live="polite"
+          className="space-y-1 px-3 pb-2"
+        >
+          {undoToast.map((notice) => (
+            <div
+              key={notice.key}
+              className={`rounded-lg px-3 py-2 text-xs ${UNDO_TONE_CLASS[notice.tone]}`}
+            >
+              {t(notice.key, notice.values)}
+            </div>
+          ))}
         </div>
       )}
 

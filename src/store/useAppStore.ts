@@ -61,8 +61,18 @@ export interface ScheduleSettings {
   schedule_time_4: string | null;
 }
 
+/**
+ * The four outcomes `undo_action_cmd` can return. A union, not `string`, so a
+ * status the backend adds later fails to compile here instead of falling
+ * through every switch to the "success" branch. `missing` is the one that
+ * matters: the row is marked undone and the file is never restored, so a
+ * caller that ignores it reports a green "Undone" badge for a file that is
+ * still in its organised location.
+ */
+export type UndoStatus = "ok" | "collision" | "missing" | "failed";
+
 export interface UndoResult {
-  status: string; // 'ok' | 'collision' | 'missing' | 'failed'
+  status: UndoStatus;
   message: string | null;
   restoredTo: string | null;
 }
