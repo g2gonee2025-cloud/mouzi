@@ -1205,3 +1205,474 @@ Coverage is broad and shallow. Nothing in the suite would fail if `perform_undo`
 
 **Scope of this pass.** 10 of the 21 audit reports. No executive summary is added or amended: the
 summary in section 1 predates these findings, and a later pass should reconcile it.
+
+---
+
+## 13. Addendum - eighth pass: fork hygiene, type contracts and doc accuracy
+
+**Scope.** 3 of the 21 audit reports, bringing the absorbed total to 13 of 21. The three scopes are
+fork hygiene and plan compliance, TypeScript strictness and type contracts, and docs, naming and
+cross-language consistency. Findings run C9-C10, H25-H28, M27-M43, plus a Low subsection and a
+dedicated refutation subsection.
+
+### 13.1 CRITICAL C9 - four features shipped, no version bump, no changelog, so none of them can be documented
+
+`src-tauri/tauri.conf.json:4` is still `"version": "0.1.6"`, byte-identical to upstream, and
+`package.json:4` agrees. There is no `CHANGELOG.md` anywhere in the repository. The only changelog
+artefacts are upstream's own Astro marketing-site release notes, `website/src/content/changelog/0-1-5.mdx`
+and `0-1-6.mdx`. Both describe upstream work; `0-1-6.mdx` lists quick rule toggles, inline `#`
+comments in `.mouziignore`, locked-file handling and translation updates, and none of the four
+elevate features.
+
+`README.md:125-127` and `README.md:135-137` still advertise `Mouzi_0.1.5_*` signed installers with
+SHA-256 checksums at `README.md:144-147`, while `README.md:257` opens a section titled "Coming in
+0.1.6". The README therefore advertises 0.1.5 binaries and previews 0.1.6 in the same document, and
+the version those binaries correspond to is not the version the app declares.
+
+Consequence: there is no version number and no changelog entry under which the dashboard, smart
+cleanup, AI suggestions or the Recycle Bin work can be recorded. A user downloading `0.1.5` and a
+user running this build are indistinguishable from the outside. This is the administrative root of
+every documentation defect in 13.5: there is no target to document against.
+
+### 13.2 CRITICAL C10 - the tray menu is the only entry point to three shipped features, and the README documents three other items
+
+Plan D3 required the dashboard be reachable via "new tray menu item + settings link". The tray menu
+item exists; the settings link was never built. `src/components/Settings.tsx` contains **zero**
+occurrences of `dashboard`, `cleanup` or `suggestions` (verified by grep across the whole file:
+0 matches). The menu itself is built at `src-tauri/src/tray.rs:11-19` and carries seven items -
+`quit`, `clean_now`, `suggestions`, `dashboard`, `cleanup`, `settings`, and a separator - wired at
+`tray.rs:24-44`.
+
+`README.md:171` reads: "Right-click the tray icon for the menu: `Clean Now`, `Settings`, `Quit`." That
+is three of the seven, and it omits `Suggestions`, `Dashboard` and `Cleanup` - the three entry points
+to the fork's headline features. `README.md:170` documents only the left-click popup.
+
+Consequence: a user following the README literally can never reach the dashboard, the cleanup surface
+or the suggestions surface. This is the mechanism by which C9 becomes user-visible. It also **refines**
+two earlier findings. The D3 deviation recorded at line 489 as "Partial" is more accurately a **full
+non-implementation of the settings link**; the window is built, the second half of the plan is simply
+absent. And the stale-tray-menu finding previously treated as cosmetic is a discoverability defect,
+not a wording defect.
+
+### 13.3 HIGH H25 - the undo per-file status is returned by the backend and discarded by the frontend
+
+The plan's M1 headline deliverable was a per-file status of `ok | collision | missing | cross-device |
+failed`. The backend emits four of the five. In `src-tauri/src/commands.rs`, `missing` is returned at
+`:154-159` and `:165-170`, `ok` at `:181-186`, `collision` at `:193-198`, and `failed` at `:199-203`
+and again at `:235-240` in the batch path.
+
+The frontend throws the value away. `src/components/Popup.tsx:219` reads
+`onClick={() => undoAction(log.id!)}`: no `.then`, no destructuring, no comparison against any status.
+`log.id!` is additionally a non-null assertion on `ActionLog.id?: number`.
+
+Consequence: an undo that returned `failed` is visually identical to one that returned `ok`. An undo
+that hit a collision and therefore landed the file under a timestamp-suffixed name is also
+indistinguishable from a clean restore, even though `restored_to` carries the suffixed path and
+`perform_undo` took a different branch for it. The one operation whose entire purpose is restoring
+user trust gives the user no feedback at all.
+
+`cross-device` is **unrepresentable**. `src-tauri/src/safe_fs.rs:64 move_file` dispatches to
+`copy_delete_fallback` (`:37`) on EXDEV and on Windows `ERROR_NOT_SAME_DEVICE` (`:36`, `:83`), and
+that function returns `Ok(MoveOutcome::Moved)`. A cross-device restore is therefore byte-identical to
+a same-device one. The plan's fifth status has no code path anywhere in the crate.
+
+### 13.4 HIGH H26 - the undo status has no type-level contract in either language, and no i18n keys
+
+`UndoResult.status` is a bare `String` in Rust (`commands.rs:130`, with the union written only in a
+trailing comment) and a bare `string` in TypeScript. Nothing prevents a status being added on one side
+and not the other. That is the exact defect class already recorded elsewhere in this audit for the
+`hashedCount` alias-casing bug. There is no `switch` and no comparison against an undo status anywhere
+in `src`, and `src/i18n/locales/en.json` has no keys for `collision`, for undo-specific `missing`
+(the only `missing` string at `:254` belongs to the cleanup surface) or for undo failure.
+
+The contrast within this same codebase is the finding. The cleanup status contract is closed end to
+end: `src-tauri/src/cleanup.rs` emits `ok`, `failed` and `skipped` at nine sites;
+`src/utils/cleanup.ts:26` types the field as the exact union `"ok" | "failed" | "skipped"`;
+`src/components/cleanup/ResultsPanel.tsx:44,47,50` and `:60,62,66,68` handle all three; and
+`en.json:223-225` supplies `cleanup.ok`, `cleanup.failed` and `cleanup.skipped`. One contract in this
+repository is exemplary and one is unmanaged, and the difference is entirely whether somebody wrote
+the union down.
+
+### 13.5 HIGH H27 - there is no way to create an `ignore` rule from the UI, so the Rust `ignore` branch is nearly unreachable
+
+`src/components/Settings.tsx:491` hardcodes `action: "move"` in the object the new-rule button
+constructs, and `src-tauri/src/db.rs:343` hardcodes `'move'` in the rule INSERT. There is no action
+picker anywhere in the rules form. The Rust `ignore` branch at `src-tauri/src/rules.rs:201`
+(`"ignore" => Ok(file_info.path.to_string_lossy().to_string())`) is therefore reachable only by
+hand-editing SQLite or by importing a JSON rules file through `import_rules_cmd`.
+
+This is a plan-compliance correction. Line 494 records D8 ("never route cleanup through
+`execute_rule`") as **Compliant** on the grounds that `delete` has no UI selector. That reasoning is
+right but the framing is generous: there is no action selector at all, so `delete` was never
+selectable and hiding it is **vacuously** true. Record D8 as compliant-but-vacuous, not as a
+delivered mitigation, so nobody later reads it as evidence that a dangerous option was deliberately
+withheld from users.
+
+### 13.6 HIGH H28 - the two extension-to-category tables in the same crate disagree
+
+`src-tauri/src/scan.rs:44 categorize()` and `src-tauri/src/classify.rs:26 extension_to_category()` are
+two independent implementations of the same extension-to-category mapping. The comment at
+`classify.rs:20` says it "mirrors scan.rs::categorize", so the divergence is unintentional. Verified
+divergences:
+
+- `rtf`, `odt`, `ods`, `odp` are Documents in classify (`classify.rs:30`) and fall through to Other in
+  scan, whose Documents arm is `scan.rs:50`.
+- `heif` and `ico` are Images in classify (`classify.rs:31`) and Other in scan (`scan.rs:53`).
+- `flv` is Videos in classify (`:34`) and Other in scan. `wma` is Audio in classify (`:35`) and Other
+  in scan. `xz`, `iso` and `dmg` are Archives in classify (`:36`) and Other in scan.
+- `exe`, `msi`, `msix`, `appx`, `deb`, `rpm`, `apk` and `appimage` are Archives in classify
+  (`:41-43`) and Other in scan, whose Archives arm is `scan.rs:56`. **`exe` is the one that matters in
+  practice**: it is the most common file a Downloads-folder organiser encounters.
+- Code extensions: classify carries 32 (`classify.rs:37-40`), scan carries 10 (`scan.rs:57`).
+
+Consequence: `file_inventory.category`, written at `scan.rs:102`, and the Suggestions panel's proposed
+category, written by classify, disagree about the same file. The dashboard's "By kind" chart is built
+from the scan side and the Suggestions surface reasons from the classify side, so a user can be shown
+a file as "Other" on one screen and "Archives" on another. Neither table has an `Installers`
+category, although `README.md:50` documents an "Installers" rule, so the documented rule and the
+shipped taxonomy do not correspond either.
+
+### 13.7 MEDIUM M27 - Ollama cannot be turned on or off
+
+`classify.rs:447` probes `http://localhost:11434/api/tags` and `classify.rs:495` posts to
+`http://localhost:11434/api/generate`. Both are hardcoded. There is no setting, no environment
+variable, no config key and no UI control. `detect_provider` (`classify.rs:539`) probes
+unconditionally on every suggestions request.
+
+So Ollama is not "off by default" and not user-selectable. If something is listening on port 11434,
+the app silently starts sending filenames to it. Plan D2 described an "optional enhancement behind a
+trait", and that is what shipped, but "optional" here means optional for the user to have installed
+Ollama, not optional for the user to select. Anyone documenting "how do I turn the AI off" has to
+answer "you cannot, short of not running Ollama".
+
+### 13.8 MEDIUM M28 - there are two parallel i18n stores for one product, and the tray's own labels are English in every locale
+
+The ten files in `src/i18n/locales/*.json` (`de`, `en`, `es`, `fr`, `it`, `ja`, `pl`, `ru`, `uk`,
+`vi`) are one store. `src-tauri/src/i18n.rs` is a second, entirely separate hardcoded table for the
+tray, notifications and window titles. It is a `HashMap<&'static str, &'static str>` (`:3-5`) built by
+nine named language arms (`pl` `:11`, `it` `:28`, `de` `:45`, `fr` `:62`, `ru` `:79`, `ja` `:96`,
+`vi` `:113`, `es` `:130`, `uk` `:147`) plus an `_` English default (`:164`). Every arm contains
+exactly 15 `strings.insert` calls, 150 in total, covering 15 keys. Two sources of truth for strings
+that appear in the same product, with no shared key namespace and no check that they agree.
+
+Within the Rust table the coverage is uneven in a way that is easy to miss: `cleanup` and
+`cleanup_title` are translated per language (`Pulizia` `:39`, `Aufräumen` `:56`, `Nettoyage` `:73`,
+`D?n d?p` `:124`, `Limpiar` `:141` and others), but `dashboard` and `dashboard_title` are the literal
+strings `"Dashboard"` and `"Mouzi Dashboard"` in **all ten** blocks, at `:20-21`, `:37-38`, `:54-55`,
+`:71-72`, `:88-89`, `:105-106`, `:122-123`, `:139-140`, `:156-157` and `:173-174`. The two
+fork-specific menu labels are the two that were never translated.
+
+### 13.9 MEDIUM M29 - four backend payload types are declared inline a second time, and the compiler cannot catch a backend rename
+
+`src/store/useDashboardStore.ts` declares `CategoryStat` (`:8-12`), `RootStat` (`:22-26`) and
+`WeeklyStat` (`:56-59`). Each is then re-declared as an inline structural type in a consuming
+component: `src/components/dashboard/CategoryBars.tsx:7` re-declares the category payload as
+`Array<{ category: string; files: number; bytes: number }>`, `StorageTreemap.tsx:10` re-declares
+`RootStat` as `Array<{ path: string; files: number; bytes: number }>`, and `ActivityTimeline.tsx:6`
+re-declares `WeeklyStat` as `Array<{ file_type: string; count: number }>`. A third definition of the
+category payload lives in `src/utils/dashboard.ts:17-21` as `CategoryShare`, and
+`StorageRibbon.tsx:3,6` is the one component that imports it properly.
+
+So one backend payload has three definitions and another has two. All of them are structurally
+compatible, which is the problem: they compile. If the Rust side renames `file_type`, every
+duplicated inline type keeps compiling, and the breakage surfaces as `undefined` at runtime rather
+than as a build error. Contrast `AgeHistogram.tsx:3`, `FileBrowser.tsx:8` and `InsightCards.tsx:4`,
+which import their payload types from the store and are therefore immune. The fix is mechanical:
+import the type instead of restating it.
+
+### 13.10 MEDIUM M30 - a correctly-built union type is discarded at its only use site
+
+`src/utils/dashboard.ts:11` defines `export const AGE_BUCKETS = ["7d", "30d", "90d", "365d", "older"] as const`,
+which makes the literal union `'7d' | '30d' | '90d' | '365d' | 'older'` available to importers.
+`src/components/dashboard/AgeHistogram.tsx:4` imports exactly that.
+
+`AgeBucket.bucket` in `useDashboardStore.ts:39` is typed `string`, throwing the union away at the
+point of declaration. Consequently `labels` at `AgeHistogram.tsx:12` must be declared
+`Record<string, string>`, and `labels[bucket.bucket]` at `:46` and `:50` compiles as `string` rather
+than `string | undefined`. If the backend ever emits a bucket id outside the five, say `"180d"`, the
+label renders as `undefined` and is invisible, and `ordered` at `AgeHistogram.tsx:20-22` silently
+drops the row because it maps over `AGE_BUCKETS`, not over the data.
+
+This is the only place in the codebase where an already-correct type was available and thrown away,
+which makes it a better teaching example than a typical missing-type bug. Type `AgeBucket.bucket` as
+`(typeof AGE_BUCKETS)[number]`, and every one of the above becomes a compile error instead of an
+invisible chart.
+
+### 13.11 MEDIUM M31 - the one `any` in the codebase sits on the event handler that drives the popup
+
+`src/components/Popup.tsx:72` is `listen("file-organized", (event: any) => {...})`. This is the only
+`any` in any type position across all of `src` (verified by grep for `: any` and `as any` across
+every `.ts` and `.tsx`: one hit). The `listen` API is generic, so the parameter could have been typed
+with no extra work.
+
+Because it is `any`, every field read on the payload is unchecked: `payload.destination_folder`,
+`payload.destination`, `payload.file`, `payload.rule`, `payload.success` at `Popup.tsx:74-80`. That
+matters because the emit site is a hand-built `serde_json::json!` object in
+`src-tauri/src/watcher.rs:110` and `:120`, and those key strings are the **only** contract between the
+two halves. There is no `rename_all` to lean on, because `json!` bypasses serde derive entirely. The
+`payload.destination_folder || payload.destination` fallback at `Popup.tsx:75` happens to work against
+today's emitter, and nothing whatsoever would catch a rename on the Rust side.
+
+### 13.12 MEDIUM M32 - the sole `as unknown as` cast in the codebase is a symptom of one function's design
+
+`src/__tests__/dashboard.test.ts:53` needs
+`globalThis as unknown as { window?: { location: { hash: string } } }` in order to fake a window for
+`navigateHash`. The cause is in `src/utils/paths.ts`: `navigateHash` at `:28-33` reaches directly for
+`window.location` at `:32` with no `typeof window` guard, while its sibling `parseHash` at `:13` in
+the same file does guard, defaulting the parameter with
+`typeof window !== "undefined" ? window.location.hash : ""`.
+
+Inconsistent guarding between two functions in one small module, and the consequence is concrete: one
+of them is untestable in the default vitest node environment, and the test that wants to test it has
+to lie to the type system to do so. Add the same `typeof window` guard to `navigateHash` and the cast
+disappears along with the need for the fake.
+
+### 13.13 MEDIUM M33 - `parseHash` returns an unconstrained `string` and a test encodes the bug as expected behaviour
+
+`parseHash` in `src/utils/paths.ts:13-26` declares `route: string`, not a union of the five valid
+routes. `App.tsx:112-122` is a chain of `hash ===` comparisons with a `:120-121` fallback to
+`<Popup />`, so a typo'd or unrecognised route renders the popup rather than failing visibly. The
+regex at `paths.ts:17`, `/^#\/?/`, strips only one leading `#` and an optional `/`, so the input
+`#/#/dashboard` yields the literal route string `"#/dashboard"`, which matches no branch.
+
+`src/__tests__/dashboard.test.ts:38-41` asserts this input's route is **not** `"dashboard"`:
+
+```
+it("does not treat a doubled hash from location.hash = '/#/dashboard' as dashboard", () => {
+  expect(parseHash("#/#/dashboard").route).not.toBe("dashboard");
+  expect(parseHash("#/dashboard").route).toBe("dashboard");
+});
+```
+
+The first expectation passes against the buggy value, so the test documents the defect instead of
+catching it, and its title describes the defect as intended behaviour. The assertion needs to be
+`toBe("")` or the route to be normalised, and the return type needs to be a five-member union. This
+is the same pattern as C8: a green test pinning incorrect behaviour. It should be rewritten in the
+same change as the fix, or the fix will be reverted by someone who trusts the suite.
+
+### 13.14 MEDIUM M34 - the persisted settings surface is entirely undocumented
+
+The `settings` table carries `autostart`, `grace_period_seconds`, `lock_check_enabled`,
+`schedule_enabled`, `schedule_times_per_day`, `schedule_time_1` through `schedule_time_4`
+(`src-tauri/src/db.rs:96-105`), plus `language`, `theme`, `telemetry_enabled` and `first_run`
+(`db.rs:94-95` and the surrounding struct). None of these column names appears in `README.md`, and
+there is no troubleshooting section explaining what a grace period of 300 seconds does, what the
+lock check protects against, or how the four schedule slots are used.
+
+Consequence: every one of these is a behaviour a user can observe and change and cannot look up. A
+user who wants a scheduled clean has no way to learn the syntax of `schedule_time_1` short of reading
+Rust. Note the default grace period is 300 (`rules.rs:209`), and `README.md` does not mention it.
+
+### 13.15 MEDIUM M35 - data location, dev port and uninstall are undocumented, and the backup-relevant commands are undocumented too
+
+`src-tauri/src/lib.rs:102` opens the database with `ProjectDirs::from("cc", "mouzi", "mouzi")`, which
+on Windows resolves under the roaming application-data directory. There is no README statement of
+where the database lives, no backup guidance, no reset procedure and no uninstall section. The
+Recycle Bin work means the app now holds user data across several locations, and none of them are
+documented.
+
+Separately, `tauri.conf.json:8` sets `devUrl` to `http://localhost:1420` with `strictPort: true`, so a
+port clash is an immediate hard failure with no documented remedy. The README's contributing section
+does not mention the port.
+
+And `export_rules_cmd` (`commands.rs:480`) and `import_rules_cmd` (`commands.rs:491`) exist, are
+registered Tauri commands, and are documented nowhere. These are the only backup and restore paths
+that exist for rules, and `import_rules_cmd` takes a `replace: bool` that determines whether it
+merges or overwrites. That is a data-destroying flag with no documentation.
+
+### 13.16 MEDIUM M36 - `package.json` has no lint or format script, which is the root cause of the split quoting convention
+
+`package.json:6-13` declares `dev`, `build`, `preview`, `tauri`, `start` and `test`. There is no
+`lint`, no `format`, and no lint or formatter dependency in `devDependencies`. Nothing enforces a
+convention, so none exists: upstream's `src/store/useAppStore.ts` uses single quotes (`useAppStore.ts:46`
+reads `language: 'en'`) while every elevate-authored file uses double quotes.
+
+Name the missing tool rather than picking one. Until something runs, every "why are these different"
+question has the same answer, and the codebase will keep splitting at whatever line the fork was
+branched from. The `// @ts-expect-error` inherited into `vite.config.ts` (see 13.17) is a second
+construct that no tool would catch, because that file is not typechecked at all.
+
+### 13.17 MEDIUM M37 - the `file_inventory` DDL is duplicated, and every inventory test runs against the copy
+
+`src-tauri/src/db.rs:189-216` creates `file_inventory` and its four indexes in the real schema
+(`idx_file_inventory_root`, `_size`, `_category`, `_mtime`). `db.rs:731-750` declares a second,
+textually near-identical copy of the table and all four indexes under `#[cfg(test)]`, in
+`create_file_inventory_table`.
+
+Consequence: every inventory query test exercises a test-only schema. The two can drift with CI
+green - add a column to the real DDL and forget the test copy, or the reverse, and the suite passes
+while the app's queries break. This is a structural twin of C1 and C8: the test asserts against
+something other than what ships.
+
+### 13.18 MEDIUM M38 - two field-naming conventions coexist, split by which commit introduced them
+
+Upstream's interfaces in `src/store/useAppStore.ts` are snake_case (`autostart`, `grace_period_seconds`,
+`lock_check_enabled` at `useAppStore.ts:40-42`) because the corresponding Rust structs do not carry
+`#[serde(rename_all = "camelCase")]`. Every elevate-authored type is camelCase:
+`DashboardStats` (`useDashboardStore.ts:44-54`), `InventoryFile` (`:14-20`), `CleanupOutcome`
+(`src/utils/cleanup.ts:24-28`), `ScanProgress` (`useDashboardStore.ts:61`).
+
+`WeeklyStat.file_type` (`useDashboardStore.ts:57`) is snake_case sitting among camelCase neighbours,
+and it is the one that generates the `ActivityTimeline.tsx:6` duplication from M29. One codebase, two
+conventions, and the seam between them is invisible: nothing marks which files are pre-fork and which
+are post-fork. The fix is a single serde attribute per affected struct plus a rename, and until it
+happens a reviewer cannot tell from a diff whether a snake_case field is deliberate or an oversight.
+
+### 13.19 MEDIUM M39 - three different action vocabularies are written into two audit tables
+
+`rules.action` receives `move` and `ignore` (`rules.rs:201-202`, and the `'move'` default at
+`db.rs:142`). `action_logs.action` receives the literal `move` (`db.rs:1318` in tests, and the
+INSERT in the same shape). `cleanup_actions.action` receives the cleanup `kind` values instead -
+`trash_duplicate`, `remove_empty_dir` and siblings (`cleanup.rs:391-393`,
+`HistoryPanel.tsx:53` compares `log.action === "remove_empty_dir"`).
+
+Nothing normalises the three vocabularies, and `HistoryPanel.tsx:53` renders the raw value. So the
+user-facing history list displays three different naming conventions for "what Mouzi did to this
+file", and a query joining across `action_logs` and `cleanup_actions` has to know which table it is
+in before it can interpret the column.
+
+### 13.20 LOW
+
+- **The plan's 5-second figure is stale, and the code is correct.** `watcher.rs:12` declares
+  `IGNORE_DURATION_SECS: u64 = 30`, not the 5 recorded in plan section 2, and the constant is consumed
+  at `watcher.rs:218` and `:270`. M1's "extend beyond the 5s window" was in fact done. Do not re-raise
+  the 5-second number.
+- **`defaultSettings` (`useAppStore.ts:45`) is dead.** One reference in the whole of `src`: its own
+  definition. Every settings read goes through the store, so the export is unreachable.
+- **`applyAccept` is public but internal.** It is on the `useSuggestionsStore` interface at
+  `useSuggestionsStore.ts:29` and defined at `:60`, but its only two callers are `acceptSuggestion`
+  (`:75`) and `acceptAll` (`:103`), both inside the store. It should be private to the store.
+- **`CATEGORY_COLORS` is exported but file-local.** Declared at `src/utils/dashboard.ts:1` and
+  referenced only at `:14` in the same file. `categoryColor` (`:13`) is the intended public surface.
+- **`EMPTY_INSIGHTS` has two export statements.** Declared `const` at `useDashboardStore.ts:78` and
+  re-exported by a trailing `export { EMPTY_INSIGHTS }` at `:236`. It is genuinely consumed externally
+  (`src/pages/Dashboard.tsx:7,221`), so this is a style oddity, not dead code.
+- **`cleanup.rs:391-394` is a constant expressed as a match.** Both arms of
+  `match action.kind.as_str() { "remove_empty_dir" => false, _ => false }` evaluate to `false`, so
+  `undoable` is always `false` for every cleanup action. The match reads as though empty-dir removal
+  is a special case, which implies the other kind might be undoable. It is not. `en.json:229` says so
+  correctly ("Empty folder removals are not undoable") but implies trash deletions might be.
+- **`cleanup_actions.prev_path` and `.dest` are always NULL.** The struct declares them at
+  `db.rs:82-83`, the reader reads them at `db.rs:636`, and the only writer sets both to `None`
+  (`cleanup.rs:399`). The `UndoAllResult`-style machinery for cleanup does not exist. Both columns
+  are carried forever and read as `None`.
+- **`close_settings` no longer describes what it does.** `commands.rs:386 close_settings(app: AppHandle)`
+  closes the shared window, which since the C3 window consolidation is the only window. The name is a
+  leftover from the multi-window model and will mislead the next reader.
+- **The `app` window label, the D3 deviation, the undo status vocabulary and the `prev_path` naming were
+  all independently re-raised by two of these three reports.** See 13.21 for the balance.
+
+### 13.21 Refuted
+
+Recorded so they are not raised a third time. Each was checked and cleared.
+
+- **`key={log.id}` where `id: number | null` is not a type error.** React 19's `HTMLAttributes`
+  declares `key?: Key | null | undefined` at `node_modules/@types/react/index.d.ts:259`. `null` is
+  explicitly permitted. Checked in the installed type definitions. The sites are
+  `src/components/Popup.tsx:197` and `src/components/Settings.tsx:713`.
+- **`sourceLabel(s.source, t)` is not a type error.** With no `declare module 'i18next'` augmentation
+  anywhere in `src`, the installed i18next's `ResourceKeys` falls back to `string`, so `TFunction` is
+  assignable to `(key: string) => string`. Checked in the installed `i18next` `.d.ts`. This is a real
+  weakness in the setup (no key safety, see M28) but it is not a compile error.
+- **Indexed access is not a type error under the current tsconfig.** `noUncheckedIndexedAccess` is off,
+  so `files[0]` is non-nullable and TypeScript narrows away any `?.`. The two sites are
+  `src/__tests__/cleanup.test.ts:50` and `:55`, both written as plain `a.files[0].path` with no `?.`
+  at all. The **runtime** truth is that `files[0]` can be `undefined` for an empty group, so the type
+  is lying; that is the same missing-flag class as M30 and is recorded there rather than as an error.
+- **The `prev_path` serialisation mismatch is real, but the SQL is not the cause, and the query is not
+  aliased.** `db.rs:623-624` reads `SELECT id, timestamp, path, prev_path, dest, action, status,
+  undoable FROM cleanup_actions` with **no** `prev_path AS prevPath` alias; the column really is
+  selected as `prev_path`, and `db.rs:636` binds it to `row.get(3)`. The defect is solely the missing
+  `#[serde(rename_all = "camelCase")]` on the `CleanupAction` struct at `db.rs:77-87`, which carries
+  only `#[derive(Debug, Clone, Serialize, Deserialize)]`. Attribute the mismatch to the serialisation
+  attribute, not to the query.
+- **The 2^53 integer-overflow concern is not live.** Exceeding `Number.MAX_SAFE_INTEGER` (about
+  9.007e15) through the `SUM(size_bytes)` path requires a single file of roughly 8 EiB (9.007e15 bytes
+  of disk). Through the `(cnt - 1) * size` reclaimable aggregate in `src/utils/cleanup.ts:31-33` it
+  requires roughly 8 PiB of duplicated content. Neither is reachable. Record as a non-issue with the
+  arithmetic shown, because it is a plausible-sounding concern and closing it saves a future pass the
+  work.
+- **`strict: true` really is on.** `tsconfig.json` carries `"strict": true`, so plan section 7's "tsc
+  strict" claim holds. But `noUncheckedIndexedAccess`, `exactOptionalPropertyTypes`,
+  `noImplicitOverride` and `verbatimModuleSyntax` are all **off**, and `tsconfig.node.json` has no
+  `strict` at all. `noUnusedLocals`, `noUnusedParameters`, `noFallthroughCasesInSwitch` and
+  `isolatedModules` are on.
+- **`vite.config.ts` is never typechecked.** `package.json:8` sets `"build": "tsc && vite build"`, and
+  plain `tsc` without `-b` checks only the root project, so the `references` entry to
+  `tsconfig.node.json` at the end of `tsconfig.json` is not built. The file contains an inherited
+  upstream `// @ts-expect-error`, which is a plan-banned construct, and it is consequently never
+  checked by anything.
+- **The existing `dist/` build is not evidence that the current tree compiles.** `dist/index.html` and
+  `dist/assets` are dated 2026-08-24 21:37, while the newest source file under `src` and
+  `src-tauri/src` is dated 2026-08-25 09:34. The build predates the current tree by roughly twelve
+  hours, so it says nothing about it.
+- **Every frontend import resolves.** An initial scan appeared to show ten unresolved imports; that was
+  a bug in the checking script, which appended `.json` to paths that already ended in `.json`.
+  Corrected, all imports resolve. Recorded because the original finding is wrong and would otherwise
+  be re-raised.
+- **Zero TODO, FIXME and HACK markers, and zero commented-out code blocks**, anywhere in `src` or
+  `src-tauri/src` (verified by grep across every `.ts`, `.tsx` and `.rs` file: 0 hits).
+  `console.log` and `debugger` are absent; only `console.error` is used, which is appropriate.
+- **Upstream's `.mouziignore` documentation is accurate.** The inline-comment rule is at
+  `ignore.rs:21` (an unescaped `#` truncates the line), the `\#` escape is at `ignore.rs:32` on read
+  and `ignore.rs:44` on write, empty and comment lines are filtered at `ignore.rs:31`, and the
+  `{year}`, `{month}`, `{day}`, `{extension}`, `{filename}` destination placeholders are at
+  `rules.rs:141-145`. `README.md:59-62` and `README.md:261` describe these accurately. Recorded as a
+  checked-and-correct claim so that the count of real README defects in this document stays honest.
+  **`UNVERIFIED`:** the README's wildcard examples at `README.md:62` (`*.tmp`, exact names, trailing
+  `/` for folders) were not traced to a specific glob-matching line during this pass; the pattern
+  syntax itself was not re-derived here.
+
+### 13.22 Where these three reports agree with, and refine, earlier findings
+
+The cross-language consistency report reached four of the same conclusions as earlier passes without
+being given the earlier findings, which is worth recording as independent agreement rather than as
+repetition.
+
+- **C3 (line 145) is now better understood as a symptom.** The `app` window label breaks the
+  capability ACL, but the cause is the abandoned window model itself: the plan's windows were never
+  consolidated, so a label that upstream could hardcode no longer suffices. C3 is not an ACL
+  configuration mistake to be fixed in `capabilities/*.json`; it is downstream of a window-architecture
+  decision that was never completed. Anyone patching C3 in isolation will produce a passing ACL and
+  an unchanged window model.
+- **The D3 deviation, recorded at line 489 as "Partial", is a full non-implementation.** The tray menu
+  item exists; the settings link does not exist at all, as `Settings.tsx` grep count 0 shows. See C10.
+  Line 489's "Partial" should be read as "one half of a two-part plan was delivered".
+- **The undo status vocabulary defect is confirmed from a third direction.** H24 (line 1060) recorded
+  two divergent status vocabularies. H25 confirms the undo side specifically, and adds what H24 could
+  not: that the frontend does not read the undo status at all, and that the plan's fifth status
+  (`cross-device`) has no code path because `safe_fs.rs` resolves EXDEV internally.
+- **The `prev_path` naming mismatch is confirmed, with the cause relocated.** Attribute it to the
+  missing serde attribute on `CleanupAction` (`db.rs:77-87`), not to the query. See 13.21.
+- **Four things these reports cleared, not confirmed as defects.** The `key={log.id}` nullability, the
+  `sourceLabel` i18next typing, the `files[0]` indexed access and the 2^53 overflow concern were all
+  previously flagged as suspicious somewhere in this audit. All four are non-issues. The balance is
+  worth stating plainly: these three reports produced two new Criticals, four new Highs and thirteen
+  new Mediums, and they also retired four false suspicions. A report that only finds defects is not
+  being given credit for the ones it disproves.
+
+### 13.23 Caveats and confidence
+
+- **All three source reports were read-only.** No source file in either mouzi directory was modified.
+  `git status --porcelain` is clean apart from `MOUZI-AUDIT.md` itself. No build, test, `cargo`, `npm`,
+  `npx` or Tauri command was run, and no database was opened, so every claim here is from static
+  reading only.
+- **Where a source report's own confidence was medium, it stays medium.** Specifically: the H28
+  divergence list is verified extension by extension against both tables, but the claim about *user
+  impact* ("the user is shown Other on one screen and Archives on another") is inferred from the code
+  paths and was not observed at runtime. C10's "a user following the README literally can never reach
+  the dashboard" is likewise inferred from the README text plus the grep count of 0, not observed.
+- **Two claims from the source briefs did not survive verification and have been corrected above.**
+  First, the brief asserted `db.rs:623-624` contains `prev_path AS prevPath`; it does not, and 13.21
+  records the corrected location and cause. Second, the brief located the dashboard components at
+  `src/components/*.tsx`; they are at `src/components/dashboard/*.tsx`, and all line numbers in
+  M29-M30 are for the `dashboard/` paths.
+- **Nothing in this section reopens a finding from sections 1 to 12.** Where a new finding refines an
+  old one, 13.22 says so explicitly. No C-number, H-number or M-number from earlier sections is
+  renumbered, withdrawn or reused.
+
+---
+
+**Scope of this pass.** 3 of the 21 audit reports, 13 of 21 absorbed in total. No executive summary is
+added or amended: the summary in section 1 predates all seven addenda, and a reconciliation pass
+should reconcile it.
