@@ -223,6 +223,7 @@
     "ok": "fatto",
     "failed": "fallito",
     "skipped": "saltato",
+    "permanentlyDeleted": "eliminato definitivamente",
     "backToList": "Torna alla lista",
     "historyTitle": "Cronologia pulizia",
     "historyEmpty": "Ancora nessuna cronologia di pulizia.",

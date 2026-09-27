@@ -223,6 +223,7 @@
     "ok": "gotowe",
     "failed": "niepowodzenie",
     "skipped": "pominięte",
+    "permanentlyDeleted": "usunięto bezpowrotnie",
     "backToList": "Powrót do listy",
     "historyTitle": "Historia sprzątania",
     "historyEmpty": "Brak historii sprzątania.",

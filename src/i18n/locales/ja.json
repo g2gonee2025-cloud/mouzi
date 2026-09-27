@@ -223,6 +223,7 @@
     "ok": "完了",
     "failed": "失敗",
     "skipped": "スキップ",
+    "permanentlyDeleted": "完全に削除",
     "backToList": "リストに戻る",
     "historyTitle": "クリーンアップ履歴",
     "historyEmpty": "クリーンアップ履歴はまだありません。",

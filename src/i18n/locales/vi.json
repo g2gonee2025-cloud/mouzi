@@ -229,6 +229,7 @@
     "ok": "xong",
     "failed": "thất bại",
     "skipped": "đã bỏ qua",
+    "permanentlyDeleted": "đã xóa vĩnh viễn",
     "backToList": "Quay lại danh sách",
     "historyTitle": "Lịch sử dọn dẹp",
     "historyEmpty": "Chưa có lịch sử dọn dẹp.",

@@ -223,6 +223,7 @@
     "ok": "done",
     "failed": "failed",
     "skipped": "skipped",
+    "permanentlyDeleted": "deleted permanently",
     "backToList": "Back to list",
     "historyTitle": "Cleanup History",
     "historyEmpty": "No cleanup history yet.",

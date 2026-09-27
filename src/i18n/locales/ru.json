@@ -223,6 +223,7 @@
     "ok": "готово",
     "failed": "ошибка",
     "skipped": "пропущено",
+    "permanentlyDeleted": "удалено безвозвратно",
     "backToList": "Назад к списку",
     "historyTitle": "История очистки",
     "historyEmpty": "Истории очистки пока нет.",

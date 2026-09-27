@@ -51,6 +51,15 @@ pub struct CleanupOutcome {
     pub message: Option<String>,
 }
 
+/// A fourth status, and the reason it is a named constant: this exact string is
+/// a contract, not an internal detail. `src/utils/cleanup.ts` declares the
+/// result status as a closed union and `ResultsPanel` counts and colours on
+/// each member, and `cleanup_actions.status` in the database is read back
+/// verbatim by `HistoryPanel`. Change or rename the string and the frontend
+/// stops compiling or silently draws the result in no bucket — the half of this
+/// change that lives in TypeScript has to be made at the same time.
+const PERMANENTLY_DELETED_STATUS: &str = "permanently_deleted";
+
 const PERMANENTLY_DELETED_MESSAGE: &str = "Deleted permanently — Windows did not put this in the \
                                          Recycle Bin, so it cannot be restored";
 const UNVERIFIED_MESSAGE: &str = "The Recycle Bin could not be read to confirm this one, so \
@@ -59,19 +68,22 @@ const UNVERIFIED_MESSAGE: &str = "The Recycle Bin could not be read to confirm t
 impl CleanupOutcome {
     /// Fold an observed Recycle Bin verdict into this outcome.
     ///
-    /// `status` stays inside the three values `src/utils/cleanup.ts` declares as
-    /// a closed union, because `ResultsPanel` counts and colours on exactly
-    /// "ok" | "failed" | "skipped"; a fourth value would be counted in no bucket
-    /// and drawn as "skipped". The two cases that matter therefore travel in
-    /// `message`, which the panel does render under every status.
+    /// The fourth status, `PERMANENTLY_DELETED_STATUS`, exists because
+    /// "Windows shredded this and I cannot get it back" and "the move failed
+    /// and nothing was destroyed" are different facts and the user needs to be
+    /// able to tell them apart. Folding the first into "failed" hid the one
+    /// case in this function where data is genuinely gone.
+    ///
+    /// `status` is still a closed union shared with `src/utils/cleanup.ts`, so
+    /// that file declares this string too; the two are edited together. The
+    /// `Unverified` arm below is deliberately *not* a fifth value — it is a
+    /// caveat on a success, and inventing a status for "we could not check"
+    /// would report uncertainty as an outcome.
     fn apply_trash_verdict(&mut self, verdict: safe_fs::TrashVerdict) {
         match verdict {
             safe_fs::TrashVerdict::InRecycleBin => {}
             safe_fs::TrashVerdict::PermanentlyDeleted => {
-                // Counted as failed rather than ok. "ok" is what the user reads
-                // as recoverable, and this file is not recoverable; under-counting
-                // successes is the safe direction for a data-loss report.
-                self.status = "failed".to_string();
+                self.status = PERMANENTLY_DELETED_STATUS.to_string();
                 self.message = Some(PERMANENTLY_DELETED_MESSAGE.to_string());
             }
             safe_fs::TrashVerdict::Unverified => {
@@ -935,11 +947,17 @@ mod tests {
         outcome
     }
 
-    /// The invariant the frontend depends on: only these three values exist, so
-    /// every result is counted in exactly one `ResultsPanel` bucket.
+    /// The invariant the frontend depends on: a status outside this set is
+    /// counted in no `ResultsPanel` bucket and, read back out of
+    /// `cleanup_actions`, mislabelled in `HistoryPanel`. The fourth member is
+    /// the constant, not a second literal, so the guard cannot be widened here
+    /// while the TypeScript union is left behind.
     fn assert_status_is_in_the_frontend_vocabulary(outcome: &CleanupOutcome) {
         assert!(
-            matches!(outcome.status.as_str(), "ok" | "failed" | "skipped"),
+            matches!(
+                outcome.status.as_str(),
+                "ok" | "failed" | "skipped" | PERMANENTLY_DELETED_STATUS
+            ),
             "status {:?} is outside the union declared in src/utils/cleanup.ts",
             outcome.status
         );
@@ -954,12 +972,18 @@ mod tests {
     }
 
     /// The defect: this file is gone forever, so it must not be counted as a
-    /// success anywhere the frontend reads status.
+    /// success anywhere the frontend reads status — and it must not be
+    /// indistinguishable from a move that failed and destroyed nothing.
     #[test]
-    fn a_permanently_deleted_file_is_never_reported_as_ok() {
+    fn a_permanently_deleted_file_gets_its_own_status() {
         let outcome = outcome_with_verdict(safe_fs::TrashVerdict::PermanentlyDeleted);
         assert_status_is_in_the_frontend_vocabulary(&outcome);
-        assert_eq!(outcome.status, "failed");
+        // Spelled as a literal on purpose: this is the cross-language contract
+        // with the union in src/utils/cleanup.ts, so renaming the string has to
+        // break this test rather than ride along on the constant.
+        assert_eq!(outcome.status, "permanently_deleted");
+        assert_ne!(outcome.status, "ok");
+        assert_ne!(outcome.status, "failed");
         assert_eq!(outcome.message.as_deref(), Some(PERMANENTLY_DELETED_MESSAGE));
     }
 
@@ -969,6 +993,30 @@ mod tests {
         assert_status_is_in_the_frontend_vocabulary(&outcome);
         assert_eq!(outcome.status, "ok");
         assert_eq!(outcome.message.as_deref(), Some(UNVERIFIED_MESSAGE));
+    }
+
+    /// A guard that accepts everything is worse than no guard. Pinned against a
+    /// value the union does not declare.
+    #[test]
+    fn the_vocabulary_guard_still_rejects_an_unknown_status() {
+        let outcome = CleanupOutcome {
+            path: "C:/Users/Me/victim.txt".to_string(),
+            status: "moved_to_recycle_bin".to_string(),
+            message: None,
+        };
+        let verdict = std::panic::catch_unwind(|| assert_status_is_in_the_frontend_vocabulary(&outcome));
+        assert!(
+            verdict.is_err(),
+            "a status the TypeScript union does not declare must be rejected"
+        );
+    }
+
+    /// The spelling is agreed with the frontend agent; `PERMANENTLY_DELETED_STATUS`
+    /// and the union in `src/utils/cleanup.ts` are two halves of one contract and
+    /// a typo on either side compiles fine and renders nothing.
+    #[test]
+    fn the_permanent_status_is_the_string_the_frontend_declares() {
+        assert_eq!(PERMANENTLY_DELETED_STATUS, "permanently_deleted");
     }
 
     #[test]

@@ -1,3 +1,6 @@
+import { Ban, CheckCircle2, HelpCircle, MinusCircle, XCircle } from "lucide-react";
+import type { LucideIcon } from "lucide-react";
+
 export interface DuplicateFile {
   path: string;
   size: number;
@@ -21,10 +24,149 @@ export interface CleanupRequest {
   keepPath?: string;
 }
 
+/**
+ * The cleanup result contract shared with `src-tauri/src/cleanup.rs`.
+ *
+ * `permanently_deleted` is NOT a flavour of `failed`. `failed` means the move
+ * did not happen and the file is still on disk; this means Windows refused the
+ * Recycle Bin (typically because it was full) and shredded the file, so no copy
+ * exists anywhere. Collapsing the two hides the only outcome the user cannot
+ * recover from, which is why it gets its own member rather than a `message`
+ * hanging off `failed`.
+ */
+export type CleanupStatus = "ok" | "failed" | "skipped" | "permanently_deleted";
+
 export interface CleanupOutcome {
   path: string;
-  status: "ok" | "failed" | "skipped";
+  status: CleanupStatus;
   message?: string;
+}
+
+/** Worst last: a reader scanning the pills meets the irreversible outcome at the end. */
+export const CLEANUP_STATUS_ORDER: readonly CleanupStatus[] = [
+  "ok",
+  "skipped",
+  "failed",
+  "permanently_deleted",
+];
+
+export interface CleanupStatusMark {
+  icon: LucideIcon;
+  className: string;
+}
+
+export interface CleanupStatusSummary {
+  labelKey: string;
+  pillClass: string;
+}
+
+export type CleanupCountField = "ok" | "skipped" | "failed" | "permanentlyDeleted";
+
+export interface CleanupBreakdown {
+  total: number;
+  ok: number;
+  skipped: number;
+  failed: number;
+  permanentlyDeleted: number;
+  /**
+   * Statuses outside `CleanupStatus`. Counted here or nowhere - never folded
+   * into a real bucket, because every historical "unknown value" bug in this
+   * file was an `else` branch quietly reusing a known bucket's wording.
+   */
+  unknown: number;
+}
+
+/**
+ * Every map below is a `Record<CleanupStatus, ...>` rather than a chain of
+ * `===` tests, so a fifth status added on the Rust side fails to compile here
+ * instead of reaching the final `else`. The `Record` is the compile-time
+ * guard; the `Map` built from it is the runtime one, and the miss it can return
+ * is the only thing that makes an off-union value detectable at all.
+ */
+const STATUS_MARK: Record<CleanupStatus, CleanupStatusMark> = {
+  ok: { icon: CheckCircle2, className: "text-green-500" },
+  skipped: { icon: MinusCircle, className: "text-yellow-500" },
+  failed: { icon: XCircle, className: "text-red-500" },
+  // Deep red plus a `Ban` glyph no other status uses; at icon size a
+  // red-to-red hue shift alone could not separate this from `failed`.
+  permanently_deleted: { icon: Ban, className: "text-red-700 dark:text-red-400" },
+};
+
+const STATUS_SUMMARY: Record<CleanupStatus, CleanupStatusSummary> = {
+  ok: { labelKey: "cleanup.ok", pillClass: "bg-green-100 text-green-700" },
+  skipped: { labelKey: "cleanup.skipped", pillClass: "bg-yellow-100 text-yellow-700" },
+  failed: { labelKey: "cleanup.failed", pillClass: "bg-red-100 text-red-700" },
+  // Filled where the others are tinted, so the irreversible count is the one
+  // chip in the row that cannot be skimmed past as just another bad number.
+  permanently_deleted: {
+    labelKey: "cleanup.permanentlyDeleted",
+    pillClass: "bg-red-700 text-white",
+  },
+};
+
+const COUNT_FIELD: Record<CleanupStatus, CleanupCountField> = {
+  ok: "ok",
+  skipped: "skipped",
+  failed: "failed",
+  permanently_deleted: "permanentlyDeleted",
+};
+
+const MARK_BY_WIRE = new Map<string, CleanupStatusMark>(Object.entries(STATUS_MARK));
+const COUNT_FIELD_BY_WIRE = new Map<string, CleanupCountField>(Object.entries(COUNT_FIELD));
+
+/** Deliberately not `skipped`'s yellow, which is the trap this whole map exists to close. */
+const UNKNOWN_MARK: CleanupStatusMark = {
+  icon: HelpCircle,
+  className: "text-text-muted",
+};
+
+/**
+ * `status` arrives as a bare string across IPC, so nothing forces it to be a
+ * member of the union: an unrecognised value has to be *drawn* as
+ * unrecognised rather than inherit a status we do understand.
+ */
+export function cleanupStatusMark(status: string): CleanupStatusMark {
+  return MARK_BY_WIRE.get(status) ?? UNKNOWN_MARK;
+}
+
+export function cleanupBreakdown(
+  results: readonly { status: string }[],
+): CleanupBreakdown {
+  const counts: CleanupBreakdown = {
+    total: results.length,
+    ok: 0,
+    skipped: 0,
+    failed: 0,
+    permanentlyDeleted: 0,
+    unknown: 0,
+  };
+  for (const result of results) {
+    const field = COUNT_FIELD_BY_WIRE.get(result.status);
+    if (field === undefined) counts.unknown += 1;
+    else counts[field] += 1;
+  }
+  return counts;
+}
+
+export interface CleanupSummaryRow extends CleanupStatusSummary {
+  status: CleanupStatus;
+  count: number;
+}
+
+/**
+ * The pills above the result rows, with their counts read out of the same
+ * breakdown pass. Deriving both from one source is what keeps a label from
+ * drifting away from the number printed next to it.
+ */
+export function cleanupSummaryRows(
+  results: readonly { status: string }[],
+): CleanupSummaryRow[] {
+  const counts = cleanupBreakdown(results);
+  return CLEANUP_STATUS_ORDER.map((status) => ({
+    status,
+    ...STATUS_SUMMARY[status],
+    count: counts[COUNT_FIELD[status]],
+  }));
 }
 
 /** Total bytes that can be reclaimed by keeping one copy per duplicate group. */

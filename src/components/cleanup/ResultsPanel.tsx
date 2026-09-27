@@ -1,6 +1,10 @@
 import { useTranslation } from "react-i18next";
-import type { CleanupOutcome } from "../../utils/cleanup";
-import { CheckCircle2, XCircle, MinusCircle, RotateCcw } from "lucide-react";
+import {
+  cleanupStatusMark,
+  cleanupSummaryRows,
+  type CleanupOutcome,
+} from "../../utils/cleanup";
+import { RotateCcw } from "lucide-react";
 
 interface ResultsPanelProps {
   results: CleanupOutcome[];
@@ -14,9 +18,6 @@ export default function ResultsPanel({
   onDone,
 }: ResultsPanelProps) {
   const { t } = useTranslation();
-
-  const countBy = (status: CleanupOutcome["status"]) =>
-    results.filter((r) => r.status === status).length;
 
   return (
     <div className="space-y-3">
@@ -40,15 +41,11 @@ export default function ResultsPanel({
       )}
 
       <div className="flex flex-wrap gap-2 text-xs">
-        <span className="rounded-full bg-green-100 text-green-700 px-2 py-0.5">
-          {t("cleanup.ok")}: {countBy("ok")}
-        </span>
-        <span className="rounded-full bg-yellow-100 text-yellow-700 px-2 py-0.5">
-          {t("cleanup.skipped")}: {countBy("skipped")}
-        </span>
-        <span className="rounded-full bg-red-100 text-red-700 px-2 py-0.5">
-          {t("cleanup.failed")}: {countBy("failed")}
-        </span>
+        {cleanupSummaryRows(results).map((row) => (
+          <span key={row.status} className={`rounded-full px-2 py-0.5 ${row.pillClass}`}>
+            {t(row.labelKey)}: {row.count}
+          </span>
+        ))}
       </div>
 
       <div className="rounded-lg border border-border bg-surface-dark overflow-hidden">
@@ -56,24 +53,14 @@ export default function ResultsPanel({
           {results.map((r) => {
             const fname =
               r.path.split("\\").pop()?.split("/").pop() || r.path;
-            const Icon =
-              r.status === "ok"
-                ? CheckCircle2
-                : r.status === "failed"
-                  ? XCircle
-                  : MinusCircle;
-            const color =
-              r.status === "ok"
-                ? "text-green-500"
-                : r.status === "failed"
-                  ? "text-red-500"
-                  : "text-yellow-500";
+            const mark = cleanupStatusMark(r.status);
+            const Icon = mark.icon;
             return (
               <div
                 key={r.path}
                 className="flex items-start gap-2 px-3 py-2 border-b border-border last:border-0"
               >
-                <Icon size={14} className={`${color} mt-0.5 shrink-0`} />
+                <Icon size={14} className={`${mark.className} mt-0.5 shrink-0`} />
                 <div className="min-w-0">
                   <div className="text-xs text-text truncate">{fname}</div>
                   <div className="text-[10px] text-text-muted truncate">

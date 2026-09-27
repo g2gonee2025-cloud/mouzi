@@ -2,6 +2,7 @@ import { useEffect } from "react";
 import { useTranslation } from "react-i18next";
 import i18n from "../../i18n";
 import { useCleanupStore } from "../../store/useCleanupStore";
+import { cleanupStatusMark } from "../../utils/cleanup";
 import { Trash2, FolderX, ExternalLink } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 
@@ -52,12 +53,7 @@ export default function HistoryPanel() {
                 log.path.split("\\").pop()?.split("/").pop() || log.path;
               const isDir = log.action === "remove_empty_dir";
               const Icon = isDir ? FolderX : Trash2;
-              const statusColor =
-                log.status === "ok"
-                  ? "text-green-500"
-                  : log.status === "failed"
-                    ? "text-red-500"
-                    : "text-yellow-500";
+              const statusMark = cleanupStatusMark(log.status);
               return (
                 <div
                   key={log.id}
@@ -65,7 +61,7 @@ export default function HistoryPanel() {
                 >
                   <Icon
                     size={14}
-                    className={`${statusColor} shrink-0`}
+                    className={`${statusMark.className} shrink-0`}
                   />
                   <div className="flex-1 min-w-0">
                     <div className="text-xs text-text truncate">{fname}</div>

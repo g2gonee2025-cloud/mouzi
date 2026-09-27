@@ -223,6 +223,7 @@
     "ok": "erledigt",
     "failed": "fehlgeschlagen",
     "skipped": "übersprungen",
+    "permanentlyDeleted": "endgültig gelöscht",
     "backToList": "Zurück zur Liste",
     "historyTitle": "Bereinigungsverlauf",
     "historyEmpty": "Noch kein Bereinigungsverlauf.",
