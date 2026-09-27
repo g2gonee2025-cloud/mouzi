@@ -12,7 +12,13 @@ pub enum MoveOutcome {
 /// Collapse `.` and `..` without touching the filesystem. `canonicalize` is
 /// deliberately not used: it fails on paths that do not exist and would resolve
 /// a link to its target, which can sit outside the root the caller checked.
-fn normalize_lexically(path: &Path) -> PathBuf {
+///
+/// `pub(crate)` because `suppress.rs` needs the identical normalisation to key
+/// its guard map. A second, slightly different copy of this function would mean
+/// a path the app armed under one spelling and the watcher reported under
+/// another would miss the guard — which is indistinguishable from having no
+/// guard at all.
+pub(crate) fn normalize_lexically(path: &Path) -> PathBuf {
     let mut normalized = PathBuf::new();
     for component in path.components() {
         match component {

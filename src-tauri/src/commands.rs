@@ -1,15 +1,18 @@
 use crate::db::*;
 use crate::ignore::{load_mouziignore, save_mouziignore};
 use crate::rules::manual_scan_folder;
-use crate::safe_fs::{move_file, MoveOutcome};
+use crate::safe_fs::{is_within_any_root, move_file, MoveOutcome};
 use crate::scan::{self, ScanEvent};
+use crate::suppress::{SuppressionSet, SUPPRESSION_TTL};
 use crate::AppState;
 use serde::Serialize;
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::Arc;
 use std::time::Instant;
+// `MOVE_OBSERVER` and the two test modules that read it are the only users.
+#[cfg(test)]
+use std::sync::{Mutex, MutexGuard};
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_notification::NotificationExt;
@@ -36,13 +39,44 @@ pub fn get_rules_cmd() -> Result<Vec<Rule>, String> {
     get_rules().map_err(|e| e.to_string())
 }
 
+/// Reject a move rule that could only ever rename a file in place.
+///
+/// A destination of `.` or empty resolves to the watched root itself, so the
+/// "move" becomes `fs::rename(<root>/report.pdf, <root>/report_0.pdf)`: the same
+/// folder, a suffixed name. The watcher then reads that as the user creating a
+/// file, and the next pass produces `report_0_0.pdf`, and so on until the app is
+/// killed. Layer 1 now catches it and skips the file instead, so this is a
+/// belt-and-braces check on the way in rather than the only thing standing
+/// between a user and that loop — the guard in `rules::is_already_filed` does not
+/// depend on this validation having run, and rules already in the database are
+/// covered by it.
+///
+/// An absolute destination is exempt: it is resolved as written, so pointing at
+/// a fixed folder is a legitimate thing to ask for.
+fn validate_rule_destination(rule: &Rule) -> Result<(), String> {
+    if rule.action != "move" {
+        return Ok(());
+    }
+    let destination = rule.destination.trim();
+    if destination.is_empty() || destination == "." || destination == ".." {
+        return Err(format!(
+            "Destination '{}' resolves to the folder itself, which would rename files in place forever. \
+             Choose a subfolder, or a fixed path outside it.",
+            rule.destination
+        ));
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub fn add_rule_cmd(rule: Rule) -> Result<i64, String> {
+    validate_rule_destination(&rule)?;
     add_rule(&rule).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub fn update_rule_cmd(rule: Rule) -> Result<(), String> {
+    validate_rule_destination(&rule)?;
     update_rule(&rule).map_err(|e| e.to_string())
 }
 
@@ -168,7 +202,7 @@ pub struct UndoAllResult {
 }
 
 /// The watcher's self-suppression guards, shared with `AppState`.
-type IgnoredFiles = Arc<Mutex<HashMap<String, Instant>>>;
+type IgnoredFiles = Arc<SuppressionSet>;
 
 /// One `action_logs` row, copied out of the database in phase 1.
 struct UndoTarget {
@@ -195,12 +229,6 @@ enum UndoMove {
     Failed(String),
 }
 
-fn lock_ignored(ignored_files: &IgnoredFiles) -> Result<MutexGuard<'_, HashMap<String, Instant>>, String> {
-    ignored_files
-        .lock()
-        .map_err(|_| "Watcher self-suppression list is poisoned".to_string())
-}
-
 /// Open the watcher's self-suppression window for `paths`.
 ///
 /// Callers arm before the rename, never after: the watcher can deliver the
@@ -211,10 +239,11 @@ fn arm_suppression(ignored_files: &IgnoredFiles, paths: &[String]) -> Result<(),
         return Ok(());
     }
     let now = Instant::now();
-    let mut ignored = lock_ignored(ignored_files)?;
-    for path in paths {
-        ignored.insert(path.clone(), now);
-    }
+    ignored_files.arm(
+        &paths.iter().map(PathBuf::from).collect::<Vec<_>>(),
+        now,
+        SUPPRESSION_TTL,
+    );
     Ok(())
 }
 
@@ -668,11 +697,18 @@ pub fn export_rules_cmd(path: String) -> Result<(), String> {
 
 /// Import rules from a JSON file at the given path.
 /// If `replace` is true, all existing rules are removed before inserting.
-/// Each imported rule is inserted with `id` set to None to avoid collisions.
 #[tauri::command]
 pub fn import_rules_cmd(path: String, replace: bool) -> Result<usize, String> {
     let data = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
     let rules: Vec<Rule> = serde_json::from_str(&data).map_err(|e| e.to_string())?;
+
+    // Validate the whole file before touching the table. A file of rules where
+    // one is unusable has no useful half-applied state, and the alternative is a
+    // `delete_all_rules` that has already run.
+    for (index, rule) in rules.iter().enumerate() {
+        validate_rule_destination(rule)
+            .map_err(|e| format!("Rule {} of {} ({}) is not usable: {e}", index + 1, rules.len(), rule.name))?;
+    }
 
     if replace {
         delete_all_rules().map_err(|e| e.to_string())?;
@@ -874,13 +910,66 @@ pub fn dismiss_suggestion_cmd(path: String) -> Result<(), String> {
     crate::db::dismiss_suggestion(&path).map_err(|e| e.to_string())
 }
 
+/// The watched root that contains `path`, most specific first.
+///
+/// Containment rather than parent equality, because the file may sit in a
+/// subfolder — that is the normal case once the watch is recursive, and
+/// ambiguous the moment two watched roots nest. Of the roots that contain the
+/// file, the one with the most path components is the one it "belongs" to, so
+/// the answer does not depend on the order rows happen to come back in.
+///
+/// `None` when no watched root contains the file. The caller then falls back to
+/// the file's own parent, which is the pre-existing behaviour for a file outside
+/// every watched folder.
+fn owning_watched_root(path: &Path) -> Option<PathBuf> {
+    let roots: Vec<PathBuf> = get_watched_folders()
+        .ok()?
+        .into_iter()
+        .map(|f| PathBuf::from(f.path))
+        .collect();
+    roots
+        .iter()
+        .filter(|root| is_within_any_root(path, std::slice::from_ref(*root)))
+        .max_by_key(|root| root.components().count())
+        .cloned()
+}
+
 /// Move a file into its suggested category folder and optionally create a
 /// matching rule. Returns a per-file status; never panics on missing files.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn accept_suggestion_cmd(
     path: String,
     suggested_category: String,
     create_rule: bool,
+    state: tauri::State<AppState>,
+) -> Result<AcceptOutcome, String> {
+    let root = owning_watched_root(Path::new(&path))
+        .or_else(|| Path::new(&path).parent().map(|p| p.to_path_buf()))
+        .unwrap_or_default();
+    accept_suggestion_with(
+        path,
+        suggested_category,
+        create_rule,
+        &state.ignored_files,
+        &root,
+    )
+}
+
+/// The body of `accept_suggestion_cmd`, callable without a Tauri state.
+///
+/// This command does not go through `rules::process_file`, so it builds its own
+/// destination and needs its own copy of both guards. Before this, the watcher
+/// saw the result of every accepted suggestion as brand new user activity with
+/// nothing standing in front of it — and under a recursive watch accepting a
+/// suggestion for `C:\W\Documents\report.pdf` would file it at
+/// `C:\W\Documents\Documents\report.pdf`, the app's own output feeding its own
+/// input.
+fn accept_suggestion_with(
+    path: String,
+    suggested_category: String,
+    create_rule: bool,
+    ignored_files: &IgnoredFiles,
+    root: &Path,
 ) -> Result<AcceptOutcome, String> {
     let src = Path::new(&path);
     if !src.exists() {
@@ -901,6 +990,40 @@ pub fn accept_suggestion_cmd(
         .map(|p| p.join(&suggested_category).join(&file_name))
         .unwrap_or_else(|| Path::new(&suggested_category).join(&file_name));
 
+    // Layer 1, applied by hand because this path never reaches
+    // `rules::is_already_filed`. `suggested_category` is a bare folder name, so
+    // the destination directory has the same shape `resolve_dest_dir` produces:
+    // the category under the watched root.
+    let dest_dir = root.join(&suggested_category);
+    if let Some(src_parent) = src.parent() {
+        if is_within_any_root(src_parent, std::slice::from_ref(&dest_dir)) {
+            // Already filed, so nothing moves and nothing is logged. The early
+            // return is the point: falling through to `log_action` would write
+            // the exact row this check exists to prevent — `source` equal to
+            // `destination`.
+            return Ok(AcceptOutcome {
+                path: path.clone(),
+                status: "ok".to_string(),
+                message: None,
+                // Where the file actually is, which is where it stays. The UI
+                // shows this next to "accepted", and "no arrow" would read as a
+                // failure rather than as "nothing needed doing".
+                dest: Some(path.clone()),
+            });
+        }
+    }
+
+    // `move_file` runs its own collision naming, and it does not count upwards
+    // the way `unique_destination` does, so the predicted name can differ from
+    // the name the move actually takes. That is why the real path is armed again
+    // afterwards rather than only predicted now.
+    let predicted = crate::safe_fs::unique_destination(&dest_dir, &file_name);
+    arm_suppression(
+        ignored_files,
+        &[src.to_string_lossy().into_owned(), predicted.to_string_lossy().into_owned()],
+    )?;
+
+    notify_move_observer();
     let outcome = match move_file(src, &dest) {
         Ok(MoveOutcome::Moved) => AcceptOutcome {
             path: path.clone(),
@@ -924,6 +1047,12 @@ pub fn accept_suggestion_cmd(
             dest: None,
         },
     };
+
+    if outcome.status == "ok" {
+        if let Some(actual) = &outcome.dest {
+            arm_suppression(ignored_files, std::slice::from_ref(actual))?;
+        }
+    }
 
     if outcome.status == "ok" {
         let _ = crate::db::log_action(&ActionLog {
@@ -1085,7 +1214,7 @@ mod undo_tests {
     }
 
     fn ignored_files() -> IgnoredFiles {
-        Arc::new(Mutex::new(HashMap::new()))
+        Arc::new(SuppressionSet::new())
     }
 
     /// Put a file where a logged move left it, and return (source, dest).
@@ -1120,10 +1249,23 @@ mod undo_tests {
             if fired.swap(true, Ordering::SeqCst) {
                 return;
             }
-            let mut guarded = ignored.lock().unwrap().keys().cloned().collect::<Vec<_>>();
+            let mut guarded = ignored.guarded_keys();
             guarded.sort();
             *into.lock().unwrap() = guarded;
         })))
+    }
+
+    /// The key the guard map stores a path under.
+    ///
+    /// The set normalises lexically and lowercases, so an expectation written
+    /// with the temp directory's original casing can never match an armed guard
+    /// and the test would fail for a reason that has nothing to do with arming.
+    /// Normalising the expectation with the same function the map uses keeps the
+    /// assertion about what it was always about: this path was guarded.
+    fn guarded_key(path: &str) -> String {
+        crate::safe_fs::normalize_lexically(Path::new(path))
+            .to_string_lossy()
+            .to_lowercase()
     }
 
     #[test]
@@ -1141,7 +1283,7 @@ mod undo_tests {
         let observer_ignored = ignored.clone();
         let _observer = ObserverReset(set_move_observer(Some(Arc::new(move || {
             let db_free = get_db().try_lock().is_ok();
-            let watcher_free = observer_ignored.try_lock().is_ok();
+            let watcher_free = observer_ignored.is_lock_free();
             observer_samples.lock().unwrap().push((db_free, watcher_free));
         }))));
 
@@ -1271,7 +1413,7 @@ mod undo_tests {
         );
         for source in &sources {
             assert!(
-                guarded.contains(source),
+                guarded.contains(&guarded_key(source)),
                 "{source} had no guard when the first rename ran"
             );
         }
@@ -1300,11 +1442,11 @@ mod undo_tests {
 
         let guarded = at_first_move.lock().unwrap();
         assert!(
-            guarded.contains(&source),
+            guarded.contains(&guarded_key(&source)),
             "the restored path had no guard when the rename ran: {guarded:?}"
         );
         assert!(
-            guarded.contains(&dest),
+            guarded.contains(&guarded_key(&dest)),
             "the path the file left had no guard when the rename ran: {guarded:?}"
         );
     }
@@ -1375,11 +1517,208 @@ mod undo_tests {
         // The suffixed name is only knowable after the move, so it is armed
         // then — the path the watcher will actually report.
         {
-            let guarded = ignored.lock().unwrap();
             assert!(
-                guarded.contains_key(restored[3].unwrap()),
+                ignored.is_guarded(restored[3].unwrap()),
                 "the collision's new name was never guarded"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod accept_tests {
+    use super::*;
+    use crate::db::{get_db, init_test_db, lock_db, serialise_test_db};
+
+    /// Everything one accept test puts on disk: the shared-database lock, a
+    /// private temp tree, and a clean `action_logs`. `UndoFixture`'s copy is not
+    /// reused because its cleanup contract is stated in terms of the undo batch
+    /// query, and "this table is empty" is a different promise.
+    struct AcceptFixture {
+        _serialised: MutexGuard<'static, ()>,
+        root: PathBuf,
+    }
+
+    impl AcceptFixture {
+        fn new(name: &str) -> Self {
+            let serialised = serialise_test_db();
+            init_test_db();
+            lock_db()
+                .expect("lock db")
+                .execute("DELETE FROM action_logs", [])
+                .expect("clear action_logs");
+
+            let root = std::env::temp_dir()
+                .join(format!("mouzi-accept-{}-{}", name, std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).expect("create test root");
+            AcceptFixture { _serialised: serialised, root }
+        }
+
+        fn root(&self) -> &Path {
+            &self.root
+        }
+
+        fn put(&self, relative: &str) -> PathBuf {
+            let path = self.root.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).expect("create parent");
+            std::fs::write(&path, b"payload").expect("write fixture file");
+            path
+        }
+    }
+
+    impl Drop for AcceptFixture {
+        fn drop(&mut self) {
+            if let Err(e) = lock_db().and_then(|c| {
+                c.execute("DELETE FROM action_logs", [])
+                    .map_err(|e| e.to_string())
+            }) {
+                eprintln!("accept test fixture: action_logs not cleared: {e}");
+            }
+            if let Err(e) = std::fs::remove_dir_all(&self.root) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    eprintln!("accept test fixture: {} not removed: {e}", self.root.display());
+                }
+            }
+        }
+    }
+
+    /// Puts the previous observer back when the test ends, panic or not, so a
+    /// failure here cannot fire inside the next test's move.
+    struct ObserverReset(Option<MoveObserver>);
+
+    impl Drop for ObserverReset {
+        fn drop(&mut self) {
+            set_move_observer(self.0.take());
+        }
+    }
+
+    /// T10, and T8's arming half, on the one move site stage 1 adds.
+    ///
+    /// `accept_suggestion_with` moves a file inside a watched root, and before
+    /// this change it did so with the guard wide open. Two properties, sampled
+    /// by the same hook at the exact instant before the rename: the paths are
+    /// already guarded, and neither the database nor the suppression set is held
+    /// while the filesystem is touched. The lock half is the same assertion the
+    /// undo batch makes, applied to the path that was not covered by it.
+    #[test]
+    fn accept_suggestion_arms_before_the_move_and_holds_neither_lock() {
+        let fixture = AcceptFixture::new("armed");
+        let source = fixture.put("report.pdf");
+        let ignored: IgnoredFiles = Arc::new(SuppressionSet::new());
+
+        let samples = Arc::new(Mutex::new(Vec::new()));
+        let observer_samples = samples.clone();
+        let observer_ignored = ignored.clone();
+        let _observer = ObserverReset(set_move_observer(Some(Arc::new(move || {
+            let db_free = get_db().try_lock().is_ok();
+            let watcher_free = observer_ignored.is_lock_free();
+            let mut guarded = observer_ignored.guarded_keys();
+            guarded.sort();
+            observer_samples.lock().unwrap().push((db_free, watcher_free, guarded));
+        }))));
+
+        let outcome = accept_suggestion_with(
+            source.to_string_lossy().into_owned(),
+            "Documents".to_string(),
+            false,
+            &ignored,
+            fixture.root(),
+        )
+        .expect("accept_suggestion_with");
+
+        assert_eq!(outcome.status, "ok", "{outcome:?}");
+        let dest = PathBuf::from(outcome.dest.expect("a move reports a destination"));
+        assert_eq!(dest, fixture.root().join("Documents").join("report.pdf"));
+        assert!(dest.is_file(), "the file should have moved: {dest:?}");
+
+        let samples = samples.lock().unwrap();
+        assert_eq!(samples.len(), 1, "the hook must run once, before the move");
+        let (db_free, watcher_free, guarded) = &samples[0];
+        assert!(*db_free, "the global DB mutex was held while a file was being moved");
+        assert!(*watcher_free, "the suppression set was held while a file was being moved");
+
+        let source_key = crate::safe_fs::normalize_lexically(&source).to_string_lossy().to_lowercase();
+        assert!(
+            guarded.contains(&source_key),
+            "the source had no guard when the rename ran: {guarded:?}"
+        );
+        assert!(
+            guarded.contains(&dest.to_string_lossy().to_lowercase()),
+            "the predicted destination had no guard when the rename ran: {guarded:?}"
+        );
+    }
+
+    /// T8's Layer 1 half: accepting a suggestion for a file that is already in
+    /// the folder the suggestion names must move nothing.
+    ///
+    /// This is the shape the recursive watch would feed itself — the app's own
+    /// output, offered back as new work — and the reason this command carries
+    /// its own path-shape check rather than relying on `process_file`.
+    #[test]
+    fn accept_suggestion_leaves_a_file_that_is_already_in_its_category_alone() {
+        let fixture = AcceptFixture::new("layer1");
+        let source = fixture.put("Documents/report.pdf");
+        let ignored: IgnoredFiles = Arc::new(SuppressionSet::new());
+
+        let outcome = accept_suggestion_with(
+            source.to_string_lossy().into_owned(),
+            "Documents".to_string(),
+            false,
+            &ignored,
+            fixture.root(),
+        )
+        .expect("accept_suggestion_with");
+
+        assert_eq!(outcome.status, "ok", "{outcome:?}");
+        assert!(
+            source.is_file(),
+            "the file must be left where it already is: {source:?}"
+        );
+        assert!(
+            !fixture.root().join("Documents").join("Documents").exists(),
+            "the file was filed a second time into its own category folder"
+        );
+        assert!(
+            ignored.guarded_keys().is_empty(),
+            "nothing was armed, because nothing was moved"
+        );
+
+        // The row this check exists to prevent: an action logged for a move that
+        // never happened, with the source equal to the destination.
+        let same_path_rows: i64 = lock_db()
+            .expect("lock db")
+            .query_row(
+                "SELECT COUNT(*) FROM action_logs WHERE source_path = destination_path",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count rows");
+        assert_eq!(
+            same_path_rows, 0,
+            "a no-op acceptance wrote an action_logs row with source == destination"
+        );
+    }
+
+    /// A missing file is still a per-file status, not an error: the popup offers
+    /// a list and any entry in it can be gone by the time it is clicked.
+    #[test]
+    fn accept_suggestion_reports_a_missing_file_without_touching_anything() {
+        let fixture = AcceptFixture::new("missing");
+        let absent = fixture.root().join("not-here.pdf");
+        let ignored: IgnoredFiles = Arc::new(SuppressionSet::new());
+
+        let outcome = accept_suggestion_with(
+            absent.to_string_lossy().into_owned(),
+            "Documents".to_string(),
+            false,
+            &ignored,
+            fixture.root(),
+        )
+        .expect("accept_suggestion_with");
+
+        assert_eq!(outcome.status, "missing");
+        assert!(outcome.dest.is_none());
+        assert!(ignored.guarded_keys().is_empty());
     }
 }

@@ -14,7 +14,7 @@ use std::time::UNIX_EPOCH;
 const PROGRESS_EVERY: u64 = 200;
 
 /// Do not descend deeper than this to guard against pathological trees.
-const MAX_DEPTH: usize = 128;
+pub(crate) const MAX_DEPTH: usize = 128;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -62,7 +62,12 @@ pub fn categorize(path: &str) -> &'static str {
 /// True for symlinks on all platforms, plus NTFS junctions on Windows
 /// (junctions report as directory reparse points and would otherwise
 /// create cycles during recursion).
-fn is_symlink(ft: &fs::FileType) -> bool {
+///
+/// `pub(crate)` so a recursive walk over a watched folder reuses this exact
+/// check. A second walk with its own junction test is a second place for a
+/// cycle to survive, and the symptom of getting that wrong is a hang, not an
+/// error, so it would never surface as a test failure.
+pub(crate) fn is_symlink(ft: &fs::FileType) -> bool {
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::fs::FileTypeExt;

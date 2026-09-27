@@ -102,6 +102,11 @@ pub struct AppSettings {
     pub schedule_time_2: Option<String>,
     pub schedule_time_3: Option<String>,
     pub schedule_time_4: Option<String>,
+    /// Whether watched folders should be watched recursively. `false` on every
+    /// existing install and on every new one: this is a file-moving
+    /// application, and a change to where files end up must never arrive
+    /// unrequested on upgrade.
+    pub recursive_watch: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -268,6 +273,12 @@ pub fn init_db(app_dir: PathBuf) -> SqliteResult<()> {
     }
     if !cols.iter().any(|c| c == "schedule_time_4") {
         conn.execute("ALTER TABLE settings ADD COLUMN schedule_time_4 TEXT", [])?;
+    }
+    // Additive only, and defaulting to 0: an install that upgrades must keep
+    // behaving exactly as it did, because the alternative reading of this column
+    // is "start re-filing files the user never asked to be re-filed".
+    if !cols.iter().any(|c| c == "recursive_watch") {
+        conn.execute("ALTER TABLE settings ADD COLUMN recursive_watch INTEGER NOT NULL DEFAULT 0", [])?;
     }
     // Insert default settings if empty
     let count: i64 = conn.query_row(
@@ -553,7 +564,7 @@ pub fn get_settings() -> SqliteResult<AppSettings> {
     let db = get_db();
     let conn = db.lock().unwrap();
     conn.query_row(
-        "SELECT id, language, theme, telemetry_enabled, first_run, autostart, grace_period_seconds, lock_check_enabled, schedule_enabled, schedule_times_per_day, schedule_time_1, schedule_time_2, schedule_time_3, schedule_time_4 FROM settings LIMIT 1",
+        "SELECT id, language, theme, telemetry_enabled, first_run, autostart, grace_period_seconds, lock_check_enabled, schedule_enabled, schedule_times_per_day, schedule_time_1, schedule_time_2, schedule_time_3, schedule_time_4, recursive_watch FROM settings LIMIT 1",
         [],
         |row| {
             Ok(AppSettings {
@@ -571,6 +582,10 @@ pub fn get_settings() -> SqliteResult<AppSettings> {
                 schedule_time_2: row.get(11).ok(),
                 schedule_time_3: row.get(12).ok(),
                 schedule_time_4: row.get(13).ok(),
+                // `unwrap_or(0)`, not `unwrap_or(1)`: a row written before this
+                // column existed, or a database whose migration did not run,
+                // must resolve to the pre-recursion behaviour.
+                recursive_watch: row.get::<_, i32>(14).unwrap_or(0) != 0,
             })
         },
     )
@@ -580,7 +595,7 @@ pub fn update_settings(settings: &AppSettings) -> SqliteResult<()> {
     let db = get_db();
     let conn = db.lock().unwrap();
     conn.execute(
-        "UPDATE settings SET language=?1, theme=?2, telemetry_enabled=?3, first_run=?4, autostart=?5, grace_period_seconds=?6, lock_check_enabled=?7, schedule_enabled=?8, schedule_times_per_day=?9, schedule_time_1=?10, schedule_time_2=?11, schedule_time_3=?12, schedule_time_4=?13 WHERE id=?14",
+        "UPDATE settings SET language=?1, theme=?2, telemetry_enabled=?3, first_run=?4, autostart=?5, grace_period_seconds=?6, lock_check_enabled=?7, schedule_enabled=?8, schedule_times_per_day=?9, schedule_time_1=?10, schedule_time_2=?11, schedule_time_3=?12, schedule_time_4=?13, recursive_watch=?15 WHERE id=?14",
         params![
             settings.language,
             settings.theme,
@@ -595,7 +610,8 @@ pub fn update_settings(settings: &AppSettings) -> SqliteResult<()> {
             settings.schedule_time_2,
             settings.schedule_time_3,
             settings.schedule_time_4,
-            settings.id
+            settings.id,
+            settings.recursive_watch as i32
         ],
     )?;
     Ok(())

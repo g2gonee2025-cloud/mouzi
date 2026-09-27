@@ -9,25 +9,25 @@ pub mod rules;
 pub mod safe_fs;
 pub mod scan;
 pub mod scheduler;
+pub mod suppress;
 pub mod tray;
 pub mod watcher;
 
 use commands::*;
 use db::{init_db, FOLDER_MODE_SILENT};
 use directories::ProjectDirs;
-use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
 use tauri::Manager;
 use tauri_plugin_autostart::ManagerExt;
+use suppress::SuppressionSet;
 use watcher::FolderWatcher;
 #[cfg(target_os = "macos")]
 use tauri::ActivationPolicy;
 
 pub struct AppState {
     pub watcher: Arc<Mutex<FolderWatcher>>,
-    pub ignored_files: Arc<Mutex<HashMap<String, Instant>>>,
+    pub ignored_files: Arc<SuppressionSet>,
     /// Last destination folder waiting to be opened when app is activated by notification click
     pub pending_open_folder: Arc<Mutex<Option<String>>>,
     pub scheduler: scheduler::Scheduler,
@@ -36,7 +36,7 @@ pub struct AppState {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let ignored_files = Arc::new(Mutex::new(HashMap::new()));
+    let ignored_files = Arc::new(SuppressionSet::new());
     let pending_open_folder: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
