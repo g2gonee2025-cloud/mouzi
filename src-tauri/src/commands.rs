@@ -319,20 +319,19 @@ pub fn open_folder_cmd(path: String) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
         if path.starts_with("http://") || path.starts_with("https://") {
-            std::process::Command::new("cmd")
-                .args(["/c", "start", "", &path])
+            // No shell: a URL carrying " & " would otherwise run a second command.
+            std::process::Command::new("rundll32")
+                .args(["url.dll,FileProtocolHandler", &path])
                 .spawn()
                 .map_err(|e| e.to_string())?;
         } else {
             // Normalize to backslashes - Windows Explorer requires them
             let win_path = path.replace('/', "\\");
-            std::process::Command::new("powershell")
-                .args([
-                    "-NoProfile",
-                    "-NonInteractive",
-                    "-Command",
-                    &format!("explorer '{}'", win_path),
-                ])
+            // Pass the path as an argument rather than building a shell command.
+            // A path containing a single quote would otherwise close the quoted
+            // string and everything after it would execute as PowerShell.
+            std::process::Command::new("explorer")
+                .arg(&win_path)
                 .spawn()
                 .map_err(|e| e.to_string())?;
         }
