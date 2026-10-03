@@ -48,7 +48,7 @@ export default function Popup() {
     loadLogs,
     loadStats,
     loadFolders,
-    scanFolder,
+    cleanNow,
     undoAction,
     folders,
     pendingFiles,
@@ -57,6 +57,7 @@ export default function Popup() {
   const [scanResults, setScanResults] = useState<
     { file: string; rule: string; destination: string }[]
   >([]);
+  const [cleanCompleted, setCleanCompleted] = useState(false);
   const [toast, setToast] = useState<{
     file: string;
     rule: string;
@@ -65,6 +66,12 @@ export default function Popup() {
   } | null>(null);
   const [pending, setPending] = useState<ConfirmRequest | null>(null);
   const [undoToast, setUndoToast] = useState<UndoNotice[] | null>(null);
+
+  useEffect(() => {
+    if (!toast) return;
+    const timer = setTimeout(() => setToast(null), 30000);
+    return () => clearTimeout(timer);
+  }, [toast]);
 
   // 8s, not the 3s the other popups use: a `collision` line ends in a
   // filesystem path, and 3s cuts it off before it can be read or copied.
@@ -75,9 +82,9 @@ export default function Popup() {
   }, [undoToast]);
 
   useEffect(() => {
-    loadLogs();
-    loadStats();
-    loadFolders();
+    loadLogs().catch(console.error);
+    loadStats().catch(console.error);
+    loadFolders().catch(console.error);
     getPendingFiles();
 
     // Listen for file-organized events from Rust watcher — show in-app toast
@@ -92,9 +99,8 @@ export default function Popup() {
           destination: payload.destination,
           destination_folder: destFolder,
         });
-        setTimeout(() => setToast(null), 30000);
-        loadLogs();
-        loadStats();
+        loadLogs().catch(console.error);
+        loadStats().catch(console.error);
         getPendingFiles();
       }
     });
@@ -105,7 +111,7 @@ export default function Popup() {
     }, 3000);
 
     return () => {
-      unlisten.then((f) => f());
+      unlisten.then((f) => f()).catch(console.error);
       clearInterval(interval);
     };
   }, [loadLogs, loadStats, loadFolders, getPendingFiles]);
@@ -113,14 +119,10 @@ export default function Popup() {
 
 
   const handleClean = async () => {
-    let allResults: { file: string; rule: string; destination: string }[] = [];
-    const activeFolders = folders.filter((f) => f.mode !== "paused");
-    const targets = activeFolders.length > 0 ? activeFolders.map((f) => f.path) : [await invoke<string>("get_downloads_folder")];
-    for (const path of targets) {
-      const results = await scanFolder(path);
-      allResults = allResults.concat(results);
-    }
+    setCleanCompleted(false);
+    const allResults = await cleanNow();
     setScanResults(allResults);
+    setCleanCompleted(true);
     await getPendingFiles();
     if (allResults.length > 0) {
       await invoke("show_notification", {
@@ -198,6 +200,7 @@ export default function Popup() {
           onClick={handleQuit}
           className="p-1.5 rounded-md hover:bg-border transition-colors"
           title={t("popup.quit")}
+          aria-label={t("popup.quit")}
         >
           <X size={14} />
         </button>
@@ -208,7 +211,7 @@ export default function Popup() {
         <button
           onClick={handleCleanClick}
           disabled={isLoading}
-          className="w-full flex items-center justify-center gap-2 rounded-lg bg-primary px-3 py-2.5 text-sm font-medium text-white hover:bg-primary-hover transition-colors disabled:opacity-60"
+          className="w-full flex items-center justify-center gap-2 rounded-lg bg-primary px-3 py-2.5 text-sm font-medium text-on-primary hover:bg-primary-hover transition-colors disabled:opacity-60"
         >
           <Sparkles size={15} />
           {isLoading ? "..." : t("popup.cleanNow")}
@@ -258,7 +261,8 @@ export default function Popup() {
                     <button
                       onClick={() => handleOpenActionFolder(log.destination_path)}
                       className="p-1 rounded hover:bg-border text-text-muted hover:text-text"
-                      title="Open folder"
+                      title={t("cleanup.openFolder")}
+                      aria-label={t("cleanup.openFolder")}
                     >
                       <FolderOpen size={12} />
                     </button>
@@ -266,6 +270,7 @@ export default function Popup() {
                       onClick={() => void handleUndo(log.id)}
                       className="p-1 rounded hover:bg-border text-text-muted hover:text-text"
                       title={t("popup.undo")}
+                      aria-label={t("popup.undo")}
                     >
                       <RotateCcw size={12} />
                     </button>
@@ -306,28 +311,23 @@ export default function Popup() {
       {/* Clickable toast for auto-organized files */}
       {toast && (
         <div className="px-3 pb-2">
-          <div
-            onPointerDown={async () => {
-              try {
-                await invoke("open_folder_cmd", { path: toast.destination_folder });
-              } catch {
-                console.error("Failed to open folder");
-              }
-              setToast(null);
-            }}
-            className="w-full text-left rounded-lg bg-primary/10 border border-primary/20 px-3 py-2 text-xs hover:bg-primary/20 transition-colors cursor-pointer"
-            role="button"
-          >
+          <div className="w-full rounded-lg bg-primary/10 border border-primary/20 px-3 py-2 text-xs">
             <div className="flex items-center justify-between">
-              <div className="flex items-center gap-1.5 text-primary">
+              <button type="button" className="flex items-center gap-1.5 text-primary text-left hover:underline" onClick={async () => {
+                try {
+                  await invoke("open_folder_cmd", { path: toast.destination_folder });
+                  setToast(null);
+                } catch (e) {
+                  setUndoToast([{ tone: "error", key: "confirm.failed", values: { error: String(e) } }]);
+                }
+              }}>
                 <ExternalLink size={12} />
                 <span className="font-medium">{t("popup.organized", { file: toast.file })}</span>
-              </div>
+              </button>
               <button
-                onClick={(e) => {
-                  e.stopPropagation();
-                  setToast(null);
-                }}
+                type="button"
+                onClick={() => setToast(null)}
+                aria-label={t("common.dismiss")}
                 className="p-0.5 rounded hover:bg-primary/20 text-primary"
               >
                 <X size={10} />
@@ -361,7 +361,7 @@ export default function Popup() {
       )}
 
       {/* Scan results toast */}
-      {scanResults.length > 0 && (
+      {cleanCompleted && (
         <div className="px-3 pb-3">
           <div className="rounded-lg bg-green-50 border border-green-200 px-3 py-2 text-xs text-green-700">
             {t("notifications.cleaned", { count: scanResults.length })}

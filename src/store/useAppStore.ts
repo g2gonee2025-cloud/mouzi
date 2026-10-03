@@ -31,8 +31,8 @@ export interface ActionLog {
   undone: boolean;
 }
 
-export interface AppSettings {
-  id?: number;
+export interface AppSettings extends ScheduleSettings {
+  id: number | null;
   language: string;
   theme: string;
   telemetry_enabled: boolean;
@@ -40,17 +40,21 @@ export interface AppSettings {
   autostart: boolean;
   grace_period_seconds: number;
   lock_check_enabled: boolean;
+  recursive_watch: boolean;
+  revision: number;
+  local_ai_enabled: boolean;
+  local_ai_model: string;
 }
 
-export const defaultSettings: AppSettings = {
-  language: 'en',
-  theme: 'system',
-  telemetry_enabled: false,
-  first_run: true,
-  autostart: true,
-  grace_period_seconds: 300,
-  lock_check_enabled: true,
-};
+export type PreferencesPatch = Partial<Pick<AppSettings,
+  'language' | 'theme' | 'autostart' | 'grace_period_seconds' |
+  'lock_check_enabled' | 'local_ai_enabled' | 'local_ai_model'
+>>;
+
+export interface HistoryCounts {
+  total: number;
+  undoable: number;
+}
 
 export interface ScheduleSettings {
   schedule_enabled: boolean;
@@ -62,9 +66,9 @@ export interface ScheduleSettings {
 }
 
 /**
- * The four outcomes `undo_action_cmd` can return. A union, not `string`, so a
- * status the backend adds later fails to compile here instead of falling
- * through every switch to the "success" branch. `missing` is the one that
+ * The outcomes understood by this frontend. IPC values still require runtime
+ * validation; the TypeScript union cannot enforce Rust wire values. `missing`
+ * is the one that
  * matters: the row is marked undone and the file is never restored, so a
  * caller that ignores it reports a green "Undone" badge for a file that is
  * still in its organised location.
@@ -86,6 +90,7 @@ interface AppState {
   rules: Rule[];
   folders: WatchedFolder[];
   logs: ActionLog[];
+  historyCounts: HistoryCounts | null;
   stats: { file_type: string; count: number }[];
   settings: AppSettings | null;
   schedule: ScheduleSettings | null;
@@ -93,13 +98,15 @@ interface AppState {
   isLoading: boolean;
 
   loadSettings: () => Promise<void>;
-  saveSettings: (settings: AppSettings) => Promise<void>;
+  applySettings: (settings: AppSettings) => void;
+  saveSettings: (settings: PreferencesPatch) => Promise<void>;
   setAutostart: (enabled: boolean) => Promise<void>;
   loadRules: () => Promise<void>;
   loadFolders: () => Promise<void>;
   loadLogs: () => Promise<void>;
+  loadHistoryCounts: () => Promise<HistoryCounts>;
   loadStats: () => Promise<void>;
-  scanFolder: (path: string) => Promise<{ file: string; rule: string; destination: string }[]>;
+  cleanNow: () => Promise<{ file: string; rule: string; destination: string }[]>;
   undoAction: (id: number) => Promise<UndoResult>;
   undoAll: () => Promise<UndoAllResult>;
   addFolder: (path: string, mode: string) => Promise<void>;
@@ -116,10 +123,28 @@ interface AppState {
   importRules: (path: string, replace: boolean) => Promise<number>;
 }
 
+function scheduleFrom(settings: AppSettings): ScheduleSettings {
+  return {
+    schedule_enabled: settings.schedule_enabled,
+    schedule_times_per_day: settings.schedule_times_per_day,
+    schedule_time_1: settings.schedule_time_1,
+    schedule_time_2: settings.schedule_time_2,
+    schedule_time_3: settings.schedule_time_3,
+    schedule_time_4: settings.schedule_time_4,
+  };
+}
+
+let foldersRequest = 0;
+let logsRequest = 0;
+let countsRequest = 0;
+let statsRequest = 0;
+let pendingRequest = 0;
+
 export const useAppStore = create<AppState>((set, get) => ({
   rules: [],
   folders: [],
   logs: [],
+  historyCounts: null,
   stats: [],
   settings: null,
   schedule: null,
@@ -128,12 +153,31 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   loadSettings: async () => {
     const settings = await invoke<AppSettings>('get_settings_cmd');
-    set({ settings });
+    get().applySettings(settings);
+  },
+
+  applySettings: (settings) => {
+    set((state) => {
+      if (state.settings && settings.revision < state.settings.revision) return {};
+      const nextSchedule = scheduleFrom(settings);
+      const schedule = state.schedule && Object.keys(nextSchedule).every(
+        (key) => state.schedule![key as keyof ScheduleSettings] === nextSchedule[key as keyof ScheduleSettings],
+      ) ? state.schedule : nextSchedule;
+      return { settings, schedule };
+    });
   },
 
   saveSettings: async (settings) => {
-    await invoke('update_settings_cmd', { settings });
-    set({ settings });
+    // Keep the wire patch narrow even if a caller passes a settings object.
+    const allowed = ['language', 'theme', 'autostart', 'grace_period_seconds',
+      'lock_check_enabled', 'local_ai_enabled', 'local_ai_model'] as const;
+    const current = get().settings;
+    const patch = Object.fromEntries(allowed.filter((key) =>
+      settings[key] !== undefined && settings[key] !== current?.[key],
+    ).map((key) => [key, settings[key]])) as PreferencesPatch;
+    if (Object.keys(patch).length === 0) return;
+    const committed = await invoke<AppSettings>('update_settings_cmd', { settings: patch });
+    get().applySettings(committed);
   },
 
   setAutostart: async (enabled) => {
@@ -144,9 +188,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     } else {
       await invoke('disable_autostart_cmd');
     }
-    const updated = { ...settings, autostart: enabled };
-    await invoke('update_settings_cmd', { settings: updated });
-    set({ settings: updated });
+    await get().saveSettings({ autostart: enabled });
   },
 
   loadRules: async () => {
@@ -155,24 +197,35 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   loadFolders: async () => {
+    const request = ++foldersRequest;
     const folders = await invoke<WatchedFolder[]>('get_folders_cmd');
-    set({ folders });
+    if (request === foldersRequest) set({ folders });
   },
 
   loadLogs: async () => {
+    const request = ++logsRequest;
     const logs = await invoke<ActionLog[]>('get_logs_cmd', { limit: 50 });
-    set({ logs });
+    if (request === logsRequest) set({ logs });
+    await get().loadHistoryCounts();
+  },
+
+  loadHistoryCounts: async () => {
+    const request = ++countsRequest;
+    const historyCounts = await invoke<HistoryCounts>('get_history_counts_cmd');
+    if (request === countsRequest) set({ historyCounts });
+    return historyCounts;
   },
 
   loadStats: async () => {
+    const request = ++statsRequest;
     const raw = await invoke<[string, number][]>('get_stats_cmd');
-    set({ stats: raw.map(([file_type, count]) => ({ file_type, count })) });
+    if (request === statsRequest) set({ stats: raw.map(([file_type, count]) => ({ file_type, count })) });
   },
 
-  scanFolder: async (path) => {
+  cleanNow: async () => {
     set({ isLoading: true });
     try {
-      const results = await invoke<[string, string, string][]>('scan_folder_cmd', { path });
+      const results = await invoke<[string, string, string][]>('clean_now_cmd');
       await get().loadLogs();
       await get().loadStats();
       return results.map(([file, rule, destination]) => ({ file, rule, destination }));
@@ -244,30 +297,29 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   clearLogs: async () => {
     await invoke('clear_logs_cmd');
-    set({ logs: [], stats: [] });
+    ++logsRequest;
+    ++countsRequest;
+    ++statsRequest;
+    set({ logs: [], stats: [], historyCounts: { total: 0, undoable: 0 } });
   },
 
   getPendingFiles: async () => {
+    const request = ++pendingRequest;
     try {
       const pendingFiles = await invoke<[string, string][]>('get_pending_files_cmd');
-      set({ pendingFiles });
+      if (request === pendingRequest) set({ pendingFiles });
     } catch (e) {
       console.error('getPendingFiles failed:', e);
     }
   },
 
   getSchedule: async () => {
-    try {
-      const schedule = await invoke<ScheduleSettings>('get_schedule_cmd');
-      set({ schedule });
-    } catch (e) {
-      console.error('getSchedule failed:', e);
-    }
+    await get().loadSettings();
   },
 
   updateSchedule: async (schedule) => {
-    await invoke('update_schedule_cmd', { schedule });
-    set({ schedule });
+    const committed = await invoke<AppSettings>('update_schedule_cmd', { schedule });
+    get().applySettings(committed);
   },
 
   exportRules: async (path) => {

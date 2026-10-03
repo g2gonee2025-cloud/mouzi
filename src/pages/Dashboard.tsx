@@ -36,6 +36,8 @@ export default function Dashboard() {
     isLoading,
     error,
     scanReason,
+    scanErrors,
+    scanStatus,
     startScan,
     refresh,
     syncScanState,
@@ -45,22 +47,30 @@ export default function Dashboard() {
   const [root, setRoot] = useState<string | null>(null);
 
   useEffect(() => {
-    refresh();
-    syncScanState();
+    const controller = new AbortController();
     let unsub: (() => void) | undefined;
     let cancelled = false;
-    subscribeDashboardEvents().then((u) => {
+    subscribeDashboardEvents(controller.signal).then((u) => {
       if (cancelled) {
         u();
       } else {
         unsub = u;
+        void refresh();
+        void syncScanState();
       }
+    }).catch((error) => {
+      if (!cancelled) useDashboardStore.setState({ error: String(error) });
     });
     return () => {
       cancelled = true;
+      controller.abort();
       unsub?.();
     };
   }, [refresh, syncScanState]);
+
+  useEffect(() => {
+    if (root && stats && !stats.watchedRoots.some((item) => item.path === root)) setRoot(null);
+  }, [root, stats]);
 
   const handleFocus = useCallback(() => {
     refresh();
@@ -103,7 +113,8 @@ export default function Dashboard() {
         ? t("dashboard.scanAlready")
         : null;
 
-  const hasData = Boolean(stats && stats.totalFiles > 0);
+  const hasData = Boolean(stats && (stats.totalFiles > 0 || stats.watchedRoots.length > 0));
+  const scanFailed = scanStatus === "failed";
 
   return (
     <div className="h-full flex flex-col bg-surface text-text">
@@ -112,9 +123,10 @@ export default function Dashboard() {
           <button
             type="button"
             onClick={handleClose}
+            aria-label={t("common.back")}
             className="p-1.5 rounded-md hover:bg-border transition-colors"
           >
-            <ChevronLeft size={18} />
+            <ChevronLeft size={18} aria-hidden="true" />
           </button>
           <LayoutDashboard size={18} className="text-primary shrink-0" />
           <h1 className="text-base font-semibold truncate">{t("dashboard.title")}</h1>
@@ -125,14 +137,15 @@ export default function Dashboard() {
             onClick={() => refresh()}
             className="p-1.5 rounded-md hover:bg-border text-text-muted hover:text-text transition-colors"
             title={t("dashboard.refresh")}
+            aria-label={t("dashboard.refresh")}
           >
-            <RefreshCw size={15} />
+            <RefreshCw size={15} aria-hidden="true" />
           </button>
           <button
             type="button"
             onClick={startScan}
             disabled={isScanning}
-            className="rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-white hover:bg-primary-hover disabled:opacity-50 transition-colors inline-flex items-center gap-1.5"
+            className="rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-on-primary hover:bg-primary-hover disabled:opacity-50 transition-colors inline-flex items-center gap-1.5"
           >
             <RefreshCw size={13} className={isScanning ? "animate-spin" : ""} />
             {isScanning ? t("dashboard.scanning") : t("dashboard.scanNow")}
@@ -141,7 +154,7 @@ export default function Dashboard() {
       </header>
 
       {isScanning && (
-        <div className="px-5 py-2 border-b border-border bg-surface-dark/80 text-xs text-text-muted flex items-center gap-3">
+        <div role="status" aria-live="polite" className="px-5 py-2 border-b border-border bg-surface-dark/80 text-xs text-text-muted flex items-center gap-3">
           <div className="scan-bar flex-1" />
           <span className="tabular-nums shrink-0">
             {scanProgress
@@ -156,8 +169,14 @@ export default function Dashboard() {
 
       <div className="flex-1 overflow-auto p-5 space-y-4">
         {error && (
-          <div className="rounded-lg bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 px-4 py-3 text-sm text-red-700 dark:text-red-400">
+          <div role="alert" className="rounded-lg bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 px-4 py-3 text-sm text-red-700 dark:text-red-400">
             {error}
+          </div>
+        )}
+        {scanFailed && (
+          <div role="alert" className="rounded-lg border border-red-200 dark:border-red-800 px-4 py-3 text-sm text-red-700 dark:text-red-400">
+            <p>{t("dashboard.scanFailed")}</p>
+            {scanErrors.map((message, index) => <p key={index} className="mt-1">{message}</p>)}
           </div>
         )}
         {reasonMessage && !isScanning && (
@@ -180,6 +199,12 @@ export default function Dashboard() {
           <div className="flex items-center justify-center h-64">
             <div className="animate-pulse text-sm text-text-muted">{t("app.loading")}</div>
           </div>
+        ) : error && !stats ? (
+          <div className="flex items-center justify-center h-64">
+            <button type="button" onClick={() => refresh()} className="rounded-md border border-border px-4 py-1.5 text-sm hover:bg-surface-dark">
+              {t("common.retry")}
+            </button>
+          </div>
         ) : !hasData ? (
           <div className="flex flex-col items-center justify-center h-64 text-center px-6">
             <LayoutDashboard size={32} className="text-text-muted mb-2" />
@@ -188,7 +213,8 @@ export default function Dashboard() {
               <button
                 type="button"
                 onClick={startScan}
-                className="rounded-md bg-primary px-4 py-1.5 text-sm font-medium text-white hover:bg-primary-hover transition-colors"
+                disabled={isScanning}
+                className="rounded-md bg-primary px-4 py-1.5 text-sm font-medium text-on-primary hover:bg-primary-hover disabled:opacity-50 transition-colors"
               >
                 {isScanning ? t("dashboard.scanning") : t("dashboard.scanNow")}
               </button>
@@ -269,6 +295,7 @@ export default function Dashboard() {
               initialRecent={stats!.recentFiles ?? []}
               category={category}
               root={root}
+              revision={stats!.revision}
             />
           </>
         )}

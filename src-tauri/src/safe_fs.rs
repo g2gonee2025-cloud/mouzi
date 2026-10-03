@@ -1,4 +1,275 @@
+use std::fs::{File, Metadata, OpenOptions};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
+
+/// Physical identity, obtained from an open OS handle. Path spelling is never
+/// used as a substitute for identity (including case-sensitive NTFS folders).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct FileIdentity {
+    pub volume: u64,
+    pub file_id: [u8; 16],
+}
+
+impl FileIdentity {
+    pub fn key(&self) -> String {
+        let mut key = format!("{:016x}:", self.volume);
+        for byte in self.file_id { key.push_str(&format!("{:02x}", byte)); }
+        key
+    }
+}
+
+#[cfg(windows)]
+mod windows_fs {
+    use super::*;
+    use std::ffi::c_void;
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use std::os::windows::ffi::OsStrExt;
+
+    #[repr(C)]
+    struct FileIdInfo { volume: u64, id: [u8; 16] }
+    #[repr(C)]
+    struct ByHandleInfo {
+        attributes: u32, created: [u32; 2], accessed: [u32; 2], modified: [u32; 2],
+        volume: u32, size_high: u32, size_low: u32, links: u32, index_high: u32, index_low: u32,
+    }
+    #[repr(C)]
+    struct RenameInfo { replace: u8, root: *mut c_void, length: u32, name: [u16; 1] }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetFileInformationByHandleEx(handle: *mut c_void, class: i32, info: *mut c_void, size: u32) -> i32;
+        fn GetFileInformationByHandle(handle: *mut c_void, info: *mut ByHandleInfo) -> i32;
+        fn SetFileInformationByHandle(handle: *mut c_void, class: i32, info: *const c_void, size: u32) -> i32;
+    }
+
+    pub(super) fn open(path: &Path, directory: bool, moving: bool) -> io::Result<File> {
+        let mut options = OpenOptions::new();
+        options.read(true).custom_flags(0x02000000 | 0x00200000); // BACKUP_SEMANTICS | OPEN_REPARSE_POINT
+        if moving {
+            options.access_mode(0x80000000 | 0x00010000).share_mode(1); // READ | DELETE; deny external writes/deletion
+        } else {
+            options.share_mode(if directory { 1 | 2 } else { 1 }); // ancestors deny deletion; files deny writes/deletion
+        }
+        options.open(path)
+    }
+
+    pub(super) fn identity(file: &File) -> io::Result<FileIdentity> {
+        let mut info = FileIdInfo { volume: 0, id: [0; 16] };
+        let ok = unsafe { GetFileInformationByHandleEx(file.as_raw_handle(), 18, &mut info as *mut _ as *mut c_void, std::mem::size_of::<FileIdInfo>() as u32) };
+        if ok == 0 { return Err(io::Error::last_os_error()); }
+        Ok(FileIdentity { volume: info.volume, file_id: info.id })
+    }
+
+    pub(super) fn links(file: &File) -> io::Result<u64> {
+        let mut info: ByHandleInfo = unsafe { std::mem::zeroed() };
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 { return Err(io::Error::last_os_error()); }
+        Ok(info.links as u64)
+    }
+
+    pub(super) fn rename(file: &File, destination: &Path) -> io::Result<()> {
+        // The Win32 wrapper resolves a DOS path. Use the canonical absolute
+        // destination while its parent ancestry is pinned by the caller.
+        // Include a terminator in the allocation, but not FileNameLength.
+        let name: Vec<u16> = destination.as_os_str().encode_wide().collect();
+        let offset = std::mem::offset_of!(RenameInfo, name);
+        let bytes = offset + (name.len() + 1) * 2;
+        let mut buffer = vec![0u64; bytes.div_ceil(8)];
+        let info = buffer.as_mut_ptr().cast::<RenameInfo>();
+        unsafe {
+            (*info).replace = 0; // FileRenameInfo: never replace a destination
+            (*info).root = std::ptr::null_mut();
+            (*info).length = (name.len() * 2) as u32;
+            std::ptr::copy_nonoverlapping(name.as_ptr(), (info as *mut u8).add(offset).cast::<u16>(), name.len());
+            if SetFileInformationByHandle(file.as_raw_handle(), 3, info.cast(), bytes as u32) == 0 { return Err(io::Error::last_os_error()); }
+        }
+        Ok(())
+    }
+
+    pub(super) fn remove(file: &File) -> io::Result<()> {
+        let delete: i32 = 1;
+        if unsafe { SetFileInformationByHandle(file.as_raw_handle(), 4, &delete as *const _ as *const c_void, std::mem::size_of::<i32>() as u32) } == 0 { return Err(io::Error::last_os_error()); }
+        Ok(())
+    }
+}
+
+fn open_guard(path: &Path, directory: bool, moving: bool) -> io::Result<File> {
+    #[cfg(windows)] { windows_fs::open(path, directory, moving) }
+    #[cfg(not(windows))] { let _ = (directory, moving); File::open(path) }
+}
+
+pub fn identity_from_handle(file: &File) -> Result<FileIdentity, String> {
+    #[cfg(windows)] { windows_fs::identity(file).map_err(|e| format!("Cannot read file identity: {}", e)) }
+    #[cfg(unix)] {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = file.metadata().map_err(|e| e.to_string())?;
+        let mut file_id = [0u8; 16]; file_id[..8].copy_from_slice(&metadata.ino().to_le_bytes());
+        Ok(FileIdentity { volume: metadata.dev(), file_id })
+    }
+    #[cfg(not(any(windows, unix)))] { let _ = file; Err("Physical file identity is unsupported on this platform".into()) }
+}
+
+pub fn file_identity(path: &Path) -> Result<FileIdentity, String> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+    if is_link(&metadata) { return Err("Links are not eligible filesystem targets".into()); }
+    #[cfg(windows)]
+    let file = {
+        use std::os::windows::fs::OpenOptionsExt;
+        OpenOptions::new().read(true).share_mode(1 | 2 | 4).custom_flags(0x02000000 | 0x00200000).open(path)
+    };
+    #[cfg(not(windows))]
+    let file = File::open(path);
+    let file = file.map_err(|e| e.to_string())?;
+    if is_link(&file.metadata().map_err(|e| e.to_string())?) { return Err("Target changed to a link".into()); }
+    identity_from_handle(&file)
+}
+
+fn link_count(file: &File) -> Result<u64, String> {
+    #[cfg(windows)] { windows_fs::links(file).map_err(|e| e.to_string()) }
+    #[cfg(unix)] { use std::os::unix::fs::MetadataExt; Ok(file.metadata().map_err(|e| e.to_string())?.nlink()) }
+    #[cfg(not(any(windows, unix)))] { let _ = file; Err("Link count unavailable".into()) }
+}
+
+fn is_link(metadata: &Metadata) -> bool {
+    #[cfg(windows)] { use std::os::windows::fs::MetadataExt; metadata.file_attributes() & 0x400 != 0 }
+    #[cfg(not(windows))] { metadata.file_type().is_symlink() }
+}
+
+fn has_dot_component(path: &Path) -> bool {
+    path.as_os_str().as_encoded_bytes().split(|byte| *byte == b'/' || *byte == b'\\')
+        .any(|part| part == b"." || part == b"..")
+}
+
+fn pin_ancestry(path: &Path) -> Result<Vec<File>, String> {
+    let mut guards = Vec::new();
+    for ancestor in path.ancestors() {
+        if ancestor.as_os_str().is_empty() { continue; }
+        let metadata = std::fs::symlink_metadata(ancestor).map_err(|e| format!("Cannot inspect {}: {}", ancestor.display(), e))?;
+        if is_link(&metadata) { return Err(format!("Linked ancestry is not allowed: {}", ancestor.display())); }
+        if !metadata.is_dir() { return Err(format!("An ancestor is not a directory: {}", ancestor.display())); }
+        let guard = open_guard(ancestor, true, false).map_err(|e| format!("Cannot protect {}: {}", ancestor.display(), e))?;
+        if is_link(&guard.metadata().map_err(|e| e.to_string())?) { return Err("An ancestor changed to a link".into()); }
+        guards.push(guard);
+    }
+    Ok(guards)
+}
+
+/// Reject drive/share roots, dot aliases and every reparse/symlink ancestor.
+pub fn validate_root(path: &Path) -> Result<PathBuf, String> {
+    if !path.is_absolute() || has_dot_component(path) { return Err("Choose an absolute folder without dot segments".into()); }
+    let guards = pin_ancestry(path)?;
+    let canonical = std::fs::canonicalize(path).map_err(|e| e.to_string())?;
+    if !canonical.components().any(|part| matches!(part, Component::Normal(_))) { return Err("A volume root cannot be watched".into()); }
+    if identity_from_handle(&guards[0])? != file_identity(&canonical)? { return Err("Folder identity changed during validation".into()); }
+    Ok(canonical)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ScopedRoot { path: PathBuf, identity: FileIdentity, active: bool }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RootScope { roots: Vec<ScopedRoot> }
+
+pub fn eligible_scope(folders: &[crate::db::WatchedFolder]) -> Result<RootScope, String> {
+    let mut roots: Vec<ScopedRoot> = Vec::new();
+    for folder in folders {
+        let path = validate_root(Path::new(&folder.path))?;
+        let identity = file_identity(&path)?;
+        let active = folder.enabled && folder.mode != crate::db::FOLDER_MODE_PAUSED;
+        if let Some(existing) = roots.iter_mut().find(|root| root.identity == identity) {
+            // Conflicting legacy aliases fail closed rather than enabling an inactive root.
+            existing.active &= active;
+        } else { roots.push(ScopedRoot { path, identity, active }); }
+    }
+    Ok(RootScope { roots })
+}
+
+#[derive(Debug)]
+pub struct AncestorGuard { _files: Vec<File> }
+
+#[derive(Debug)]
+pub struct ValidatedFile {
+    pub canonical_path: PathBuf, pub identity: FileIdentity, pub file: File,
+    pub owning_root: PathBuf,
+    pub link_count: u64, pub metadata: Metadata, ancestors: AncestorGuard,
+}
+
+#[derive(Debug)]
+pub struct ValidatedDirectory {
+    pub canonical_path: PathBuf, pub identity: FileIdentity, pub file: File,
+    pub owning_root: PathBuf,
+    pub metadata: Metadata, ancestors: AncestorGuard,
+}
+
+impl ValidatedFile { pub fn into_parent_guard(self) -> AncestorGuard { self.ancestors } }
+impl ValidatedDirectory { pub fn into_parent_guard(self) -> AncestorGuard { self.ancestors } }
+
+impl RootScope {
+    pub fn active_roots(&self) -> Vec<PathBuf> { self.roots.iter().filter(|r| r.active).map(|r| r.path.clone()).collect() }
+    pub fn root_identities(&self) -> Vec<FileIdentity> { self.roots.iter().map(|r| r.identity.clone()).collect() }
+
+    fn validate(&self, path: &Path, directory: bool) -> Result<(PathBuf, FileIdentity, File, Metadata, AncestorGuard, PathBuf), String> {
+        if !path.is_absolute() || has_dot_component(path) { return Err("Target must be an absolute path without dot segments".into()); }
+        for root in &self.roots {
+            if validate_root(&root.path)? != root.path || file_identity(&root.path)? != root.identity { return Err("A configured root changed identity".into()); }
+        }
+        let parent = path.parent().ok_or("Target has no parent directory")?;
+        let ancestors = pin_ancestry(parent)?;
+        let metadata = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+        if is_link(&metadata) || if directory { !metadata.is_dir() } else { !metadata.is_file() } { return Err("Target has the wrong type or is a link".into()); }
+        let file = open_guard(path, directory, false).map_err(|e| e.to_string())?;
+        let metadata = file.metadata().map_err(|e| e.to_string())?;
+        if is_link(&metadata) || if directory { !metadata.is_dir() } else { !metadata.is_file() } { return Err("Target changed type".into()); }
+        let identity = identity_from_handle(&file)?;
+        if self.roots.iter().any(|root| root.identity == identity) { return Err("A watched root cannot be mutated".into()); }
+        let owner = ancestors.iter().find_map(|guard| {
+            let identity = identity_from_handle(guard).ok()?;
+            self.roots.iter().find(|root| root.identity == identity)
+        }).ok_or("Target is not strictly below a registered root")?;
+        if !owner.active { return Err("The owning root is disabled or paused".into()); }
+        let canonical = std::fs::canonicalize(path).map_err(|e| e.to_string())?;
+        if file_identity(&canonical)? != identity { return Err("Target changed identity during validation".into()); }
+        Ok((canonical, identity, file, metadata, AncestorGuard { _files: ancestors }, owner.path.clone()))
+    }
+
+    pub fn validate_file(&self, path: &Path) -> Result<ValidatedFile, String> {
+        let (canonical_path, identity, file, metadata, ancestors, owning_root) = self.validate(path, false)?;
+        let link_count = link_count(&file)?;
+        Ok(ValidatedFile { canonical_path, identity, file, link_count, metadata, ancestors, owning_root })
+    }
+
+    pub fn validate_dir(&self, path: &Path) -> Result<ValidatedDirectory, String> {
+        let (canonical_path, identity, file, metadata, ancestors, owning_root) = self.validate(path, true)?;
+        Ok(ValidatedDirectory { canonical_path, identity, file, metadata, ancestors, owning_root })
+    }
+}
+
+/// Physical directory ancestry for live policy checks. Unlike lexical matching,
+/// this honors short-name aliases and genuinely distinct case-sensitive paths.
+pub fn directory_contains(directory: &Path, ancestor: &Path) -> Result<bool, String> {
+    let identity = file_identity(ancestor)?;
+    Ok(pin_ancestry(directory)?.iter().any(|file| identity_from_handle(file).ok().as_ref() == Some(&identity)))
+}
+
+pub(crate) fn guard_directory(path: &Path) -> Result<AncestorGuard, String> {
+    Ok(AncestorGuard { _files: pin_ancestry(path)? })
+}
+
+/// Resolve a directory that may not yet exist without accepting linked or
+/// traversing ancestry. This is also used to isolate development data.
+pub(crate) fn resolve_future_directory(path: &Path) -> Result<PathBuf, String> {
+    if !path.is_absolute() || has_dot_component(path) { return Err("Directory must be absolute without dot segments".into()); }
+    let existing = path.ancestors().find(|part| part.exists()).ok_or("Directory has no existing ancestor")?;
+    let _guard = guard_directory(existing)?;
+    let resolved = std::fs::canonicalize(existing).map_err(|e| e.to_string())?;
+    Ok(resolved.join(path.strip_prefix(existing).map_err(|e| e.to_string())?))
+}
+
+/// Convenience scope validation for callers that already own authorized roots.
+pub fn validate_scoped_path(path: &Path, roots: &[PathBuf], expect_dir: bool) -> Result<PathBuf, String> {
+    let folders: Vec<_> = roots.iter().map(|root| crate::db::WatchedFolder { id: None, path: root.to_string_lossy().into_owned(), enabled: true, mode: crate::db::FOLDER_MODE_MANUAL.into() }).collect();
+    let scope = eligible_scope(&folders)?;
+    if expect_dir { Ok(scope.validate_dir(path)?.canonical_path) } else { Ok(scope.validate_file(path)?.canonical_path) }
+}
 
 /// The outcome of a safe file move operation.
 #[derive(Debug, Clone, PartialEq)]
@@ -75,10 +346,13 @@ pub fn is_within_any_root(path: &Path, roots: &[PathBuf]) -> bool {
 /// the same candidate, and the rename then replaces the first file outright
 /// rather than failing. Counting upwards until the name is free makes the
 /// result unique by construction rather than by luck.
-pub fn unique_destination(dir: &Path, file_name: &str) -> PathBuf {
+pub fn try_unique_destination(dir: &Path, file_name: &str) -> Result<PathBuf, String> {
+    if Path::new(file_name).components().count() != 1 || file_name.is_empty() || file_name == "." || file_name == ".." {
+        return Err("Destination filename must contain one ordinary component".into());
+    }
     let candidate = dir.join(file_name);
-    if !candidate.exists() {
-        return candidate;
+    if !path_occupied(&candidate)? {
+        return Ok(candidate);
     }
     let source = Path::new(file_name);
     let stem = source
@@ -99,89 +373,215 @@ pub fn unique_destination(dir: &Path, file_name: &str) -> PathBuf {
             format!("{}_{}.{}", stem, attempt, extension)
         };
         let candidate = dir.join(name);
-        if !candidate.exists() {
-            return candidate;
+        if !path_occupied(&candidate)? {
+            return Ok(candidate);
         }
     }
-    candidate
+    Err(format!("No collision-free destination is available for {}", file_name))
 }
 
-fn resolve_destination(dest: &Path) -> (PathBuf, MoveOutcome) {
-    if !dest.exists() {
-        return (dest.to_path_buf(), MoveOutcome::Moved);
+fn path_occupied(path: &Path) -> Result<bool, String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true), Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(format!("Cannot inspect destination {}: {}", path.display(), e)),
     }
-    let parent = dest.parent().unwrap_or(dest);
-    let name = dest.file_name().unwrap_or_default().to_string_lossy().to_string();
-    let new_path = unique_destination(parent, &name);
-    let new_name = new_path
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_string();
-    (new_path, MoveOutcome::MovedWithNewName(new_name))
 }
 
-/// Copy `src` to `dest` and delete `src`.
-///
-/// Used as a fallback when `std::fs::rename` fails across devices
-/// (EXDEV on Linux, ERROR_NOT_SAME_DEVICE on Windows).
-fn copy_delete_fallback(src: &Path, dest: &Path) -> Result<MoveOutcome, String> {
-    let (actual_dest, outcome) = resolve_destination(dest);
-    std::fs::copy(src, &actual_dest).map_err(|e| {
-        format!(
-            "Failed to copy {} to {}: {}",
-            src.to_string_lossy(),
-            actual_dest.to_string_lossy(),
-            e
-        )
-    })?;
-    std::fs::remove_file(src).map_err(|e| {
-        format!(
-            "Copied {} to {} but failed to remove source: {}",
-            src.to_string_lossy(),
-            actual_dest.to_string_lossy(),
-            e
-        )
-    })?;
-    Ok(outcome)
-}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MoveResult { pub destination: PathBuf, pub renamed: bool, pub identity: FileIdentity }
 
-/// Move a file from `src` to `dest` with safe handling:
-///
-/// - Creates parent directories of `dest` if they do not exist.
-/// - If `dest` already exists, appends a timestamp suffix to the filename.
-/// - Falls back to copy + delete if `std::fs::rename` crosses devices.
-/// - Never silently swallows errors.
-pub fn move_file(src: &Path, dest: &Path) -> Result<MoveOutcome, String> {
-    let src_str = src.to_string_lossy();
-    let dest_str = dest.to_string_lossy();
-
-    // Ensure parent directory exists
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("Failed to create parent dirs for {}: {}", dest_str, e))?;
+fn collision_error(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::AlreadyExists || {
+        #[cfg(windows)] { matches!(error.raw_os_error(), Some(80 | 183)) }
+        #[cfg(not(windows))] { false }
     }
+}
 
-    let (actual_dest, outcome) = resolve_destination(dest);
+fn cross_device_error(error: &io::Error) -> bool {
+    #[cfg(windows)] { error.raw_os_error() == Some(17) } // ERROR_NOT_SAME_DEVICE; 18 is NO_MORE_FILES
+    #[cfg(not(windows))] { error.kind() == io::ErrorKind::CrossesDevices || error.raw_os_error() == Some(18) }
+}
 
-    // Try atomic rename first; fall back to copy+delete for cross-device moves.
-    match std::fs::rename(src, &actual_dest) {
-        Ok(()) => Ok(outcome),
-        Err(rename_err) => {
-            if rename_err.raw_os_error() == Some(18)
-                || rename_err.kind() == std::io::ErrorKind::CrossesDevices
-            {
-                copy_delete_fallback(src, &actual_dest)
-            } else {
-                Err(format!(
-                    "Failed to move {} to {}: {}",
-                    src_str,
-                    actual_dest.to_string_lossy(),
-                    rename_err
-                ))
+fn rename_no_replace(source: &File, src: &Path, parent: &File, destination: &Path) -> io::Result<()> {
+    #[cfg(windows)] { let _ = (src, parent); windows_fs::rename(source, destination) }
+    #[cfg(not(windows))] {
+        // Creating a hard link reserves the destination atomically without replacing it.
+        // Unix handles cannot prevent external pathname replacements: check again before unlinking.
+        let _ = parent;
+        std::fs::hard_link(src, destination)?;
+        if file_identity(src).ok() != identity_from_handle(source).ok() {
+            let _ = std::fs::remove_file(destination);
+            return Err(io::Error::other("Source identity changed before unlink"));
+        }
+        std::fs::remove_file(src)
+    }
+}
+
+fn remove_open_source(source: &File, src: &Path) -> Result<(), String> {
+    #[cfg(windows)] { let _ = src; windows_fs::remove(source).map_err(|e| e.to_string()) }
+    #[cfg(not(windows))] {
+        if file_identity(src)? != identity_from_handle(source)? { return Err("Source identity changed before removal".into()); }
+        std::fs::remove_file(src).map_err(|e| e.to_string())
+    }
+}
+
+fn stable_metadata(before: &Metadata, after: &Metadata) -> bool {
+    before.len() == after.len() && before.modified().ok() == after.modified().ok() && before.is_file() == after.is_file()
+}
+
+fn hash_handle(file: &mut File) -> Result<blake3::Hash, String> {
+    file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+    let mut hash = blake3::Hasher::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop { let count = file.read(&mut buffer).map_err(|e| e.to_string())?; if count == 0 { break; } hash.update(&buffer[..count]); }
+    Ok(hash.finalize())
+}
+
+fn copy_verified(source: &mut File, src: &Path, destination: &Path) -> Result<FileIdentity, String> {
+    let before = source.metadata().map_err(|e| e.to_string())?;
+    let identity = identity_from_handle(source)?;
+    let mut output_options = OpenOptions::new();
+    output_options.read(true).write(true).create_new(true);
+    #[cfg(windows)] {
+        use std::os::windows::fs::OpenOptionsExt;
+        output_options.access_mode(0x80000000 | 0x40000000 | 0x00010000).share_mode(1); // deny external write/delete
+    }
+    let mut output = output_options.open(destination).map_err(|e| if collision_error(&e) { format!("Destination collision: {}", e) } else { e.to_string() })?;
+    let output_identity = identity_from_handle(&output)?;
+    let transfer: Result<(), String> = (|| {
+        source.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+        io::copy(source, &mut output).map_err(|e| e.to_string())?;
+        output.flush().map_err(|e| e.to_string())?;
+        output.sync_all().map_err(|e| e.to_string())?;
+        let copied_hash = hash_handle(&mut output)?;
+        let source_hash = hash_handle(source)?;
+        let after = source.metadata().map_err(|e| e.to_string())?;
+        if !stable_metadata(&before, &after) || identity_from_handle(source)? != identity || file_identity(src)? != identity || output.metadata().map_err(|e| e.to_string())?.len() != before.len() || copied_hash != source_hash {
+            return Err("Source changed or transfer verification failed; source preserved".into());
+        }
+        if file_identity(destination)? != output_identity { return Err("Destination changed during transfer; source preserved".into()); }
+        remove_open_source(source, src).map_err(|e| format!("Verified copy at {}, source remains: {}", destination.display(), e))?;
+        Ok(())
+    })();
+    if let Err(ref error) = transfer {
+        // Delete only our incomplete copy. A verified copy whose source removal failed
+        // is retained for recovery and the error names both locations.
+        if !error.starts_with("Verified copy at ") && file_identity(destination).ok().as_ref() == Some(&output_identity) {
+            #[cfg(windows)]
+            let cleanup = windows_fs::remove(&output);
+            #[cfg(not(windows))]
+            let cleanup = std::fs::remove_file(destination);
+            if let Err(cleanup_error) = cleanup {
+                return Err(format!("{}; partial destination retained at {}: {}", error, destination.display(), cleanup_error));
             }
         }
     }
+    drop(output);
+    transfer.map(|()| output_identity)
+}
+
+fn prepare_destination_parent(dest: &Path) -> Result<(PathBuf, Vec<File>), String> {
+    if !dest.is_absolute() || has_dot_component(dest) { return Err("Move destination must be absolute and have no dot segments".into()); }
+    let parent = dest.parent().ok_or("Destination has no parent")?;
+    let existing = parent.ancestors().find(|path| path.exists()).ok_or("No existing destination ancestor")?;
+    let _existing_guards = pin_ancestry(existing)?;
+    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    let guards = pin_ancestry(parent)?;
+    Ok((std::fs::canonicalize(parent).map_err(|e| e.to_string())?, guards))
+}
+
+/// No-replace movement, returning the complete actual destination. On Windows
+/// source rename/deletion is bound to its open handle and ancestors are pinned.
+/// Path-based Shell deletion still requires releasing its victim handle; Unix
+/// external pathname races cannot be fully excluded by these portable guards.
+pub fn move_file_checked(src: &Path, dest: &Path) -> Result<MoveResult, String> {
+    move_file_checked_inner(src, dest, None, false)
+}
+
+pub fn move_file_checked_expected(src: &Path, dest: &Path, expected: &FileIdentity) -> Result<MoveResult, String> {
+    move_file_checked_inner(src, dest, Some(expected), false)
+}
+
+/// Validate reviewed contents using the same write-denying source handle that
+/// performs the rename, so closing a preview handle cannot admit an edit.
+pub fn move_file_checked_expected_content(src: &Path, dest: &Path, expected: &FileIdentity, digest: &str) -> Result<MoveResult, String> {
+    move_file_checked_content_inner(src, dest, Some(expected), Some(digest), false, true)
+}
+
+pub fn remove_empty_directory_expected(path: &Path, expected: &FileIdentity) -> Result<(), String> {
+    let _parents = pin_ancestry(path.parent().ok_or("Directory has no parent")?)?;
+    let directory = open_guard(path, true, true).map_err(|e|e.to_string())?;
+    if !directory.metadata().map_err(|e|e.to_string())?.is_dir() || identity_from_handle(&directory)? != *expected { return Err("Reviewed directory changed identity or type".into()); }
+    if std::fs::read_dir(path).map_err(|e|e.to_string())?.next().is_some() { return Err("Directory is no longer empty".into()); }
+    #[cfg(windows)] windows_fs::remove(&directory).map_err(|e|e.to_string())?;
+    #[cfg(not(windows))] {
+        if file_identity(path)? != *expected { return Err("Reviewed directory changed identity".into()); }
+        std::fs::remove_dir(path).map_err(|e|e.to_string())?;
+    }
+    drop(directory);
+    Ok(())
+}
+
+pub fn move_reviewed_file(src: &Path, dest: &Path, expected: &FileIdentity, digest: &str) -> Result<MoveResult, String> {
+    move_file_checked_content_inner(src, dest, Some(expected), Some(digest), false, false)
+}
+
+fn move_file_checked_inner(src: &Path, dest: &Path, expected: Option<&FileIdentity>, force_copy: bool) -> Result<MoveResult, String> {
+    move_file_checked_content_inner(src, dest, expected, None, force_copy, true)
+}
+
+fn move_file_checked_content_inner(src: &Path, dest: &Path, expected: Option<&FileIdentity>, expected_digest: Option<&str>, force_copy: bool, allow_rename: bool) -> Result<MoveResult, String> {
+    if !src.is_absolute() || has_dot_component(src) { return Err("Move source must be absolute and have no dot segments".into()); }
+    let _source_ancestors = pin_ancestry(src.parent().ok_or("Source has no parent")?)?;
+    let metadata = std::fs::symlink_metadata(src).map_err(|e| e.to_string())?;
+    if !metadata.is_file() || is_link(&metadata) { return Err("Move source must be a regular file without links".into()); }
+    let mut source = open_guard(src, false, true).map_err(|e| e.to_string())?;
+    if !source.metadata().map_err(|e| e.to_string())?.is_file() { return Err("Move source changed type".into()); }
+    let identity = identity_from_handle(&source)?;
+    if expected.is_some_and(|expected| *expected != identity) { return Err("Move source changed identity".into()); }
+    if let Some(expected_digest) = expected_digest {
+        if hash_handle(&mut source)?.to_hex().as_str() != expected_digest {
+            return Err("Reviewed source contents changed; preview again".into());
+        }
+    }
+    let (parent, guards) = prepare_destination_parent(dest)?;
+    let requested_name = dest.file_name().and_then(|name| name.to_str()).ok_or("Destination requires a valid Unicode filename")?;
+    let requested = parent.join(requested_name);
+    if path_occupied(&requested)? && file_identity(&requested).ok().as_ref() == Some(&identity) { return Err("Source and destination identify the same physical file".into()); }
+    for _ in 0..10_001 {
+        let actual = if allow_rename { try_unique_destination(&parent, requested_name)? } else {
+            if path_occupied(&requested)? { return Err("Reviewed destination is now occupied; preview again".into()); }
+            requested.clone()
+        };
+        let actual_identity = if force_copy {
+            match copy_verified(&mut source, src, &actual) { Err(error) if allow_rename && error.starts_with("Destination collision:") => continue, result => result? }
+        } else {
+            match rename_no_replace(&source, src, &guards[0], &actual) {
+                Ok(()) => identity.clone(),
+                Err(error) if allow_rename && collision_error(&error) => continue,
+                Err(error) if cross_device_error(&error) => {
+                    match copy_verified(&mut source, src, &actual) { Err(error) if allow_rename && error.starts_with("Destination collision:") => continue, result => result? }
+                },
+                Err(error) => return Err(format!("Cannot move {} to {}: {}", src.display(), actual.display(), error)),
+            }
+        };
+        return Ok(MoveResult { renamed: actual != requested, destination: actual, identity: actual_identity });
+    }
+    Err("Destination collision allocation exhausted".into())
+}
+
+fn legacy_outcome(result: MoveResult) -> MoveOutcome {
+    if result.renamed { MoveOutcome::MovedWithNewName(result.destination.file_name().unwrap_or_default().to_string_lossy().into_owned()) } else { MoveOutcome::Moved }
+}
+
+/// Legacy adapter for callers/tests that do not need the destination path.
+pub fn move_file(src: &Path, dest: &Path) -> Result<MoveOutcome, String> {
+    move_file_checked(src, dest).map(legacy_outcome)
+}
+
+#[cfg(test)]
+fn copy_delete_fallback(src: &Path, dest: &Path) -> Result<MoveOutcome, String> {
+    move_file_checked_inner(src, dest, None, true).map(legacy_outcome)
 }
 
 /// Delete a file by moving it to the platform's trash / Recycle Bin.
@@ -195,7 +595,23 @@ pub fn move_file(src: &Path, dest: &Path) -> Result<MoveOutcome, String> {
 /// or if the operation fails.
 pub fn delete_to_trash(path: &Path) -> Result<(), String> {
     let path_str = path.to_string_lossy();
-    trash::delete(path).map_err(|e| format!("Failed to send {} to trash: {}", path_str, e))
+    trash::delete(path).map_err(|e| format!("Failed to send {} to trash: {}", path_str, e))?;
+    match source_absence(path) {
+        SourceAbsence::Absent => Ok(()),
+        SourceAbsence::Present => Err(format!("Trash operation returned success but source remains: {}", path_str)),
+        SourceAbsence::Unknown => Err(format!("Trash operation returned success but source absence could not be verified: {}", path_str)),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SourceAbsence { Absent, Present, Unknown }
+
+pub(crate) fn source_absence(path: &Path) -> SourceAbsence {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => SourceAbsence::Present,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => SourceAbsence::Absent,
+        Err(_) => SourceAbsence::Unknown,
+    }
 }
 
 /// What actually became of a file whose `trash::delete` call returned `Ok`.
@@ -210,8 +626,8 @@ pub fn delete_to_trash(path: &Path) -> Result<(), String> {
 pub(crate) enum TrashVerdict {
     /// Seen in the Recycle Bin, so the user can restore it.
     InRecycleBin,
-    /// Absent from the Recycle Bin even though the call succeeded: Windows
-    /// deleted it permanently.
+    /// Reserved for future direct per-item evidence of permanent deletion.
+    /// Counts or failure to find a bin entry never establish this verdict.
     PermanentlyDeleted,
     /// The evidence is missing, so the fate is genuinely unknown.
     Unverified,
@@ -226,11 +642,16 @@ pub(crate) enum TrashVerdict {
 /// only thing this buys is an honest report. Do not "optimise" it into a check
 /// that runs before `delete_to_trash` and conclude the outcome is then safe.
 #[derive(Debug, Clone)]
+struct TrashEntry {
+    id: std::ffi::OsString,
+    exact_original_path: Option<PathBuf>,
+    identity: Option<FileIdentity>,
+    deleted_at: i64,
+}
+
+#[derive(Debug, Clone)]
 pub(crate) struct TrashSnapshot {
-    /// One key per item currently in the bin. A `Vec` and not a set: `report.txt`
-    /// and `report.docx` share a key once the extension is dropped, and letting
-    /// one entry vouch for both files would repeat the original defect.
-    items: Vec<Vec<Vec<u8>>>,
+    items: Vec<TrashEntry>,
     /// Whether the bin could actually be read at all. When false, `items` means
     /// "unknown", never "empty".
     known: bool,
@@ -250,49 +671,6 @@ impl TrashSnapshot {
     }
 }
 
-/// The key two paths are compared by, one entry per path component.
-///
-/// Deliberately lossy, because what the Recycle Bin reports about an item's
-/// original path is lossy too — `TrashItem::original_path()` is NOT the path the
-/// file had. Two things are lost on the way in:
-///
-/// * The Recycle Bin exposes a shell item's name through `SIGDN_PARENTRELATIVE`,
-///   which for a binned file omits the extension: a file `report.txt` comes back
-///   as the name `report`. Comparing full paths would therefore fail to match
-///   essentially every real file.
-/// * The original folder arrives in its long form even when the app holds the
-///   8.3 short form, and the app may hold a path reached either way.
-///
-/// Both are absorbed by the key rather than by the comparison: the last
-/// extension is dropped and every component is ASCII-folded. Folding only ASCII
-/// keeps this the same notion of "same path" that `is_within_any_root` uses via
-/// `eq_ignore_ascii_case`, so a snapshot lookup and a root check cannot disagree
-/// about a path's identity. Components are bytes, not `str`, because a Windows
-/// path need not be valid Unicode and two distinct paths must not collapse onto
-/// one key.
-fn trash_key(path: &Path) -> Vec<Vec<u8>> {
-    let mut components: Vec<Vec<u8>> = normalize_lexically(path)
-        .components()
-        .map(|component| {
-            component
-                .as_os_str()
-                .as_encoded_bytes()
-                .to_ascii_lowercase()
-        })
-        .collect();
-    // `Path::file_stem` semantics applied to the last component: cut at the
-    // final dot, except for a name that is nothing but a leading dot, which
-    // Rust also treats as having no extension.
-    if let Some(last) = components.last_mut() {
-        if let Some(dot) = last.iter().rposition(|byte| *byte == b'.') {
-            if dot > 0 {
-                last.truncate(dot);
-            }
-        }
-    }
-    components
-}
-
 /// Read the Recycle Bin once.
 ///
 /// Take exactly one reading before a batch and one after. Listing walks every
@@ -303,10 +681,14 @@ pub(crate) fn trash_snapshot() -> TrashSnapshot {
         Ok(items) => TrashSnapshot {
             items: items
                 .iter()
-                // `original_path()` is `original_parent.join(name)`, and `name`
-                // is already extension-stripped, so the same key rule applies to
-                // both sides of the comparison.
-                .map(|item| trash_key(&item.original_path()))
+                .map(|item| TrashEntry {
+                    id: item.id.clone(),
+                    // Windows supplies SIGDN_PARENTRELATIVE display names, with no
+                    // indication that extensions were omitted. Do not guess a path.
+                    exact_original_path: if cfg!(windows) { None } else { Some(item.original_path()) },
+                    identity: file_identity(Path::new(&item.id)).ok(),
+                    deleted_at: item.time_deleted,
+                })
                 .collect(),
             known: true,
         },
@@ -323,58 +705,49 @@ pub(crate) fn trash_snapshot() -> TrashSnapshot {
 /// come back in the same order. Pure so the policy can be tested without a
 /// Recycle Bin.
 ///
-/// A path that does not match a new bin entry is NOT on its own evidence of a
-/// permanent deletion: `trash_key` is deliberately lossy, and any further
-/// mismatch we have not thought of would condemn files the bin in fact accepted.
-/// A deletion is therefore only reported when the bin's own item count
-/// independently shows that items went missing, and only when that shortfall
-/// exactly accounts for the unmatched paths. Reporting a recoverable file as
-/// destroyed would be a different lie, and a more corrosive one.
+/// Only a new stable bin item ID with exact per-item evidence can prove a match.
+/// Concurrent removals/insertions make aggregate bin counts unsuitable evidence.
+#[cfg(test)]
 pub(crate) fn classify_trash_outcomes(
     before: &TrashSnapshot,
     after: &TrashSnapshot,
     attempted: &[PathBuf],
 ) -> Vec<TrashVerdict> {
-    // Without both readings there is no way to tell a new entry from a stale
-    // one, and no count to corroborate an absence with, so nothing is claimed.
+    classify_trash_evidence(before, after, attempted, None)
+}
+
+pub(crate) fn classify_trash_outcomes_with_identity(
+    before: &TrashSnapshot,
+    after: &TrashSnapshot,
+    attempted: &[(PathBuf, FileIdentity)],
+) -> Vec<TrashVerdict> {
+    let paths: Vec<_> = attempted.iter().map(|(path, _)| path.clone()).collect();
+    let identities: Vec<_> = attempted.iter().map(|(_, identity)| identity.clone()).collect();
+    classify_trash_evidence(before, after, &paths, Some(&identities))
+}
+
+fn classify_trash_evidence(before: &TrashSnapshot, after: &TrashSnapshot, attempted: &[PathBuf], identities: Option<&[FileIdentity]>) -> Vec<TrashVerdict> {
     if !before.known || !after.known {
         return vec![TrashVerdict::Unverified; attempted.len()];
     }
 
-    // Attribute bin entries to paths one-for-one. Greedy, in the order the batch
-    // ran, so a key shared by two items cannot be spent on the same path twice.
     let mut verdicts = vec![TrashVerdict::Unverified; attempted.len()];
     let mut spent = vec![false; after.items.len()];
     for (index, path) in attempted.iter().enumerate() {
-        let key = trash_key(path);
-        let is_new = !before.items.contains(&key);
-        let landed = after.items.iter().enumerate().position(|(i, item)| {
-            !spent[i] && is_new && *item == key
-        });
-        if let Some(found) = landed {
+        let matches: Vec<_> = after.items.iter().enumerate().filter(|(i, item)| {
+            !spent[*i] && !before.items.iter().any(|old| old.id == item.id && old.deleted_at == item.deleted_at) && (
+                identities.is_some_and(|ids| item.identity.as_ref() == Some(&ids[index])) ||
+                item.exact_original_path.as_ref().is_some_and(|original| normalize_lexically(original) == normalize_lexically(path))
+            )
+        }).map(|(i, _)| i).collect();
+        // More than one new entry with the same evidence is ambiguous.
+        if let [found] = matches.as_slice() {
+            let found = *found;
             spent[found] = true;
             verdicts[index] = TrashVerdict::InRecycleBin;
         }
     }
 
-    let unmatched = attempted.len() - verdicts.iter().filter(|v| **v == TrashVerdict::InRecycleBin).count();
-    if unmatched == 0 {
-        return verdicts;
-    }
-    // Signed: the user emptying the bin mid-batch makes this negative, which
-    // must not be read as a shortfall.
-    let growth = after.items.len() as i64 - before.items.len() as i64;
-    let missing = attempted.len() as i64 - growth;
-    if missing == unmatched as i64 {
-        for verdict in verdicts.iter_mut() {
-            if *verdict == TrashVerdict::Unverified {
-                *verdict = TrashVerdict::PermanentlyDeleted;
-            }
-        }
-    }
-    // Otherwise the bin accounted for the batch (the shortfall is zero or
-    // negative) or the shortfall is smaller than the number of unmatched paths,
-    // so the unmatched ones are unproven either way and stay Unverified.
     verdicts
 }
 
@@ -384,7 +757,10 @@ impl TrashSnapshot {
     /// builder the real snapshot uses.
     fn from_paths(paths: &[&Path]) -> Self {
         Self {
-            items: paths.iter().map(|path| trash_key(path)).collect(),
+            items: paths.iter().enumerate().map(|(index, path)| TrashEntry {
+                id: format!("fixture:{}:{}", index, path.display()).into(),
+                exact_original_path: Some(path.to_path_buf()), identity: None, deleted_at: 0,
+            }).collect(),
             known: true,
         }
     }
@@ -499,7 +875,7 @@ mod tests {
     #[test]
     fn unique_destination_keeps_a_free_name_unchanged() {
         let dir = test_dir("unique_free");
-        let picked = unique_destination(&dir, "report.txt");
+        let picked = try_unique_destination(&dir, "report.txt").unwrap();
         assert_eq!(picked, dir.join("report.txt"));
     }
 
@@ -507,7 +883,7 @@ mod tests {
     fn unique_destination_suffixes_a_taken_name() {
         let dir = test_dir("unique_taken");
         fs::write(dir.join("report.txt"), b"original").unwrap();
-        let picked = unique_destination(&dir, "report.txt");
+        let picked = try_unique_destination(&dir, "report.txt").unwrap();
         assert_ne!(picked, dir.join("report.txt"));
         assert!(picked.starts_with(&dir));
     }
@@ -519,9 +895,9 @@ mod tests {
     fn unique_destination_never_repeats_a_name_it_already_issued() {
         let dir = test_dir("unique_repeat");
         fs::write(dir.join("report.txt"), b"original").unwrap();
-        let first = unique_destination(&dir, "report.txt");
+        let first = try_unique_destination(&dir, "report.txt").unwrap();
         fs::write(&first, b"first move").unwrap();
-        let second = unique_destination(&dir, "report.txt");
+        let second = try_unique_destination(&dir, "report.txt").unwrap();
         assert_ne!(first, second, "two collisions produced the same name");
         assert_eq!(fs::read(dir.join("report.txt")).unwrap(), b"original");
         assert_eq!(fs::read(&first).unwrap(), b"first move");
@@ -531,7 +907,7 @@ mod tests {
     fn unique_destination_does_not_add_a_trailing_dot_to_an_extensionless_file() {
         let dir = test_dir("unique_noext");
         fs::write(dir.join("README"), b"original").unwrap();
-        let picked = unique_destination(&dir, "README");
+        let picked = try_unique_destination(&dir, "README").unwrap();
         let name = picked.file_name().unwrap().to_string_lossy().to_string();
         assert!(!name.ends_with('.'), "got {:?}", name);
     }
@@ -542,7 +918,7 @@ mod tests {
         fs::write(dir.join("a.txt"), b"x").unwrap();
         fs::write(dir.join("a_0.txt"), b"x").unwrap();
         fs::write(dir.join("a_2.txt"), b"x").unwrap();
-        let picked = unique_destination(&dir, "a.txt");
+        let picked = try_unique_destination(&dir, "a.txt").unwrap();
         assert_eq!(picked, dir.join("a_1.txt"));
     }
 
@@ -556,6 +932,20 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         root
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn moving_handle_denies_external_replacement_until_mutation_finishes() {
+        let root=test_dir("moving_pin");let source=root.join("source.txt");let other=root.join("external.txt");
+        std::fs::write(&source,b"original").unwrap();
+        let file=open_guard(&source,false,true).unwrap();
+        assert!(std::fs::rename(&source,&other).is_err());
+        assert!(std::fs::remove_file(&source).is_err());
+        assert_eq!(std::fs::read(&source).unwrap(),b"original");
+        drop(file);
+        std::fs::rename(&source,&other).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -666,6 +1056,32 @@ mod tests {
         fs::remove_dir_all(&root).ok();
     }
 
+    #[test]
+    fn empty_directory_removal_requires_identity_and_current_emptiness() {
+        let root = test_dir("empty_directory_identity");
+        let directory = root.join("reviewed");
+        fs::create_dir(&directory).unwrap();
+        let reviewed = file_identity(&directory).unwrap();
+
+        let child = directory.join("new-arrival.txt");
+        fs::write(&child, b"preserve me").unwrap();
+        assert!(remove_empty_directory_expected(&directory, &reviewed).is_err());
+        assert_eq!(fs::read(&child).unwrap(), b"preserve me");
+        fs::remove_file(&child).unwrap();
+
+        let preserved = root.join("original");
+        fs::rename(&directory, &preserved).unwrap();
+        fs::create_dir(&directory).unwrap();
+        assert!(remove_empty_directory_expected(&directory, &reviewed).is_err());
+        assert!(directory.exists() && preserved.exists());
+
+        let replacement_identity = file_identity(&directory).unwrap();
+        remove_empty_directory_expected(&directory, &replacement_identity).unwrap();
+        assert!(!directory.exists());
+        assert!(preserved.exists());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
     /// A long-form scratch directory under the user profile.
     ///
     /// `std::env::temp_dir()` hands back the 8.3 short form on some Windows
@@ -686,6 +1102,7 @@ mod tests {
     /// `MOUZI_SKIP_TRASH_INTEGRATION_TEST=1` to opt out explicitly; there is no
     /// silent path where a broken trash implementation still passes.
     #[test]
+    #[ignore = "opt-in only: changes the native Recycle Bin"]
     fn delete_to_trash_places_the_file_in_the_recycle_bin() {
         if std::env::var("MOUZI_SKIP_TRASH_INTEGRATION_TEST").as_deref() == Ok("1") {
             eprintln!("skipped: MOUZI_SKIP_TRASH_INTEGRATION_TEST=1");
@@ -698,6 +1115,7 @@ mod tests {
         assert!(file.exists());
 
         let before = trash_snapshot();
+        let original_identity = file_identity(&file).unwrap();
         // Previously the Err arm printed a note and the test passed anyway, so a
         // totally broken trash path was invisible to CI. A failure here is a
         // failure.
@@ -711,14 +1129,13 @@ mod tests {
              to skip this test on a machine where the Shell will not enumerate it"
         );
         assert!(
-            after.items.len() > before.items.len(),
-            "delete_to_trash returned Ok but the Recycle Bin did not grow — Windows \
-             deleted the file permanently (bin full, item too large, or bin disabled)"
+            after.items.iter().any(|entry| !before.items.iter().any(|old| old.id == entry.id)),
+            "no new stable Recycle Bin item ID was observed; recovery remains unverified"
         );
         // The strongest form of the assertion: the snapshot has to positively
         // find the item and attribute it, not merely notice a larger bin.
         assert_eq!(
-            classify_trash_outcomes(&before, &after, std::slice::from_ref(&file)),
+            classify_trash_outcomes_with_identity(&before, &after, &[(file.clone(), original_identity)]),
             vec![TrashVerdict::InRecycleBin],
             "the item landed but the snapshot could not match it back to its path"
         );
@@ -761,12 +1178,12 @@ mod tests {
     }
 
     #[test]
-    fn a_path_that_never_appears_is_reported_as_permanently_deleted() {
+    fn missing_bin_evidence_remains_unverified() {
         let before = TrashSnapshot::from_paths(&[Path::new("C:/Users/Me/other.txt")]);
         let after = TrashSnapshot::from_paths(&[Path::new("C:/Users/Me/other.txt")]);
         assert_eq!(
             classify(&before, &after, &["C:/Users/Me/victim.txt"]),
-            vec![TrashVerdict::PermanentlyDeleted]
+            vec![TrashVerdict::Unverified]
         );
     }
 
@@ -800,15 +1217,14 @@ mod tests {
         );
     }
 
-    /// A pre-existing entry does not vouch for this attempt — and because the
-    /// bin did not grow, the count says this one really was destroyed.
+    /// A pre-existing entry cannot establish the outcome of a new attempt.
     #[test]
     fn a_pre_existing_entry_does_not_vouch_for_this_attempt() {
         let before = TrashSnapshot::from_paths(&[Path::new("C:/Users/Me/recycled.txt")]);
         let after = TrashSnapshot::from_paths(&[Path::new("C:/Users/Me/recycled.txt")]);
         assert_eq!(
             classify(&before, &after, &["C:/Users/Me/recycled.txt"]),
-            vec![TrashVerdict::PermanentlyDeleted]
+            vec![TrashVerdict::Unverified]
         );
     }
 
@@ -858,8 +1274,7 @@ mod tests {
     }
 
     #[test]
-    fn two_items_sharing_a_stem_are_not_spent_on_one_path() {
-        // `report.txt` and `report.docx` both land under the key `report`.
+    fn extensionless_display_names_cannot_vouch_for_distinct_files() {
         let before = TrashSnapshot::from_paths(&[]);
         let after = TrashSnapshot::from_paths(&[
             Path::new("C:/Users/Me/report"),
@@ -871,36 +1286,35 @@ mod tests {
                 &after,
                 &["C:/Users/Me/report.txt", "C:/Users/Me/report.docx"]
             ),
-            vec![TrashVerdict::InRecycleBin, TrashVerdict::InRecycleBin]
+            vec![TrashVerdict::Unverified, TrashVerdict::Unverified]
         );
     }
 
-    /// The Recycle Bin reports a binned `report.txt` under the name `report`,
-    /// so the key has to drop the extension or nothing would ever match.
+    /// Dropping extensions previously allowed different files to vouch for each other.
     #[test]
-    fn matching_ignores_the_extension_the_bin_drops() {
+    fn matching_never_guesses_an_omitted_extension() {
         let before = TrashSnapshot::from_paths(&[]);
         let after = TrashSnapshot::from_paths(&[Path::new("C:/Users/Me/report")]);
         assert_eq!(
             classify(&before, &after, &["C:/Users/Me/report.txt"]),
-            vec![TrashVerdict::InRecycleBin]
+            vec![TrashVerdict::Unverified]
         );
     }
 
     #[test]
-    fn matching_is_case_insensitive_like_the_root_check() {
+    fn uncertain_path_aliases_without_identity_remain_unverified() {
         let before = TrashSnapshot::from_paths(&[]);
         let after = TrashSnapshot::from_paths(&[Path::new("c:/users/me/report")]);
         assert_eq!(
             classify(&before, &after, &["C:\\Users\\Me\\Report.TXT"]),
-            vec![TrashVerdict::InRecycleBin]
+            vec![TrashVerdict::Unverified]
         );
     }
 
     #[test]
     fn matching_normalises_dot_segments_like_the_root_check() {
         let before = TrashSnapshot::from_paths(&[]);
-        let after = TrashSnapshot::from_paths(&[Path::new("C:/Users/Me/a")]);
+        let after = TrashSnapshot::from_paths(&[Path::new("C:/Users/Me/a.txt")]);
         assert_eq!(
             classify(&before, &after, &["C:/Users/Me/sub/../a.txt"]),
             vec![TrashVerdict::InRecycleBin]
@@ -910,14 +1324,14 @@ mod tests {
     #[test]
     fn verdicts_come_back_in_the_order_the_paths_were_attempted() {
         let before = TrashSnapshot::from_paths(&[]);
-        let after = TrashSnapshot::from_paths(&[Path::new("C:/Users/Me/b")]);
+        let after = TrashSnapshot::from_paths(&[Path::new("C:/Users/Me/b.txt")]);
         assert_eq!(
             classify(
                 &before,
                 &after,
                 &["C:/Users/Me/a.txt", "C:/Users/Me/b.txt"]
             ),
-            vec![TrashVerdict::PermanentlyDeleted, TrashVerdict::InRecycleBin]
+            vec![TrashVerdict::Unverified, TrashVerdict::InRecycleBin]
         );
     }
 }

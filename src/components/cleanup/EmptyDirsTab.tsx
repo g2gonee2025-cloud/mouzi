@@ -37,26 +37,25 @@ export default function EmptyDirsTab() {
     }
   }, [store.emptyDirs, checked]);
 
-  const runCleanup = async () => {
-    const actions: CleanupRequest[] = Array.from(checked).map((path) => ({
+  const handleConfirm = async () => {
+    const paths = (store.emptyDirs ?? []).filter((path) => checked.has(path));
+    if (!paths.length) return;
+    const actions: CleanupRequest[] = paths.map((path) => ({
       kind: "remove_empty_dir",
       path,
     }));
-    await store.executeCleanup(actions);
-    setShowResults(true);
-  };
-
-  const handleConfirm = () => {
-    if (checked.size === 0) return;
+    try {
+    const plan = await store.prepareCleanup(actions);
     setPending({
       title: t("confirm.op.removeEmptyDirs"),
-      count: checked.size,
+      count: plan.actions.length,
       // `remove_empty_dir` is a bare `fs::remove_dir`, not a trash: there is no
       // byte figure to quote and no Recycle Bin copy to fall back on.
       notice: "permanent",
-      preview: Array.from(checked),
-      onConfirm: runCleanup,
+      preview: plan.actions.map((action) => action.path),
+      onConfirm: async () => { await store.executeCleanup(plan.planId); setShowResults(true); },
     });
+    } catch { /* The store displays the preparation error. */ }
   };
 
   const handleResultsDone = () => {
@@ -83,8 +82,8 @@ export default function EmptyDirsTab() {
         <p className="text-xs text-text-muted">{t("cleanup.emptyDirsHint")}</p>
         <button
           onClick={handleFind}
-          disabled={store.loading}
-          className="flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-white hover:bg-primary-hover disabled:opacity-50 transition-colors"
+          disabled={store.loading || store.busy || !!store.preparedPlan}
+          className="flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-on-primary hover:bg-primary-hover disabled:opacity-50 transition-colors"
         >
           <Search size={14} />
           {store.loading ? t("app.loading") : t("cleanup.findEmptyDirs")}
@@ -150,7 +149,7 @@ export default function EmptyDirsTab() {
       )}
 
       {pending && (
-        <ConfirmDialog {...pending} onClose={() => setPending(null)} />
+        <ConfirmDialog {...pending} onClose={() => { store.cancelPlan(); setPending(null); }} />
       )}
     </div>
   );

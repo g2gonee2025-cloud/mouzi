@@ -96,6 +96,7 @@ export default function ConfirmDialog({
   const titleId = useId();
   const bodyId = useId();
   const inputId = useId();
+  const returnFocusRef = useRef<HTMLElement | null>(null);
 
   const tier = confirmTier(count, bytes);
   const word = t("confirm.word");
@@ -107,6 +108,7 @@ export default function ConfirmDialog({
   const confirmDisabled = busy || nothingSelected || (tier === "typed" && !wordMatches);
 
   useEffect(() => {
+    if (!returnFocusRef.current && document.activeElement instanceof HTMLElement) returnFocusRef.current = document.activeElement;
     // Land focus in the dialog, not on either button: a focused "Cancel" would
     // make Enter dismiss, and a focused destructive button would make Enter
     // destroy. The typed tier is the exception - typing is the whole point.
@@ -115,8 +117,26 @@ export default function ConfirmDialog({
   }, [tier]);
 
   useEffect(() => {
+    const siblings = Array.from(panelRef.current?.parentElement?.parentElement?.children ?? []).filter((element) => element !== panelRef.current?.parentElement && element instanceof HTMLElement) as HTMLElement[];
+    const previous = siblings.map((element) => element.inert);
+    siblings.forEach((element) => { element.inert = true; });
+    return () => {
+      siblings.forEach((element, index) => { element.inert = previous[index]; });
+      returnFocusRef.current?.focus();
+    };
+  }, []);
+
+  useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape" && !busy) onClose();
+      if (e.key !== "Tab") return;
+      const panel = panelRef.current;
+      const controls = panel ? Array.from(panel.querySelectorAll<HTMLElement>('button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), a[href], [tabindex="0"]')).filter((element) => !element.hidden) : [];
+      if (!controls.length) { e.preventDefault(); panel?.focus(); return; }
+      const first = controls[0];
+      const last = controls[controls.length - 1];
+      if (e.shiftKey && (document.activeElement === first || document.activeElement === panel)) { e.preventDefault(); last.focus(); }
+      else if (!e.shiftKey && (document.activeElement === last || document.activeElement === panel)) { e.preventDefault(); first.focus(); }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
@@ -186,7 +206,7 @@ export default function ConfirmDialog({
             <p className="text-xs text-text-muted">{t("confirm.bytesUnknown")}</p>
           )}
 
-          {note && <p className="text-xs text-text-muted">{note}</p>}
+          {note && <p className="text-xs text-text-muted whitespace-pre-line">{note}</p>}
 
           {shownPreview.length > 0 && (
             <ul className="rounded-md border border-border bg-surface-dark max-h-28 overflow-auto">

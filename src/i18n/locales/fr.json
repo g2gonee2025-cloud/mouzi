@@ -42,7 +42,8 @@
       "importingShort": "Import...",
       "importSuccess": "{{extracted}} fichier(s) extrait(s) et {{count}} fichier(s) organisé(s).",
       "importError": "Échec de l'import de l'archive : {{error}}",
-      "openImportFolder": "Ouvrir le dossier d'import"
+      "openImportFolder": "Ouvrir le dossier d'import",
+      "progress": "{{files}} fichiers extraits · {{bytes}}"
     },
     "rules": {
       "title": "Règles",
@@ -71,7 +72,8 @@
       "undone": "Annulé",
       "empty": "Aucun historique",
       "revertAll": "Tout annuler",
-      "revertAllDisabled": "Aucune action à annuler"
+      "revertAllDisabled": "Aucune action à annuler",
+      "showing": "{{shown}} entrées affichées sur {{total}} dans l’historique"
     },
     "general": {
       "title": "Général",
@@ -90,7 +92,11 @@
       "gracePeriodMinutes": "Minutes",
       "gracePeriodHours": "Heures",
       "gracePeriodCustom": "Personnalisé",
-      "gracePeriodMaxError": "La période de grâce ne peut pas dépasser 7 jours"
+      "gracePeriodMaxError": "La période de grâce ne peut pas dépasser 7 jours",
+      "localAi": "Activer les suggestions IA locales",
+      "localAiModel": "Modèle Ollama",
+      "localAiPrivacy": "Désactivé par défaut. Une fois activé, les noms de fichiers sont envoyés à Ollama sur cet ordinateur. Le contenu des fichiers n’est pas envoyé.",
+      "gracePeriodUnit": "Unité de durée"
     },
     "ignore": {
       "title": "Ignorer",
@@ -105,13 +111,17 @@
       "tips": "Astuces :",
       "save": "Enregistrer .mouziignore",
       "saved": "Enregistré !",
-      "remove": "Supprimer"
+      "remove": "Supprimer",
+      "extensionTip": "ignorer tous les fichiers .tmp",
+      "folderTip": "ignorer le dossier",
+      "officeTip": "ignorer les fichiers temporaires Office",
+      "exactTip": "ignorer ce nom de fichier exact"
     },
     "about": {
       "title": "À propos",
       "tagline": "Vos téléchargements, domptés.",
-      "description": "Mouzi est un organiseur de fichiers silencieux et élégant qui vit dans votre barre d'état système et garde automatiquement votre dossier Téléchargements (et tout autre dossier) bien rangé. Il fonctionne tranquillement en arrière-plan, surveille les dossiers sélectionnés et déplace, renomme ou trie les fichiers selon des règles personnalisables.",
-      "checkUpdates": "Vérifier les mises à jour",
+      "description": "Mouzi organise les fichiers des dossiers sélectionnés à l’aide de règles. Il déplace les fichiers et conserve un historique pour annuler les opérations.",
+      "checkUpdates": "Téléchargements du projet original",
       "support": "Soutenir Mouzi sur Ko-fi",
       "supportDesc": "Votre soutien permet d'améliorer Mouzi. Merci ! 🙏",
       "versionLabel": "Version",
@@ -135,13 +145,20 @@
   },
   "common": {
     "cancel": "Annuler",
-    "off": "OFF"
+    "off": "OFF",
+    "retry": "Réessayer",
+    "save": "Enregistrer",
+    "saving": "Enregistrement…",
+    "loading": "Chargement…",
+    "dismiss": "Fermer",
+    "close": "Fermer",
+    "back": "Retour"
   },
   "dashboard": {
     "title": "Tableau de bord",
     "totalFiles": "Fichiers totaux",
     "totalBytes": "Taille totale",
-    "watchedRoots": "Dossiers surveillés",
+    "watchedRoots": "Dossiers configurés",
     "lastScan": "Dernière analyse",
     "neverScanned": "Jamais",
     "scanNow": "Analyser maintenant",
@@ -169,11 +186,11 @@
     "largeFiles": "Gros fichiers",
     "staleFiles": "Fichiers anciens",
     "possibleDuplicates": "Doublons possibles",
-    "uncategorized": "Non classés",
+    "uncategorized": "Autres fichiers",
     "largeHint": "plus de 100 Mo",
     "staleHint": "intact depuis 1 an",
     "duplicatesHint": "même taille",
-    "uncategorizedHint": "aucune règle",
+    "uncategorizedHint": "extension sans catégorie attribuée",
     "insightClear": "Rien à signaler",
     "open": "Ouvrir",
     "openSuggestions": "Suggestions",
@@ -186,7 +203,13 @@
     "ageOlder": "Plus ancien",
     "filterBy": "{{name}}",
     "scanRoots": "{{done}} / {{total}} dossiers",
-    "noFiles": "Aucun fichier correspondant"
+    "noFiles": "Aucun fichier correspondant",
+    "loadingFiles": "Chargement des fichiers…",
+    "rootPending": "Jamais analysé",
+    "rootStale": "L’analyse précédente est obsolète",
+    "rootFailed": "Échec de l’analyse",
+    "rootLastScan": "Dernière analyse : {{date}}",
+    "scanFailed": "L’analyse ne s’est pas terminée correctement."
   },
   "cleanup": {
     "title": "Nettoyage intelligent",
@@ -230,7 +253,11 @@
     "historyEmptyDirs": "La suppression des dossiers vides ne peut pas être annulée.",
     "refresh": "Actualiser",
     "openFolder": "Ouvrir le dossier",
-    "scanFirstHint": "Lancez une analyse d'abord"
+    "scanFirstHint": "Lancez une analyse d'abord",
+    "historyLoading": "Chargement de l’historique du nettoyage…",
+    "historyError": "Impossible de charger l’historique du nettoyage.",
+    "notSearched": "Lancez une recherche pour examiner les candidats.",
+    "historyUnknown": "Résultat inconnu"
   },
   "suggestions": {
     "title": "Suggestions",
@@ -254,7 +281,21 @@
     "failed": "Échoué",
     "missing": "Le fichier n'existe plus",
     "resultsTitle": "Résultats",
-    "backToList": "Retour à la liste"
+    "backToList": "Retour à la liste",
+    "resetDismissed": "Afficher à nouveau les fichiers écartés",
+    "rulePreview": "Automatisation future",
+    "ruleScope": "S’applique à",
+    "rulePriority": "Priorité",
+    "ruleExtension": "Extension",
+    "ruleDestination": "Destination",
+    "ruleAlreadyCovered": "Une règle existante couvre déjà cette extension.",
+    "ruleConflict": "Une règle antérieure peut être prioritaire.",
+    "ruleNotApplicable": "Aucune nouvelle règle ne sera créée.",
+    "partial": "Certains fichiers n’ont pas pu être traités.",
+    "preparing": "Préparation du plan à confirmer…",
+    "ruleCount": "Nouvelles règles : {{count}}",
+    "planChanged": "Le fichier ou les paramètres ont changé. Examinez un nouveau plan.",
+    "alreadyFiled": "Déjà classé ; catégorie enregistrée"
   },
   "confirm": {
     "impactItems": "{{count}} élément",
@@ -330,5 +371,14 @@
     "allFailed_one": "{{count}} fichier non restauré",
     "allFailed_other": "{{count}} fichiers non restaurés",
     "allFailed_many": "{{count}} fichiers non restaurés"
+  },
+  "categories": {
+    "Documents": "Documents",
+    "Images": "Images",
+    "Videos": "Vidéos",
+    "Audio": "Audio",
+    "Archives": "Archives",
+    "Code": "Code",
+    "Other": "Autres"
   }
 }

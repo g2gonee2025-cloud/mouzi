@@ -2273,7 +2273,6 @@ dependencies = [
  "tauri-plugin-opener",
  "tauri-plugin-single-instance",
  "tauri-winrt-notification",
- "thiserror 1.0.69",
  "trash",
  "ureq",
  "zip",

@@ -42,7 +42,8 @@
       "importingShort": "Importazione...",
       "importSuccess": "{{extracted}} file estratti e {{count}} file organizzati.",
       "importError": "Impossibile importare l'archivio: {{error}}",
-      "openImportFolder": "Apri cartella di importazione"
+      "openImportFolder": "Apri cartella di importazione",
+      "progress": "{{files}} file estratti · {{bytes}}"
     },
     "rules": {
       "title": "Regole",
@@ -71,7 +72,8 @@
       "undone": "Annullato",
       "empty": "Nessuna cronologia",
       "revertAll": "Annulla tutto",
-      "revertAllDisabled": "Nessuna azione da annullare"
+      "revertAllDisabled": "Nessuna azione da annullare",
+      "showing": "Mostrate {{shown}} di {{total}} voci della cronologia"
     },
     "general": {
       "title": "Generale",
@@ -90,7 +92,11 @@
       "gracePeriodMinutes": "Minuti",
       "gracePeriodHours": "Ore",
       "gracePeriodCustom": "Personalizzato",
-      "gracePeriodMaxError": "Il periodo di grazia non può superare 7 giorni"
+      "gracePeriodMaxError": "Il periodo di grazia non può superare 7 giorni",
+      "localAi": "Abilita suggerimenti AI locali",
+      "localAiModel": "Modello Ollama",
+      "localAiPrivacy": "Disattivato per impostazione predefinita. Se abilitato, i nomi dei file vengono inviati a Ollama su questo computer. Il contenuto dei file non viene inviato.",
+      "gracePeriodUnit": "Unità di durata"
     },
     "ignore": {
       "title": "Ignora",
@@ -105,13 +111,17 @@
       "tips": "Suggerimenti:",
       "save": "Salva .mouziignore",
       "saved": "Salvato!",
-      "remove": "Rimuovi"
+      "remove": "Rimuovi",
+      "extensionTip": "ignora tutti i file .tmp",
+      "folderTip": "ignora la cartella",
+      "officeTip": "ignora i file temporanei di Office",
+      "exactTip": "ignora questo nome di file esatto"
     },
     "about": {
       "title": "Informazioni",
       "tagline": "I tuoi download, domati.",
-      "description": "Mouzi è un organizzatore di file silenzioso ed elegante che vive nella tua barra delle applicazioni e tiene in ordine automaticamente la cartella Download (e qualsiasi altra cartella). Funziona silenziosamente in background, monitora le cartelle selezionate e sposta, rinomina o ordina i file in base a regole personalizzabili.",
-      "checkUpdates": "Controlla aggiornamenti",
+      "description": "Mouzi organizza i file nelle cartelle selezionate usando regole. Sposta i file e conserva una cronologia per annullare le operazioni.",
+      "checkUpdates": "Download del progetto originale",
       "support": "Supporta Mouzi su Ko-fi",
       "supportDesc": "Il tuo supporto aiuta a migliorare Mouzi. Grazie! 🙏",
       "versionLabel": "Versione",
@@ -135,13 +145,20 @@
   },
   "common": {
     "cancel": "Annulla",
-    "off": "OFF"
+    "off": "OFF",
+    "retry": "Riprova",
+    "save": "Salva",
+    "saving": "Salvataggio…",
+    "loading": "Caricamento…",
+    "dismiss": "Chiudi",
+    "close": "Chiudi",
+    "back": "Indietro"
   },
   "dashboard": {
     "title": "Dashboard",
     "totalFiles": "File totali",
     "totalBytes": "Dimensioni totali",
-    "watchedRoots": "Cartelle osservate",
+    "watchedRoots": "Cartelle configurate",
     "lastScan": "Ultima scansione",
     "neverScanned": "Mai",
     "scanNow": "Scansiona ora",
@@ -169,11 +186,11 @@
     "largeFiles": "File grandi",
     "staleFiles": "File vecchi",
     "possibleDuplicates": "Possibili duplicati",
-    "uncategorized": "Senza categoria",
+    "uncategorized": "Altri file",
     "largeHint": "oltre 100 MB",
     "staleHint": "intatti da 1 anno",
     "duplicatesHint": "stessa dimensione",
-    "uncategorizedHint": "nessuna regola",
+    "uncategorizedHint": "estensione senza categoria assegnata",
     "insightClear": "Tutto in ordine",
     "open": "Apri",
     "openSuggestions": "Suggerimenti",
@@ -186,7 +203,13 @@
     "ageOlder": "Più vecchi",
     "filterBy": "{{name}}",
     "scanRoots": "{{done}} / {{total}} cartelle",
-    "noFiles": "Nessun file corrispondente"
+    "noFiles": "Nessun file corrispondente",
+    "loadingFiles": "Caricamento dei file…",
+    "rootPending": "Mai analizzato",
+    "rootStale": "La scansione precedente è obsoleta",
+    "rootFailed": "Scansione non riuscita",
+    "rootLastScan": "Ultima scansione: {{date}}",
+    "scanFailed": "La scansione non è terminata correttamente."
   },
   "cleanup": {
     "title": "Pulizia intelligente",
@@ -230,7 +253,11 @@
     "historyEmptyDirs": "La rimozione di cartelle vuote non è annullabile.",
     "refresh": "Aggiorna",
     "openFolder": "Apri cartella",
-    "scanFirstHint": "Esegui prima una scansione"
+    "scanFirstHint": "Esegui prima una scansione",
+    "historyLoading": "Caricamento della cronologia di pulizia…",
+    "historyError": "Impossibile caricare la cronologia di pulizia.",
+    "notSearched": "Avvia una ricerca per esaminare i candidati.",
+    "historyUnknown": "Esito sconosciuto"
   },
   "suggestions": {
     "title": "Suggerimenti",
@@ -254,7 +281,21 @@
     "failed": "Fallito",
     "missing": "Il file non esiste più",
     "resultsTitle": "Risultati",
-    "backToList": "Torna alla lista"
+    "backToList": "Torna alla lista",
+    "resetDismissed": "Mostra di nuovo i file ignorati",
+    "rulePreview": "Automazione futura",
+    "ruleScope": "Si applica a",
+    "rulePriority": "Priorità",
+    "ruleExtension": "Estensione",
+    "ruleDestination": "Destinazione",
+    "ruleAlreadyCovered": "Una regola esistente copre già questa estensione.",
+    "ruleConflict": "Una regola precedente potrebbe avere la precedenza.",
+    "ruleNotApplicable": "Non verrà creata alcuna regola futura.",
+    "partial": "Non è stato possibile elaborare alcuni file.",
+    "preparing": "Preparazione del piano da confermare…",
+    "ruleCount": "Nuove regole: {{count}}",
+    "planChanged": "Il file o le impostazioni sono cambiati. Esamina un nuovo piano.",
+    "alreadyFiled": "Già archiviato; categoria salvata"
   },
   "confirm": {
     "impactItems": "{{count}} elemento",
@@ -330,5 +371,14 @@
     "allFailed_one": "{{count}} file non ripristinato",
     "allFailed_other": "{{count}} file non ripristinati",
     "allFailed_many": "{{count}} file non ripristinati"
+  },
+  "categories": {
+    "Documents": "Documenti",
+    "Images": "Immagini",
+    "Videos": "Video",
+    "Audio": "Audio",
+    "Archives": "Archivi",
+    "Code": "Codice",
+    "Other": "Altro"
   }
 }

@@ -42,7 +42,8 @@
       "importingShort": "インポート中...",
       "importSuccess": "{{extracted}} 個のファイルを展開し、{{count}} 個のファイルを整理しました。",
       "importError": "アーカイブのインポートに失敗しました: {{error}}",
-      "openImportFolder": "インポートフォルダーを開く"
+      "openImportFolder": "インポートフォルダーを開く",
+      "progress": "{{files}} 個のファイルを抽出 · {{bytes}}"
     },
     "rules": {
       "title": "ルール",
@@ -71,7 +72,8 @@
       "undone": "取り消し済み",
       "empty": "履歴がありません",
       "revertAll": "すべて取り消す",
-      "revertAllDisabled": "元に戻すアクションがありません"
+      "revertAllDisabled": "元に戻すアクションがありません",
+      "showing": "履歴{{total}}件中{{shown}}件を表示"
     },
     "general": {
       "title": "一般",
@@ -90,7 +92,11 @@
       "gracePeriodMinutes": "分",
       "gracePeriodHours": "時間",
       "gracePeriodCustom": "カスタム",
-      "gracePeriodMaxError": "猶予期間は7日を超えることはできません"
+      "gracePeriodMaxError": "猶予期間は7日を超えることはできません",
+      "localAi": "ローカルAIの提案を有効にする",
+      "localAiModel": "Ollamaモデル",
+      "localAiPrivacy": "初期設定では無効です。有効にすると、ファイル名をこのコンピューター上のOllamaに送信します。ファイルの内容は送信しません。",
+      "gracePeriodUnit": "時間の単位"
     },
     "ignore": {
       "title": "除外",
@@ -105,13 +111,17 @@
       "tips": "ヒント:",
       "save": ".mouziignoreを保存",
       "saved": "保存しました!",
-      "remove": "削除"
+      "remove": "削除",
+      "extensionTip": "すべての.tmpファイルを除外",
+      "folderTip": "フォルダーを除外",
+      "officeTip": "Officeの一時ファイルを除外",
+      "exactTip": "このファイル名を完全一致で除外"
     },
     "about": {
       "title": "Mouziについて",
       "tagline": "ダウンロードを、思い通りに。",
-      "description": "Mouziは、システムトレイに常駐する静かで洗練されたファイルオーガナイザーで、ダウンロードフォルダ(およびその他のフォルダ)を自動で整理します。バックグラウンドで静かに動作し、カスタマイズ可能なルールに基づきファイルを移動、名前の変更、または並べ替えます。",
-      "checkUpdates": "アップデートを確認",
+      "description": "Mouziは、選択したフォルダー内のファイルをルールに従って整理します。ファイルを移動し、元に戻すための履歴を保存します。",
+      "checkUpdates": "元のプロジェクトのダウンロード",
       "support": "Ko-fiでMouziを支援する",
       "supportDesc": "皆様のご支援により、Mouziは日々進化し続けています。支援していただき、ありがとうございます！ 🙏",
       "versionLabel": "バージョン",
@@ -135,13 +145,20 @@
   },
   "common": {
     "cancel": "キャンセル",
-    "off": "OFF"
+    "off": "OFF",
+    "retry": "再試行",
+    "save": "保存",
+    "saving": "保存中…",
+    "loading": "読み込み中…",
+    "dismiss": "閉じる",
+    "close": "閉じる",
+    "back": "戻る"
   },
   "dashboard": {
     "title": "ダッシュボード",
     "totalFiles": "合計ファイル数",
     "totalBytes": "合計サイズ",
-    "watchedRoots": "監視対象ルート",
+    "watchedRoots": "設定されたフォルダー",
     "lastScan": "最終スキャン",
     "neverScanned": "未実行",
     "scanNow": "今すぐスキャン",
@@ -169,11 +186,11 @@
     "largeFiles": "大きなファイル",
     "staleFiles": "古いファイル",
     "possibleDuplicates": "重複の可能性",
-    "uncategorized": "未分類",
+    "uncategorized": "その他のファイル",
     "largeHint": "100 MB超",
     "staleHint": "1年以上未更新",
     "duplicatesHint": "同じサイズ",
-    "uncategorizedHint": "ルールなし",
+    "uncategorizedHint": "拡張子にカテゴリが割り当てられていません",
     "insightClear": "問題なし",
     "open": "開く",
     "openSuggestions": "提案",
@@ -186,7 +203,13 @@
     "ageOlder": "それ以前",
     "filterBy": "{{name}}",
     "scanRoots": "{{done}} / {{total}} フォルダ",
-    "noFiles": "一致するファイルはありません"
+    "noFiles": "一致するファイルはありません",
+    "loadingFiles": "ファイルを読み込み中…",
+    "rootPending": "未スキャン",
+    "rootStale": "前回のスキャンは古くなっています",
+    "rootFailed": "スキャンに失敗しました",
+    "rootLastScan": "前回のスキャン: {{date}}",
+    "scanFailed": "スキャンは正常に完了しませんでした。"
   },
   "cleanup": {
     "title": "スマートクリーンアップ",
@@ -230,7 +253,11 @@
     "historyEmptyDirs": "空のフォルダの削除は元に戻せません。",
     "refresh": "更新",
     "openFolder": "フォルダを開く",
-    "scanFirstHint": "先にスキャンを実行してください"
+    "scanFirstHint": "先にスキャンを実行してください",
+    "historyLoading": "クリーンアップ履歴を読み込み中…",
+    "historyError": "クリーンアップ履歴を読み込めませんでした。",
+    "notSearched": "検索を実行して候補を確認してください。",
+    "historyUnknown": "不明な結果"
   },
   "suggestions": {
     "title": "提案",
@@ -254,7 +281,21 @@
     "failed": "失敗",
     "missing": "ファイルはもう存在しません",
     "resultsTitle": "結果",
-    "backToList": "リストに戻る"
+    "backToList": "リストに戻る",
+    "resetDismissed": "除外したファイルを再表示",
+    "rulePreview": "今後の自動処理",
+    "ruleScope": "適用対象",
+    "rulePriority": "優先順位",
+    "ruleExtension": "拡張子",
+    "ruleDestination": "移動先",
+    "ruleAlreadyCovered": "既存のルールがこの拡張子を対象にしています。",
+    "ruleConflict": "前のルールが優先される場合があります。",
+    "ruleNotApplicable": "今後のルールは作成されません。",
+    "partial": "一部のファイルを処理できませんでした。",
+    "preparing": "確認用の計画を準備中…",
+    "ruleCount": "新しいルール: {{count}}",
+    "planChanged": "ファイルまたは設定が変更されました。新しい計画を確認してください。",
+    "alreadyFiled": "分類済み・カテゴリーを保存しました"
   },
   "confirm": {
     "impactItems": "{{count}} 件",
@@ -303,5 +344,14 @@
     "allCollision": "{{count}} 件を別の名前で復元しました",
     "allMissing": "{{count}} 件が見つからず、復元されませんでした",
     "allFailed": "{{count}} 件を復元できませんでした"
+  },
+  "categories": {
+    "Documents": "文書",
+    "Images": "画像",
+    "Videos": "動画",
+    "Audio": "音声",
+    "Archives": "アーカイブ",
+    "Code": "コード",
+    "Other": "その他"
   }
 }

@@ -2,6 +2,8 @@
  *  so the palette follows the light/dark scheme instead of being baked in
  *  here as hex literals. The seven keys must stay aligned with the
  *  `categorize()` arms in src-tauri/src/scan.rs. */
+import type { InventoryFile } from "../store/useDashboardStore";
+
 export const CATEGORY_CLASSES: Record<string, string> = {
   Documents: "bg-cat-documents",
   Images: "bg-cat-images",
@@ -16,6 +18,65 @@ export const AGE_BUCKETS = ["7d", "30d", "90d", "365d", "older"] as const;
 
 export function categoryClass(name: string): string {
   return CATEGORY_CLASSES[name] ?? CATEGORY_CLASSES.Other;
+}
+
+export function categoryLabel(name: string, translate: (key: string) => string): string {
+  return Object.prototype.hasOwnProperty.call(CATEGORY_CLASSES, name) ? translate(`categories.${name}`) : name;
+}
+
+interface InventoryQuery {
+  sort: "size" | "mtime";
+  category: string;
+  root: string;
+  query: string;
+  limit: number;
+}
+
+interface BrowserRequest extends Omit<InventoryQuery, "category" | "root" | "limit"> {
+  category: string | null;
+  root: string | null;
+  initialLargest: InventoryFile[];
+  initialRecent: InventoryFile[];
+}
+
+/** Owns response eligibility, including requests invalidated before debounce fires. */
+export function createInventoryBrowserLoader(
+  fetchRows: (query: InventoryQuery) => Promise<InventoryFile[]>,
+  updates: {
+    rows: (rows: InventoryFile[]) => void;
+    loading: (loading: boolean) => void;
+    error: (error: string | null) => void;
+  },
+) {
+  let generation = 0;
+  return {
+    cancel: () => { ++generation; },
+    load: async (request: BrowserRequest) => {
+      const current = ++generation;
+      const query = request.query.trim();
+      updates.error(null);
+      if (!query && !request.category && !request.root) {
+        updates.rows(request.sort === "size" ? request.initialLargest : request.initialRecent);
+        updates.loading(false);
+        return;
+      }
+      updates.loading(true);
+      try {
+        const rows = await fetchRows({
+          sort: request.sort,
+          query,
+          category: request.category ?? "",
+          root: request.root ?? "",
+          limit: 80,
+        });
+        if (current === generation) updates.rows(rows);
+      } catch (error) {
+        if (current === generation) updates.error(String(error));
+      } finally {
+        if (current === generation) updates.loading(false);
+      }
+    },
+  };
 }
 
 export interface CategoryShare {

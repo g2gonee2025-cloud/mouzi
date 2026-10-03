@@ -1,37 +1,73 @@
 use std::fs;
+use std::io::ErrorKind;
 use std::path::Path;
 
-/// Load .mouziignore patterns from a folder. Returns Vec of non-empty, non-comment lines.
-pub fn load_mouziignore(folder_path: &str) -> Vec<String> {
+/// Load non-empty, non-comment patterns from a folder's protection file.
+/// An absent file has no rules; an existing file that cannot be read is an error.
+pub fn load_mouziignore(folder_path: &str) -> Result<Vec<String>, String> {
     let path = Path::new(folder_path).join(".mouziignore");
-    if !path.exists() {
-        return Vec::new();
-    }
-    match fs::read_to_string(&path) {
-        Ok(content) => content
-            .lines()
-            .map(|l| {
-                let l = l.trim();
-                let mut escaped = false;
-                let mut end = l.len();
-
-                for (i, c) in l.char_indices() {
-                    match c {
-                        '\\' => escaped = !escaped,
-                        '#' if !escaped => {
-                            end = i;
-                            break;
-                        }
-                        _ => escaped = false,
+    let content = match fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(error) => {
+            // A dangling symlink is an existing protection file, even though reading
+            // its missing target reports NotFound. Do not silently disable its rules.
+            if error.kind() == ErrorKind::NotFound {
+                match fs::symlink_metadata(&path) {
+                    Err(metadata_error) if metadata_error.kind() == ErrorKind::NotFound => {
+                        return Ok(Vec::new());
                     }
+                    _ => {}
                 }
+            }
+            return Err(format!(
+                "Unable to read ignore protection file {}: {error}",
+                path.display()
+            ));
+        }
+    };
 
-                l[..end].trim().to_string()
-            })
-            .filter(|l| !l.is_empty() && !l.starts_with('#'))
-            .map(|l| l.replace(r"\#", "#"))
-            .collect(),
-        Err(_) => Vec::new(),
+    Ok(content
+        .lines()
+        .map(|l| {
+            let l = l.trim();
+            let mut escaped = false;
+            let mut end = l.len();
+
+            for (i, c) in l.char_indices() {
+                match c {
+                    '\\' => escaped = !escaped,
+                    '#' if !escaped => {
+                        end = i;
+                        break;
+                    }
+                    _ => escaped = false,
+                }
+            }
+
+            l[..end].trim().to_string()
+        })
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(|l| l.replace(r"\#", "#"))
+        .collect())
+}
+
+/// Rules loaded once for a folder. Loading errors must pause that folder's work.
+#[derive(Clone, Debug, Default)]
+pub struct IgnorePatterns {
+    patterns: Vec<String>,
+}
+
+impl IgnorePatterns {
+    pub fn from_folder(folder_path: &str) -> Result<Self, String> {
+        load_mouziignore(folder_path).map(|patterns| Self { patterns })
+    }
+
+    pub fn is_ignored(&self, name: &str) -> bool {
+        is_ignored(name, &self.patterns)
+    }
+
+    pub fn as_slice(&self) -> &[String] {
+        &self.patterns
     }
 }
 
@@ -83,43 +119,38 @@ pub fn is_ignored(name: &str, patterns: &[String]) -> bool {
     false
 }
 
-/// Simple glob matcher supporting multiple `*` wildcards.
+/// Match the complete name, allowing each `*` to consume zero or more bytes.
 /// On Windows both `name` and `pat` are expected to already be lowercased.
 fn glob_match(name: &str, pat: &str) -> bool {
-    let parts: Vec<&str> = pat.split('*').collect();
-    if parts.is_empty() {
-        return true;
-    }
+    let name = name.as_bytes();
+    let pat = pat.as_bytes();
+    let (mut name_index, mut pattern_index) = (0, 0);
+    let mut last_star = None;
+    let mut star_end = 0;
 
-    let starts_with_star = pat.starts_with('*');
-    let ends_with_star = pat.ends_with('*');
-    let mut rest = name;
-
-    for (i, part) in parts.iter().enumerate() {
-        if part.is_empty() {
-            continue;
-        }
-        if i == 0 && !starts_with_star {
-            // First non-empty part must match the start of the name.
-            if !rest.starts_with(part) {
-                return false;
-            }
-            rest = &rest[part.len()..];
+    while name_index < name.len() {
+        if pattern_index < pat.len() && pat[pattern_index] == b'*' {
+            last_star = Some(pattern_index);
+            pattern_index += 1;
+            star_end = name_index;
+        } else if pattern_index < pat.len() && pat[pattern_index] == name[name_index] {
+            name_index += 1;
+            pattern_index += 1;
+        } else if let Some(star_index) = last_star {
+            // A literal suffix may occur more than once. Retry after extending
+            // the preceding wildcard instead of committing to its first match.
+            star_end += 1;
+            name_index = star_end;
+            pattern_index = star_index + 1;
         } else {
-            // Subsequent parts must appear somewhere in the remaining name.
-            match rest.find(part) {
-                Some(pos) => rest = &rest[pos + part.len()..],
-                None => return false,
-            }
+            return false;
         }
     }
 
-    // If the pattern does not end with `*`, the remaining text must be empty.
-    if !ends_with_star && !rest.is_empty() {
-        return false;
+    while pattern_index < pat.len() && pat[pattern_index] == b'*' {
+        pattern_index += 1;
     }
-
-    true
+    pattern_index == pat.len()
 }
 
 #[cfg(test)]
@@ -146,7 +177,7 @@ mod tests {
         )
         .unwrap();
 
-        let patterns = load_mouziignore(folder.to_str().unwrap());
+        let patterns = load_mouziignore(folder.to_str().unwrap()).unwrap();
         assert_eq!(patterns, vec!["*.tmp", "report#final.pdf"]);
 
         fs::remove_dir_all(folder).unwrap();
@@ -159,7 +190,10 @@ mod tests {
 
         let saved = fs::read_to_string(folder.join(".mouziignore")).unwrap();
         assert!(saved.contains("report\\#final.pdf"));
-        assert_eq!(load_mouziignore(folder.to_str().unwrap()), vec!["report#final.pdf"]);
+        assert_eq!(
+            load_mouziignore(folder.to_str().unwrap()).unwrap(),
+            vec!["report#final.pdf"]
+        );
 
         fs::remove_dir_all(folder).unwrap();
     }
@@ -178,9 +212,18 @@ mod tests {
 
     #[test]
     fn multiple_wildcards_and_spaces() {
-        assert!(is_ignored("The Chronicle Herald (Metro)_20260612.txt", &["*metro*".to_string()]));
-        assert!(is_ignored("The Chronicle Herald (Metro)_20260612.txt", &["*chronicle herald*".to_string()]));
-        assert!(is_ignored("some.Metro.file.txt", &["*metro*.txt".to_string()]));
+        assert!(is_ignored(
+            "The Chronicle Herald (Metro)_20260612.txt",
+            &["*Metro*".to_string()]
+        ));
+        assert!(is_ignored(
+            "The Chronicle Herald (Metro)_20260612.txt",
+            &["*Chronicle Herald*".to_string()]
+        ));
+        assert!(is_ignored(
+            "some.Metro.file.txt",
+            &["*Metro*.txt".to_string()]
+        ));
         assert!(is_ignored("file.name.txt", &["file.*.txt".to_string()]));
         assert!(!is_ignored("foo.txt", &["*metro*".to_string()]));
     }
@@ -190,5 +233,69 @@ mod tests {
     fn wildcard_case_sensitive_on_non_windows() {
         assert!(is_ignored("foo.tmp", &["*.tmp".to_string()]));
         assert!(!is_ignored("FOO.TMP", &["*.tmp".to_string()]));
+    }
+
+    #[test]
+    fn suffix_wildcards_retry_repeated_literals() {
+        assert!(is_ignored(
+            "report.txt.backup.txt",
+            &["*.txt".to_string()]
+        ));
+        assert!(is_ignored("fooXXbarYYbar", &["foo*bar".to_string()]));
+        assert!(is_ignored(
+            "fooXXbarYYbarZZbaz",
+            &["foo*bar*baz".to_string()]
+        ));
+        assert!(!is_ignored("report.txt.backup", &["*.txt".to_string()]));
+        assert!(!is_ignored("XfooXXbar", &["foo*bar".to_string()]));
+    }
+
+    #[test]
+    fn wildcard_handles_empty_matches_and_unicode() {
+        assert!(glob_match("", "***"));
+        assert!(glob_match("foo", "f**o*o"));
+        assert!(glob_match("résumé.backup.résumé", "*résumé"));
+        assert!(glob_match("a日本語日本語b", "a*日本語*b"));
+        assert!(!glob_match("", "*a*"));
+        assert!(!glob_match("foo", "f**o*o*o"));
+    }
+
+    #[test]
+    fn missing_ignore_file_is_empty() {
+        let folder = temporary_folder();
+        let patterns = IgnorePatterns::from_folder(folder.to_str().unwrap()).unwrap();
+        assert!(patterns.as_slice().is_empty());
+        assert!(!patterns.is_ignored("report.txt"));
+        fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn unreadable_ignore_file_is_an_error() {
+        let folder = temporary_folder();
+        // A directory is deterministically unreadable as text on every platform,
+        // including Windows and processes that can bypass file permission bits.
+        fs::create_dir(folder.join(".mouziignore")).unwrap();
+        let error = load_mouziignore(folder.to_str().unwrap()).unwrap_err();
+        assert!(error.contains(".mouziignore"));
+        assert!(IgnorePatterns::from_folder(folder.to_str().unwrap()).is_err());
+        fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn invalid_utf8_ignore_file_is_an_error() {
+        let folder = temporary_folder();
+        fs::write(folder.join(".mouziignore"), [0xff, 0xfe]).unwrap();
+        assert!(load_mouziignore(folder.to_str().unwrap()).is_err());
+        fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn dangling_ignore_symlink_is_an_error() {
+        let folder = temporary_folder();
+        std::os::unix::fs::symlink(folder.join("missing"), folder.join(".mouziignore"))
+            .unwrap();
+        assert!(load_mouziignore(folder.to_str().unwrap()).is_err());
+        fs::remove_dir_all(folder).unwrap();
     }
 }

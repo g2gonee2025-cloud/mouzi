@@ -11,7 +11,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Nothing yet.
+### Changed
+
+- Reviewed cleanup and suggestion actions now use expiring backend plans, live
+  content checks and physical file identities. Moves preserve occupied names
+  and record actual destinations; new Undo records reject replacement files.
+- Inventory scans publish completed root snapshots, retain failed snapshots,
+  and reconcile app-managed mutations. Settings use field-specific patches.
+- Automatic organization retries transient failures, respects settling, and
+  cancels queued work invalidated by Undo. Scheduling persists occurrences.
+- Suggestions retain offline/model provenance, learn from explicit acceptance,
+  preserve classification overrides, and default future rule creation off.
+- Archive extraction has byte, entry and time budgets, cancellation, preserved
+  timestamps, durable staging and recovery manifests.
+- Development uses a separate profile. CI covers the active branch, both test
+  suites and an unsigned build. Documentation records remaining native Shell,
+  cross-volume, GUI and installer verification limits.
 
 ## [0.2.0] - 2026-09-27
 

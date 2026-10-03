@@ -24,7 +24,6 @@ notify = "7"
 rusqlite = { version = "0.32", features = ["bundled", "chrono", "serde_json"] }
 directories = "5"
 once_cell = "1"
-thiserror = "1"
 regex = "1"
 log = "0.4"
 sys-locale = "0.3"

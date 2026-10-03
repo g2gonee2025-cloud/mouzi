@@ -38,8 +38,8 @@ Mouzi aims to remain lightweight, local-first, and easy to understand. Features 
 
 ### Requirements
 
-* Node.js 22 or newer
-* Rust stable
+* Node.js 22.12 or newer
+* Rust 1.98.0 (selected by `rust-toolchain.toml`)
 * Tauri system dependencies for your operating system
 * Windows SDK and MSVC Build Tools on Windows
 * WebKitGTK and AppIndicator development packages on Linux
@@ -49,9 +49,11 @@ Mouzi aims to remain lightweight, local-first, and easy to understand. Features 
 ```bash
 git clone https://github.com/g2gonee2025-cloud/mouzi.git
 cd mouzi
-npm install
+npm ci
 npm run tauri dev
 ```
+
+Debug builds use a separate development profile and disable Windows autostart. Set an absolute `MOUZI_DATA_DIR` to an isolated fixture directory when needed. Use disposable watched folders; a development database does not make the files it watches disposable. Production-profile paths and descendants are rejected.
 
 The upstream project is `https://github.com/hsr88/mouzi`. If you need it for reference, add it as a second remote rather than replacing `origin`:
 
@@ -62,13 +64,13 @@ git remote add upstream https://github.com/hsr88/mouzi.git
 ### Creating a production build
 
 ```bash
-npm run tauri build
+npm run tauri build -- --no-bundle --ci -- --locked --jobs 2
 ```
 
 Build output is created in:
 
 ```text
-src-tauri/target/release/bundle/
+src-tauri/target/release/mouzi.exe
 ```
 
 ## Pull Requests
@@ -76,6 +78,16 @@ src-tauri/target/release/bundle/
 Please keep pull requests focused on one change.
 
 Before submitting a pull request:
+
+```powershell
+npm test -- --maxWorkers=2
+npm run build
+Push-Location src-tauri
+cargo test --lib --locked --jobs 2 -- --test-threads=2
+Pop-Location
+```
+
+The native Recycle Bin test is ignored by default and requires explicit selection on disposable files. First assess a failing test against current requirements, including whether its fixtures or expectations are stale, before changing the implementation or test. Keep assertions about keepers, no-op acceptance, actual restoration counts and lock discipline meaningful.
 
 * Make sure the application builds successfully.
 * Test the change on the operating systems available to you.

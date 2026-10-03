@@ -1,5 +1,5 @@
 use chrono::{DateTime, TimeZone, Utc};
-use rusqlite::{params, Connection, Result as SqliteResult};
+use rusqlite::{params, Connection, OptionalExtension, Result as SqliteResult};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -84,6 +84,7 @@ pub struct CleanupAction {
     pub action: String,
     pub status: String,
     pub undoable: bool,
+    pub message: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -107,6 +108,24 @@ pub struct AppSettings {
     /// application, and a change to where files end up must never arrive
     /// unrequested on upgrade.
     pub recursive_watch: bool,
+    pub local_ai_enabled: bool,
+    pub local_ai_model: String,
+    pub revision: i64,
+}
+
+/// Only independently editable preferences. Schedule and onboarding state have
+/// separate writers so a delayed window cannot replace another window's work.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PreferencesPatch {
+    pub language: Option<String>,
+    pub theme: Option<String>,
+    pub telemetry_enabled: Option<bool>,
+    pub autostart: Option<bool>,
+    pub grace_period_seconds: Option<i64>,
+    pub lock_check_enabled: Option<bool>,
+    pub recursive_watch: Option<bool>,
+    pub local_ai_enabled: Option<bool>,
+    pub local_ai_model: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -124,6 +143,13 @@ static DB: OnceCell<Arc<Mutex<Connection>>> = OnceCell::new();
 pub fn init_db(app_dir: PathBuf) -> SqliteResult<()> {
     let db_path = app_dir.join("mouzi.db");
     let conn = Connection::open(db_path)?;
+    initialize_schema(&conn)?;
+    DB.set(Arc::new(Mutex::new(conn)))
+        .map_err(|_| rusqlite::Error::ExecuteReturnedResults)?;
+    Ok(())
+}
+
+fn initialize_schema(conn: &Connection) -> SqliteResult<()> {
 
     conn.execute(
         "CREATE TABLE IF NOT EXISTS watched_folders (
@@ -171,7 +197,7 @@ pub fn init_db(app_dir: PathBuf) -> SqliteResult<()> {
             theme TEXT NOT NULL DEFAULT 'system',
             telemetry_enabled INTEGER NOT NULL DEFAULT 0,
             first_run INTEGER NOT NULL DEFAULT 1,
-            autostart INTEGER NOT NULL DEFAULT 1
+            autostart INTEGER NOT NULL DEFAULT 0
         )",
         [],
     )?;
@@ -243,12 +269,15 @@ pub fn init_db(app_dir: PathBuf) -> SqliteResult<()> {
         [],
     )?;
 
+    let action_columns: Vec<String> = conn.prepare("PRAGMA table_info(action_logs)")?.query_map([], |row| row.get(1))?.collect::<SqliteResult<_>>()?;
+    if !action_columns.iter().any(|column| column == "file_identity") { conn.execute("ALTER TABLE action_logs ADD COLUMN file_identity TEXT", [])?; }
+
     // Migration: add missing columns
     let cols: Vec<String> = conn.prepare("PRAGMA table_info(settings)")?
         .query_map([], |row| row.get::<_, String>(1))?
         .collect::<Result<Vec<_>, _>>()?;
     if !cols.iter().any(|c| c == "autostart") {
-        conn.execute("ALTER TABLE settings ADD COLUMN autostart INTEGER NOT NULL DEFAULT 1", [])?;
+        conn.execute("ALTER TABLE settings ADD COLUMN autostart INTEGER NOT NULL DEFAULT 0", [])?;
     }
     if !cols.iter().any(|c| c == "grace_period_seconds") {
         conn.execute("ALTER TABLE settings ADD COLUMN grace_period_seconds INTEGER NOT NULL DEFAULT 300", [])?;
@@ -280,6 +309,66 @@ pub fn init_db(app_dir: PathBuf) -> SqliteResult<()> {
     if !cols.iter().any(|c| c == "recursive_watch") {
         conn.execute("ALTER TABLE settings ADD COLUMN recursive_watch INTEGER NOT NULL DEFAULT 0", [])?;
     }
+    for (name, definition) in [
+        ("local_ai_enabled", "INTEGER NOT NULL DEFAULT 0"),
+        ("local_ai_model", "TEXT NOT NULL DEFAULT 'llama3.2'"),
+        ("revision", "INTEGER NOT NULL DEFAULT 0"),
+    ] {
+        if !cols.iter().any(|c| c == name) {
+            conn.execute(&format!("ALTER TABLE settings ADD COLUMN {name} {definition}"), [])?;
+        }
+    }
+    let cleanup_cols: Vec<String> = conn.prepare("PRAGMA table_info(cleanup_actions)")?
+        .query_map([], |row| row.get(1))?.collect::<SqliteResult<_>>()?;
+    if !cleanup_cols.iter().any(|c| c == "message") {
+        conn.execute("ALTER TABLE cleanup_actions ADD COLUMN message TEXT", [])?;
+    }
+    let dismissal_cols: Vec<String> = conn.prepare("PRAGMA table_info(dismissed_suggestions)")?
+        .query_map([], |row| row.get(1))?.collect::<SqliteResult<_>>()?;
+    for (name, definition) in [("identity", "TEXT"), ("size", "INTEGER"), ("mtime_ns", "TEXT")] {
+        if !dismissal_cols.iter().any(|c| c == name) {
+            conn.execute(&format!("ALTER TABLE dismissed_suggestions ADD COLUMN {name} {definition}"), [])?;
+        }
+    }
+    conn.execute_batch("
+        CREATE TABLE IF NOT EXISTS inventory_state (id INTEGER PRIMARY KEY CHECK(id=1), revision INTEGER NOT NULL DEFAULT 0, mutation_revision INTEGER NOT NULL DEFAULT 0);
+        INSERT OR IGNORE INTO inventory_state(id,revision) VALUES(1,0);
+        CREATE TABLE IF NOT EXISTS inventory_roots (
+            root_path TEXT PRIMARY KEY, generation INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'unscanned', stale INTEGER NOT NULL DEFAULT 1,
+            last_scan_at INTEGER, error TEXT
+        );
+        CREATE TABLE IF NOT EXISTS inventory_fingerprints (
+            path TEXT PRIMARY KEY, identity TEXT NOT NULL, size INTEGER NOT NULL, mtime_ns TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS inventory_scan_stage (
+            root_path TEXT NOT NULL, generation INTEGER NOT NULL, path TEXT NOT NULL,
+            size INTEGER NOT NULL, mtime INTEGER NOT NULL, category TEXT NOT NULL,
+            identity TEXT NOT NULL, mtime_ns TEXT NOT NULL,
+            PRIMARY KEY(root_path,generation,path)
+        );
+        CREATE TABLE IF NOT EXISTS category_overrides (
+            path TEXT PRIMARY KEY, identity TEXT NOT NULL, size INTEGER NOT NULL,
+            mtime_ns TEXT NOT NULL, category TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS operation_intents (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL,
+            completed_at TEXT, action TEXT NOT NULL, source_path TEXT NOT NULL,
+            requested_destination TEXT, actual_destination TEXT,
+            status TEXT NOT NULL DEFAULT 'pending', message TEXT, cleanup_id INTEGER
+        );
+        CREATE TABLE IF NOT EXISTS accepted_suggestion_feedback (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, action_log_id INTEGER NOT NULL,
+            file_name TEXT NOT NULL, category TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS scheduler_state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS schedule_occurrences (key TEXT PRIMARY KEY, claimed_at TEXT NOT NULL);
+    ")?;
+    let inventory_state_cols:Vec<String>=conn.prepare("PRAGMA table_info(inventory_state)")?.query_map([],|r|r.get(1))?.collect::<SqliteResult<_>>()?;
+    if !inventory_state_cols.iter().any(|name|name=="mutation_revision") {
+        conn.execute("ALTER TABLE inventory_state ADD COLUMN mutation_revision INTEGER NOT NULL DEFAULT 0",[])?;
+    }
+    conn.execute("INSERT OR IGNORE INTO inventory_roots(root_path) SELECT path FROM watched_folders",[])?;
     // Insert default settings if empty
     let count: i64 = conn.query_row(
         "SELECT COUNT(*) FROM settings",
@@ -289,13 +378,11 @@ pub fn init_db(app_dir: PathBuf) -> SqliteResult<()> {
 
     if count == 0 {
         conn.execute(
-            "INSERT INTO settings (language, theme, telemetry_enabled, first_run, autostart) VALUES ('en', 'system', 0, 1, 1)",
+            "INSERT INTO settings (language, theme, telemetry_enabled, first_run, autostart) VALUES ('en', 'system', 0, 1, 0)",
             [],
         )?;
+        conn.execute("INSERT OR REPLACE INTO scheduler_state(key,value) VALUES('first_run_language_pending','1')",[])?;
     }
-
-    DB.set(Arc::new(Mutex::new(conn)))
-        .map_err(|_| rusqlite::Error::ExecuteReturnedResults)?;
 
     Ok(())
 }
@@ -318,32 +405,14 @@ pub fn lock_db() -> Result<MutexGuard<'static, Connection>, String> {
         .map_err(|_| "Database lock is poisoned".to_string())
 }
 
-pub fn migrate_rules_to_relative() -> SqliteResult<()> {
-    let folders = get_watched_folders()?;
-    let db = get_db();
-    let conn = db.lock().unwrap();
-    for folder in folders {
-        let folder_norm = folder.path.trim_end_matches('/').trim_end_matches('\\');
-        if folder_norm.is_empty() { continue; }
-        let mut stmt = conn.prepare("SELECT id, destination FROM rules WHERE destination LIKE ?1")?;
-        let rows: Vec<(i64, String)> = stmt
-            .query_map([format!("{}%", folder_norm)], |row| Ok((row.get(0)?, row.get(1)?)))?
-            .collect::<SqliteResult<Vec<_>>>()?;
-        for (id, dest) in rows {
-            let relative = dest.strip_prefix(folder_norm)
-                    .map(|s| s.trim_start_matches('/').trim_start_matches('\\').to_string())
-                    .unwrap_or_else(|| dest.clone());
-            if !relative.is_empty() && relative != dest {
-                conn.execute("UPDATE rules SET destination = ?1 WHERE id = ?2", params![relative, id])?;
-            }
-        }
-    }
-    Ok(())
+pub fn insert_default_rules(_folder_path: &str) -> SqliteResult<()> {
+    let mut conn = sqlite_lock()?;
+    let tx = conn.transaction()?;
+    insert_default_rules_on(&tx)?;
+    tx.commit()
 }
 
-pub fn insert_default_rules(_folder_path: &str) -> SqliteResult<()> {
-    let db = get_db();
-    let conn = db.lock().unwrap();
+fn insert_default_rules_on(conn:&Connection)->SqliteResult<()> {
 
     // Only insert defaults if no rules exist yet
     let count: i64 = conn.query_row("SELECT COUNT(*) FROM rules", [], |row| row.get(0))?;
@@ -373,9 +442,49 @@ pub fn insert_default_rules(_folder_path: &str) -> SqliteResult<()> {
     Ok(())
 }
 
+pub fn initialize_defaults_atomic(downloads:&str,mode:&str)->SqliteResult<()> {
+    let mut conn=sqlite_lock()?;let tx=conn.transaction()?;
+    tx.execute("INSERT OR IGNORE INTO watched_folders(path,enabled,mode) VALUES(?1,1,?2)",params![downloads,mode])?;
+    tx.execute("INSERT OR IGNORE INTO inventory_roots(root_path) VALUES(?1)",[downloads])?;
+    insert_default_rules_on(&tx)?;
+    tx.execute("UPDATE inventory_state SET revision=revision+1,mutation_revision=mutation_revision+1 WHERE id=1",[])?;
+    tx.commit()
+}
+
+pub fn complete_first_run(language:&str)->SqliteResult<AppSettings> {
+    let mut conn=sqlite_lock()?;let tx=conn.transaction()?;
+    let existing=get_settings_on(&tx)?;
+    if !existing.first_run {tx.commit()?;return Ok(existing);}
+    insert_default_rules_on(&tx)?;
+    tx.execute("UPDATE settings SET language=CASE WHEN EXISTS(SELECT 1 FROM scheduler_state WHERE key='first_run_language_pending') THEN ?1 ELSE language END,first_run=0,revision=revision+1 WHERE first_run=1 AND id=(SELECT id FROM settings ORDER BY id LIMIT 1)",[language])?;
+    tx.execute("DELETE FROM scheduler_state WHERE key='first_run_language_pending'",[])?;
+    let settings=get_settings_on(&tx)?;tx.commit()?;Ok(settings)
+}
+
+pub fn import_rules_atomic(rules: &[Rule], replace: bool) -> SqliteResult<usize> {
+    let mut conn = sqlite_lock()?;
+    import_rules_atomic_on(&mut conn,rules,replace)
+}
+
+fn import_rules_atomic_on(conn:&mut Connection,rules:&[Rule],replace:bool)->SqliteResult<usize> {
+    let tx = conn.transaction()?;
+    if replace { tx.execute("DELETE FROM rules", [])?; }
+    for rule in rules {
+        tx.execute(
+            "INSERT INTO rules (name,priority,enabled,extensions,pattern,destination,action,folder_id) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![rule.name, rule.priority, rule.enabled, rule.extensions.join(","), rule.pattern, rule.destination, rule.action, rule.folder_id],
+        )?;
+    }
+    tx.commit()?;
+    Ok(rules.len())
+}
+
+fn sqlite_lock() -> SqliteResult<MutexGuard<'static, Connection>> {
+    lock_db().map_err(|_| rusqlite::Error::InvalidQuery)
+}
+
 pub fn get_rules() -> SqliteResult<Vec<Rule>> {
-    let db = get_db();
-    let conn = db.lock().unwrap();
+    let conn = sqlite_lock()?;
     let mut stmt = conn.prepare(
         "SELECT id, name, priority, enabled, extensions, pattern, destination, action, folder_id FROM rules ORDER BY priority"
     )?;
@@ -400,8 +509,7 @@ pub fn get_rules() -> SqliteResult<Vec<Rule>> {
 }
 
 pub fn add_rule(rule: &Rule) -> SqliteResult<i64> {
-    let db = get_db();
-    let conn = db.lock().unwrap();
+    let conn = sqlite_lock()?;
     let exts = rule.extensions.join(",");
     conn.execute(
         "INSERT INTO rules (name, priority, enabled, extensions, pattern, destination, action, folder_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -411,8 +519,7 @@ pub fn add_rule(rule: &Rule) -> SqliteResult<i64> {
 }
 
 pub fn update_rule(rule: &Rule) -> SqliteResult<()> {
-    let db = get_db();
-    let conn = db.lock().unwrap();
+    let conn = sqlite_lock()?;
     let exts = rule.extensions.join(",");
     conn.execute(
         "UPDATE rules SET name=?1, priority=?2, enabled=?3, extensions=?4, pattern=?5, destination=?6, action=?7, folder_id=?8 WHERE id=?9",
@@ -422,22 +529,13 @@ pub fn update_rule(rule: &Rule) -> SqliteResult<()> {
 }
 
 pub fn delete_rule(id: i64) -> SqliteResult<()> {
-    let db = get_db();
-    let conn = db.lock().unwrap();
+    let conn = sqlite_lock()?;
     conn.execute("DELETE FROM rules WHERE id=?1", params![id])?;
     Ok(())
 }
 
-pub fn delete_all_rules() -> SqliteResult<()> {
-    let db = get_db();
-    let conn = db.lock().unwrap();
-    conn.execute("DELETE FROM rules", [])?;
-    Ok(())
-}
-
 pub fn get_watched_folders() -> SqliteResult<Vec<WatchedFolder>> {
-    let db = get_db();
-    let conn = db.lock().unwrap();
+    let conn = sqlite_lock()?;
     let mut stmt = conn.prepare("SELECT id, path, enabled, mode FROM watched_folders")?;
     let folders = stmt.query_map([], |row| {
         Ok(WatchedFolder {
@@ -452,32 +550,45 @@ pub fn get_watched_folders() -> SqliteResult<Vec<WatchedFolder>> {
 }
 
 pub fn add_watched_folder(path: &str, mode: &str) -> SqliteResult<i64> {
-    let db = get_db();
-    let conn = db.lock().unwrap();
-    conn.execute(
+    let mut conn=sqlite_lock()?;let tx=conn.transaction()?;
+    let changed=tx.execute(
         "INSERT OR IGNORE INTO watched_folders (path, enabled, mode) VALUES (?1, 1, ?2)",
         params![path, mode],
     )?;
-    Ok(conn.last_insert_rowid())
+    // INSERT OR IGNORE leaves last_insert_rowid unchanged on an existing row.
+    let id = tx.query_row("SELECT id FROM watched_folders WHERE path=?1", [path], |row| row.get(0))?;
+    if changed>0 {tx.execute("UPDATE inventory_state SET revision=revision+1,mutation_revision=mutation_revision+1 WHERE id=1", [])?;}
+    tx.execute("INSERT OR IGNORE INTO inventory_roots(root_path) VALUES(?1)", [path])?;
+    tx.commit()?;
+    Ok(id)
 }
 
 pub fn remove_watched_folder(id: i64) -> SqliteResult<()> {
-    let db = get_db();
-    let conn = db.lock().unwrap();
-    conn.execute("DELETE FROM watched_folders WHERE id=?1", params![id])?;
-    Ok(())
+    let mut conn = sqlite_lock()?;
+    let tx = conn.transaction()?;
+    let path: Option<String> = tx.query_row("SELECT path FROM watched_folders WHERE id=?1", [id], |row| row.get(0)).optional()?;
+    if let Some(path) = path {
+        tx.execute("DELETE FROM hash_cache WHERE path IN (SELECT path FROM file_inventory WHERE root_path=?1)", [&path])?;
+        tx.execute("DELETE FROM dismissed_suggestions WHERE path IN (SELECT path FROM file_inventory WHERE root_path=?1)", [&path])?;
+        tx.execute("DELETE FROM inventory_fingerprints WHERE path IN (SELECT path FROM file_inventory WHERE root_path=?1)", [&path])?;
+        tx.execute("DELETE FROM file_inventory WHERE root_path=?1", [&path])?;
+        tx.execute("DELETE FROM inventory_scan_stage WHERE root_path=?1", [&path])?;
+        tx.execute("DELETE FROM inventory_roots WHERE root_path=?1", [&path])?;
+    }
+    tx.execute("DELETE FROM watched_folders WHERE id=?1", [id])?;
+    tx.execute("UPDATE inventory_state SET revision=revision+1,mutation_revision=mutation_revision+1 WHERE id=1", [])?;
+    tx.commit()
 }
 
 pub fn update_folder_mode(id: i64, mode: &str) -> SqliteResult<()> {
-    let db = get_db();
-    let conn = db.lock().unwrap();
-    conn.execute("UPDATE watched_folders SET mode=?1 WHERE id=?2", params![mode, id])?;
-    Ok(())
+    let mut conn=sqlite_lock()?;let tx=conn.transaction()?;
+    let changed=tx.execute("UPDATE watched_folders SET mode=?1 WHERE id=?2 AND mode<>?1", params![mode, id])?;
+    if changed>0 {tx.execute("UPDATE inventory_state SET revision=revision+1,mutation_revision=mutation_revision+1 WHERE id=1", [])?;}
+    tx.commit()
 }
 
 pub fn log_action(log: &ActionLog) -> SqliteResult<i64> {
-    let db = get_db();
-    let conn = db.lock().unwrap();
+    let conn = sqlite_lock()?;
     conn.execute(
         "INSERT INTO action_logs (timestamp, source_path, destination_path, action, file_name, file_type, undone) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0)",
         params![
@@ -493,8 +604,7 @@ pub fn log_action(log: &ActionLog) -> SqliteResult<i64> {
 }
 
 pub fn get_recent_logs(limit: i64) -> SqliteResult<Vec<ActionLog>> {
-    let db = get_db();
-    let conn = db.lock().unwrap();
+    let conn = sqlite_lock()?;
     let mut stmt = conn.prepare(
         "SELECT id, timestamp, source_path, destination_path, action, file_name, file_type, undone FROM action_logs ORDER BY timestamp DESC LIMIT ?1"
     )?;
@@ -515,17 +625,17 @@ pub fn get_recent_logs(limit: i64) -> SqliteResult<Vec<ActionLog>> {
     Ok(logs)
 }
 
-pub fn get_undoable_logs() -> SqliteResult<Vec<(i64, String, Option<String>)>> {
-    let db = get_db();
-    let conn = db.lock().unwrap();
+pub fn get_undoable_logs() -> SqliteResult<Vec<(i64, String, Option<String>, Option<String>)>> {
+    let conn = sqlite_lock()?;
     let mut stmt = conn.prepare(
-        "SELECT id, source_path, destination_path FROM action_logs WHERE undone = 0 ORDER BY timestamp DESC"
+        "SELECT id, source_path, destination_path, file_identity FROM action_logs WHERE undone = 0 AND action IN ('move','rename','accept') ORDER BY timestamp DESC"
     )?;
     let logs = stmt.query_map([], |row| {
         Ok((
             row.get::<_, i64>(0)?,
             row.get::<_, String>(1)?,
             row.get::<_, Option<String>>(2)?,
+            row.get::<_, Option<String>>(3)?,
         ))
     })?
     .collect::<SqliteResult<Vec<_>>>()?;
@@ -533,10 +643,9 @@ pub fn get_undoable_logs() -> SqliteResult<Vec<(i64, String, Option<String>)>> {
 }
 
 pub fn get_weekly_stats() -> SqliteResult<Vec<(String, i64)>> {
-    let db = get_db();
-    let conn = db.lock().unwrap();
+    let conn = sqlite_lock()?;
     let mut stmt = conn.prepare(
-        "SELECT file_type, COUNT(*) FROM action_logs WHERE timestamp > datetime('now', '-7 days') AND undone = 0 GROUP BY file_type"
+        "SELECT file_type, COUNT(*) FROM action_logs WHERE julianday(timestamp) > julianday('now', '-7 days') AND undone = 0 GROUP BY file_type"
     )?;
     let stats = stmt.query_map([], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
@@ -545,26 +654,14 @@ pub fn get_weekly_stats() -> SqliteResult<Vec<(String, i64)>> {
     Ok(stats)
 }
 
-pub fn undo_action(id: i64) -> SqliteResult<Option<(String, String)>> {
-    let db = get_db();
-    let conn = db.lock().unwrap();
-    let log: Option<(String, String)> = conn.query_row(
-        "SELECT source_path, destination_path FROM action_logs WHERE id=?1 AND undone=0",
-        params![id],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    ).ok();
-
-    if log.is_some() {
-        conn.execute("UPDATE action_logs SET undone=1 WHERE id=?1", params![id])?;
-    }
-    Ok(log)
+pub fn get_settings() -> SqliteResult<AppSettings> {
+    let conn = sqlite_lock()?;
+    get_settings_on(&conn)
 }
 
-pub fn get_settings() -> SqliteResult<AppSettings> {
-    let db = get_db();
-    let conn = db.lock().unwrap();
+fn get_settings_on(conn: &Connection) -> SqliteResult<AppSettings> {
     conn.query_row(
-        "SELECT id, language, theme, telemetry_enabled, first_run, autostart, grace_period_seconds, lock_check_enabled, schedule_enabled, schedule_times_per_day, schedule_time_1, schedule_time_2, schedule_time_3, schedule_time_4, recursive_watch FROM settings LIMIT 1",
+        "SELECT id, language, theme, telemetry_enabled, first_run, autostart, grace_period_seconds, lock_check_enabled, schedule_enabled, schedule_times_per_day, schedule_time_1, schedule_time_2, schedule_time_3, schedule_time_4, recursive_watch, local_ai_enabled, local_ai_model, revision FROM settings ORDER BY id LIMIT 1",
         [],
         |row| {
             Ok(AppSettings {
@@ -586,40 +683,74 @@ pub fn get_settings() -> SqliteResult<AppSettings> {
                 // column existed, or a database whose migration did not run,
                 // must resolve to the pre-recursion behaviour.
                 recursive_watch: row.get::<_, i32>(14).unwrap_or(0) != 0,
+                local_ai_enabled: row.get(15)?,
+                local_ai_model: row.get(16)?,
+                revision: row.get(17)?,
             })
         },
     )
 }
 
-pub fn update_settings(settings: &AppSettings) -> SqliteResult<()> {
-    let db = get_db();
-    let conn = db.lock().unwrap();
+fn update_preferences_on(conn: &Connection, patch: &PreferencesPatch) -> SqliteResult<AppSettings> {
     conn.execute(
-        "UPDATE settings SET language=?1, theme=?2, telemetry_enabled=?3, first_run=?4, autostart=?5, grace_period_seconds=?6, lock_check_enabled=?7, schedule_enabled=?8, schedule_times_per_day=?9, schedule_time_1=?10, schedule_time_2=?11, schedule_time_3=?12, schedule_time_4=?13, recursive_watch=?15 WHERE id=?14",
-        params![
-            settings.language,
-            settings.theme,
-            settings.telemetry_enabled as i32,
-            settings.first_run as i32,
-            settings.autostart as i32,
-            settings.grace_period_seconds,
-            settings.lock_check_enabled as i32,
-            settings.schedule_enabled as i32,
-            settings.schedule_times_per_day,
-            settings.schedule_time_1,
-            settings.schedule_time_2,
-            settings.schedule_time_3,
-            settings.schedule_time_4,
-            settings.id,
-            settings.recursive_watch as i32
-        ],
+        "UPDATE settings SET language=COALESCE(?1,language), theme=COALESCE(?2,theme),
+         telemetry_enabled=COALESCE(?3,telemetry_enabled), autostart=COALESCE(?4,autostart),
+         grace_period_seconds=COALESCE(?5,grace_period_seconds), lock_check_enabled=COALESCE(?6,lock_check_enabled),
+         recursive_watch=COALESCE(?7,recursive_watch), local_ai_enabled=COALESCE(?8,local_ai_enabled),
+         local_ai_model=COALESCE(?9,local_ai_model), revision=revision+1
+         WHERE id=(SELECT id FROM settings ORDER BY id LIMIT 1)",
+        params![patch.language,patch.theme,patch.telemetry_enabled,patch.autostart,patch.grace_period_seconds,
+            patch.lock_check_enabled,patch.recursive_watch,patch.local_ai_enabled,patch.local_ai_model],
     )?;
+    get_settings_on(conn)
+}
+
+pub fn update_preferences(patch: &PreferencesPatch) -> SqliteResult<AppSettings> {
+    let mut conn=sqlite_lock()?;let tx=conn.transaction()?;
+    let settings=update_preferences_on(&tx,patch)?;tx.commit()?;Ok(settings)
+}
+
+fn update_schedule_settings_on(conn: &Connection, schedule: &ScheduleSettings) -> SqliteResult<AppSettings> {
+    conn.execute(
+        "UPDATE settings SET schedule_enabled=?1,schedule_times_per_day=?2,schedule_time_1=?3,
+         schedule_time_2=?4,schedule_time_3=?5,schedule_time_4=?6,revision=revision+1
+         WHERE id=(SELECT id FROM settings ORDER BY id LIMIT 1)",
+        params![schedule.schedule_enabled,schedule.schedule_times_per_day,schedule.schedule_time_1,
+            schedule.schedule_time_2,schedule.schedule_time_3,schedule.schedule_time_4],
+    )?;
+    get_settings_on(conn)
+}
+
+pub fn update_schedule_settings(schedule: &ScheduleSettings) -> SqliteResult<AppSettings> {
+    let mut conn=sqlite_lock()?;let tx=conn.transaction()?;
+    let settings=update_schedule_settings_on(&tx,schedule)?;tx.commit()?;Ok(settings)
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HistoryCounts { pub total: i64, pub undoable: i64 }
+
+pub fn history_counts() -> SqliteResult<HistoryCounts> {
+    sqlite_lock()?.query_row(
+        "SELECT COUNT(*),COALESCE(SUM(CASE WHEN undone=0 AND action IN ('move','rename','accept') THEN 1 ELSE 0 END),0) FROM action_logs",
+        [], |row| Ok(HistoryCounts{total:row.get(0)?,undoable:row.get(1)?}),
+    )
+}
+
+pub fn get_schedule_last_check() -> SqliteResult<Option<String>> {
+    sqlite_lock()?.query_row("SELECT value FROM scheduler_state WHERE key='last_check'", [], |row| row.get(0)).optional()
+}
+
+pub fn set_schedule_last_check(value: &str) -> SqliteResult<()> {
+    sqlite_lock()?.execute("INSERT INTO scheduler_state(key,value) VALUES('last_check',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[value])?;
     Ok(())
 }
 
+pub fn claim_schedule_occurrence(key: &str) -> SqliteResult<bool> {
+    Ok(sqlite_lock()?.execute("INSERT OR IGNORE INTO schedule_occurrences(key,claimed_at) VALUES(?1,?2)", params![key,Utc::now().to_rfc3339()])? == 1)
+}
+
 pub fn clear_logs() -> SqliteResult<()> {
-    let db = get_db();
-    let conn = db.lock().unwrap();
+    let conn = sqlite_lock()?;
     conn.execute("DELETE FROM action_logs", [])?;
     Ok(())
 }
@@ -629,11 +760,10 @@ pub fn clear_logs() -> SqliteResult<()> {
 // ---------------------------------------------------------------------------
 
 pub fn insert_cleanup_action(action: &CleanupAction) -> SqliteResult<i64> {
-    let db = get_db();
-    let conn = db.lock().unwrap();
+    let conn = sqlite_lock()?;
     conn.execute(
-        "INSERT INTO cleanup_actions (timestamp, path, prev_path, dest, action, status, undoable)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT INTO cleanup_actions (timestamp, path, prev_path, dest, action, status, undoable,message)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7,?8)",
         params![
             action.timestamp.to_rfc3339(),
             action.path,
@@ -642,16 +772,16 @@ pub fn insert_cleanup_action(action: &CleanupAction) -> SqliteResult<i64> {
             action.action,
             action.status,
             action.undoable as i32,
+            action.message,
         ],
     )?;
     Ok(conn.last_insert_rowid())
 }
 
 pub fn get_cleanup_logs(limit: i64) -> SqliteResult<Vec<CleanupAction>> {
-    let db = get_db();
-    let conn = db.lock().unwrap();
+    let conn = sqlite_lock()?;
     let mut stmt = conn.prepare(
-        "SELECT id, timestamp, path, prev_path, dest, action, status, undoable
+        "SELECT id, timestamp, path, prev_path, dest, action, status, undoable,message
          FROM cleanup_actions ORDER BY timestamp DESC LIMIT ?1",
     )?;
     let logs = stmt
@@ -668,20 +798,172 @@ pub fn get_cleanup_logs(limit: i64) -> SqliteResult<Vec<CleanupAction>> {
                 action: row.get(5)?,
                 status: row.get(6)?,
                 undoable: row.get::<_, i32>(7)? != 0,
+                message: row.get(8)?,
             })
         })?
         .collect::<SqliteResult<Vec<_>>>()?;
     Ok(logs)
 }
 
-pub fn mark_cleanup_undone(id: i64) -> SqliteResult<()> {
-    let db = get_db();
-    let conn = db.lock().unwrap();
-    conn.execute(
-        "UPDATE cleanup_actions SET undoable = 0, status = 'undone' WHERE id = ?1",
-        params![id],
-    )?;
+pub fn begin_operation_intent(action:&str,source:&str,requested_destination:Option<&str>)->SqliteResult<i64> {
+    let conn=sqlite_lock()?;
+    conn.execute("INSERT INTO operation_intents(created_at,action,source_path,requested_destination) VALUES(?1,?2,?3,?4)",params![Utc::now().to_rfc3339(),action,source,requested_destination])?;
+    Ok(conn.last_insert_rowid())
+}
+
+pub fn finalize_operation_intent(id:i64,status:&str,actual_destination:Option<&str>,message:Option<&str>)->SqliteResult<()> {
+    let conn=sqlite_lock()?;
+    let changed=conn.execute("UPDATE operation_intents SET completed_at=?2,status=?3,actual_destination=?4,message=?5 WHERE id=?1 AND status='pending'",params![id,Utc::now().to_rfc3339(),status,actual_destination,message])?;
+    if changed!=1 {return Err(rusqlite::Error::QueryReturnedNoRows);}
     Ok(())
+}
+
+pub fn begin_cleanup_intent(action:&str,path:&str)->SqliteResult<i64> {
+    let mut conn=sqlite_lock()?;let tx=conn.transaction()?;
+    let timestamp=Utc::now().to_rfc3339();
+    tx.execute("INSERT INTO cleanup_actions(timestamp,path,action,status,undoable) VALUES(?1,?2,?3,'pending',0)",params![timestamp,path,action])?;
+    let cleanup_id=tx.last_insert_rowid();
+    tx.execute("INSERT INTO operation_intents(created_at,action,source_path,cleanup_id) VALUES(?1,?2,?3,?4)",params![timestamp,action,path,cleanup_id])?;
+    let id=tx.last_insert_rowid();tx.commit()?;Ok(id)
+}
+
+fn inventory_paths_for_spelling(conn:&Connection,path:&str)->SqliteResult<Vec<String>> {
+    #[cfg(target_os="windows")]
+    {
+        let normalized=crate::safe_fs::normalize_lexically(std::path::Path::new(path)).to_string_lossy().replace("\\\\?\\UNC\\","//").replace("\\\\?\\","").replace('\\',"/");
+        let mut stmt=conn.prepare(r"SELECT path FROM file_inventory WHERE REPLACE(REPLACE(REPLACE(path,'\\?\UNC\','//'),'\\?\',''),'\','/')=?1 COLLATE NOCASE")?;
+        let mut paths=stmt.query_map([normalized],|r|r.get::<_,String>(0))?.collect::<SqliteResult<Vec<_>>>()?;
+        if !paths.iter().any(|value|value==path) {paths.push(path.to_string());}
+        Ok(paths)
+    }
+    #[cfg(not(target_os="windows"))]
+    {let _=conn;Ok(vec![path.to_string()])}
+}
+
+fn remove_inventory_path_on(conn:&Connection,path:&str)->SqliteResult<()> {
+    for path in inventory_paths_for_spelling(conn,path)? {
+        conn.execute("DELETE FROM hash_cache WHERE path=?1",[&path])?;
+        conn.execute("DELETE FROM dismissed_suggestions WHERE path=?1",[&path])?;
+        conn.execute("DELETE FROM category_overrides WHERE path=?1",[&path])?;
+        conn.execute("DELETE FROM inventory_fingerprints WHERE path=?1",[&path])?;
+        conn.execute("UPDATE inventory_roots SET stale=1 WHERE root_path IN (SELECT root_path FROM file_inventory WHERE path=?1)",[&path])?;
+        conn.execute("DELETE FROM file_inventory WHERE path=?1",[&path])?;
+    }
+    conn.execute("UPDATE inventory_state SET revision=revision+1,mutation_revision=mutation_revision+1 WHERE id=1",[])?;
+    Ok(())
+}
+
+pub fn remove_inventory_path(path:&str)->SqliteResult<()> {
+    let mut conn=sqlite_lock()?;let tx=conn.transaction()?;remove_inventory_path_on(&tx,path)?;tx.commit()
+}
+
+pub fn finalize_cleanup_intent(id:i64,status:&str,message:Option<&str>,source_removed:bool)->SqliteResult<()> {
+    let mut conn=sqlite_lock()?;let tx=conn.transaction()?;
+    let (path,cleanup_id):(String,i64)=tx.query_row("SELECT source_path,cleanup_id FROM operation_intents WHERE id=?1 AND status='pending'",[id],|r|Ok((r.get(0)?,r.get(1)?)))?;
+    tx.execute("UPDATE operation_intents SET completed_at=?2,status=?3,message=?4 WHERE id=?1",params![id,Utc::now().to_rfc3339(),status,message])?;
+    tx.execute("UPDATE cleanup_actions SET status=?2,message=?3,undoable=0 WHERE id=?1",params![cleanup_id,status,message])?;
+    if source_removed {remove_inventory_path_on(&tx,&path)?;}
+    tx.commit()
+}
+
+pub fn metadata_mtime_ns(metadata:&std::fs::Metadata)->String {
+    metadata.modified().ok().and_then(|time|time.duration_since(UNIX_EPOCH).ok()).map(|elapsed|elapsed.as_nanos().to_string()).unwrap_or_else(||"0".into())
+}
+
+struct PreparedMove { destination:String, size:i64,mtime:i64,identity:String,mtime_ns:String,owner:Option<(i64,String)> }
+
+fn prepare_move(destination:&str)->Result<PreparedMove,String> {
+    // Every filesystem read happens before acquiring the mutation transaction.
+    let path=std::fs::canonicalize(destination).map_err(|e|format!("Moved file metadata unavailable: {e}"))?;
+    let metadata=std::fs::metadata(&path).map_err(|e|e.to_string())?;
+    if !metadata.is_file() {return Err("Moved destination is not a regular file".into());}
+    let identity=crate::safe_fs::file_identity(&path)?.key();
+    let folders=get_watched_folders().map_err(|e|e.to_string())?;
+    let mut owner:Option<(usize,i64,String)>=None;
+    for folder in folders {
+        let Ok(root)=crate::safe_fs::validate_root(std::path::Path::new(&folder.path)) else {continue;};
+        if path.starts_with(&root) && path!=root {
+            let depth=root.components().count();
+            if owner.as_ref().is_none_or(|existing|depth>existing.0) {
+                if let Some(id)=folder.id {owner=Some((depth,id,folder.path));}
+            }
+        }
+    }
+    let mtime=metadata.modified().ok().and_then(|t|t.duration_since(UNIX_EPOCH).ok()).map(|d|d.as_secs() as i64).unwrap_or(0);
+    Ok(PreparedMove{destination:path.to_string_lossy().into_owned(),size:metadata.len() as i64,mtime,identity,mtime_ns:metadata_mtime_ns(&metadata),owner:owner.map(|(_,id,path)|(id,path))})
+}
+
+fn reconcile_move_on(conn:&Connection,old:&str,prepared:&PreparedMove,category:Option<&str>)->SqliteResult<()> {
+    let mut previous_category=None;
+    for path in inventory_paths_for_spelling(conn,old)? {
+        previous_category=conn.query_row("SELECT category FROM category_overrides WHERE path=?1",[&path],|r|r.get::<_,String>(0)).optional()?;
+        if previous_category.is_some(){break;}
+    }
+    remove_inventory_path_on(conn,old)?;
+    // Also clear a prior destination row/cache (including its different spelling).
+    remove_inventory_path_on(conn,&prepared.destination)?;
+    if let Some((id,root))=&prepared.owner {
+        let still_configured:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM watched_folders WHERE id=?1 AND path=?2)",params![id,root],|r|r.get(0))?;
+        if !still_configured {return Ok(());}
+        let selected=category.or(previous_category.as_deref()).unwrap_or_else(||crate::scan::categorize(&prepared.destination));
+        conn.execute("INSERT INTO file_inventory(root_path,path,size,mtime,category,scanned_at) VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(path) DO UPDATE SET root_path=excluded.root_path,size=excluded.size,mtime=excluded.mtime,category=excluded.category,scanned_at=excluded.scanned_at",params![root,prepared.destination,prepared.size,prepared.mtime,selected,now_epoch()])?;
+        conn.execute("INSERT INTO inventory_fingerprints(path,identity,size,mtime_ns) VALUES(?1,?2,?3,?4) ON CONFLICT(path) DO UPDATE SET identity=excluded.identity,size=excluded.size,mtime_ns=excluded.mtime_ns",params![prepared.destination,prepared.identity,prepared.size,prepared.mtime_ns])?;
+        if category.is_some() || previous_category.is_some() {
+            conn.execute("INSERT INTO category_overrides(path,identity,size,mtime_ns,category) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(path) DO UPDATE SET identity=excluded.identity,size=excluded.size,mtime_ns=excluded.mtime_ns,category=excluded.category",params![prepared.destination,prepared.identity,prepared.size,prepared.mtime_ns,selected])?;
+        }
+        conn.execute("UPDATE inventory_roots SET stale=1 WHERE root_path=?1",[root])?;
+    }
+    Ok(())
+}
+
+pub fn reconcile_move(old:&str,new:&str,category:Option<&str>)->Result<(),String> {
+    if category.is_some_and(|category|!crate::categories::is_valid_category(category)) {return Err("Invalid canonical category".into());}
+    let prepared=prepare_move(new)?;let mut conn=lock_db()?;let tx=conn.transaction().map_err(|e|e.to_string())?;
+    reconcile_move_on(&tx,old,&prepared,category).map_err(|e|e.to_string())?;tx.commit().map_err(|e|e.to_string())
+}
+
+fn finalize_moved(id:i64,log:&ActionLog,actual_destination:&str,category:Option<&str>,accepted:bool,expected_identity:&str)->Result<(),String> {
+    if category.is_some_and(|category|!crate::categories::is_valid_category(category)) {return Err("Invalid canonical category".into());}
+    let prepared=prepare_move(actual_destination)?;
+    if prepared.identity != expected_identity { return Err("Moved file was replaced before history finalization; recovery intent retained".into()); }
+    let mut conn=lock_db()?;let tx=conn.transaction().map_err(|e|e.to_string())?;
+    let changed=tx.execute("UPDATE operation_intents SET completed_at=?2,status='completed',actual_destination=?3 WHERE id=?1 AND status='pending'",params![id,Utc::now().to_rfc3339(),actual_destination]).map_err(|e|e.to_string())?;
+    if changed!=1 {return Err("Operation journal intent is unavailable".into());}
+    tx.execute("INSERT INTO action_logs(timestamp,source_path,destination_path,action,file_name,file_type,undone,file_identity) VALUES(?1,?2,?3,?4,?5,?6,0,?7)",params![log.timestamp.to_rfc3339(),log.source_path,actual_destination,log.action,log.file_name,log.file_type,prepared.identity]).map_err(|e|e.to_string())?;
+    let log_id=tx.last_insert_rowid();
+    reconcile_move_on(&tx,&log.source_path,&prepared,category).map_err(|e|e.to_string())?;
+    if accepted {
+        tx.execute("INSERT INTO accepted_suggestion_feedback(action_log_id,file_name,category) VALUES(?1,?2,?3)",params![log_id,log.file_name,category]).map_err(|e|e.to_string())?;
+    }
+    tx.commit().map_err(|e|e.to_string())
+}
+
+pub fn finalize_move_intent(id:i64,log:&ActionLog,actual_destination:&str,category:Option<&str>,expected_identity:&str)->Result<(),String> {
+    finalize_moved(id,log,actual_destination,category,false,expected_identity)
+}
+
+pub fn finalize_suggestion_intent(id:i64,log:&ActionLog,actual_destination:&str,category:&str,expected_identity:&str)->Result<(),String> {
+    finalize_moved(id,log,actual_destination,Some(category),true,expected_identity)
+}
+
+pub fn finalize_undo_intent(id:i64,action_log_id:i64,old:&str,new:&str)->Result<(),String> {
+    let prepared=prepare_move(new)?;let mut conn=lock_db()?;let tx=conn.transaction().map_err(|e|e.to_string())?;
+    let changed=tx.execute("UPDATE operation_intents SET completed_at=?2,status='completed',actual_destination=?3 WHERE id=?1 AND status='pending'",params![id,Utc::now().to_rfc3339(),new]).map_err(|e|e.to_string())?;
+    if changed!=1 {return Err("Operation journal intent is unavailable".into());}
+    tx.execute("UPDATE action_logs SET undone=1 WHERE id=?1",[action_log_id]).map_err(|e|e.to_string())?;
+    let accepted:bool=tx.query_row("SELECT action='accept' FROM action_logs WHERE id=?1",[action_log_id],|row|row.get(0)).map_err(|e|e.to_string())?;
+    if accepted {
+        for path in inventory_paths_for_spelling(&tx,old).map_err(|e|e.to_string())? { tx.execute("DELETE FROM category_overrides WHERE path=?1",[path]).map_err(|e|e.to_string())?; }
+    }
+    reconcile_move_on(&tx,old,&prepared,None).map_err(|e|e.to_string())?;tx.commit().map_err(|e|e.to_string())
+}
+
+#[derive(Debug,Clone)]
+pub struct AcceptedSuggestionFeedback {pub file_name:String,pub category:String}
+
+pub fn get_accepted_suggestion_feedback()->Result<Vec<AcceptedSuggestionFeedback>,String> {
+    let conn=lock_db()?;let mut stmt=conn.prepare("SELECT f.file_name,f.category FROM accepted_suggestion_feedback f LEFT JOIN action_logs l ON l.id=f.action_log_id WHERE f.action_log_id=0 OR l.undone=0 ORDER BY f.id").map_err(|e|e.to_string())?;
+    let rows=stmt.query_map([],|r|Ok(AcceptedSuggestionFeedback{file_name:r.get(0)?,category:r.get(1)?})).map_err(|e|e.to_string())?.collect::<SqliteResult<Vec<_>>>().map_err(|e|e.to_string())?;Ok(rows)
 }
 
 // ---------------------------------------------------------------------------
@@ -718,10 +1000,30 @@ pub struct LargestFile {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all="camelCase")]
 pub struct RootStat {
     pub path: String,
     pub files: i64,
     pub bytes: i64,
+    pub status: String,
+    pub stale: bool,
+    pub last_scan_at: Option<i64>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DashboardSnapshot {
+    pub total_files: i64,
+    pub total_bytes: i64,
+    pub category_breakdown: Vec<CategoryStat>,
+    pub largest_files: Vec<InventoryFile>,
+    pub recent_files: Vec<InventoryFile>,
+    pub watched_roots: Vec<RootStat>,
+    pub last_scan_at: Option<i64>,
+    pub insights: DashboardInsights,
+    pub age_buckets: Vec<AgeBucket>,
+    pub revision: i64,
 }
 
 pub const LARGE_FILE_BYTES: i64 = 100 * 1024 * 1024;
@@ -760,6 +1062,7 @@ pub struct InventoryFile {
 
 #[cfg(test)]
 fn create_file_inventory_table(conn: &Connection) -> SqliteResult<()> {
+    initialize_schema(conn)?;
     conn.execute(
         "CREATE TABLE IF NOT EXISTS file_inventory (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -792,8 +1095,9 @@ fn append_inventory_batch_on(conn: &mut Connection, root: &str, rows: &[Inventor
     let tx = conn.transaction()?;
     {
         let mut stmt = tx.prepare(
-            "INSERT OR REPLACE INTO file_inventory (root_path, path, size, mtime, category, scanned_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO file_inventory (root_path, path, size, mtime, category, scanned_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(path) DO UPDATE SET
+             root_path=excluded.root_path,size=excluded.size,mtime=excluded.mtime,category=excluded.category,scanned_at=excluded.scanned_at",
         )?;
         for row in rows {
             stmt.execute(params![root, row.path, row.size, row.mtime, row.category, scanned_at])?;
@@ -803,11 +1107,22 @@ fn append_inventory_batch_on(conn: &mut Connection, root: &str, rows: &[Inventor
 }
 
 fn replace_inventory_on(conn: &mut Connection, root: &str, rows: &[InventoryRow]) -> SqliteResult<()> {
-    conn.execute("DELETE FROM file_inventory WHERE root_path = ?1", params![root])?;
-    for chunk in rows.chunks(INVENTORY_BATCH_SIZE) {
-        append_inventory_batch_on(conn, root, chunk)?;
+    let tx = conn.transaction()?;
+    let scanned_at = now_epoch();
+    tx.execute("CREATE TEMP TABLE IF NOT EXISTS replacement_paths(path TEXT PRIMARY KEY)", [])?;
+    tx.execute("DELETE FROM replacement_paths", [])?;
+    for row in rows {
+        tx.execute("INSERT INTO replacement_paths(path) VALUES(?1)", [&row.path])?;
+        tx.execute(
+            "INSERT INTO file_inventory(root_path,path,size,mtime,category,scanned_at) VALUES(?1,?2,?3,?4,?5,?6)
+             ON CONFLICT(path) DO UPDATE SET root_path=excluded.root_path,size=excluded.size,mtime=excluded.mtime,category=excluded.category,scanned_at=excluded.scanned_at",
+            params![root,row.path,row.size,row.mtime,row.category,scanned_at],
+        )?;
     }
-    Ok(())
+    tx.execute("DELETE FROM file_inventory WHERE root_path=?1 AND path NOT IN (SELECT path FROM replacement_paths)",[root])?;
+    tx.execute("INSERT INTO inventory_roots(root_path,status,stale,last_scan_at) VALUES(?1,'complete',0,?2) ON CONFLICT(root_path) DO UPDATE SET status='complete',stale=0,last_scan_at=excluded.last_scan_at,error=NULL",params![root,scanned_at])?;
+    tx.execute("UPDATE inventory_state SET revision=revision+1,mutation_revision=mutation_revision+1 WHERE id=1", [])?;
+    tx.commit()
 }
 
 #[cfg(test)]
@@ -817,7 +1132,7 @@ fn clear_inventory_on(conn: &Connection, root: &str) -> SqliteResult<()> {
 
 fn get_inventory_stats_on(conn: &Connection) -> SqliteResult<InventoryStats> {
     conn.query_row(
-        "SELECT COUNT(*), COALESCE(SUM(size), 0), MAX(scanned_at) FROM file_inventory",
+        "SELECT COUNT(*), COALESCE(SUM(size), 0), (SELECT MAX(last_scan_at) FROM inventory_roots) FROM file_inventory",
         [],
         |row| {
             Ok(InventoryStats {
@@ -863,7 +1178,9 @@ fn get_category_distribution_on(conn: &Connection) -> SqliteResult<Vec<CategoryS
 
 fn get_root_summaries_on(conn: &Connection) -> SqliteResult<Vec<RootStat>> {
     let mut stmt = conn.prepare(
-        "SELECT root_path, COUNT(*), COALESCE(SUM(size), 0) FROM file_inventory GROUP BY root_path ORDER BY 3 DESC",
+        "SELECT r.root_path, COUNT(i.id), COALESCE(SUM(i.size),0),r.status,r.stale,r.last_scan_at,r.error
+         FROM inventory_roots r LEFT JOIN file_inventory i ON i.root_path=r.root_path
+         GROUP BY r.root_path ORDER BY 3 DESC,r.root_path",
     )?;
     let rows = stmt
         .query_map([], |row| {
@@ -871,6 +1188,10 @@ fn get_root_summaries_on(conn: &Connection) -> SqliteResult<Vec<RootStat>> {
                 path: row.get(0)?,
                 files: row.get(1)?,
                 bytes: row.get(2)?,
+                status: row.get(3)?,
+                stale: row.get(4)?,
+                last_scan_at: row.get(5)?,
+                error: row.get(6)?,
             })
         })?
         .collect::<SqliteResult<Vec<_>>>()?;
@@ -973,26 +1294,17 @@ fn get_inventory_files_on(
     let cat = category.unwrap_or("");
     let root_path = root.unwrap_or("");
     let q = query.unwrap_or("").trim();
-    let sanitized: String = q
-        .chars()
-        .filter(|c| *c != '%' && *c != '_' && *c != '\\')
-        .collect();
-    let like = if sanitized.is_empty() {
-        String::new()
-    } else {
-        format!("%{}%", sanitized.to_lowercase())
-    };
     let sql = format!(
         "SELECT path, size, mtime, category, root_path FROM file_inventory
          WHERE (?1 = '' OR category = ?1)
            AND (?2 = '' OR root_path = ?2)
-           AND (?3 = '' OR LOWER(path) LIKE ?3)
+           AND (?3 = '' OR INSTR(LOWER(path),LOWER(?3)) > 0)
          ORDER BY {order}
          LIMIT ?4"
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt
-        .query_map(params![cat, root_path, like, limit], |row| {
+        .query_map(params![cat, root_path, q, limit.max(0)], |row| {
             Ok(InventoryFile {
                 path: row.get(0)?,
                 size: row.get(1)?,
@@ -1008,57 +1320,48 @@ fn get_inventory_files_on(
 // Public wrappers that use the global DB.
 
 pub fn replace_inventory_for_root(root: &str, rows: &[InventoryRow]) -> SqliteResult<()> {
-    let db = get_db();
-    let mut conn = db.lock().unwrap();
+    let mut conn = sqlite_lock()?;
     replace_inventory_on(&mut conn, root, rows)
 }
 
 pub fn append_inventory_batch(root: &str, rows: &[InventoryRow]) -> SqliteResult<()> {
-    let db = get_db();
-    let mut conn = db.lock().unwrap();
+    let mut conn = sqlite_lock()?;
     append_inventory_batch_on(&mut conn, root, rows)
 }
 
 pub fn clear_inventory_for_root(root: &str) -> SqliteResult<()> {
-    let db = get_db();
-    let conn = db.lock().unwrap();
+    let conn = sqlite_lock()?;
     conn.execute("DELETE FROM file_inventory WHERE root_path = ?1", params![root])
         .map(|_| ())
 }
 
 pub fn get_inventory_stats() -> SqliteResult<InventoryStats> {
-    let db = get_db();
-    let conn = db.lock().unwrap();
+    let conn = sqlite_lock()?;
     get_inventory_stats_on(&conn)
 }
 
 pub fn get_largest_files(limit: i64) -> SqliteResult<Vec<LargestFile>> {
-    let db = get_db();
-    let conn = db.lock().unwrap();
+    let conn = sqlite_lock()?;
     get_largest_files_on(&conn, limit)
 }
 
 pub fn get_category_distribution() -> SqliteResult<Vec<CategoryStat>> {
-    let db = get_db();
-    let conn = db.lock().unwrap();
+    let conn = sqlite_lock()?;
     get_category_distribution_on(&conn)
 }
 
 pub fn get_root_summaries() -> SqliteResult<Vec<RootStat>> {
-    let db = get_db();
-    let conn = db.lock().unwrap();
+    let conn = sqlite_lock()?;
     get_root_summaries_on(&conn)
 }
 
 pub fn get_dashboard_insights() -> SqliteResult<DashboardInsights> {
-    let db = get_db();
-    let conn = db.lock().unwrap();
+    let conn = sqlite_lock()?;
     get_insights_on(&conn, now_epoch())
 }
 
 pub fn get_age_buckets() -> SqliteResult<Vec<AgeBucket>> {
-    let db = get_db();
-    let conn = db.lock().unwrap();
+    let conn = sqlite_lock()?;
     get_age_buckets_on(&conn, now_epoch())
 }
 
@@ -1069,9 +1372,112 @@ pub fn get_inventory_files(
     query: Option<&str>,
     limit: i64,
 ) -> SqliteResult<Vec<InventoryFile>> {
-    let db = get_db();
-    let conn = db.lock().unwrap();
+    let conn = sqlite_lock()?;
     get_inventory_files_on(&conn, sort, category, root, query, limit)
+}
+
+pub fn get_dashboard_snapshot() -> SqliteResult<DashboardSnapshot> {
+    let mut conn = sqlite_lock()?;
+    let tx = conn.transaction()?;
+    // Legacy inventory left by a previously removed root is excluded without
+    // altering the user's stored evidence during an upgrade.
+    let (total_files,total_bytes): (i64,i64) = tx.query_row(
+        "SELECT COUNT(*),COALESCE(SUM(size),0) FROM file_inventory WHERE root_path IN (SELECT path FROM watched_folders)",
+        [],|r| Ok((r.get(0)?,r.get(1)?)),
+    )?;
+    let mut category_stmt = tx.prepare("SELECT category,COUNT(*),COALESCE(SUM(size),0) FROM file_inventory WHERE root_path IN (SELECT path FROM watched_folders) GROUP BY category ORDER BY 3 DESC")?;
+    let category_breakdown = category_stmt.query_map([],|r| Ok(CategoryStat{category:r.get(0)?,files:r.get(1)?,bytes:r.get(2)?}))?.collect::<SqliteResult<Vec<_>>>()?;
+    drop(category_stmt);
+    let mut roots_stmt=tx.prepare("SELECT w.path,COUNT(i.id),COALESCE(SUM(i.size),0),COALESCE(r.status,'unscanned'),COALESCE(r.stale,1),r.last_scan_at,r.error FROM watched_folders w LEFT JOIN inventory_roots r ON r.root_path=w.path LEFT JOIN file_inventory i ON i.root_path=w.path GROUP BY w.id ORDER BY 3 DESC,w.path")?;
+    let roots=roots_stmt.query_map([],|r|Ok(RootStat{path:r.get(0)?,files:r.get(1)?,bytes:r.get(2)?,status:r.get(3)?,stale:r.get(4)?,last_scan_at:r.get(5)?,error:r.get(6)?}))?.collect::<SqliteResult<Vec<_>>>()?;
+    drop(roots_stmt);
+    let last_scan_at = roots.iter().filter_map(|root|root.last_scan_at).max();
+    let largest_files=get_snapshot_files_on(&tx,"size")?;
+    let recent_files=get_snapshot_files_on(&tx,"mtime")?;
+    let now=now_epoch();
+    let mut insights = get_insights_on(&tx,now)?;
+    // Use the current-root relation for all snapshot aggregates.
+    let (large_files,large_bytes,stale_files,stale_bytes,other_files):(i64,i64,i64,i64,i64)=tx.query_row(
+        "SELECT COALESCE(SUM(size>=?1),0),COALESCE(SUM(CASE WHEN size>=?1 THEN size ELSE 0 END),0),
+         COALESCE(SUM(mtime>0 AND mtime<?2),0),COALESCE(SUM(CASE WHEN mtime>0 AND mtime<?2 THEN size ELSE 0 END),0),COALESCE(SUM(category='Other'),0)
+         FROM file_inventory WHERE root_path IN (SELECT path FROM watched_folders)",
+        params![LARGE_FILE_BYTES,now-STALE_FILE_DAYS*86_400],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)),
+    )?;
+    insights.large_files=large_files; insights.large_bytes=large_bytes; insights.stale_files=stale_files; insights.stale_bytes=stale_bytes; insights.other_files=other_files;
+    let (groups,extras):(i64,i64)=tx.query_row("SELECT COUNT(*),COALESCE(SUM((cnt-1)*size),0) FROM (SELECT size,COUNT(*) AS cnt FROM file_inventory WHERE size>?1 AND root_path IN (SELECT path FROM watched_folders) GROUP BY size HAVING COUNT(*)>1)",[SAME_SIZE_MIN_BYTES],|r|Ok((r.get(0)?,r.get(1)?)))?;
+    insights.same_size_groups=groups; insights.same_size_extra_bytes=extras;
+    let mut age_buckets:Vec<AgeBucket>=["7d","30d","90d","365d","older"].iter().map(|b|AgeBucket{bucket:b.to_string(),files:0,bytes:0}).collect();
+    let mut age_stmt=tx.prepare("SELECT CASE WHEN mtime>=?1 THEN 0 WHEN mtime>=?2 THEN 1 WHEN mtime>=?3 THEN 2 WHEN mtime>=?4 THEN 3 ELSE 4 END,COUNT(*),COALESCE(SUM(size),0) FROM file_inventory WHERE root_path IN (SELECT path FROM watched_folders) GROUP BY 1")?;
+    for row in age_stmt.query_map(params![now-7*86_400,now-30*86_400,now-90*86_400,now-365*86_400],|r|Ok((r.get::<_,usize>(0)?,r.get::<_,i64>(1)?,r.get::<_,i64>(2)?)))? {
+        let (index,files,bytes)=row?; age_buckets[index].files=files;age_buckets[index].bytes=bytes;
+    }
+    drop(age_stmt);
+    let revision=tx.query_row("SELECT revision FROM inventory_state WHERE id=1",[],|r|r.get(0))?;
+    let snapshot=DashboardSnapshot{total_files,total_bytes,category_breakdown,largest_files,recent_files,watched_roots:roots,last_scan_at,insights,age_buckets,revision};
+    tx.commit()?;
+    Ok(snapshot)
+}
+
+fn get_snapshot_files_on(conn:&Connection,sort:&str)->SqliteResult<Vec<InventoryFile>> {
+    let order=if sort=="mtime" {"mtime DESC,path ASC"} else {"size DESC,path ASC"};
+    let mut stmt=conn.prepare(&format!("SELECT path,size,mtime,category,root_path FROM file_inventory WHERE root_path IN (SELECT path FROM watched_folders) ORDER BY {order} LIMIT 50"))?;
+    let rows=stmt.query_map([],|r|Ok(InventoryFile{path:r.get(0)?,size:r.get(1)?,mtime:r.get(2)?,category:r.get(3)?,root_path:r.get(4)?}))?.collect::<SqliteResult<Vec<_>>>()?;
+    Ok(rows)
+}
+
+#[derive(Debug,Clone)]
+pub struct ScanToken { pub root: String, root_id:i64, generation:i64, revision:i64 }
+
+#[derive(Debug,Clone)]
+pub struct SnapshotInventoryRow { pub row:InventoryRow, pub identity:String, pub mtime_ns:String }
+
+pub fn begin_inventory_scan(root:&str)->Result<ScanToken,String> {
+    let mut conn=lock_db()?;
+    let tx=conn.transaction().map_err(|e|e.to_string())?;
+    let root_id=tx.query_row("SELECT id FROM watched_folders WHERE path=?1 AND enabled=1 AND mode<>'paused'",[root],|r|r.get(0)).map_err(|_|format!("Root is no longer active: {root}"))?;
+    tx.execute("INSERT INTO inventory_roots(root_path,generation,status,stale) VALUES(?1,1,'scanning',1) ON CONFLICT(root_path) DO UPDATE SET generation=generation+1,status='scanning',stale=1,error=NULL",[root]).map_err(|e|e.to_string())?;
+    tx.execute("DELETE FROM inventory_scan_stage WHERE root_path=?1",[root]).map_err(|e|e.to_string())?;
+    tx.execute("UPDATE inventory_state SET revision=revision+1 WHERE id=1",[]).map_err(|e|e.to_string())?;
+    let generation=tx.query_row("SELECT generation FROM inventory_roots WHERE root_path=?1",[root],|r|r.get(0)).map_err(|e|e.to_string())?;
+    let revision=tx.query_row("SELECT mutation_revision FROM inventory_state WHERE id=1",[],|r|r.get(0)).map_err(|e|e.to_string())?;
+    tx.commit().map_err(|e|e.to_string())?;
+    Ok(ScanToken{root:root.to_string(),root_id,generation,revision})
+}
+
+pub fn stage_inventory_batch(token:&ScanToken,rows:&[SnapshotInventoryRow])->Result<(),String> {
+    let mut conn=lock_db()?;
+    let tx=conn.transaction().map_err(|e|e.to_string())?;
+    for item in rows {
+        tx.execute("INSERT INTO inventory_scan_stage(root_path,generation,path,size,mtime,category,identity,mtime_ns) VALUES(?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(root_path,generation,path) DO UPDATE SET size=excluded.size,mtime=excluded.mtime,category=excluded.category,identity=excluded.identity,mtime_ns=excluded.mtime_ns",params![token.root,token.generation,item.row.path,item.row.size,item.row.mtime,item.row.category,item.identity,item.mtime_ns]).map_err(|e|e.to_string())?;
+    }
+    tx.commit().map_err(|e|e.to_string())
+}
+
+pub fn publish_inventory_scan(token:&ScanToken)->Result<(),String> {
+    let mut conn=lock_db()?;
+    let tx=conn.transaction().map_err(|e|e.to_string())?;
+    let current:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM watched_folders w JOIN inventory_roots r ON r.root_path=w.path WHERE w.id=?1 AND w.path=?2 AND w.enabled=1 AND w.mode<>'paused' AND r.generation=?3) AND (SELECT mutation_revision FROM inventory_state WHERE id=1)=?4",params![token.root_id,token.root,token.generation,token.revision],|r|r.get(0)).map_err(|e|e.to_string())?;
+    if !current {return Err("Inventory changed during scan; previous snapshot retained. Scan again.".into());}
+    let scanned_at=now_epoch();
+    tx.execute("DELETE FROM hash_cache WHERE path IN (SELECT path FROM file_inventory WHERE root_path=?1)",[&token.root]).map_err(|e|e.to_string())?;
+    tx.execute("DELETE FROM inventory_fingerprints WHERE path IN (SELECT path FROM file_inventory WHERE root_path=?1)",[&token.root]).map_err(|e|e.to_string())?;
+    tx.execute("DELETE FROM file_inventory WHERE root_path=?1 AND path NOT IN (SELECT path FROM inventory_scan_stage WHERE root_path=?1 AND generation=?2)",params![token.root,token.generation]).map_err(|e|e.to_string())?;
+    tx.execute("INSERT INTO file_inventory(root_path,path,size,mtime,category,scanned_at) SELECT s.root_path,s.path,s.size,s.mtime,COALESCE(o.category,s.category),?3 FROM inventory_scan_stage s LEFT JOIN category_overrides o ON o.path=s.path AND o.identity=s.identity AND o.size=s.size AND o.mtime_ns=s.mtime_ns WHERE s.root_path=?1 AND s.generation=?2 ON CONFLICT(path) DO UPDATE SET root_path=excluded.root_path,size=excluded.size,mtime=excluded.mtime,category=excluded.category,scanned_at=excluded.scanned_at",params![token.root,token.generation,scanned_at]).map_err(|e|e.to_string())?;
+    tx.execute("INSERT INTO inventory_fingerprints(path,identity,size,mtime_ns) SELECT path,identity,size,mtime_ns FROM inventory_scan_stage WHERE root_path=?1 AND generation=?2 ON CONFLICT(path) DO UPDATE SET identity=excluded.identity,size=excluded.size,mtime_ns=excluded.mtime_ns",params![token.root,token.generation]).map_err(|e|e.to_string())?;
+    tx.execute("UPDATE inventory_roots SET status='complete',stale=0,last_scan_at=?2,error=NULL WHERE root_path=?1",params![token.root,scanned_at]).map_err(|e|e.to_string())?;
+    tx.execute("DELETE FROM inventory_scan_stage WHERE root_path=?1 AND generation=?2",params![token.root,token.generation]).map_err(|e|e.to_string())?;
+    tx.execute("UPDATE inventory_state SET revision=revision+1 WHERE id=1",[]).map_err(|e|e.to_string())?;
+    // Publishing another root does not invalidate an in-progress scan; only
+    // user/file mutations advance this revision.
+    tx.commit().map_err(|e|e.to_string())
+}
+
+pub fn fail_inventory_scan(token:&ScanToken,error:&str)->Result<(),String> {
+    let mut conn=lock_db()?;let tx=conn.transaction().map_err(|e|e.to_string())?;
+    tx.execute("UPDATE inventory_roots SET status='failed',stale=1,error=?3 WHERE root_path=?1 AND generation=?2",params![token.root,token.generation,error]).map_err(|e|e.to_string())?;
+    tx.execute("DELETE FROM inventory_scan_stage WHERE root_path=?1 AND generation=?2",params![token.root,token.generation]).map_err(|e|e.to_string())?;
+    tx.execute("UPDATE inventory_state SET revision=revision+1 WHERE id=1",[]).map_err(|e|e.to_string())?;
+    tx.commit().map_err(|e|e.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -1079,8 +1485,7 @@ pub fn get_inventory_files(
 // ---------------------------------------------------------------------------
 
 pub fn get_cached_hash(path: &str, size: i64, mtime: i64) -> SqliteResult<Option<(String, bool)>> {
-    let db = get_db();
-    let conn = db.lock().unwrap();
+    let conn = sqlite_lock()?;
     let mut stmt = conn.prepare(
         "SELECT hash, is_full FROM hash_cache WHERE path = ?1 AND size = ?2 AND mtime = ?3",
     )?;
@@ -1095,8 +1500,7 @@ pub fn get_cached_hash(path: &str, size: i64, mtime: i64) -> SqliteResult<Option
 }
 
 pub fn set_cached_hash(path: &str, size: i64, mtime: i64, hash: &str, is_full: bool) -> SqliteResult<()> {
-    let db = get_db();
-    let conn = db.lock().unwrap();
+    let conn = sqlite_lock()?;
     conn.execute(
         "INSERT OR REPLACE INTO hash_cache (path, size, mtime, hash, is_full) VALUES (?1, ?2, ?3, ?4, ?5)",
         params![path, size, mtime, hash, is_full as i32],
@@ -1109,8 +1513,7 @@ pub fn set_cached_hash(path: &str, size: i64, mtime: i64, hash: &str, is_full: b
 // ---------------------------------------------------------------------------
 
 pub fn count_inventory_files() -> SqliteResult<i64> {
-    let db = get_db();
-    let conn = db.lock().unwrap();
+    let conn = sqlite_lock()?;
     conn.query_row("SELECT COUNT(*) FROM file_inventory", [], |row| row.get(0))
 }
 
@@ -1118,8 +1521,7 @@ pub fn count_inventory_files() -> SqliteResult<i64> {
 /// Groups are returned unsorted (caller may sort by size desc).
 pub type SizeGroup = (i64, Vec<(String, i64)>);
 pub fn get_inventory_size_groups() -> SqliteResult<Vec<SizeGroup>> {
-    let db = get_db();
-    let conn = db.lock().unwrap();
+    let conn = sqlite_lock()?;
     let mut stmt = conn.prepare(
         "SELECT size, path, mtime FROM file_inventory
          WHERE size IN (SELECT size FROM file_inventory GROUP BY size HAVING COUNT(*) > 1)
@@ -1142,8 +1544,7 @@ pub fn get_inventory_size_groups() -> SqliteResult<Vec<SizeGroup>> {
 }
 
 pub fn get_large_files_from_inventory(min_bytes: i64) -> SqliteResult<Vec<LargestFile>> {
-    let db = get_db();
-    let conn = db.lock().unwrap();
+    let conn = sqlite_lock()?;
     let mut stmt = conn.prepare(
         "SELECT path, size, mtime FROM file_inventory WHERE size >= ?1 ORDER BY size DESC",
     )?;
@@ -1160,8 +1561,7 @@ pub fn get_large_files_from_inventory(min_bytes: i64) -> SqliteResult<Vec<Larges
 }
 
 pub fn get_stale_files_from_inventory(cutoff_mtime: i64) -> SqliteResult<Vec<LargestFile>> {
-    let db = get_db();
-    let conn = db.lock().unwrap();
+    let conn = sqlite_lock()?;
     let mut stmt = conn.prepare(
         "SELECT path, size, mtime FROM file_inventory WHERE mtime < ?1 ORDER BY mtime ASC",
     )?;
@@ -1182,60 +1582,51 @@ pub fn get_stale_files_from_inventory(cutoff_mtime: i64) -> SqliteResult<Vec<Lar
 // ---------------------------------------------------------------------------
 
 pub fn dismiss_suggestion(path: &str) -> SqliteResult<()> {
-    let db = get_db();
-    let conn = db.lock().unwrap();
+    let conn = sqlite_lock()?;
     let now = now_epoch();
     conn.execute(
-        "INSERT OR IGNORE INTO dismissed_suggestions (path, dismissed_at) VALUES (?1, ?2)",
+        "INSERT INTO dismissed_suggestions(path,dismissed_at,identity,size,mtime_ns)
+         SELECT path,?2,identity,size,mtime_ns FROM inventory_fingerprints WHERE path=?1
+         ON CONFLICT(path) DO UPDATE SET dismissed_at=excluded.dismissed_at,identity=excluded.identity,size=excluded.size,mtime_ns=excluded.mtime_ns",
         params![path, now],
     )?;
     Ok(())
 }
 
 pub fn clear_dismissed_suggestion(path: &str) -> SqliteResult<()> {
-    let db = get_db();
-    let conn = db.lock().unwrap();
+    let conn = sqlite_lock()?;
     conn.execute("DELETE FROM dismissed_suggestions WHERE path = ?1", params![path])?;
     Ok(())
 }
 
 pub fn get_dismissed_suggestions() -> SqliteResult<std::collections::HashSet<String>> {
-    let db = get_db();
-    let conn = db.lock().unwrap();
-    let mut stmt = conn.prepare("SELECT path FROM dismissed_suggestions")?;
+    let conn = sqlite_lock()?;
+    let mut stmt = conn.prepare("SELECT d.path FROM dismissed_suggestions d JOIN inventory_fingerprints f ON f.path=d.path AND f.identity=d.identity AND f.size=d.size AND f.mtime_ns=d.mtime_ns")?;
     let rows = stmt
         .query_map([], |row| row.get::<_, String>(0))?
         .collect::<SqliteResult<Vec<_>>>()?;
     Ok(rows.into_iter().collect())
 }
 
-pub fn get_unclassified_files(limit: i64) -> SqliteResult<Vec<InventoryRow>> {
-    let db = get_db();
-    let conn = db.lock().unwrap();
-    let mut stmt = conn.prepare(
-        "SELECT path, size, mtime, category FROM file_inventory WHERE category = 'Other' ORDER BY size DESC LIMIT ?1",
-    )?;
-    let rows = stmt
-        .query_map(params![limit], |row| {
-            Ok(InventoryRow {
-                path: row.get(0)?,
-                size: row.get(1)?,
-                mtime: row.get(2)?,
-                category: row.get(3)?,
-            })
-        })?
-        .collect::<SqliteResult<Vec<_>>>()?;
-    Ok(rows)
+pub fn reset_dismissed_suggestions()->SqliteResult<()> {
+    sqlite_lock()?.execute("DELETE FROM dismissed_suggestions",[])?;Ok(())
 }
 
-pub fn update_inventory_category(path: &str, category: &str) -> SqliteResult<()> {
-    let db = get_db();
-    let conn = db.lock().unwrap();
-    conn.execute(
-        "UPDATE file_inventory SET category = ?1 WHERE path = ?2",
-        params![category, path],
-    )?;
-    Ok(())
+pub fn get_suggestion_candidates_page(limit:i64,after:Option<&str>)->Result<Vec<InventoryFile>,String> {
+    let conn=lock_db()?;
+    let mut stmt=conn.prepare("SELECT i.path,i.size,i.mtime,i.category,i.root_path FROM file_inventory i JOIN watched_folders w ON w.path=i.root_path AND w.enabled=1 AND w.mode<>'paused' JOIN inventory_fingerprints f ON f.path=i.path WHERE i.category='Other' AND (?1 IS NULL OR i.path>?1) AND NOT EXISTS(SELECT 1 FROM dismissed_suggestions d WHERE d.path=i.path AND d.identity=f.identity AND d.size=f.size AND d.mtime_ns=f.mtime_ns) ORDER BY i.path LIMIT ?2").map_err(|e|e.to_string())?;
+    let rows=stmt.query_map(params![after,limit.max(0)],|r|Ok(InventoryFile{path:r.get(0)?,size:r.get(1)?,mtime:r.get(2)?,category:r.get(3)?,root_path:r.get(4)?})).map_err(|e|e.to_string())?.collect::<SqliteResult<Vec<_>>>().map_err(|e|e.to_string())?;Ok(rows)
+}
+
+pub fn record_suggestion_feedback(path:&str,category:&str,action_log_id:Option<i64>)->Result<(),String> {
+    if !crate::categories::is_valid_category(category) {return Err("Invalid canonical category".into());}
+    let prepared=prepare_move(path)?;
+    let name=std::path::Path::new(path).file_name().unwrap_or_default().to_string_lossy().into_owned();
+    let mut conn=lock_db()?;let tx=conn.transaction().map_err(|e|e.to_string())?;
+    reconcile_move_on(&tx,path,&prepared,Some(category)).map_err(|e|e.to_string())?;
+    // No-op explicit acceptances are feedback without fabricated move history.
+    tx.execute("INSERT INTO accepted_suggestion_feedback(action_log_id,file_name,category) VALUES(?1,?2,?3)",params![action_log_id.unwrap_or(0),name,category]).map_err(|e|e.to_string())?;
+    tx.commit().map_err(|e|e.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -1523,5 +1914,108 @@ mod tests {
         let root = get_inventory_files_on(&conn, "size", None, Some("/pics"), None, 10).unwrap();
         assert_eq!(root.len(), 1);
         assert_eq!(root[0].root_path, "/pics");
+    }
+
+    #[test]
+    fn preference_patch_preserves_concurrent_schedule_and_returns_revision() {
+        let conn=mem_conn_with_inventory();
+        let first=get_settings_on(&conn).unwrap();assert!(!first.autostart);assert!(!first.local_ai_enabled);assert_eq!(first.local_ai_model,"llama3.2");
+        let schedule=ScheduleSettings{schedule_enabled:true,schedule_times_per_day:1,schedule_time_1:Some("10:30".into()),schedule_time_2:None,schedule_time_3:None,schedule_time_4:None};
+        let scheduled=update_schedule_settings_on(&conn,&schedule).unwrap();
+        let committed=update_preferences_on(&conn,&PreferencesPatch{theme:Some("dark".into()),..Default::default()}).unwrap();
+        assert_eq!(committed.theme,"dark");assert!(committed.schedule_enabled);assert_eq!(committed.schedule_time_1.as_deref(),Some("10:30"));assert_eq!(committed.revision,scheduled.revision+1);
+        let after=update_schedule_settings_on(&conn,&ScheduleSettings{schedule_enabled:false,..schedule}).unwrap();assert_eq!(after.theme,"dark");assert_eq!(after.revision,committed.revision+1);
+    }
+
+    #[test]
+    fn additive_upgrade_preserves_existing_preferences_and_automation_choice() {
+        let conn=Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE settings(id INTEGER PRIMARY KEY,language TEXT NOT NULL,theme TEXT NOT NULL,telemetry_enabled INTEGER NOT NULL,first_run INTEGER NOT NULL,autostart INTEGER NOT NULL);INSERT INTO settings VALUES(42,'hy','light',1,0,1);").unwrap();
+        initialize_schema(&conn).unwrap();let settings=get_settings_on(&conn).unwrap();
+        assert_eq!(settings.id,Some(42));assert_eq!(settings.language,"hy");assert_eq!(settings.theme,"light");assert!(settings.autostart);assert!(settings.telemetry_enabled);assert!(!settings.first_run);assert!(!settings.local_ai_enabled);
+        initialize_schema(&conn).unwrap();assert_eq!(get_settings_on(&conn).unwrap().id,Some(42));
+    }
+
+    #[test]
+    fn literal_search_keeps_percent_underscore_and_windows_separator() {
+        let mut conn=mem_conn_with_inventory();
+        let paths=[r"C:\docs\100%_ready.txt",r"C:\docs\100Xready.txt",r"C:\other\100%_ready.txt"];
+        let rows:Vec<_>=paths.iter().map(|path|InventoryRow{path:path.to_string(),size:1,mtime:1,category:"Other".into()}).collect();
+        replace_inventory_on(&mut conn,"root",&rows).unwrap();
+        let result=get_inventory_files_on(&conn,"size",None,None,Some(r"\docs\100%_"),10).unwrap();assert_eq!(result.len(),1);assert_eq!(result[0].path,paths[0]);
+    }
+
+    #[test]
+    fn replacement_failure_rolls_back_rows_and_preserves_ids() {
+        let mut conn=mem_conn_with_inventory();let row=InventoryRow{path:"/root/old".into(),size:3,mtime:1,category:"Other".into()};
+        replace_inventory_on(&mut conn,"/root",std::slice::from_ref(&row)).unwrap();
+        let id:i64=conn.query_row("SELECT id FROM file_inventory WHERE path='/root/old'",[],|r|r.get(0)).unwrap();
+        replace_inventory_on(&mut conn,"/root",std::slice::from_ref(&row)).unwrap();assert_eq!(conn.query_row::<i64,_,_>("SELECT id FROM file_inventory WHERE path='/root/old'",[],|r|r.get(0)).unwrap(),id);
+        conn.execute_batch("CREATE TRIGGER fail_inventory_insert BEFORE INSERT ON file_inventory WHEN NEW.path='/root/fail' BEGIN SELECT RAISE(ABORT,'injected failure');END;").unwrap();
+        assert!(replace_inventory_on(&mut conn,"/root",&[InventoryRow{path:"/root/fail".into(),..row}]).is_err());assert_eq!(get_inventory_stats_on(&conn).unwrap().total_files,1);assert_eq!(conn.query_row::<i64,_,_>("SELECT id FROM file_inventory WHERE path='/root/old'",[],|r|r.get(0)).unwrap(),id);
+    }
+
+    #[test]
+    fn replacing_rules_is_one_transaction_on_insert_failure() {
+        let mut conn=mem_conn_with_inventory();insert_default_rules_on(&conn).unwrap();
+        let before:i64=conn.query_row("SELECT COUNT(*) FROM rules",[],|r|r.get(0)).unwrap();
+        let first_id:i64=conn.query_row("SELECT MIN(id) FROM rules",[],|r|r.get(0)).unwrap();
+        conn.execute_batch("CREATE TRIGGER fail_rule_insert BEFORE INSERT ON rules WHEN NEW.name='fail' BEGIN SELECT RAISE(ABORT,'injected failure');END;").unwrap();
+        let rule=Rule{id:None,name:"fail".into(),priority:0,enabled:true,extensions:vec!["txt".into()],pattern:None,destination:"Documents".into(),action:"move".into(),folder_id:0};
+        assert!(import_rules_atomic_on(&mut conn,&[rule],true).is_err());assert_eq!(conn.query_row::<i64,_,_>("SELECT COUNT(*) FROM rules",[],|r|r.get(0)).unwrap(),before);assert_eq!(conn.query_row::<i64,_,_>("SELECT MIN(id) FROM rules",[],|r|r.get(0)).unwrap(),first_id);
+    }
+
+    #[test]
+    fn existing_root_returns_its_id_after_another_insert() {
+        let _guard=serialise_test_db();init_test_db();
+        let first=add_watched_folder("/db-id-test-a",FOLDER_MODE_MANUAL).unwrap();let second=add_watched_folder("/db-id-test-b",FOLDER_MODE_MANUAL).unwrap();
+        struct Roots(i64,i64);impl Drop for Roots{fn drop(&mut self){let _=remove_watched_folder(self.0);let _=remove_watched_folder(self.1);}}
+        let _roots=Roots(first,second);assert_ne!(first,second);assert_eq!(add_watched_folder("/db-id-test-a",FOLDER_MODE_MANUAL).unwrap(),first);
+    }
+
+    #[test]
+    fn week_cutoff_uses_timestamp_instant_and_history_count_uses_all_rows() {
+        let _guard=serialise_test_db();init_test_db();
+        let before=history_counts().unwrap();let now=Utc::now();
+        let log=|age:chrono::Duration|ActionLog{id:None,timestamp:now-age,source_path:"/week-test".into(),destination_path:Some("/dest".into()),action:"move".into(),file_name:"week-test".into(),file_type:"week-test-category".into(),undone:false};
+        let recent=log_action(&log(chrono::Duration::days(6)+chrono::Duration::hours(23))).unwrap();let old=log_action(&log(chrono::Duration::days(7)+chrono::Duration::hours(1))).unwrap();
+        let _recent=LogRow{id:recent,table:"action_logs",remove:remove_action_log};let _old=LogRow{id:old,table:"action_logs",remove:remove_action_log};
+        let stats=get_weekly_stats().unwrap();assert_eq!(stats.iter().find(|(category,_)|category=="week-test-category").unwrap().1,1);
+        let counts=history_counts().unwrap();assert_eq!(counts.total,before.total+2);assert_eq!(counts.undoable,before.undoable+2);
+    }
+
+    #[test]
+    fn candidate_page_filters_dismissed_and_paused_before_limit() {
+        let _guard=serialise_test_db();init_test_db();
+        let active=add_watched_folder("/candidate-active",FOLDER_MODE_MANUAL).unwrap();let paused=add_watched_folder("/candidate-paused",FOLDER_MODE_PAUSED).unwrap();
+        struct Roots(i64,i64);impl Drop for Roots{fn drop(&mut self){let _=remove_watched_folder(self.0);let _=remove_watched_folder(self.1);}}
+        let _roots=Roots(active,paused);
+        {
+            let conn=lock_db().unwrap();
+            for (path,root) in [("/candidate-active/000","/candidate-active"),("/candidate-active/001","/candidate-active"),("/candidate-paused/000","/candidate-paused")] {
+                conn.execute("INSERT INTO file_inventory(root_path,path,size,mtime,category) VALUES(?1,?2,1,1,'Other')",params![root,path]).unwrap();
+                conn.execute("INSERT INTO inventory_fingerprints(path,identity,size,mtime_ns) VALUES(?1,?2,1,'100')",params![path,path]).unwrap();
+            }
+        }
+        dismiss_suggestion("/candidate-active/000").unwrap();
+        let page=get_suggestion_candidates_page(1,Some("/candidate-active/")).unwrap();assert_eq!(page.len(),1);assert_eq!(page[0].path,"/candidate-active/001");
+        // Replacing the file under the same name invalidates the dismissal.
+        lock_db().unwrap().execute("UPDATE inventory_fingerprints SET identity='replacement' WHERE path='/candidate-active/000'",[]).unwrap();
+        let page=get_suggestion_candidates_page(1,Some("/candidate-active/")).unwrap();assert_eq!(page[0].path,"/candidate-active/000");
+    }
+
+    #[test]
+    fn cleanup_intent_exists_before_outcome_and_reconciles_only_on_removal() {
+        let _guard=serialise_test_db();init_test_db();let root=add_watched_folder("/journal-test",FOLDER_MODE_MANUAL).unwrap();
+        struct Root(i64);impl Drop for Root{fn drop(&mut self){let _=remove_watched_folder(self.0);}}
+        let _root=Root(root);let path="/journal-test/file";
+        lock_db().unwrap().execute("INSERT INTO file_inventory(root_path,path,size,mtime,category) VALUES('/journal-test',?1,1,1,'Other')",[path]).unwrap();
+        let intent=begin_cleanup_intent("trash_large",path).unwrap();
+        let cleanup_id:i64=lock_db().unwrap().query_row("SELECT cleanup_id FROM operation_intents WHERE id=?1 AND status='pending'",[intent],|r|r.get(0)).unwrap();
+        finalize_cleanup_intent(intent,"failed",Some("kept source"),false).unwrap();assert_eq!(get_inventory_files("size",None,Some("/journal-test"),None,10).unwrap().len(),1);
+        let next=begin_cleanup_intent("trash_large",path).unwrap();let next_cleanup:i64=lock_db().unwrap().query_row("SELECT cleanup_id FROM operation_intents WHERE id=?1",[next],|r|r.get(0)).unwrap();
+        finalize_cleanup_intent(next,"deleted",Some("removed"),true).unwrap();assert!(get_inventory_files("size",None,Some("/journal-test"),None,10).unwrap().is_empty());
+        let logs=get_cleanup_logs(100).unwrap();assert_eq!(logs.iter().find(|log|log.id==Some(cleanup_id)).unwrap().message.as_deref(),Some("kept source"));
+        lock_db().unwrap().execute("DELETE FROM operation_intents WHERE id IN (?1,?2)",params![intent,next]).unwrap();remove_cleanup_log(cleanup_id).unwrap();remove_cleanup_log(next_cleanup).unwrap();
     }
 }

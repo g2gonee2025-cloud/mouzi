@@ -1,7 +1,7 @@
 import { useMemo } from "react";
 import { useTranslation } from "react-i18next";
 import { formatBytes } from "../../utils/format";
-import { categoryClass, percentOf } from "../../utils/dashboard";
+import { categoryClass, categoryLabel, percentOf } from "../../utils/dashboard";
 
 interface CategoryBarsProps {
   data: Array<{ category: string; files: number; bytes: number }>;
@@ -57,7 +57,7 @@ export default function CategoryBars({
                     className={`inline-block w-2 h-2 rounded-sm ${categoryClass(item.category)}`}
                     aria-hidden="true"
                   />
-                  <span className="text-text font-medium">{item.category}</span>
+                  <span className="text-text font-medium">{categoryLabel(item.category, t)}</span>
                 </div>
                 <span className="text-text-muted tabular-nums">
                   {item.files.toLocaleString()} {t("dashboard.filesLabel")} · {formatBytes(item.bytes)}

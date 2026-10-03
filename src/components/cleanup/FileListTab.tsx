@@ -44,10 +44,6 @@ export default function FileListTab({
     () => (data ?? []).filter((f) => checked.has(f.path)),
     [data, checked],
   );
-  const checkedBytes = useMemo(
-    () => checkedFiles.reduce((sum, f) => sum + f.size, 0),
-    [checkedFiles],
-  );
 
   const handleFind = () => {
     if (kind === "large") {
@@ -78,25 +74,24 @@ export default function FileListTab({
     }
   }, [data, checked]);
 
-  const runCleanup = async () => {
-    const actions: CleanupRequest[] = Array.from(checked).map((path) => ({
+  const handleConfirm = async () => {
+    if (checkedFiles.length === 0) return;
+    const actions: CleanupRequest[] = checkedFiles.map(({ path }) => ({
       kind: kind === "large" ? "trash_large" : "trash_stale",
       path,
+      ...(kind === "large" ? { minBytes: threshold * 1_048_576 } : { days: threshold }),
     }));
-    await store.executeCleanup(actions);
-    setShowResults(true);
-  };
-
-  const handleConfirm = () => {
-    if (checked.size === 0) return;
+    try {
+    const plan = await store.prepareCleanup(actions);
     setPending({
       title: t(operationKey),
-      count: checkedFiles.length,
-      bytes: checkedBytes,
+      count: plan.actions.length,
+      bytes: plan.totalBytes,
       notice: "trash",
-      preview: checkedFiles.map((f) => f.path),
-      onConfirm: runCleanup,
+      preview: plan.actions.map((f) => f.path),
+      onConfirm: async () => { await store.executeCleanup(plan.planId); setShowResults(true); },
     });
+    } catch { /* The store displays the preparation error. */ }
   };
 
   const handleResultsDone = () => {
@@ -108,8 +103,8 @@ export default function FileListTab({
   const handleOpen = async (path: string) => {
     try {
       await invoke("open_folder_cmd", { path });
-    } catch {
-      // ignore
+    } catch (error) {
+      useCleanupStore.setState({ error: String(error) });
     }
   };
 
@@ -148,8 +143,8 @@ export default function FileListTab({
           />
           <button
             onClick={handleFind}
-            disabled={store.loading}
-            className="flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-white hover:bg-primary-hover disabled:opacity-50 transition-colors"
+          disabled={store.loading || store.busy || !!store.preparedPlan}
+            className="flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-on-primary hover:bg-primary-hover disabled:opacity-50 transition-colors"
           >
             <Search size={14} />
             {store.loading ? t("app.loading") : findLabel}
@@ -237,7 +232,7 @@ export default function FileListTab({
       )}
 
       {pending && (
-        <ConfirmDialog {...pending} onClose={() => setPending(null)} />
+        <ConfirmDialog {...pending} onClose={() => { store.cancelPlan(); setPending(null); }} />
       )}
     </div>
   );

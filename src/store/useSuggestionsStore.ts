@@ -9,12 +9,33 @@ export interface Suggestion {
   source: "heuristic" | "ollama" | "learned";
   currentCategory: string;
 }
-
 export interface AcceptOutcome {
   path: string;
-  status: "ok" | "missing" | "failed";
+  status: "ok" | "missing" | "failed" | "partial";
   message: string | null;
   dest: string | null;
+}
+export interface SuggestionRulePreview {
+  extension: string | null;
+  destination: string;
+  scope: string;
+  priority: number;
+  disposition: "create" | "already_covered" | "conflict" | "not_applicable";
+  message: string | null;
+}
+export interface SuggestionPlan {
+  planId: string;
+  path: string;
+  category: string;
+  destination: string;
+  rule: SuggestionRulePreview | null;
+}
+export function distinctSuggestionRules(plans: readonly SuggestionPlan[]): SuggestionRulePreview[] {
+  const distinct = new Map<string, SuggestionRulePreview>();
+  for (const { rule } of plans) {
+    if (rule) distinct.set(JSON.stringify([rule.extension, rule.destination, rule.scope, rule.priority, rule.disposition]), rule);
+  }
+  return [...distinct.values()];
 }
 
 interface SuggestionsState {
@@ -23,110 +44,114 @@ interface SuggestionsState {
   busy: boolean;
   error: string | null;
   createRuleDefault: boolean;
+  preparedPlans: readonly SuggestionPlan[] | null;
   results: AcceptOutcome[] | null;
-
   loadSuggestions: () => Promise<void>;
-  applyAccept: (s: Suggestion, createRule: boolean) => Promise<void>;
-  acceptSuggestion: (s: Suggestion, createRule: boolean) => Promise<void>;
+  prepareSuggestions: (suggestions: readonly Suggestion[], createRule: boolean) => Promise<readonly SuggestionPlan[]>;
+  cancelPlans: () => void;
+  acceptAll: (plans: readonly SuggestionPlan[]) => Promise<void>;
   dismissSuggestion: (path: string) => Promise<void>;
-  acceptAll: (createRule: boolean) => Promise<void>;
   dismissAll: () => Promise<void>;
+  resetDismissed: () => Promise<void>;
   clearResults: () => void;
   clearError: () => void;
 }
 
+let loadGeneration = 0;
 export const useSuggestionsStore = create<SuggestionsState>((set, get) => ({
-  suggestions: [],
-  loading: false,
-  busy: false,
-  error: null,
-  createRuleDefault: true,
-  results: null,
-
+  suggestions: [], loading: false, busy: false, error: null,
+  createRuleDefault: false, preparedPlans: null, results: null,
   loadSuggestions: async () => {
-    set({ loading: true, error: null, results: null });
+    if (get().busy || get().preparedPlans) return;
+    const generation = ++loadGeneration;
+    set({ loading: true, error: null });
     try {
-      const suggestions = await invoke<Suggestion[]>("get_suggestions_cmd", {
-        limit: 100,
-      });
-      set({ suggestions, loading: false });
-    } catch (e) {
-      set({ error: String(e), loading: false });
+      const suggestions = await invoke<Suggestion[]>("get_suggestions_cmd", { limit: 100 });
+      if (generation === loadGeneration) set({ suggestions, loading: false });
+    } catch (error) {
+      if (generation === loadGeneration) set({ error: String(error), loading: false });
     }
   },
-
-  // Internal: apply a single accept without touching busy flag.
-  // acceptSuggestion and acceptAll both call this.
-  applyAccept: async (s: Suggestion, createRule: boolean) => {
-    const outcome = await invoke<AcceptOutcome>("accept_suggestion_cmd", {
-      path: s.path,
-      suggestedCategory: s.suggestedCategory,
-      createRule,
-    });
-    set((state) => ({
-      suggestions: state.suggestions.filter((x) => x.path !== s.path),
-      results: (state.results ?? []).concat([outcome]),
-    }));
-  },
-
-  acceptSuggestion: async (s: Suggestion, createRule: boolean) => {
-    set({ busy: true, error: null });
+  prepareSuggestions: async (suggestions, createRule) => {
+    if (!suggestions.length || get().busy || get().preparedPlans) throw new Error("Another suggestion is being reviewed or processed");
+    ++loadGeneration;
+    const captured = suggestions.map((s) => ({ ...s }));
+    set({ busy: true, loading: false, error: null });
     try {
-      await get().applyAccept(s, createRule);
-    } catch (e) {
-      set({ error: String(e) });
-    } finally {
-      set({ busy: false });
-    }
+      const plans: SuggestionPlan[] = [];
+      for (const s of captured) {
+        const plan = await invoke<SuggestionPlan>("prepare_suggestion_cmd", { path: s.path, suggestedCategory: s.suggestedCategory, createRule });
+        plans.push(Object.freeze({ ...plan, rule: plan.rule ? Object.freeze({ ...plan.rule }) : null }));
+      }
+      const plannedExtensions = new Map<string, string>();
+      for (const { rule } of plans) {
+        if (rule?.disposition !== "create" || !rule.extension) continue;
+        const previous = plannedExtensions.get(rule.extension);
+        if (previous && previous !== rule.destination) throw new Error(`Conflicting future rules for .${rule.extension}; accept without creating rules or review files individually`);
+        plannedExtensions.set(rule.extension, rule.destination);
+      }
+      const frozen = Object.freeze(plans);
+      set({ preparedPlans: frozen });
+      return frozen;
+    } catch (error) {
+      set({ error: String(error) });
+      throw error;
+    } finally { set({ busy: false }); }
   },
-
-  dismissSuggestion: async (path: string) => {
-    set({ busy: true, error: null });
+  cancelPlans: () => set({ preparedPlans: null }),
+  acceptAll: async (plans) => {
+    if (get().busy || get().preparedPlans !== plans) throw new Error("Suggestion preview changed; review again");
+    ++loadGeneration;
+    set({ busy: true, loading: false, preparedPlans: null, error: null });
+    const errors: string[] = [];
+    try {
+      for (const plan of plans) {
+        let outcome: AcceptOutcome;
+        try { outcome = await invoke<AcceptOutcome>("accept_suggestion_cmd", { planId: plan.planId }); }
+        catch (error) { outcome = { path: plan.path, status: "failed", message: String(error), dest: null }; }
+        if (outcome.status === "failed" || outcome.status === "partial") errors.push(outcome.message ?? outcome.status);
+        const finished = outcome.status === "ok" || outcome.status === "missing" || (outcome.status === "partial" && outcome.dest !== null);
+        set((state) => ({
+          suggestions: finished ? state.suggestions.filter((s) => s.path !== plan.path) : state.suggestions,
+          results: (state.results ?? []).concat(outcome),
+        }));
+      }
+    } finally { set({ busy: false, error: errors.length ? errors.join("\n") : null }); }
+  },
+  dismissSuggestion: async (path) => {
+    if (get().busy || get().preparedPlans) return;
+    ++loadGeneration;
+    set({ busy: true, loading: false, error: null });
     try {
       await invoke("dismiss_suggestion_cmd", { path });
-      set((state) => ({
-        suggestions: state.suggestions.filter((x) => x.path !== path),
-      }));
-    } catch (e) {
-      set({ error: String(e) });
-    } finally {
-      set({ busy: false });
-    }
+      set((state) => ({ suggestions: state.suggestions.filter((s) => s.path !== path) }));
+    } catch (error) { set({ error: String(error) }); }
+    finally { set({ busy: false }); }
   },
-
-  acceptAll: async (createRule: boolean) => {
-    const { suggestions } = get();
-    if (suggestions.length === 0) return;
-    set({ busy: true, error: null });
-    for (const s of suggestions) {
-      try {
-        await get().applyAccept(s, createRule);
-      } catch (e) {
-        set({ error: String(e) });
-        break;
-      }
-    }
-    set({ busy: false });
-  },
-
   dismissAll: async () => {
-    const { suggestions } = get();
-    if (suggestions.length === 0) return;
-    set({ busy: true });
-    for (const s of suggestions) {
-      try {
-        await invoke("dismiss_suggestion_cmd", { path: s.path });
-        set((state) => ({
-          suggestions: state.suggestions.filter((x) => x.path !== s.path),
-        }));
-      } catch (e) {
-        set({ error: String(e) });
-        break;
+    if (get().busy || get().preparedPlans) return;
+    const captured = get().suggestions.map((s) => s.path);
+    ++loadGeneration;
+    set({ busy: true, loading: false, error: null });
+    try {
+      for (const path of captured) {
+        await invoke("dismiss_suggestion_cmd", { path });
+        set((state) => ({ suggestions: state.suggestions.filter((s) => s.path !== path) }));
       }
-    }
-    set({ busy: false });
+    } catch (error) { set({ error: String(error) }); }
+    finally { set({ busy: false }); }
   },
-
+  resetDismissed: async () => {
+    if (get().busy || get().preparedPlans) return;
+    ++loadGeneration;
+    set({ busy: true, loading: false, error: null });
+    try {
+      await invoke("reset_dismissed_suggestions_cmd");
+      set({ busy: false });
+      await get().loadSuggestions();
+    } catch (error) { set({ error: String(error) }); }
+    finally { set({ busy: false }); }
+  },
   clearResults: () => set({ results: null }),
   clearError: () => set({ error: null }),
 }));

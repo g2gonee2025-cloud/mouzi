@@ -42,7 +42,8 @@
       "importingShort": "Importiert...",
       "importSuccess": "{{extracted}} Datei(en) extrahiert und {{count}} Datei(en) organisiert.",
       "importError": "Archiv konnte nicht importiert werden: {{error}}",
-      "openImportFolder": "Importordner öffnen"
+      "openImportFolder": "Importordner öffnen",
+      "progress": "{{files}} Dateien entpackt · {{bytes}}"
     },
     "rules": {
       "title": "Regeln",
@@ -71,7 +72,8 @@
       "undone": "Rückgängig gemacht",
       "empty": "Kein Verlauf",
       "revertAll": "Alle rückgängig machen",
-      "revertAllDisabled": "Keine Aktionen zum Rückgängigmachen"
+      "revertAllDisabled": "Keine Aktionen zum Rückgängigmachen",
+      "showing": "{{shown}} von {{total}} Verlaufseinträgen angezeigt"
     },
     "general": {
       "title": "Allgemein",
@@ -90,7 +92,11 @@
       "gracePeriodMinutes": "Minuten",
       "gracePeriodHours": "Stunden",
       "gracePeriodCustom": "Benutzerdefiniert",
-      "gracePeriodMaxError": "Grace-Zeitraum darf 7 Tage nicht überschreiten"
+      "gracePeriodMaxError": "Grace-Zeitraum darf 7 Tage nicht überschreiten",
+      "localAi": "Lokale KI-Vorschläge aktivieren",
+      "localAiModel": "Ollama-Modell",
+      "localAiPrivacy": "Standardmäßig deaktiviert. Wenn aktiviert, werden Dateinamen an Ollama auf diesem Computer gesendet. Dateiinhalte werden nicht gesendet.",
+      "gracePeriodUnit": "Zeiteinheit"
     },
     "ignore": {
       "title": "Ignorieren",
@@ -105,13 +111,17 @@
       "tips": "Tipps:",
       "save": ".mouziignore speichern",
       "saved": "Gespeichert!",
-      "remove": "Entfernen"
+      "remove": "Entfernen",
+      "extensionTip": "alle .tmp-Dateien ignorieren",
+      "folderTip": "den Ordner ignorieren",
+      "officeTip": "temporäre Office-Dateien ignorieren",
+      "exactTip": "genau diesen Dateinamen ignorieren"
     },
     "about": {
       "title": "Über",
       "tagline": "Deine Downloads, im Griff.",
-      "description": "Mouzi ist ein stiller, eleganter Datei-Organizer, der in deinem System-Tray lebt und deinen Downloads-Ordner (und jeden anderen Ordner) automatisch ordentlich hält. Er arbeitet leise im Hintergrund, überwacht ausgewählte Ordner und verschiebt, benennt um oder sortiert Dateien nach anpassbaren Regeln.",
-      "checkUpdates": "Nach Updates suchen",
+      "description": "Mouzi ordnet Dateien in den ausgewählten Ordnern anhand von Regeln. Es verschiebt Dateien und speichert einen Verlauf zum Rückgängigmachen.",
+      "checkUpdates": "Downloads des ursprünglichen Projekts",
       "support": "Mouzi auf Ko-fi unterstützen",
       "supportDesc": "Deine Unterstützung hilft, Mouzi weiter zu verbessern. Danke! 🙏",
       "versionLabel": "Version",
@@ -135,13 +145,20 @@
   },
   "common": {
     "cancel": "Abbrechen",
-    "off": "AUS"
+    "off": "AUS",
+    "retry": "Erneut versuchen",
+    "save": "Speichern",
+    "saving": "Speichern…",
+    "loading": "Laden…",
+    "dismiss": "Schließen",
+    "close": "Schließen",
+    "back": "Zurück"
   },
   "dashboard": {
     "title": "Dashboard",
     "totalFiles": "Dateien insgesamt",
     "totalBytes": "Gesamtgröße",
-    "watchedRoots": "Überwachte Ordner",
+    "watchedRoots": "Konfigurierte Ordner",
     "lastScan": "Letzter Scan",
     "neverScanned": "Nie",
     "scanNow": "Jetzt scannen",
@@ -169,11 +186,11 @@
     "largeFiles": "Große Dateien",
     "staleFiles": "Alte Dateien",
     "possibleDuplicates": "Mögliche Duplikate",
-    "uncategorized": "Unkategorisiert",
+    "uncategorized": "Sonstige Dateien",
     "largeHint": "über 100 MB",
     "staleHint": "1 Jahr unberührt",
     "duplicatesHint": "gleiche Größe",
-    "uncategorizedHint": "keine passende Regel",
+    "uncategorizedHint": "Dateiendung hat keine zugewiesene Kategorie",
     "insightClear": "Sieht aufgeräumt aus",
     "open": "Öffnen",
     "openSuggestions": "Vorschläge",
@@ -186,7 +203,13 @@
     "ageOlder": "Älter",
     "filterBy": "{{name}}",
     "scanRoots": "{{done}} / {{total}} Ordner",
-    "noFiles": "Keine passenden Dateien"
+    "noFiles": "Keine passenden Dateien",
+    "loadingFiles": "Dateien werden geladen…",
+    "rootPending": "Nicht gescannt",
+    "rootStale": "Vorheriger Scan ist veraltet",
+    "rootFailed": "Scan fehlgeschlagen",
+    "rootLastScan": "Letzter Scan: {{date}}",
+    "scanFailed": "Der Scan wurde nicht erfolgreich abgeschlossen."
   },
   "cleanup": {
     "title": "Intelligente Bereinigung",
@@ -230,7 +253,11 @@
     "historyEmptyDirs": "Das Entfernen leerer Ordner kann nicht rückgängig gemacht werden.",
     "refresh": "Aktualisieren",
     "openFolder": "Ordner öffnen",
-    "scanFirstHint": "Führe zuerst einen Scan durch"
+    "scanFirstHint": "Führe zuerst einen Scan durch",
+    "historyLoading": "Bereinigungsverlauf wird geladen…",
+    "historyError": "Bereinigungsverlauf konnte nicht geladen werden.",
+    "notSearched": "Starte eine Suche, um Kandidaten zu prüfen.",
+    "historyUnknown": "Unbekanntes Ergebnis"
   },
   "suggestions": {
     "title": "Vorschläge",
@@ -254,7 +281,21 @@
     "failed": "Fehlgeschlagen",
     "missing": "Datei existiert nicht mehr",
     "resultsTitle": "Ergebnisse",
-    "backToList": "Zurück zur Liste"
+    "backToList": "Zurück zur Liste",
+    "resetDismissed": "Ausgeblendete Dateien wieder anzeigen",
+    "rulePreview": "Zukünftige Automatisierung",
+    "ruleScope": "Gilt für",
+    "rulePriority": "Priorität",
+    "ruleExtension": "Dateiendung",
+    "ruleDestination": "Ziel",
+    "ruleAlreadyCovered": "Eine vorhandene Regel deckt diese Dateiendung bereits ab.",
+    "ruleConflict": "Eine frühere Regel hat möglicherweise Vorrang.",
+    "ruleNotApplicable": "Es wird keine neue Regel erstellt.",
+    "partial": "Einige Dateien konnten nicht verarbeitet werden.",
+    "preparing": "Plan zur Bestätigung wird vorbereitet…",
+    "ruleCount": "Neue Regeln: {{count}}",
+    "planChanged": "Datei oder Einstellungen haben sich geändert. Prüfe einen neuen Plan.",
+    "alreadyFiled": "Bereits abgelegt; Kategorie gespeichert"
   },
   "confirm": {
     "impactItems": "{{count}} Element",
@@ -321,5 +362,14 @@
     "allFailed": "{{count}} Datei(en) konnte nicht wiederhergestellt werden",
     "allFailed_one": "{{count}} Datei konnte nicht wiederhergestellt werden",
     "allFailed_other": "{{count}} Dateien konnten nicht wiederhergestellt werden"
+  },
+  "categories": {
+    "Documents": "Dokumente",
+    "Images": "Bilder",
+    "Videos": "Videos",
+    "Audio": "Audio",
+    "Archives": "Archive",
+    "Code": "Code",
+    "Other": "Sonstige"
   }
 }

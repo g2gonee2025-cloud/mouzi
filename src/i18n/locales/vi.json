@@ -48,7 +48,8 @@
       "importingShort": "Đang nhập...",
       "importSuccess": "Đã giải nén {{extracted}} tệp và sắp xếp {{count}} tệp.",
       "importError": "Không thể nhập kho lưu trữ: {{error}}",
-      "openImportFolder": "Mở thư mục nhập"
+      "openImportFolder": "Mở thư mục nhập",
+      "progress": "Đã giải nén {{files}} tệp · {{bytes}}"
     },
     "rules": {
       "title": "Quy tắc",
@@ -77,7 +78,8 @@
       "undone": "Đã hoàn tác",
       "empty": "Không có lịch sử",
       "revertAll": "Khôi phục tất cả",
-      "revertAllDisabled": "Không có hành động nào để khôi phục"
+      "revertAllDisabled": "Không có hành động nào để khôi phục",
+      "showing": "Hiển thị {{shown}} trong {{total}} mục lịch sử"
     },
     "general": {
       "title": "Chung",
@@ -96,7 +98,11 @@
       "gracePeriodMinutes": "Phút",
       "gracePeriodHours": "Giờ",
       "gracePeriodCustom": "Tùy chỉnh",
-      "gracePeriodMaxError": "Thời gian chờ không được quá 7 ngày"
+      "gracePeriodMaxError": "Thời gian chờ không được quá 7 ngày",
+      "localAi": "Bật gợi ý AI cục bộ",
+      "localAiModel": "Mô hình Ollama",
+      "localAiPrivacy": "Mặc định tắt. Khi bật, tên tệp được gửi tới Ollama trên máy tính này. Nội dung tệp không được gửi.",
+      "gracePeriodUnit": "Đơn vị thời gian"
     },
     "ignore": {
       "title": "Bỏ qua",
@@ -111,13 +117,17 @@
       "tips": "Mẹo:",
       "save": "Lưu .mouziignore",
       "saved": "Đã lưu!",
-      "remove": "Xóa bỏ"
+      "remove": "Xóa bỏ",
+      "extensionTip": "bỏ qua tất cả tệp .tmp",
+      "folderTip": "bỏ qua thư mục",
+      "officeTip": "bỏ qua tệp tạm của Office",
+      "exactTip": "bỏ qua tên tệp chính xác này"
     },
     "about": {
       "title": "Giới thiệu",
       "tagline": "Quản lý tệp tải về của bạn.",
-      "description": "Mouzi là một công cụ sắp xếp tệp tinh tế và chạy ngầm, nằm ở khay hệ thống và tự động giữ cho thư mục Tải về (và bất kỳ thư mục nào khác) luôn gọn gàng. Ứng dụng chạy lặng lẽ dưới nền, theo dõi các thư mục được chọn, rồi di chuyển, đổi tên hoặc phân loại các tệp dựa trên các quy tắc tùy chỉnh.",
-      "checkUpdates": "Kiểm tra cập nhật",
+      "description": "Mouzi sắp xếp tệp trong các thư mục đã chọn bằng quy tắc. Ứng dụng di chuyển tệp và lưu lịch sử để hoàn tác.",
+      "checkUpdates": "Tải xuống từ dự án gốc",
       "support": "Ủng hộ Mouzi trên Ko-fi",
       "supportDesc": "Sự ủng hộ của bạn giúp Mouzi ngày càng hoàn thiện hơn. Xin cảm ơn! 🙏",
       "versionLabel": "Phiên bản",
@@ -141,13 +151,20 @@
   },
   "common": {
     "cancel": "Hủy",
-    "off": "TẮT"
+    "off": "TẮT",
+    "retry": "Thử lại",
+    "save": "Lưu",
+    "saving": "Đang lưu…",
+    "loading": "Đang tải…",
+    "dismiss": "Đóng",
+    "close": "Đóng",
+    "back": "Quay lại"
   },
   "dashboard": {
     "title": "Bảng điều khiển",
     "totalFiles": "Tổng số tệp",
     "totalBytes": "Tổng dung lượng",
-    "watchedRoots": "Thư mục gốc theo dõi",
+    "watchedRoots": "Thư mục đã cấu hình",
     "lastScan": "Lần quét cuối",
     "neverScanned": "Chưa bao giờ",
     "scanNow": "Quét ngay",
@@ -175,11 +192,11 @@
     "largeFiles": "Tệp lớn",
     "staleFiles": "Tệp cũ",
     "possibleDuplicates": "Có thể trùng",
-    "uncategorized": "Chưa phân loại",
+    "uncategorized": "Các tệp khác",
     "largeHint": "trên 100 MB",
     "staleHint": "không đụng 1 năm+",
     "duplicatesHint": "cùng dung lượng",
-    "uncategorizedHint": "không có quy tắc",
+    "uncategorizedHint": "phần mở rộng chưa được gán danh mục",
     "insightClear": "Trông ổn",
     "open": "Mở",
     "openSuggestions": "Gợi ý",
@@ -192,7 +209,13 @@
     "ageOlder": "Cũ hơn",
     "filterBy": "{{name}}",
     "scanRoots": "{{done}} / {{total}} thư mục",
-    "noFiles": "Không có tệp khớp"
+    "noFiles": "Không có tệp khớp",
+    "loadingFiles": "Đang tải tệp…",
+    "rootPending": "Chưa quét",
+    "rootStale": "Lần quét trước đã cũ",
+    "rootFailed": "Quét thất bại",
+    "rootLastScan": "Lần quét cuối: {{date}}",
+    "scanFailed": "Quá trình quét không hoàn tất thành công."
   },
   "cleanup": {
     "title": "Dọn dẹp thông minh",
@@ -236,7 +259,11 @@
     "historyEmptyDirs": "Việc xóa thư mục rỗng không thể hoàn tác.",
     "refresh": "Làm mới",
     "openFolder": "Mở thư mục",
-    "scanFirstHint": "Hãy chạy quét trước"
+    "scanFirstHint": "Hãy chạy quét trước",
+    "historyLoading": "Đang tải lịch sử dọn dẹp…",
+    "historyError": "Không thể tải lịch sử dọn dẹp.",
+    "notSearched": "Chạy tìm kiếm để xem các mục đề xuất.",
+    "historyUnknown": "Kết quả không xác định"
   },
   "suggestions": {
     "title": "Gợi ý",
@@ -260,7 +287,21 @@
     "failed": "Thất bại",
     "missing": "Tệp không còn tồn tại",
     "resultsTitle": "Kết quả",
-    "backToList": "Quay lại danh sách"
+    "backToList": "Quay lại danh sách",
+    "resetDismissed": "Hiện lại các tệp đã bỏ qua",
+    "rulePreview": "Tự động hóa trong tương lai",
+    "ruleScope": "Áp dụng cho",
+    "rulePriority": "Độ ưu tiên",
+    "ruleExtension": "Phần mở rộng",
+    "ruleDestination": "Đích đến",
+    "ruleAlreadyCovered": "Một quy tắc hiện có đã bao gồm phần mở rộng này.",
+    "ruleConflict": "Quy tắc trước đó có thể được ưu tiên.",
+    "ruleNotApplicable": "Sẽ không tạo quy tắc mới.",
+    "partial": "Không thể xử lý một số tệp.",
+    "preparing": "Đang chuẩn bị kế hoạch để xác nhận…",
+    "ruleCount": "Quy tắc mới: {{count}}",
+    "planChanged": "Tệp hoặc cài đặt đã thay đổi. Hãy xem lại kế hoạch mới.",
+    "alreadyFiled": "Đã sắp xếp; đã lưu danh mục"
   },
   "confirm": {
     "impactItems": "{{count}} mục",
@@ -309,5 +350,14 @@
     "allCollision": "{{count}} tệp đã được khôi phục với tên khác",
     "allMissing": "{{count}} tệp không tìm thấy và không được khôi phục",
     "allFailed": "Không khôi phục được {{count}} tệp"
+  },
+  "categories": {
+    "Documents": "Tài liệu",
+    "Images": "Hình ảnh",
+    "Videos": "Video",
+    "Audio": "Âm thanh",
+    "Archives": "Tệp nén",
+    "Code": "Mã nguồn",
+    "Other": "Khác"
   }
 }

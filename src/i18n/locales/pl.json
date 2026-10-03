@@ -42,7 +42,8 @@
       "importingShort": "Importowanie...",
       "importSuccess": "Wypakowano {{extracted}} plik(ów) i uporządkowano {{count}} plik(ów).",
       "importError": "Nie udało się zaimportować archiwum: {{error}}",
-      "openImportFolder": "Otwórz folder importu"
+      "openImportFolder": "Otwórz folder importu",
+      "progress": "Wyodrębniono {{files}} plików · {{bytes}}"
     },
     "rules": {
       "title": "Reguły",
@@ -71,7 +72,8 @@
       "undone": "Cofnięto",
       "empty": "Brak historii",
       "revertAll": "Cofnij wszystko",
-      "revertAllDisabled": "Brak akcji do cofnięcia"
+      "revertAllDisabled": "Brak akcji do cofnięcia",
+      "showing": "Wyświetlono {{shown}} z {{total}} wpisów historii"
     },
     "general": {
       "title": "Ogólne",
@@ -90,7 +92,11 @@
       "gracePeriodMinutes": "Minuty",
       "gracePeriodHours": "Godziny",
       "gracePeriodCustom": "Niestandardowy",
-      "gracePeriodMaxError": "Okres karencji nie może przekraczać 7 dni"
+      "gracePeriodMaxError": "Okres karencji nie może przekraczać 7 dni",
+      "localAi": "Włącz lokalne sugestie AI",
+      "localAiModel": "Model Ollama",
+      "localAiPrivacy": "Domyślnie wyłączone. Po włączeniu nazwy plików są wysyłane do Ollama na tym komputerze. Zawartość plików nie jest wysyłana.",
+      "gracePeriodUnit": "Jednostka czasu"
     },
     "ignore": {
       "title": "Ignoruj",
@@ -105,13 +111,17 @@
       "tips": "Wskazówki:",
       "save": "Zapisz .mouziignore",
       "saved": "Zapisano!",
-      "remove": "Usuń"
+      "remove": "Usuń",
+      "extensionTip": "pomijaj wszystkie pliki .tmp",
+      "folderTip": "pomijaj folder",
+      "officeTip": "pomijaj pliki tymczasowe Office",
+      "exactTip": "pomijaj tę dokładną nazwę pliku"
     },
     "about": {
       "title": "O aplikacji",
       "tagline": "Twoje pobrane, pod kontrolą.",
-      "description": "Mouzi to cichy, elegancki organizer plików, który mieszka w zasobniku systemowym i automatycznie utrzymuje porządek w folderze Pobrane (i dowolnym innym folderze). Działa cicho w tle, monitoruje wybrane foldery i przenosi, zmienia nazwy lub sortuje pliki na podstawie konfigurowalnych reguł.",
-      "checkUpdates": "Sprawdź aktualizacje",
+      "description": "Mouzi porządkuje pliki w wybranych folderach według reguł. Przenosi pliki i zachowuje historię umożliwiającą cofanie.",
+      "checkUpdates": "Pobieranie projektu źródłowego",
       "support": "Wesprzyj Mouzi na Ko-fi",
       "supportDesc": "Twoje wsparcie pomaga ulepszać Mouzi. Dziękuję! 🙏",
       "versionLabel": "Wersja",
@@ -135,13 +145,20 @@
   },
   "common": {
     "cancel": "Anuluj",
-    "off": "WYŁ."
+    "off": "WYŁ.",
+    "retry": "Spróbuj ponownie",
+    "save": "Zapisz",
+    "saving": "Zapisywanie…",
+    "loading": "Ładowanie…",
+    "dismiss": "Zamknij",
+    "close": "Zamknij",
+    "back": "Wstecz"
   },
   "dashboard": {
     "title": "Panel",
     "totalFiles": "Liczba plików",
     "totalBytes": "Całkowity rozmiar",
-    "watchedRoots": "Monitorowane foldery",
+    "watchedRoots": "Skonfigurowane foldery",
     "lastScan": "Ostatnie skanowanie",
     "neverScanned": "Nigdy",
     "scanNow": "Skanuj teraz",
@@ -169,11 +186,11 @@
     "largeFiles": "Duże pliki",
     "staleFiles": "Stare pliki",
     "possibleDuplicates": "Możliwe duplikaty",
-    "uncategorized": "Bez kategorii",
+    "uncategorized": "Inne pliki",
     "largeHint": "ponad 100 MB",
     "staleHint": "nietknięte od roku",
     "duplicatesHint": "ten sam rozmiar",
-    "uncategorizedHint": "brak reguły",
+    "uncategorizedHint": "rozszerzenie nie ma przypisanej kategorii",
     "insightClear": "Wygląda czysto",
     "open": "Otwórz",
     "openSuggestions": "Sugestie",
@@ -186,7 +203,13 @@
     "ageOlder": "Starsze",
     "filterBy": "{{name}}",
     "scanRoots": "{{done}} / {{total}} folderów",
-    "noFiles": "Brak pasujących plików"
+    "noFiles": "Brak pasujących plików",
+    "loadingFiles": "Ładowanie plików…",
+    "rootPending": "Nie skanowano",
+    "rootStale": "Poprzedni skan jest nieaktualny",
+    "rootFailed": "Skan nie powiódł się",
+    "rootLastScan": "Ostatni skan: {{date}}",
+    "scanFailed": "Skanowanie nie zakończyło się pomyślnie."
   },
   "cleanup": {
     "title": "Inteligentne sprzątanie",
@@ -230,7 +253,11 @@
     "historyEmptyDirs": "Usuwanie pustych folderów jest nieodwracalne.",
     "refresh": "Odśwież",
     "openFolder": "Otwórz folder",
-    "scanFirstHint": "Najpierw uruchom skanowanie"
+    "scanFirstHint": "Najpierw uruchom skanowanie",
+    "historyLoading": "Ładowanie historii porządkowania…",
+    "historyError": "Nie udało się załadować historii porządkowania.",
+    "notSearched": "Uruchom wyszukiwanie, aby przejrzeć kandydatów.",
+    "historyUnknown": "Nieznany wynik"
   },
   "suggestions": {
     "title": "Sugestie",
@@ -254,7 +281,21 @@
     "failed": "Niepowodzenie",
     "missing": "Plik już nie istnieje",
     "resultsTitle": "Wyniki",
-    "backToList": "Powrót do listy"
+    "backToList": "Powrót do listy",
+    "resetDismissed": "Pokaż ponownie odrzucone pliki",
+    "rulePreview": "Przyszła automatyzacja",
+    "ruleScope": "Dotyczy",
+    "rulePriority": "Priorytet",
+    "ruleExtension": "Rozszerzenie",
+    "ruleDestination": "Miejsce docelowe",
+    "ruleAlreadyCovered": "Istniejąca reguła już obejmuje to rozszerzenie.",
+    "ruleConflict": "Wcześniejsza reguła może mieć pierwszeństwo.",
+    "ruleNotApplicable": "Nie zostanie utworzona nowa reguła.",
+    "partial": "Niektórych plików nie udało się przetworzyć.",
+    "preparing": "Przygotowywanie planu do zatwierdzenia…",
+    "ruleCount": "Nowe reguły: {{count}}",
+    "planChanged": "Plik lub ustawienia uległy zmianie. Przejrzyj nowy plan.",
+    "alreadyFiled": "Już uporządkowano; zapisano kategorię"
   },
   "confirm": {
     "impactItems": "{{count}} element",
@@ -330,5 +371,14 @@
     "allFailed_one": "Nie udało się przywrócić {{count}} pliku",
     "allFailed_few": "Nie udało się przywrócić {{count}} plików",
     "allFailed_many": "Nie udało się przywrócić {{count}} plików"
+  },
+  "categories": {
+    "Documents": "Dokumenty",
+    "Images": "Obrazy",
+    "Videos": "Filmy",
+    "Audio": "Dźwięk",
+    "Archives": "Archiwa",
+    "Code": "Kod",
+    "Other": "Inne"
   }
 }

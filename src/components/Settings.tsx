@@ -1,7 +1,9 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { useAppStore, Rule, ScheduleSettings, WatchedFolder } from "../store/useAppStore";
+import { useAppStore, Rule, ScheduleSettings, WatchedFolder, type PreferencesPatch } from "../store/useAppStore";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+import { formatBytes } from "../utils/format";
 import { save, open } from "@tauri-apps/plugin-dialog";
 import About from "./About";
 import ConfirmDialog, { type ConfirmRequest } from "./cleanup/ConfirmDialog";
@@ -104,11 +106,13 @@ function defaultSchedule(): ScheduleSettings {
 }
 
 export default function Settings() {
-  const { t, i18n } = useTranslation();
+  const { t } = useTranslation();
   const {
     rules,
     folders,
     logs,
+    historyCounts,
+    loadHistoryCounts,
     loadRules,
     loadFolders,
     loadLogs,
@@ -134,6 +138,11 @@ export default function Settings() {
   const [tab, setTab] = useState<Tab>("folders");
   const [editingRule, setEditingRule] = useState<Rule | null>(null);
   const [newFolderPath, setNewFolderPath] = useState("");
+  const [writeError, setWriteError] = useState<string | null>(null);
+  const [isSaving, setIsSaving] = useState(false);
+  const savingRef = useRef(false);
+  const [scheduleDirty, setScheduleDirty] = useState(false);
+  const [aiModel, setAiModel] = useState("");
 
   const [graceValue, setGraceValue] = useState(300);
   const [graceUnit, setGraceUnit] = useState<GraceUnit>("seconds");
@@ -148,6 +157,17 @@ export default function Settings() {
     stagingPath?: string;
   } | null>(null);
   const [isImportingArchive, setIsImportingArchive] = useState(false);
+  const [archiveProgress, setArchiveProgress] = useState<{ bytes: number; files: number } | null>(null);
+  useEffect(() => {
+    if (!isImportingArchive) return;
+    let disposed = false;
+    let stop: (() => void) | undefined;
+    listen<{ bytes: number; files: number }>("archive-import-progress", (event) => {
+      if (!disposed) setArchiveProgress(event.payload);
+    }).then((unlisten) => { if (disposed) unlisten(); else stop = unlisten; })
+      .catch((error) => setArchiveToast({ type: "error", message: String(error) }));
+    return () => { disposed = true; stop?.(); };
+  }, [isImportingArchive]);
   const [pending, setPending] = useState<ConfirmRequest | null>(null);
   const [undoToast, setUndoToast] = useState<UndoNotice[] | null>(null);
 
@@ -160,11 +180,32 @@ export default function Settings() {
   }, [undoToast]);
 
   useEffect(() => {
-    loadRules();
-    loadFolders();
-    loadLogs();
-    getSchedule();
+    Promise.all([loadRules(), loadFolders(), loadLogs(), getSchedule()])
+      .catch((e) => setWriteError(String(e)));
   }, [loadRules, loadFolders, loadLogs, getSchedule]);
+
+  useEffect(() => {
+    setAiModel(settings?.local_ai_model ?? "");
+  }, [settings?.local_ai_model]);
+
+  const runWrite = async (action: () => Promise<unknown>): Promise<boolean> => {
+    if (savingRef.current) return false;
+    savingRef.current = true;
+    setIsSaving(true);
+    setWriteError(null);
+    try {
+      await action();
+      return true;
+    } catch (e) {
+      setWriteError(String(e));
+      return false;
+    } finally {
+      savingRef.current = false;
+      setIsSaving(false);
+    }
+  };
+
+  const savePreferences = (patch: PreferencesPatch) => runWrite(() => saveSettings(patch));
 
   // Sync local grace editor with loaded settings
   useEffect(() => {
@@ -179,25 +220,20 @@ export default function Settings() {
 
   // Sync local schedule editor with loaded schedule
   useEffect(() => {
-    if (schedule) {
+    if (schedule && !scheduleDirty) {
       setLocalSchedule(schedule);
     }
-  }, [schedule]);
+  }, [schedule, scheduleDirty]);
 
   const handleAddFolder = async () => {
     if (!newFolderPath.trim()) return;
-    await addFolder(newFolderPath.trim(), "silent");
-    setNewFolderPath("");
+    if (await runWrite(() => addFolder(newFolderPath.trim(), "manual"))) setNewFolderPath("");
   };
 
   const handleSaveRule = async () => {
     if (!editingRule) return;
-    if (editingRule.id) {
-      await updateRule(editingRule);
-    } else {
-      await addRule(editingRule);
-    }
-    setEditingRule(null);
+    const rule = editingRule;
+    if (await runWrite(() => rule.id ? updateRule(rule) : addRule(rule))) setEditingRule(null);
   };
 
   const askRemoveFolder = (folder: WatchedFolder) => {
@@ -244,8 +280,14 @@ export default function Settings() {
     }
   };
 
-  const askUndoAll = () => {
-    const restorable = logs.filter((log) => !log.undone).length;
+  const askUndoAll = async () => {
+    let restorable: number;
+    try {
+      restorable = (await loadHistoryCounts()).undoable;
+    } catch (e) {
+      setWriteError(String(e));
+      return;
+    }
     if (restorable === 0) return;
     setPending({
       title: t("confirm.op.undoAll"),
@@ -264,21 +306,27 @@ export default function Settings() {
   // `clear_logs_cmd` is an unconditional DELETE FROM action_logs, so this takes
   // the undo trail with it - every Undo button in the app reads from the same
   // table. Undoing history and deleting it are not the same verb.
-  const askClearLogs = () => {
-    if (logs.length === 0) return;
+  const askClearLogs = async () => {
+    let total: number;
+    try {
+      total = (await loadHistoryCounts()).total;
+    } catch (e) {
+      setWriteError(String(e));
+      return;
+    }
+    if (total === 0) return;
     setPending({
       title: t("confirm.op.clearHistory"),
-      count: logs.length,
+      count: total,
       notice: "permanent",
-      note: t("confirm.note.clearHistory", { count: logs.length }),
+      note: t("confirm.note.clearHistory", { count: total }),
       onConfirm: () => clearLogs(),
     });
   };
 
   const handleChangeLanguage = async (lang: string) => {
     if (!settings) return;
-    await i18n.changeLanguage(lang);
-    await saveSettings({ ...settings, language: lang });
+    await savePreferences({ language: lang });
   };
 
   const handleGraceSliderChange = (stepIndex: number) => {
@@ -288,7 +336,7 @@ export default function Settings() {
     setGraceValue(converted.value);
     setGraceUnit(converted.unit);
     setGraceError(null);
-    saveSettings({ ...settings, grace_period_seconds: seconds });
+    void savePreferences({ grace_period_seconds: seconds });
   };
 
   const handleGraceNumberChange = (value: number, unit: GraceUnit) => {
@@ -303,10 +351,11 @@ export default function Settings() {
     setGraceError(null);
     setGraceValue(value);
     setGraceUnit(unit);
-    saveSettings({ ...settings, grace_period_seconds: Math.max(0, seconds) });
+    void savePreferences({ grace_period_seconds: Math.max(0, seconds) });
   };
 
   const handleScheduleChange = (patch: Partial<ScheduleSettings>) => {
+    setScheduleDirty(true);
     setLocalSchedule((prev) => {
       const next = { ...prev, ...patch };
       const times = Math.max(1, Math.min(4, next.schedule_times_per_day || 1));
@@ -320,11 +369,7 @@ export default function Settings() {
   };
 
   const handleSaveSchedule = async () => {
-    try {
-      await updateSchedule(localSchedule);
-    } catch (e) {
-      console.error("Failed to save schedule:", e);
-    }
+    if (await runWrite(() => updateSchedule(localSchedule))) setScheduleDirty(false);
   };
 
   const handleExportRules = async () => {
@@ -375,6 +420,7 @@ export default function Settings() {
       if (!path) return;
 
       setIsImportingArchive(true);
+      setArchiveProgress(null);
       setArchiveToast({ message: t("settings.archive.importing"), type: "info" });
 
       const summary = await invoke<ArchiveImportResult>("import_archive_cmd", { path });
@@ -415,8 +461,9 @@ export default function Settings() {
       <div className="w-56 border-r border-border bg-surface-dark flex flex-col">
         <div className="px-4 py-4 flex items-center gap-2">
           <button
+            aria-label={t("common.close")}
             onClick={() => {
-              invoke("close_settings");
+              invoke("close_settings").catch((e) => setWriteError(String(e)));
             }}
             className="p-1.5 rounded-md hover:bg-border transition-colors"
           >
@@ -466,6 +513,9 @@ export default function Settings() {
 
       {/* Content */}
       <div className="flex-1 overflow-auto p-6">
+        {writeError && <p role="alert" className="mb-4 rounded-md border border-red-200 bg-red-50 p-3 text-sm text-red-700">{writeError}</p>}
+        {isSaving && <p role="status" className="mb-3 text-xs text-text-muted">{t("common.saving")}</p>}
+        <fieldset disabled={isSaving} className="min-w-0">
         {tab === "folders" && (
           <div className="space-y-4">
             <h2 className="text-lg font-semibold">{t("settings.folders.title")}</h2>
@@ -475,11 +525,12 @@ export default function Settings() {
                 value={newFolderPath}
                 onChange={(e) => setNewFolderPath(e.target.value)}
                 placeholder={t("settings.folders.placeholder")}
+                aria-label={t("settings.folders.placeholder")}
                 className="flex-1 rounded-md border border-border bg-surface px-3 py-2 text-sm outline-none focus:border-primary"
               />
               <button
                 onClick={handleAddFolder}
-                className="flex items-center gap-1.5 rounded-md bg-primary px-3 py-2 text-sm font-medium text-white hover:bg-primary-hover"
+                className="flex items-center gap-1.5 rounded-md bg-primary px-3 py-2 text-sm font-medium text-on-primary hover:bg-primary-hover"
               >
                 <Plus size={14} />
                 {t("settings.folders.add")}
@@ -504,6 +555,14 @@ export default function Settings() {
                     : t("settings.archive.import")}
                 </button>
               </div>
+              {isImportingArchive && (
+                <div className="flex items-center gap-3">
+                <button className="rounded-md border border-border px-3 py-2 text-sm hover:bg-surface" onClick={() => {
+                  void invoke("cancel_archive_import_cmd").catch((error) => setArchiveToast({ type: "error", message: String(error) }));
+                }}>{t("common.cancel")}</button>
+                {archiveProgress && <p role="status" className="text-xs text-text-muted">{t("settings.archive.progress", { files: archiveProgress.files, bytes: formatBytes(archiveProgress.bytes) })}</p>}
+                </div>
+              )}
               {archiveToast && (
                 <div
                   className={`text-xs px-3 py-2 rounded-md ${
@@ -518,7 +577,7 @@ export default function Settings() {
                   {archiveToast.stagingPath && (
                     <button
                       onClick={() =>
-                        invoke("open_folder_cmd", { path: archiveToast.stagingPath })
+                        invoke("open_folder_cmd", { path: archiveToast.stagingPath }).catch((error) => setArchiveToast({ ...archiveToast, type: "error", message: String(error) }))
                       }
                       className="mt-2 inline-flex items-center gap-1 text-xs font-medium underline"
                     >
@@ -542,8 +601,9 @@ export default function Settings() {
                         {t("settings.folders.mode")}
                       </label>
                       <select
+                        aria-label={`${f.path}: ${t("settings.folders.mode")}`}
                         value={f.mode || "silent"}
-                        onChange={(e) => f.id && updateFolderMode(f.id, e.target.value)}
+                        onChange={(e) => { if (f.id !== undefined) void runWrite(() => updateFolderMode(f.id!, e.target.value)); }}
                         className="appearance-none w-full max-w-xs rounded-md border border-border bg-surface px-2 py-1.5 text-sm outline-none focus:border-primary"
                       >
                         <option value="silent">{t("settings.folders.modeSilent")}</option>
@@ -559,6 +619,7 @@ export default function Settings() {
                     onClick={() => askRemoveFolder(f)}
                     className="p-1.5 rounded-md text-red-500 hover:bg-red-50 shrink-0"
                     title={t("confirm.op.removeFolder")}
+                    aria-label={`${t("confirm.op.removeFolder")}: ${f.path}`}
                   >
                     <Trash2 size={14} />
                   </button>
@@ -585,7 +646,7 @@ export default function Settings() {
                     folder_id: 0,
                   })
                 }
-                className="flex items-center gap-1.5 rounded-md bg-primary px-3 py-2 text-sm font-medium text-white hover:bg-primary-hover"
+                className="flex items-center gap-1.5 rounded-md bg-primary px-3 py-2 text-sm font-medium text-on-primary hover:bg-primary-hover"
               >
                 <Plus size={14} />
                 {t("settings.rules.add")}
@@ -636,6 +697,7 @@ export default function Settings() {
                   <div>
                     <label className="text-xs font-medium text-text-muted">{t("settings.rules.name")}</label>
                     <input
+                      aria-label={t("settings.rules.name")}
                       value={editingRule.name}
                       onChange={(e) => setEditingRule({ ...editingRule, name: e.target.value })}
                       className="mt-1 w-full rounded-md border border-border bg-surface px-2 py-1.5 text-sm outline-none focus:border-primary"
@@ -644,6 +706,7 @@ export default function Settings() {
                   <div>
                     <label className="text-xs font-medium text-text-muted">{t("settings.rules.extensions")}</label>
                     <input
+                      aria-label={t("settings.rules.extensions")}
                       value={editingRule.extensions.join(", ")}
                       onChange={(e) =>
                         setEditingRule({
@@ -658,6 +721,7 @@ export default function Settings() {
                   <div>
                     <label className="text-xs font-medium text-text-muted">{t("settings.rules.pattern")}</label>
                     <input
+                      aria-label={t("settings.rules.pattern")}
                       value={editingRule.pattern || ""}
                       onChange={(e) =>
                         setEditingRule({
@@ -672,6 +736,7 @@ export default function Settings() {
                   <div>
                     <label className="text-xs font-medium text-text-muted">{t("settings.rules.destination")}</label>
                     <input
+                      aria-label={t("settings.rules.destination")}
                       value={editingRule.destination}
                       onChange={(e) => setEditingRule({ ...editingRule, destination: e.target.value })}
                       className="mt-1 w-full rounded-md border border-border bg-surface px-2 py-1.5 text-sm outline-none focus:border-primary"
@@ -680,6 +745,7 @@ export default function Settings() {
                   <div>
                     <label className="text-xs font-medium text-text-muted">{t("settings.rules.priority")}</label>
                     <input
+                      aria-label={t("settings.rules.priority")}
                       type="number"
                       value={editingRule.priority}
                       onChange={(e) =>
@@ -702,7 +768,7 @@ export default function Settings() {
                 <div className="flex gap-2">
                   <button
                     onClick={handleSaveRule}
-                    className="flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-white hover:bg-primary-hover"
+                    className="flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-on-primary hover:bg-primary-hover"
                   >
                     <Save size={14} />
                     {t("settings.rules.edit")}
@@ -743,7 +809,7 @@ export default function Settings() {
                       role="switch"
                       aria-checked={r.enabled}
                       aria-label={`${r.name}: ${r.enabled ? t("settings.rules.enabled") : t("common.off")}`}
-                      onClick={() => updateRule({ ...r, enabled: !r.enabled })}
+                      onClick={() => { void runWrite(() => updateRule({ ...r, enabled: !r.enabled })); }}
                       className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2 ${r.enabled ? "bg-primary" : "bg-border"
                         }`}
                     >
@@ -753,6 +819,7 @@ export default function Settings() {
                       />
                     </button>
                     <button
+                      aria-label={`${t("settings.rules.edit")}: ${r.name}`}
                       onClick={() => setEditingRule({ ...r })}
                       className="p-1.5 rounded-md hover:bg-border text-text-muted"
                     >
@@ -762,6 +829,7 @@ export default function Settings() {
                       onClick={() => askDeleteRule(r)}
                       className="p-1.5 rounded-md text-red-500 hover:bg-red-50"
                       title={t("confirm.op.deleteRule")}
+                      aria-label={`${t("confirm.op.deleteRule")}: ${r.name}`}
                     >
                       <Trash2 size={14} />
                     </button>
@@ -779,8 +847,8 @@ export default function Settings() {
               <div className="flex items-center gap-2">
                 <button
                   onClick={askUndoAll}
-                  disabled={logs.length === 0 || logs.every((log) => log.undone)}
-                  title={logs.length === 0 || logs.every((log) => log.undone) ? t("settings.history.revertAllDisabled") : undefined}
+                  disabled={!historyCounts || historyCounts.undoable === 0}
+                  title={!historyCounts || historyCounts.undoable === 0 ? t("settings.history.revertAllDisabled") : undefined}
                   className="flex items-center gap-1.5 rounded-md border border-amber-300 px-3 py-2 text-sm text-amber-700 hover:bg-amber-50 disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                   <RotateCcw size={14} />
@@ -788,6 +856,7 @@ export default function Settings() {
                 </button>
                 <button
                   onClick={askClearLogs}
+                  disabled={!historyCounts || historyCounts.total === 0}
                   className="flex items-center gap-1.5 rounded-md border border-red-200 px-3 py-2 text-sm text-red-600 hover:bg-red-50"
                 >
                   <Trash2 size={14} />
@@ -795,6 +864,7 @@ export default function Settings() {
                 </button>
               </div>
             </div>
+            {historyCounts && <p className="text-xs text-text-muted">{t("settings.history.showing", { shown: logs.length, total: historyCounts.total })}</p>}
             {undoToast && (
               <div role="status" aria-live="polite" className="space-y-1">
                 {undoToast.map((notice) => (
@@ -840,7 +910,8 @@ export default function Settings() {
                             }
                           }}
                           className="p-1.5 rounded-md text-text-muted hover:bg-border"
-                          title="Open folder"
+                           title={t("cleanup.openFolder")}
+                           aria-label={t("cleanup.openFolder")}
                         >
                           <FolderOpen size={16} />
                         </button>
@@ -875,7 +946,9 @@ export default function Settings() {
                   {t("settings.general.language")}
                 </label>
                 <select
+                  aria-label={t("settings.general.language")}
                   value={settings?.language || "en"}
+                  disabled={!settings}
                   onChange={(e) => handleChangeLanguage(e.target.value)}
                   className="appearance-none w-full rounded-md border border-border bg-surface px-3 py-2 text-sm outline-none focus:border-primary"
                 >
@@ -896,10 +969,10 @@ export default function Settings() {
                   {t("settings.general.theme")}
                 </label>
                 <select
+                  aria-label={t("settings.general.theme")}
                   value={settings?.theme || "system"}
-                  onChange={(e) =>
-                    settings && saveSettings({ ...settings, theme: e.target.value })
-                  }
+                  disabled={!settings}
+                  onChange={(e) => { void savePreferences({ theme: e.target.value }); }}
                   className="appearance-none w-full rounded-md border border-border bg-surface px-3 py-2 text-sm outline-none focus:border-primary"
                 >
                   <option value="system">{t("settings.general.themeSystem")}</option>
@@ -912,7 +985,11 @@ export default function Settings() {
                   {t("settings.general.startWithSystem")}
                 </label>
                 <button
-                  onClick={() => setAutostart(!settings?.autostart)}
+                  role="switch"
+                  aria-label={t("settings.general.startWithSystem")}
+                  aria-checked={settings?.autostart ?? false}
+                  disabled={!settings}
+                  onClick={() => { void runWrite(() => setAutostart(!settings?.autostart)); }}
                   className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${settings?.autostart ? "bg-primary" : "bg-surface-dark"
                     }`}
                 >
@@ -934,6 +1011,7 @@ export default function Settings() {
                   </span>
                 </div>
                 <input
+                  aria-label={t("settings.general.gracePeriod")}
                   type="range"
                   min={0}
                   max={GRACE_STEPS.length - 1}
@@ -944,6 +1022,7 @@ export default function Settings() {
                 />
                 <div className="flex items-center gap-2">
                   <input
+                    aria-label={t("settings.general.gracePeriod")}
                     type="number"
                     min={0}
                     value={graceValue}
@@ -953,6 +1032,7 @@ export default function Settings() {
                     className="w-24 rounded-md border border-border bg-surface px-2 py-1.5 text-sm outline-none focus:border-primary"
                   />
                   <select
+                    aria-label={t("settings.general.gracePeriodUnit")}
                     value={graceUnit}
                     onChange={(e) =>
                       handleGraceNumberChange(graceValue, e.target.value as GraceUnit)
@@ -983,10 +1063,13 @@ export default function Settings() {
                   </p>
                 </div>
                 <button
+                  role="switch"
+                  aria-label={t("settings.general.checkFileLock")}
+                  aria-checked={settings?.lock_check_enabled ?? false}
+                  disabled={!settings}
                   onClick={() => {
                     if (!settings) return;
-                    const updated = { ...settings, lock_check_enabled: !settings.lock_check_enabled };
-                    saveSettings(updated);
+                    void savePreferences({ lock_check_enabled: !settings.lock_check_enabled });
                   }}
                   className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${settings?.lock_check_enabled ? "bg-primary" : "bg-surface-dark"
                     }`}
@@ -998,6 +1081,25 @@ export default function Settings() {
                 </button>
               </div>
 
+            </div>
+
+            <div className="border-t border-border pt-6 space-y-3">
+              <label className="flex items-center gap-2 text-sm font-medium">
+                <input type="checkbox" checked={settings?.local_ai_enabled ?? false} disabled={!settings}
+                  onChange={(e) => { void savePreferences({ local_ai_enabled: e.target.checked }); }} />
+                {t("settings.general.localAi")}
+              </label>
+              <p className="text-xs text-text-muted">{t("settings.general.localAiPrivacy")}</p>
+              <label className="block text-sm text-text-muted" htmlFor="local-ai-model">{t("settings.general.localAiModel")}</label>
+              <div className="flex gap-2">
+                <input id="local-ai-model" value={aiModel} onChange={(e) => setAiModel(e.target.value)}
+                  className="min-w-0 flex-1 rounded-md border border-border bg-surface px-3 py-2 text-sm" />
+                <button type="button" disabled={!settings || !aiModel.trim()}
+                  onClick={() => { void savePreferences({ local_ai_model: aiModel.trim() }); }}
+                  className="rounded-md bg-primary px-3 py-2 text-sm font-medium text-on-primary hover:bg-primary-hover disabled:opacity-50">
+                  {t("common.save")}
+                </button>
+              </div>
             </div>
 
             {/* Scheduler */}
@@ -1012,6 +1114,9 @@ export default function Settings() {
                   {t("settings.scheduler.enable")}
                 </label>
                 <button
+                  role="switch"
+                  aria-label={t("settings.scheduler.enable")}
+                  aria-checked={localSchedule.schedule_enabled}
                   onClick={() => handleScheduleChange({ schedule_enabled: !localSchedule.schedule_enabled })}
                   className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${localSchedule.schedule_enabled ? "bg-primary" : "bg-surface-dark"
                     }`}
@@ -1028,6 +1133,7 @@ export default function Settings() {
                   {t("settings.scheduler.timesPerDay")}
                 </label>
                 <select
+                  aria-label={t("settings.scheduler.timesPerDay")}
                   value={localSchedule.schedule_times_per_day}
                   onChange={(e) =>
                     handleScheduleChange({ schedule_times_per_day: parseInt(e.target.value, 10) })
@@ -1050,6 +1156,7 @@ export default function Settings() {
                         {t("settings.scheduler.time", { number: idx + 1 })}
                       </label>
                       <input
+                        aria-label={t("settings.scheduler.time", { number: idx + 1 })}
                         type="time"
                         value={(localSchedule[key] as string | null) || ""}
                         onChange={(e) =>
@@ -1064,7 +1171,7 @@ export default function Settings() {
 
               <button
                 onClick={handleSaveSchedule}
-                className="flex items-center gap-1.5 rounded-md bg-primary px-3 py-2 text-sm font-medium text-white hover:bg-primary-hover"
+                className="flex items-center gap-1.5 rounded-md bg-primary px-3 py-2 text-sm font-medium text-on-primary hover:bg-primary-hover"
               >
                 <Save size={14} />
                 {t("settings.rules.edit")}
@@ -1081,6 +1188,7 @@ export default function Settings() {
         {tab === "about" && (
           <About />
         )}
+        </fieldset>
       </div>
 
       {pending && (
@@ -1094,44 +1202,76 @@ function IgnoreTab() {
   const { t } = useTranslation();
   const { folders } = useAppStore();
   const [selectedFolder, setSelectedFolder] = useState("");
-  const [patterns, setPatterns] = useState<string[]>([]);
+  const [draft, setDraft] = useState<{ folder: string; patterns: string[] } | null>(null);
   const [newPattern, setNewPattern] = useState("");
   const [saved, setSaved] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [retry, setRetry] = useState(0);
+  const requestRef = useRef(0);
+  const patterns = draft?.folder === selectedFolder ? draft.patterns : [];
+  const canEdit = Boolean(draft && draft.folder === selectedFolder && !loading && !saving && folders.some((f) => f.path === selectedFolder));
 
   useEffect(() => {
+    if (selectedFolder && !folders.some((f) => f.path === selectedFolder)) setSelectedFolder("");
+  }, [folders, selectedFolder]);
+
+  useEffect(() => {
+    const request = ++requestRef.current;
+    setDraft(null);
+    setSaved(false);
+    setError(null);
+    setNewPattern("");
+    setLoading(Boolean(selectedFolder));
     if (selectedFolder) {
-      invoke<string[]>("load_mouziignore_cmd", { folderPath: selectedFolder })
-        .then(setPatterns)
-        .catch(() => setPatterns([]));
-    } else {
-      setPatterns([]);
+      invoke<string[]>("load_mouziignore_cmd", { folderPath: selectedFolder }).then((patterns) => {
+        if (request === requestRef.current) setDraft({ folder: selectedFolder, patterns });
+      }).catch((e) => {
+        if (request === requestRef.current) setError(String(e));
+      }).finally(() => {
+        if (request === requestRef.current) setLoading(false);
+      });
     }
-  }, [selectedFolder]);
+    return () => { ++requestRef.current; };
+  }, [selectedFolder, retry]);
+
+  useEffect(() => {
+    if (!saved) return;
+    const timer = setTimeout(() => setSaved(false), 2000);
+    return () => clearTimeout(timer);
+  }, [saved]);
 
   const handleAdd = () => {
+    if (!canEdit || !draft) return;
     const trimmed = newPattern.trim();
     if (!trimmed || patterns.includes(trimmed)) return;
-    setPatterns([...patterns, trimmed]);
+    setDraft({ ...draft, patterns: [...patterns, trimmed] });
     setNewPattern("");
     setSaved(false);
   };
 
   const handleRemove = (idx: number) => {
-    setPatterns(patterns.filter((_, i) => i !== idx));
+    if (!canEdit || !draft) return;
+    setDraft({ ...draft, patterns: patterns.filter((_, i) => i !== idx) });
     setSaved(false);
   };
 
   const handleSave = async () => {
-    if (!selectedFolder) return;
+    if (!canEdit || !draft) return;
+    const request = requestRef.current;
+    setSaving(true);
+    setError(null);
     try {
       await invoke("save_mouziignore_cmd", {
-        folderPath: selectedFolder,
-        patterns,
+        folderPath: draft.folder,
+        patterns: [...draft.patterns],
       });
-      setSaved(true);
-      setTimeout(() => setSaved(false), 2000);
+      if (request === requestRef.current) setSaved(true);
     } catch (e) {
-      console.error("save_mouziignore failed:", e);
+      if (request === requestRef.current) setError(String(e));
+    } finally {
+      setSaving(false);
     }
   };
 
@@ -1147,6 +1287,8 @@ function IgnoreTab() {
           {t("settings.ignore.folder")}
         </label>
         <select
+          aria-label={t("settings.ignore.folder")}
+          disabled={saving}
           value={selectedFolder}
           onChange={(e) => setSelectedFolder(e.target.value)}
           className="appearance-none w-full rounded-md border border-border bg-surface px-3 py-2 text-sm outline-none focus:border-primary"
@@ -1160,13 +1302,18 @@ function IgnoreTab() {
         </select>
       </div>
 
+      {loading && <p role="status" className="text-sm text-text-muted">{t("common.loading")}</p>}
+      {error && <div role="alert" className="text-sm text-red-600">{error}
+        {!draft && <button type="button" className="block underline mt-2" onClick={() => setRetry((value) => value + 1)}>{t("common.retry")}</button>}
+      </div>}
+
       {selectedFolder && (
         <>
           <div className="space-y-2">
             <label className="text-sm font-medium text-text-muted block">
               {t("settings.ignore.patterns")}
             </label>
-            {patterns.length === 0 && (
+            {canEdit && patterns.length === 0 && (
               <p className="text-sm text-text-muted italic">
                 {t("settings.ignore.noRules")}
               </p>
@@ -1179,8 +1326,10 @@ function IgnoreTab() {
                 <code className="text-sm text-primary">{p}</code>
                 <button
                   onClick={() => handleRemove(i)}
+                  disabled={!canEdit}
                   className="text-text-muted hover:text-red-400 transition-colors"
                   title={t("settings.ignore.remove")}
+                  aria-label={`${t("settings.ignore.remove")}: ${p}`}
                 >
                   <X size={14} />
                 </button>
@@ -1190,6 +1339,8 @@ function IgnoreTab() {
 
           <div className="flex gap-2">
             <input
+              aria-label={t("settings.ignore.patterns")}
+              disabled={!canEdit}
               type="text"
               value={newPattern}
               onChange={(e) => setNewPattern(e.target.value)}
@@ -1199,8 +1350,8 @@ function IgnoreTab() {
             />
             <button
               onClick={handleAdd}
-              disabled={!newPattern.trim()}
-              className="rounded-md bg-primary px-4 py-2 text-sm font-medium text-white hover:bg-primary-hover disabled:opacity-40 transition-colors"
+              disabled={!canEdit || !newPattern.trim()}
+              className="rounded-md bg-primary px-4 py-2 text-sm font-medium text-on-primary hover:bg-primary-hover disabled:opacity-40 transition-colors"
             >
               {t("settings.ignore.add")}
             </button>
@@ -1211,19 +1362,20 @@ function IgnoreTab() {
               <strong className="text-text">{t("settings.ignore.tips")}</strong>
             </p>
             <ul className="text-xs text-text-muted space-y-1 list-disc pl-4">
-              <li><code>*.tmp</code> — ignore all .tmp files</li>
-              <li><code>node_modules/</code> — ignore the folder</li>
-              <li><code>~$*</code> — ignore Office temp files</li>
-              <li><code>.DS_Store</code> — ignore exact file name</li>
+              <li><code>*.tmp</code> — {t("settings.ignore.extensionTip")}</li>
+              <li><code>node_modules/</code> — {t("settings.ignore.folderTip")}</li>
+              <li><code>~$*</code> — {t("settings.ignore.officeTip")}</li>
+              <li><code>.DS_Store</code> — {t("settings.ignore.exactTip")}</li>
             </ul>
           </div>
 
           <button
             onClick={handleSave}
-            className="flex items-center gap-2 rounded-md bg-primary px-4 py-2.5 text-sm font-medium text-white hover:bg-primary-hover transition-colors"
+            disabled={!canEdit}
+            className="flex items-center gap-2 rounded-md bg-primary px-4 py-2.5 text-sm font-medium text-on-primary hover:bg-primary-hover transition-colors"
           >
             <Save size={16} />
-            {saved ? t("settings.ignore.saved") : t("settings.ignore.save")}
+            {saving ? t("common.saving") : saved ? t("settings.ignore.saved") : t("settings.ignore.save")}
           </button>
         </>
       )}

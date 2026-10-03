@@ -2,12 +2,13 @@ import { useMemo } from "react";
 import { useTranslation } from "react-i18next";
 import { invoke } from "@tauri-apps/api/core";
 import { FolderOpen } from "lucide-react";
-import { formatBytes } from "../../utils/format";
+import { formatBytes, formatTimestamp } from "../../utils/format";
 import { fileName } from "../../utils/paths";
 import { formatShare, percentOf } from "../../utils/dashboard";
+import type { RootStat } from "../../store/useDashboardStore";
 
 interface StorageTreemapProps {
-  data: Array<{ path: string; files: number; bytes: number }>;
+  data: RootStat[];
   totalBytes: number;
   selected?: string | null;
   onSelect?: (path: string | null) => void;
@@ -26,7 +27,7 @@ export default function StorageTreemap({
     [data],
   );
 
-  if (sorted.length === 0 || totalBytes === 0) {
+  if (sorted.length === 0) {
     return (
       <div className="rounded-xl border border-border bg-surface-dark p-4 h-full">
         <h3 className="text-sm font-semibold text-text mb-3">{t("dashboard.watchedRoots")}</h3>
@@ -82,6 +83,16 @@ export default function StorageTreemap({
                   </div>
                   <div className="text-[10px] text-text-muted mt-1 truncate">
                     {item.files.toLocaleString()} {t("dashboard.filesLabel")}
+                  </div>
+                  <div className="text-[10px] text-text-muted mt-1">
+                    {item.status === "unscanned" && t("dashboard.rootPending")}
+                    {item.status === "scanning" && t("dashboard.scanning")}
+                    {item.status === "failed" && t("dashboard.rootFailed")}
+                    {item.stale && <span className="ml-1">{t("dashboard.rootStale")}</span>}
+                    {item.lastScanAt !== null && (
+                      <span className="block">{t("dashboard.rootLastScan", { time: formatTimestamp(item.lastScanAt) })}</span>
+                    )}
+                    {item.error && <span className="block text-red-700 dark:text-red-400 break-words">{item.error}</span>}
                   </div>
                 </button>
                 <button

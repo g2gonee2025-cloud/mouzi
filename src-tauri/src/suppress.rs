@@ -14,7 +14,8 @@
 use crate::safe_fs::normalize_lexically;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 
 /// How long a guard entry lives.
@@ -44,10 +45,26 @@ struct Suppression {
 
 struct Inner {
     entries: HashMap<String, Suppression>,
+    generations: HashMap<String, Weak<AtomicU64>>,
 }
 
 pub struct SuppressionSet {
     inner: Mutex<Inner>,
+    operations: Mutex<()>,
+}
+
+/// A queue generation remains live even after its item was drained. Undo can
+/// therefore cancel work already waiting for the operation coordinator.
+#[derive(Debug, Clone)]
+pub struct CancellationTicket {
+    generation: Arc<AtomicU64>,
+    expected: u64,
+}
+
+impl CancellationTicket {
+    pub fn is_current(&self) -> bool {
+        self.generation.load(Ordering::Acquire) == self.expected
+    }
 }
 
 /// The key a path is stored under, computed in exactly one place.
@@ -58,8 +75,16 @@ pub struct SuppressionSet {
 /// nothing, so the key is normalised lexically and lowercased. This is strictly
 /// *more* suppression than the raw-string key it replaces, and every arm site
 /// arms a path the app itself built, so in practice the two agree.
-fn key(path: &Path) -> String {
-    normalize_lexically(path).to_string_lossy().to_lowercase()
+pub(crate) fn key(path: &Path) -> String {
+    let path = normalize_lexically(path);
+    if let Ok(resolved) = std::fs::canonicalize(&path) { return resolved.to_string_lossy().to_lowercase(); }
+    for ancestor in path.ancestors().skip(1) {
+        if let Ok(resolved) = std::fs::canonicalize(ancestor) {
+            if let Ok(relative) = path.strip_prefix(ancestor) { return resolved.join(relative).to_string_lossy().to_lowercase(); }
+        }
+    }
+    // Only conservative suppression for paths without physical evidence.
+    path.to_string_lossy().to_lowercase()
 }
 
 impl SuppressionSet {
@@ -67,8 +92,41 @@ impl SuppressionSet {
         Self {
             inner: Mutex::new(Inner {
                 entries: HashMap::new(),
+                generations: HashMap::new(),
             }),
+            operations: Mutex::new(()),
         }
+    }
+
+    /// Serializes app file mutations without holding the suppression map or DB.
+    pub fn with_operation(&self) -> MutexGuard<'_, ()> {
+        self.operations.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    pub fn ticket(&self, path: &Path) -> CancellationTicket {
+        let mut inner = self.entries();
+        inner.generations.retain(|_, generation| generation.strong_count() > 0);
+        let generation = inner.generations.entry(key(path))
+            .or_insert_with(Weak::new)
+            .upgrade()
+            .unwrap_or_else(|| {
+                let generation = Arc::new(AtomicU64::new(0));
+                inner.generations.insert(key(path), Arc::downgrade(&generation));
+                generation
+            });
+        let expected = generation.load(Ordering::Acquire);
+        CancellationTicket { generation, expected }
+    }
+
+    /// Call while holding `with_operation`, before restoring an Undo path.
+    pub fn invalidate(&self, paths: &[PathBuf]) {
+        let mut inner = self.entries();
+        for path in paths {
+            if let Some(generation) = inner.generations.get(&key(path)).and_then(Weak::upgrade) {
+                generation.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+        inner.generations.retain(|_, generation| generation.strong_count() > 0);
     }
 
     /// The map, recovering from poisoning instead of propagating it.

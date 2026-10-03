@@ -3,11 +3,11 @@
 //! Zero Tauri dependencies: the Tauri command layer (commands.rs) calls
 //! `scan_roots` from a spawned std::thread and forwards progress events.
 
-use crate::db::{append_inventory_batch, clear_inventory_for_root, InventoryRow, INVENTORY_BATCH_SIZE};
+use crate::db::{self, InventoryRow, ScanToken, SnapshotInventoryRow, INVENTORY_BATCH_SIZE};
 use crate::ignore::{is_ignored, load_mouziignore};
 use serde::Serialize;
 use std::fs;
-use std::path::Path;
+use std::path::{Path,PathBuf};
 use std::time::UNIX_EPOCH;
 
 /// Emit a progress event roughly every this many files to avoid event storms.
@@ -30,6 +30,8 @@ pub struct ScanSummary {
     pub root: String,
     pub files: u64,
     pub bytes: u64,
+    pub status: String,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -46,17 +48,7 @@ pub fn categorize(path: &str) -> &'static str {
         .extension()
         .and_then(|e| e.to_str())
         .map(str::to_lowercase);
-    match ext.as_deref() {
-        Some("pdf" | "doc" | "docx" | "txt" | "md" | "xls" | "xlsx" | "ppt" | "pptx" | "csv") => {
-            "Documents"
-        }
-        Some("jpg" | "jpeg" | "png" | "gif" | "webp" | "svg" | "heic" | "bmp") => "Images",
-        Some("mp4" | "mkv" | "avi" | "mov" | "webm" | "wmv") => "Videos",
-        Some("mp3" | "wav" | "flac" | "aac" | "ogg" | "m4a") => "Audio",
-        Some("zip" | "rar" | "7z" | "tar" | "gz" | "bz2") => "Archives",
-        Some("rs" | "ts" | "tsx" | "js" | "py" | "java" | "c" | "cpp" | "go" | "rb") => "Code",
-        _ => "Other",
-    }
+    crate::categories::category_for_extension(ext.as_deref().unwrap_or(""))
 }
 
 /// True for symlinks on all platforms, plus NTFS junctions on Windows
@@ -92,22 +84,24 @@ struct RootWalk<'a> {
     patterns: &'a [String],
     processed: u64,
     bytes: u64,
-    batch: Vec<InventoryRow>,
+    batch: Vec<SnapshotInventoryRow>,
+    token: &'a ScanToken,
+    child_roots: &'a [PathBuf],
     progress: &'a mut dyn FnMut(ScanEvent),
 }
 
 impl<'a> RootWalk<'a> {
-    fn push_file(&mut self, path: &Path, meta: &fs::Metadata) {
+    fn push_file(&mut self, path: &Path, meta: &fs::Metadata) -> Result<(),String> {
         self.processed += 1;
         self.bytes += meta.len();
-        self.batch.push(InventoryRow {
+        self.batch.push(SnapshotInventoryRow{row:InventoryRow {
             path: path.to_string_lossy().into_owned(),
             size: meta.len() as i64,
             mtime: to_epoch_secs(meta),
             category: categorize(&path.to_string_lossy()).to_string(),
-        });
+        },identity:crate::safe_fs::file_identity(path)?.key(),mtime_ns:db::metadata_mtime_ns(meta)});
         if self.batch.len() >= INVENTORY_BATCH_SIZE {
-            self.flush_batch();
+            self.flush_batch()?;
         }
         if self.processed.is_multiple_of(PROGRESS_EVERY) {
             (self.progress)(ScanEvent::Progress(ScanProgress {
@@ -116,31 +110,27 @@ impl<'a> RootWalk<'a> {
                 total: None,
             }));
         }
+        Ok(())
     }
 
-    fn flush_batch(&mut self) {
+    fn flush_batch(&mut self) -> Result<(),String> {
         if self.batch.is_empty() {
-            return;
+            return Ok(());
         }
-        if let Err(e) = append_inventory_batch(self.root, &self.batch) {
-            eprintln!("[scan] failed to persist batch for {}: {}", self.root, e);
-        }
+        db::stage_inventory_batch(self.token,&self.batch)?;
         self.batch.clear();
+        Ok(())
     }
 
-    fn walk_dir(&mut self, dir: &Path, depth: usize) {
+    fn walk_dir(&mut self, dir: &Path, depth: usize)->Result<(),String> {
+        let _directory = crate::safe_fs::guard_directory(dir)?;
         if depth > MAX_DEPTH {
-            return;
+            return Err(format!("Directory nesting exceeds scan limit: {}",dir.display()));
         }
-        let entries = match fs::read_dir(dir) {
-            Ok(entries) => entries,
-            Err(_) => return,
-        };
-        for entry in entries.flatten() {
-            let file_type = match entry.file_type() {
-                Ok(ft) => ft,
-                Err(_) => continue,
-            };
+        let entries=fs::read_dir(dir).map_err(|error|format!("Could not read {}: {error}",dir.display()))?;
+        for entry in entries {
+            let entry=entry.map_err(|error|format!("Could not read an entry in {}: {error}",dir.display()))?;
+            let file_type=entry.file_type().map_err(|error|format!("Could not inspect {}: {error}",entry.path().display()))?;
             if is_symlink(&file_type) {
                 continue;
             }
@@ -149,37 +139,50 @@ impl<'a> RootWalk<'a> {
                 continue;
             }
             if file_type.is_dir() {
-                self.walk_dir(&entry.path(), depth + 1);
+                // The deepest configured root owns its tree, independent of
+                // root iteration order or which roots this run selected.
+                if self.child_roots.iter().any(|root|crate::safe_fs::directory_contains(&entry.path(),root).unwrap_or(false)) {continue;}
+                self.walk_dir(&entry.path(), depth + 1)?;
             } else if file_type.is_file() {
-                if let Ok(meta) = entry.metadata() {
-                    self.push_file(&entry.path(), &meta);
-                }
+                let meta=entry.metadata().map_err(|error|format!("Could not read metadata for {}: {error}",entry.path().display()))?;
+                self.push_file(&entry.path(), &meta)?;
             }
         }
+        Ok(())
     }
 }
 
 /// Recursively scan each root, replacing its previous inventory.
 ///
-/// Persists in batches of `INVENTORY_BATCH_SIZE` rows (one transaction /
-/// one DB lock per batch) and never holds the DB mutex during the walk.
+/// Stages batches without replacing live rows, then atomically publishes a
+/// completed root. Failed walks retain the last successful root snapshot.
 /// Skips symlinks/junctions and `.mouziignore`-matching entries.
-/// Unreadable directories are skipped; the scan is best-effort by design.
 pub fn scan_roots(paths: &[String], mut progress: impl FnMut(ScanEvent)) -> Vec<ScanSummary> {
     let mut summaries = Vec::with_capacity(paths.len());
     for root in paths {
-        let patterns = load_mouziignore(root);
-        if let Err(e) = clear_inventory_for_root(root) {
-            eprintln!("[scan] failed to clear inventory for {}: {} — skipping root", root, e);
-            continue;
-        }
-
-        let mut walk = RootWalk {
+        let result=(|| -> Result<(u64,u64),String> {
+            let token=db::begin_inventory_scan(root)?;
+            let result=(|| -> Result<(u64,u64),String> {
+            let resolved=crate::safe_fs::validate_root(Path::new(root))?;
+            let patterns=load_mouziignore(root)?;
+            let identity=crate::safe_fs::file_identity(&resolved)?;
+            let mut child_roots=Vec::new();
+            for folder in db::get_watched_folders().map_err(|e|e.to_string())? {
+                if folder.path==*root {continue;}
+                let Ok(other)=crate::safe_fs::validate_root(Path::new(&folder.path)) else {continue;};
+                if crate::safe_fs::file_identity(&other)?==identity {
+                    return Err(format!("Another configured root identifies the same folder: {}",folder.path));
+                }
+                if crate::safe_fs::directory_contains(&other,&resolved)? {child_roots.push(other);}
+            }
+            let mut walk = RootWalk {
             root: root.as_str(),
             patterns: &patterns,
             processed: 0,
             bytes: 0,
             batch: Vec::with_capacity(INVENTORY_BATCH_SIZE),
+            token:&token,
+            child_roots:&child_roots,
             progress: &mut progress,
         };
         (walk.progress)(ScanEvent::Progress(ScanProgress {
@@ -187,19 +190,25 @@ pub fn scan_roots(paths: &[String], mut progress: impl FnMut(ScanEvent)) -> Vec<
             processed: 0,
             total: None,
         }));
-        walk.walk_dir(Path::new(root), 0);
-        walk.flush_batch();
-
-        summaries.push(ScanSummary {
-            root: root.clone(),
-            files: walk.processed,
-            bytes: walk.bytes,
-        });
-        (walk.progress)(ScanEvent::Complete(ScanSummary {
-            root: root.clone(),
-            files: walk.processed,
-            bytes: walk.bytes,
-        }));
+            walk.walk_dir(&resolved,0)?;
+            walk.flush_batch()?;
+            if crate::safe_fs::file_identity(&resolved)? != identity { return Err("Root identity changed during inventory scan".into()); }
+            db::publish_inventory_scan(&token)?;
+            Ok((walk.processed,walk.bytes))
+            })();
+            if let Err(error)=&result {
+                if let Err(db_error)=db::fail_inventory_scan(&token,error) {
+                    return Err(format!("{error}; failed to record scan failure: {db_error}"));
+                }
+            }
+            result
+        })();
+        let summary=match result {
+            Ok((files,bytes))=>ScanSummary{root:root.clone(),files,bytes,status:"complete".into(),error:None},
+            Err(error)=>ScanSummary{root:root.clone(),files:0,bytes:0,status:"failed".into(),error:Some(error)},
+        };
+        progress(ScanEvent::Complete(summary.clone()));
+        summaries.push(summary);
     }
     summaries
 }
@@ -224,11 +233,15 @@ mod tests {
     /// fixture's.
     struct ScanFixture {
         root: PathBuf,
+        folder_id: i64,
     }
 
     impl ScanFixture {
         fn new(name: &str) -> Self {
-            ScanFixture { root: temp_root(name) }
+            db::init_test_db();
+            let root=temp_root(name);
+            let folder_id=db::add_watched_folder(&root.to_string_lossy(),db::FOLDER_MODE_MANUAL).unwrap();
+            ScanFixture { root,folder_id }
         }
     }
 
@@ -237,7 +250,7 @@ mod tests {
             let root = self.root.to_string_lossy().into_owned();
             // Reported, not unwrapped: a test that is already panicking must
             // not turn a cleanup problem into a second panic.
-            if let Err(e) = db::clear_inventory_for_root(&root) {
+            if let Err(e) = db::remove_watched_folder(self.folder_id) {
                 eprintln!("test fixture: inventory for {root} not cleared: {e}");
             }
             if let Err(e) = fs::remove_dir_all(&self.root) {
@@ -318,6 +331,7 @@ mod tests {
         }
 
         assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].status,"complete", "{:?}",summaries[0].error);
         // a.txt, b.jpg, c.mp4, noext, .mouziignore (not matched by *.tmp)
         // .tmp files and symlink dir are skipped
         assert_eq!(summaries[0].files, 5);
@@ -343,10 +357,77 @@ mod tests {
         assert_eq!(largest[0].size, 9);
 
         let root_stats = db::get_root_summaries().unwrap();
-        assert_eq!(root_stats.len(), 1);
-        assert_eq!((root_stats[0].files, root_stats[0].bytes), (5, 36));
+        let own=root_stats.iter().find(|stat|stat.path==root_str).unwrap();
+        assert_eq!((own.files, own.bytes), (5, 36));
 
         db::clear_inventory_for_root(&root_str).unwrap();
         assert_eq!(db::get_inventory_stats().unwrap().total_files, 0);
+    }
+
+    #[test]
+    fn empty_root_has_independent_completion_timestamp() {
+        let _guard=db::serialise_test_db();let fixture=ScanFixture::new("empty");
+        let root=fixture.root.to_string_lossy().into_owned();
+        let summaries=scan_roots(&[root.clone()], |_|{});
+        assert_eq!(summaries[0].status,"complete");assert_eq!(summaries[0].files,0);
+        let snapshot=db::get_dashboard_snapshot().unwrap();
+        let stat=snapshot.watched_roots.iter().find(|stat|stat.path==root).unwrap();
+        assert_eq!(stat.files,0);assert_eq!(stat.status,"complete");assert!(!stat.stale);assert!(stat.last_scan_at.is_some());
+    }
+
+    #[test]
+    fn unreadable_ignore_configuration_preserves_previous_snapshot() {
+        let _guard=db::serialise_test_db();let fixture=ScanFixture::new("failed");
+        let root=fixture.root.to_string_lossy().into_owned();fs::write(fixture.root.join("kept.txt"),"previous").unwrap();
+        assert_eq!(scan_roots(&[root.clone()], |_|{})[0].status,"complete");
+        fs::create_dir(fixture.root.join(".mouziignore")).unwrap();fs::write(fixture.root.join("new.txt"),"new").unwrap();
+        let summaries=scan_roots(&[root.clone()], |_|{});assert_eq!(summaries[0].status,"failed");
+        let files=db::get_inventory_files("size",None,Some(&root),None,10).unwrap();assert_eq!(files.len(),1);assert!(files[0].path.ends_with("kept.txt"));
+        let stat=db::get_root_summaries().unwrap().into_iter().find(|stat|stat.path==root).unwrap();assert!(stat.stale);assert_eq!(stat.status,"failed");assert!(stat.last_scan_at.is_some());
+    }
+
+    #[test]
+    fn failed_database_stage_does_not_publish_partial_inventory() {
+        let _guard=db::serialise_test_db();let fixture=ScanFixture::new("db-failure");
+        let root=fixture.root.to_string_lossy().into_owned();fs::write(fixture.root.join("kept.txt"),"previous").unwrap();
+        assert_eq!(scan_roots(&[root.clone()], |_|{})[0].status,"complete");
+        struct TriggerGuard;impl Drop for TriggerGuard {fn drop(&mut self){let _=db::lock_db().unwrap().execute("DROP TRIGGER IF EXISTS fail_scan_stage",[]);}}
+        db::lock_db().unwrap().execute_batch("CREATE TEMP TRIGGER fail_scan_stage BEFORE INSERT ON inventory_scan_stage BEGIN SELECT RAISE(ABORT,'injected stage failure'); END;").unwrap();
+        let _trigger=TriggerGuard;fs::write(fixture.root.join("new.txt"),"new").unwrap();
+        assert_eq!(scan_roots(&[root.clone()], |_|{})[0].status,"failed");
+        let files=db::get_inventory_files("size",None,Some(&root),None,10).unwrap();assert_eq!(files.len(),1);assert!(files[0].path.ends_with("kept.txt"));
+    }
+
+    #[test]
+    fn mutation_during_walk_cannot_resurrect_inventory() {
+        let _guard=db::serialise_test_db();let fixture=ScanFixture::new("mutation");
+        let root=fixture.root.to_string_lossy().into_owned();fs::write(fixture.root.join("gone.txt"),"x").unwrap();
+        assert_eq!(scan_roots(&[root.clone()], |_|{})[0].status,"complete");
+        let old=db::get_inventory_files("size",None,Some(&root),None,10).unwrap()[0].path.clone();
+        let mut invalidated=false;let summaries=scan_roots(&[root.clone()],|event|if matches!(event,ScanEvent::Progress(_)) && !invalidated {db::remove_inventory_path(&old).unwrap();invalidated=true;});
+        assert_eq!(summaries[0].status,"failed");assert!(db::get_inventory_files("size",None,Some(&root),None,10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn removed_root_during_walk_cannot_publish() {
+        let _guard=db::serialise_test_db();let fixture=ScanFixture::new("removed");
+        let root=fixture.root.to_string_lossy().into_owned();fs::write(fixture.root.join("file.txt"),"x").unwrap();
+        let mut removed=false;let summaries=scan_roots(&[root.clone()],|event|if matches!(event,ScanEvent::Progress(_)) && !removed {db::remove_watched_folder(fixture.folder_id).unwrap();removed=true;});
+        assert_eq!(summaries[0].status,"failed");assert!(db::get_inventory_files("size",None,Some(&root),None,10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn deepest_registered_root_owns_nested_tree_in_both_orders() {
+        let _guard=db::serialise_test_db();let fixture=ScanFixture::new("nested");
+        let child=fixture.root.join("child");fs::create_dir(&child).unwrap();fs::write(fixture.root.join("parent.txt"),"p").unwrap();fs::write(child.join("child.txt"),"c").unwrap();
+        let root=fixture.root.to_string_lossy().into_owned();let child_path=child.to_string_lossy().into_owned();
+        let child_id=db::add_watched_folder(&child_path,db::FOLDER_MODE_MANUAL).unwrap();
+        struct ChildGuard(i64);impl Drop for ChildGuard{fn drop(&mut self){let _=db::remove_watched_folder(self.0);}}
+        let _child_guard=ChildGuard(child_id);
+        for paths in [vec![root.clone(),child_path.clone()],vec![child_path.clone(),root.clone()]] {
+            assert!(scan_roots(&paths, |_|{}).iter().all(|summary|summary.status=="complete"));
+            let parent_files=db::get_inventory_files("size",None,Some(&root),None,10).unwrap();let child_files=db::get_inventory_files("size",None,Some(&child_path),None,10).unwrap();
+            assert_eq!(parent_files.len(),1);assert!(parent_files[0].path.ends_with("parent.txt"));assert_eq!(child_files.len(),1);assert!(child_files[0].path.ends_with("child.txt"));
+        }
     }
 }

@@ -4,7 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { Copy, ExternalLink, Search } from "lucide-react";
 import { formatBytes, formatTimestamp } from "../../utils/format";
 import { fileName, parentDir } from "../../utils/paths";
-import { categoryClass } from "../../utils/dashboard";
+import { categoryClass, categoryLabel, createInventoryBrowserLoader } from "../../utils/dashboard";
 import type { InventoryFile } from "../../store/useDashboardStore";
 
 interface FileBrowserProps {
@@ -12,6 +12,7 @@ interface FileBrowserProps {
   initialRecent: InventoryFile[];
   category: string | null;
   root: string | null;
+  revision: number;
 }
 
 type Mode = "size" | "mtime";
@@ -21,47 +22,48 @@ export default function FileBrowser({
   initialRecent,
   category,
   root,
+  revision,
 }: FileBrowserProps) {
   const { t } = useTranslation();
   const [mode, setMode] = useState<Mode>("size");
   const [query, setQuery] = useState("");
   const [files, setFiles] = useState<InventoryFile[]>(initialLargest);
   const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState<string | null>(null);
   const searchRef = useRef<HTMLInputElement>(null);
-  const debounce = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const copyTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const mounted = useRef(true);
+  const [loader] = useState(() => createInventoryBrowserLoader(
+    (query) => invoke<InventoryFile[]>("get_inventory_files_cmd", { ...query }),
+    { rows: setFiles, loading: setLoading, error: setError },
+  ));
 
   useEffect(() => {
-    const load = async (sort: Mode, q: string, cat: string | null, r: string | null) => {
-      const hasFilter = Boolean(q || cat || r);
-      if (!hasFilter) {
-        setFiles(sort === "size" ? initialLargest : initialRecent);
-        return;
-      }
+    const request = { sort: mode, query, category, root, initialLargest, initialRecent };
+    const filtered = Boolean(query.trim() || category || root);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    setError(null);
+    if (filtered) {
+      setFiles([]);
       setLoading(true);
-      try {
-        const rows = await invoke<InventoryFile[]>("get_inventory_files_cmd", {
-          sort,
-          category: cat ?? "",
-          root: r ?? "",
-          query: q.trim(),
-          limit: 80,
-        });
-        setFiles(rows);
-      } catch {
-        // keep last list
-      } finally {
-        setLoading(false);
-      }
-    };
-    if (debounce.current) clearTimeout(debounce.current);
-    debounce.current = setTimeout(() => {
-      void load(mode, query, category, root);
-    }, query ? 200 : 0);
+      timer = setTimeout(() => { void loader.load(request); }, query.trim() ? 200 : 0);
+    } else {
+      void loader.load(request);
+    }
     return () => {
-      if (debounce.current) clearTimeout(debounce.current);
+      if (timer) clearTimeout(timer);
+      loader.cancel();
     };
-  }, [mode, query, category, root, initialLargest, initialRecent]);
+  }, [mode, query, category, root, initialLargest, initialRecent, revision, loader]);
+
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+      if (copyTimer.current) clearTimeout(copyTimer.current);
+    };
+  }, []);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -87,8 +89,10 @@ export default function FileBrowser({
   const handleCopy = async (path: string) => {
     try {
       await navigator.clipboard.writeText(path);
+      if (!mounted.current) return;
       setCopied(path);
-      setTimeout(() => setCopied(null), 1400);
+      if (copyTimer.current) clearTimeout(copyTimer.current);
+      copyTimer.current = setTimeout(() => setCopied(null), 1400);
     } catch {
       // ignore
     }
@@ -137,7 +141,7 @@ export default function FileBrowser({
         <div className="flex flex-wrap gap-2 mb-3 text-[11px]">
           {category && (
             <span className="rounded-full border border-border px-2 py-0.5 text-text">
-              {t("dashboard.filterBy", { name: category })}
+              {t("dashboard.filterBy", { name: categoryLabel(category, t) })}
             </span>
           )}
           {root && (
@@ -154,7 +158,8 @@ export default function FileBrowser({
         </div>
       )}
 
-      {files.length === 0 ? (
+      {error && <div className="text-xs text-red-700 dark:text-red-400 mb-2" role="alert">{error}</div>}
+      {!loading && !error && files.length === 0 ? (
         <div className="flex items-center justify-center h-28 text-xs text-text-muted">
           {t("dashboard.noFiles")}
         </div>
@@ -168,7 +173,7 @@ export default function FileBrowser({
               <div className="flex items-center gap-2 min-w-0 flex-1">
                 <span
                   className={`w-1.5 h-1.5 rounded-full shrink-0 ${categoryClass(file.category)}`}
-                  title={file.category}
+                  title={categoryLabel(file.category, t)}
                 />
                 <div className="min-w-0">
                   <div className="text-sm text-text truncate">{fileName(file.path)}</div>

@@ -1,7 +1,7 @@
 import { useEffect, useCallback, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { navigateHash } from "../utils/paths";
-import { useSuggestionsStore } from "../store/useSuggestionsStore";
+import { useSuggestionsStore, distinctSuggestionRules, type Suggestion } from "../store/useSuggestionsStore";
 import {
   Sparkles,
   ChevronLeft,
@@ -58,10 +58,13 @@ export default function Suggestions() {
     createRuleDefault,
     results,
     loadSuggestions,
-    acceptSuggestion,
+    prepareSuggestions,
+    preparedPlans,
+    cancelPlans,
     dismissSuggestion,
     acceptAll,
     dismissAll,
+    resetDismissed,
     clearResults,
     clearError,
   } = useSuggestionsStore();
@@ -87,26 +90,29 @@ export default function Suggestions() {
     navigateHash("dashboard");
   };
 
-  const runAcceptAll = async () => {
-    await acceptAll(createRule);
-  };
-
   // `createRule` is pre-checked, so one click used to move every file AND leave
   // behind a permanent enabled rule per file. The dialog states both outcomes
   // and lets the rule half be called out even when the box is unticked.
-  const handleAcceptAllClick = () => {
-    if (suggestions.length === 0) return;
-    setPending({
-      title: t("confirm.op.acceptAll"),
-      count: suggestions.length,
-      notice: "move",
-      note: createRule
-        ? t("confirm.note.acceptAllRules", { count: suggestions.length })
-        : undefined,
-      preview: suggestions.map((s) => s.path),
-      onConfirm: runAcceptAll,
+  const reviewSuggestions = async (captured: readonly Suggestion[]) => {
+    if (!captured.length || busy || loading || pending) return;
+    try {
+    const plans = await prepareSuggestions(captured, createRule);
+    const rules = distinctSuggestionRules(plans);
+    const ruleNotes = rules.map((rule) => {
+      const operation = rule.disposition === "create" ? t("suggestions.rulePreview") : rule.disposition === "already_covered" ? t("suggestions.ruleAlreadyCovered") : t("suggestions.ruleNotApplicable");
+      return `${operation}: .${rule.extension ?? "—"} → ${t(`categories.${rule.destination}`, { defaultValue: rule.destination })}. ${rule.scope}. ${rule.message ?? ""}`;
     });
+    setPending({
+      title: captured.length === 1 ? t("suggestions.accept") : t("confirm.op.acceptAll"),
+      count: plans.length,
+      notice: "move",
+      note: ruleNotes.length ? [t("suggestions.ruleCount", { count: rules.filter((r) => r.disposition === "create").length }), ...ruleNotes].join("\n") : undefined,
+      preview: plans.map((plan) => `${plan.path} → ${plan.destination}`),
+      onConfirm: () => acceptAll(plans),
+    });
+    } catch { /* The store keeps the concrete preview error visible. */ }
   };
+  const handleAcceptAllClick = () => reviewSuggestions(suggestions.map((s) => ({ ...s })));
 
   return (
     <div className="h-full flex flex-col bg-surface text-text">
@@ -115,6 +121,7 @@ export default function Suggestions() {
         <div className="flex items-center gap-2">
           <button
             onClick={handleClose}
+            aria-label={t("common.back")}
             className="p-1.5 rounded-md hover:bg-border transition-colors"
           >
             <ChevronLeft size={18} />
@@ -125,11 +132,14 @@ export default function Suggestions() {
         <div className="flex items-center gap-2">
           <button
             onClick={loadSuggestions}
-            disabled={loading || busy}
+            disabled={loading || busy || !!preparedPlans}
             className="flex items-center gap-1 text-xs text-text-muted hover:text-text transition-colors disabled:opacity-50"
           >
             <RefreshCw size={14} className={loading ? "animate-spin" : ""} />
             {t("suggestions.refresh")}
+          </button>
+          <button onClick={resetDismissed} disabled={loading || busy || !!preparedPlans} className="text-xs text-text-muted hover:text-text disabled:opacity-50">
+            {t("suggestions.resetDismissed")}
           </button>
         </div>
       </header>
@@ -175,14 +185,14 @@ export default function Suggestions() {
                     }`}
                   />
                   <span className="truncate">{r.path}</span>
-                  {r.status === "ok" && r.dest && (
+                  {r.dest && r.dest !== r.path && (
                     <span className="text-text-muted truncate">
                       → {r.dest}
                     </span>
                   )}
                   {r.status === "ok" && (
                     <span className="text-green-600 dark:text-green-400 shrink-0">
-                      {t("suggestions.accepted")}
+                      {t(r.dest === r.path ? "suggestions.alreadyFiled" : "suggestions.accepted")}
                     </span>
                   )}
                   {r.status === "missing" && (
@@ -190,11 +200,12 @@ export default function Suggestions() {
                       {t("suggestions.missing")}
                     </span>
                   )}
-                  {r.status === "failed" && (
+                  {(r.status === "failed" || r.status === "partial") && (
                     <span className="text-red-600 dark:text-red-400 shrink-0">
                       {t("suggestions.failed")}: {r.message}
                     </span>
                   )}
+                  {r.status === "ok" && r.message && <span className="text-text-muted">{r.message}</span>}
                 </div>
               ))}
             </div>
@@ -231,6 +242,7 @@ export default function Suggestions() {
                   <input
                     type="checkbox"
                     checked={createRule}
+                    disabled={busy || loading || !!preparedPlans}
                     onChange={(e) => setCreateRule(e.target.checked)}
                     className="rounded border-border"
                   />
@@ -240,15 +252,15 @@ export default function Suggestions() {
               <div className="flex items-center gap-2">
                 <button
                   onClick={handleAcceptAllClick}
-                  disabled={busy}
-                  className="flex items-center gap-1 rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-white hover:bg-primary-hover transition-colors disabled:opacity-50"
+                  disabled={busy || loading || !!preparedPlans}
+                  className="flex items-center gap-1 rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-on-primary hover:bg-primary-hover transition-colors disabled:opacity-50"
                 >
                   <CheckSquare size={14} />
                   {t("suggestions.acceptAll")}
                 </button>
                 <button
                   onClick={dismissAll}
-                  disabled={busy}
+                  disabled={busy || loading || !!preparedPlans}
                   className="flex items-center gap-1 rounded-md border border-border px-3 py-1.5 text-xs font-medium text-text-muted hover:text-text hover:bg-border transition-colors disabled:opacity-50"
                 >
                   <XSquare size={14} />
@@ -270,11 +282,11 @@ export default function Suggestions() {
                         {s.filename}
                       </span>
                       <span className="text-xs px-1.5 py-0.5 rounded bg-yellow-100 dark:bg-yellow-900/30 text-yellow-700 dark:text-yellow-400">
-                        {s.currentCategory}
+                        {t(`categories.${s.currentCategory}`, { defaultValue: s.currentCategory })}
                       </span>
                       <span className="text-xs text-text-muted">→</span>
                       <span className="text-xs px-1.5 py-0.5 rounded bg-primary/10 text-primary font-medium">
-                        {s.suggestedCategory}
+                        {t(`categories.${s.suggestedCategory}`, { defaultValue: s.suggestedCategory })}
                       </span>
                     </div>
                     <div className="flex items-center gap-3 mt-1.5 text-xs text-text-muted">
@@ -301,8 +313,9 @@ export default function Suggestions() {
                   {/* Actions */}
                   <div className="flex items-center gap-1 shrink-0">
                     <button
-                      onClick={() => acceptSuggestion(s, createRule)}
-                      disabled={busy}
+                      onClick={() => reviewSuggestions([{ ...s }])}
+                      disabled={busy || loading || !!preparedPlans}
+                      aria-label={t("suggestions.accept")}
                       className="p-1.5 rounded-md bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-400 hover:bg-green-200 dark:hover:bg-green-900/50 transition-colors disabled:opacity-50"
                       title={t("suggestions.accept")}
                     >
@@ -310,7 +323,8 @@ export default function Suggestions() {
                     </button>
                     <button
                       onClick={() => dismissSuggestion(s.path)}
-                      disabled={busy}
+                      disabled={busy || loading || !!preparedPlans}
+                      aria-label={t("suggestions.dismiss")}
                       className="p-1.5 rounded-md bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-400 hover:bg-red-200 dark:hover:bg-red-900/50 transition-colors disabled:opacity-50"
                       title={t("suggestions.dismiss")}
                     >
@@ -325,7 +339,7 @@ export default function Suggestions() {
       </div>
 
       {pending && (
-        <ConfirmDialog {...pending} onClose={() => setPending(null)} />
+        <ConfirmDialog {...pending} onClose={() => { cancelPlans(); setPending(null); }} />
       )}
     </div>
   );

@@ -1,9 +1,9 @@
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Emitter, Manager};
-use crate::db::{get_settings, get_watched_folders, is_folder_paused_mode};
+use tauri::{AppHandle, Manager};
+use crate::db::get_settings;
 use crate::i18n::TrayI18n;
-use crate::rules::manual_scan_folder;
+use tauri_plugin_notification::NotificationExt;
 
 pub fn setup_tray(app: &AppHandle, lang: &str) -> Result<(), Box<dyn std::error::Error>> {
     let i18n = TrayI18n::new(lang);
@@ -38,7 +38,12 @@ pub fn setup_tray(app: &AppHandle, lang: &str) -> Result<(), Box<dyn std::error:
                 show_cleanup_window(app);
             }
             "clean" => {
-                let _ = perform_clean(app);
+                let handle = app.clone();
+                std::thread::spawn(move || {
+                    if let Err(e) = perform_clean(&handle) {
+                        let _ = handle.notification().builder().title("Mouzi").body(format!("Clean Now failed: {e}")).show();
+                    }
+                });
             }
             _ => {}
         })
@@ -107,19 +112,31 @@ pub fn show_popup_window(app: &AppHandle) {
 
 fn perform_clean(app: &AppHandle) -> Result<(), String> {
     let i18n = TrayI18n::new(&tray_lang(app));
-    let folders = get_watched_folders().map_err(|e| e.to_string())?;
-    let mut total = 0;
-    for folder in folders {
-        if !folder.enabled || is_folder_paused_mode(&folder.mode) { continue; }
-        if let Ok(results) = manual_scan_folder(&folder.path) {
-            total += results.len();
-        }
-    }
+    let total = crate::commands::clean_now_cmd(app.clone(), app.state::<crate::AppState>())?.len();
     if total > 0 {
         let msg = i18n.get("organized").replace("{}", &total.to_string());
-        let _ = app.emit("show-notification", msg);
+        let _ = app.notification().builder().title("Mouzi").body(msg).show();
     }
     Ok(())
+}
+
+pub fn update_tray_language(app: &AppHandle, lang: &str) {
+    let translated = TrayI18n::new(lang);
+    let result = (|| -> Result<Menu<tauri::Wry>, tauri::Error> {
+        let clean = MenuItem::with_id(app, "clean", translated.get("clean_now"), true, None::<&str>)?;
+        let suggestions = MenuItem::with_id(app, "suggestions", translated.get("suggestions"), true, None::<&str>)?;
+        let dashboard = MenuItem::with_id(app, "dashboard", translated.get("dashboard"), true, None::<&str>)?;
+        let cleanup = MenuItem::with_id(app, "cleanup", translated.get("cleanup"), true, None::<&str>)?;
+        let settings = MenuItem::with_id(app, "settings", translated.get("settings"), true, None::<&str>)?;
+        let separator = PredefinedMenuItem::separator(app)?;
+        let quit = MenuItem::with_id(app, "quit", translated.get("quit"), true, None::<&str>)?;
+        Menu::with_items(app, &[&clean, &suggestions, &dashboard, &cleanup, &settings, &separator, &quit])
+    })();
+    if let (Some(tray), Ok(menu)) = (app.tray_by_id("tray"), result) {
+        let _ = tray.set_menu(Some(menu));
+    }
+    let pending = app.try_state::<crate::AppState>().and_then(|state| state.watcher.lock().ok().map(|watcher| watcher.get_pending_files().len())).unwrap_or(0);
+    update_tray_tooltip(app, pending);
 }
 
 pub fn update_tray_tooltip(app: &AppHandle, count: usize) {

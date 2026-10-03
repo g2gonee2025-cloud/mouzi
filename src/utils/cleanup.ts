@@ -22,6 +22,15 @@ export interface CleanupRequest {
   kind: "trash_duplicate" | "trash_large" | "trash_stale" | "remove_empty_dir";
   path: string;
   keepPath?: string;
+  minBytes?: number;
+  days?: number;
+}
+
+export interface CleanupPlan {
+  planId: string;
+  expiresAt: string;
+  actions: CleanupRequest[];
+  totalBytes: number;
 }
 
 /**
@@ -77,11 +86,8 @@ export interface CleanupBreakdown {
 }
 
 /**
- * Every map below is a `Record<CleanupStatus, ...>` rather than a chain of
- * `===` tests, so a fifth status added on the Rust side fails to compile here
- * instead of reaching the final `else`. The `Record` is the compile-time
- * guard; the `Map` built from it is the runtime one, and the miss it can return
- * is the only thing that makes an off-union value detectable at all.
+ * The records cover the frontend union; the runtime maps also identify wire
+ * values outside it. Rust wire changes still need a matching contract update.
  */
 const STATUS_MARK: Record<CleanupStatus, CleanupStatusMark> = {
   ok: { icon: CheckCircle2, className: "text-green-500" },
@@ -127,6 +133,12 @@ const UNKNOWN_MARK: CleanupStatusMark = {
  */
 export function cleanupStatusMark(status: string): CleanupStatusMark {
   return MARK_BY_WIRE.get(status) ?? UNKNOWN_MARK;
+}
+
+export function cleanupStatusLabel(status: string): string {
+  return CLEANUP_STATUS_ORDER.includes(status as CleanupStatus)
+    ? STATUS_SUMMARY[status as CleanupStatus].labelKey
+    : "cleanup.historyUnknown";
 }
 
 export function cleanupBreakdown(

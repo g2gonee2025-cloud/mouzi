@@ -38,38 +38,25 @@ export default function DuplicatesTab() {
 
   // Summed off `actions`, never off `reclaimableBytes(groups)`: if the two ever
   // disagreed the dialog would quote one number and the backend act on another.
-  const selectedBytes = useMemo(() => {
-    const doomed = new Set(actions.map((a) => a.path));
-    let total = 0;
-    for (const g of groups) {
-      for (const f of g.files) {
-        if (doomed.has(f.path)) total += f.size;
-      }
-    }
-    return total;
-  }, [actions, groups]);
-
   const handleFind = () => store.findDuplicates();
 
   const handleKeep = (hash: string, path: string) => {
     setSelected((prev) => ({ ...prev, [hash]: path }));
   };
 
-  const runCleanup = async () => {
-    await store.executeCleanup(actions);
-    setShowResults(true);
-  };
-
-  const handleConfirm = () => {
+  const handleConfirm = async () => {
     if (actions.length === 0) return;
+    try {
+    const plan = await store.prepareCleanup(actions);
     setPending({
       title: t("confirm.op.trashDuplicates"),
-      count: actions.length,
-      bytes: selectedBytes,
+      count: plan.actions.length,
+      bytes: plan.totalBytes,
       notice: "trash",
-      preview: actions.map((a) => a.path),
-      onConfirm: runCleanup,
+      preview: plan.actions.map((a) => a.path),
+      onConfirm: async () => { await store.executeCleanup(plan.planId); setShowResults(true); },
     });
+    } catch { /* The store displays the preparation error. */ }
   };
 
   // When results come back, refresh the list
@@ -95,8 +82,8 @@ export default function DuplicatesTab() {
         <p className="text-xs text-text-muted">{t("cleanup.duplicatesHint")}</p>
         <button
           onClick={handleFind}
-          disabled={store.loading}
-          className="flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-white hover:bg-primary-hover disabled:opacity-50 transition-colors"
+          disabled={store.loading || store.busy || !!store.preparedPlan}
+          className="flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-on-primary hover:bg-primary-hover disabled:opacity-50 transition-colors"
         >
           <Search size={14} />
           {store.loading
@@ -152,7 +139,7 @@ export default function DuplicatesTab() {
       )}
 
       {pending && (
-        <ConfirmDialog {...pending} onClose={() => setPending(null)} />
+        <ConfirmDialog {...pending} onClose={() => { store.cancelPlan(); setPending(null); }} />
       )}
     </div>
   );

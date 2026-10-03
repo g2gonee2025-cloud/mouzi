@@ -27,7 +27,7 @@ export default function ResultsPanel({
         </h3>
         <button
           onClick={onDone}
-          className="flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-white hover:bg-primary-hover transition-colors"
+          className="flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-on-primary hover:bg-primary-hover transition-colors"
         >
           <RotateCcw size={14} />
           {t("cleanup.backToList")}

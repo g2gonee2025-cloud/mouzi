@@ -20,8 +20,14 @@ on:
   push:
     branches:
       - main
+      - 'wip/**'
   pull_request:
   workflow_dispatch:
+    inputs:
+      native_trash:
+        description: 'Run the real Recycle Bin test on a disposable runner fixture'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -44,20 +50,34 @@ jobs:
           cache: npm
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.0
 
       - name: Install frontend dependencies
         run: npm ci
 
-      # `tsc -b` so that tsconfig.node.json, and therefore vite.config.ts, is
-      # typechecked too. Plain `tsc` ignores project references and would
-      # leave the build config unchecked.
-      - name: Typecheck app and build config
-        run: npx tsc -b
+      - name: Frontend regressions
+        run: npm test -- --maxWorkers=2
 
-      - name: Build frontend
-        run: npx vite build
+      # The real Shell/bin test is ignored by default and separately opt-in.
+      - name: Backend regressions
+        working-directory: src-tauri
+        run: cargo test --lib --locked --jobs 2 -- --test-threads=2
 
       # --no-bundle builds the executable without producing installers, so
       # nothing distributable is generated or uploaded.
       - name: Build app executable, unsigned
-        run: npm run tauri build -- --no-bundle --ci
+        run: npm run tauri build -- --no-bundle --ci -- --locked --jobs 2
+
+  native-trash:
+    name: Explicit Windows Recycle Bin integration
+    if: github.event_name == 'workflow_dispatch' && inputs.native_trash
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.0
+      - name: Test only the disposable native-bin fixture
+        working-directory: src-tauri
+        run: cargo test --lib --locked --jobs 2 safe_fs::tests::delete_to_trash_places_the_file_in_the_recycle_bin -- --ignored --exact --test-threads=1

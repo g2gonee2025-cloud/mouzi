@@ -1,9 +1,11 @@
-use crate::db::{get_rules, get_settings, log_action, ActionLog, Rule};
+use crate::db::{get_rules, get_settings, get_watched_folders, ActionLog, Rule};
 use crate::ignore::{is_ignored, load_mouziignore};
+use crate::suppress::{CancellationTicket, SuppressionSet, SUPPRESSION_TTL};
 use chrono::Utc;
 use regex::Regex;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, SystemTime};
 
 /// Check if a file is currently locked by another process.
 /// On Windows this tries to open with write access; if another process holds
@@ -14,18 +16,18 @@ fn is_file_locked(path: &Path) -> bool {
 
 /// Check whether a file has passed its grace period since last modification.
 /// Returns true if the file is ready to be moved.
-fn check_grace_period(path: &Path, grace_seconds: i64) -> bool {
-    if grace_seconds <= 0 {
-        return true;
-    }
-    if let Ok(metadata) = fs::metadata(path) {
-        if let Ok(modified) = metadata.modified() {
-            if let Ok(elapsed) = modified.elapsed() {
-                return elapsed.as_secs() >= grace_seconds as u64;
-            }
-        }
-    }
-    true
+fn check_grace_period(path: &Path, grace_seconds: i64) -> Result<bool, String> {
+    let modified = fs::metadata(path).and_then(|metadata| metadata.modified())
+        .map_err(|e| format!("Cannot check file settling for {}: {e}", path.display()))?;
+    Ok(settled_at(modified, SystemTime::now(), grace_seconds))
+}
+
+fn settled_at(modified: SystemTime, now: SystemTime, grace_seconds: i64) -> bool {
+    // An unattended move always needs a short quiet interval, including when
+    // the optional user grace period is zero. Future timestamps fail closed.
+    now.duration_since(modified)
+        .map(|elapsed| elapsed >= Duration::from_secs(grace_seconds.max(2) as u64))
+        .unwrap_or(false)
 }
 
 #[derive(Debug, Clone)]
@@ -33,7 +35,6 @@ pub struct FileInfo {
     pub path: PathBuf,
     pub name: String,
     pub extension: String,
-    pub size: u64,
 }
 
 pub fn should_ignore_file(path: &Path) -> bool {
@@ -83,21 +84,21 @@ pub fn should_ignore_file(path: &Path) -> bool {
 /// Check whether a file is ignored by the `.mouziignore` in its parent folder.
 /// This is the single helper used by both the watcher and the manual Clean Now path
 /// so both code paths behave identically.
-pub fn is_file_ignored_by_mouziignore(path: &Path) -> bool {
+pub fn is_file_ignored_by_mouziignore(path: &Path) -> Result<bool, String> {
     if let Some(parent) = path.parent() {
-        let patterns = load_mouziignore(&parent.to_string_lossy());
+        let patterns = load_mouziignore(&parent.to_string_lossy())?;
         if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-            return is_ignored(name, &patterns);
+            return Ok(is_ignored(name, &patterns));
         }
     }
-    false
+    Ok(false)
 }
 
 pub fn scan_file(path: &Path) -> Option<FileInfo> {
     if should_ignore_file(path) {
         return None;
     }
-    let metadata = fs::metadata(path).ok()?;
+    if !fs::metadata(path).ok()?.is_file() { return None; }
     let name = path.file_name()?.to_string_lossy().to_string();
     let extension = path
         .extension()
@@ -108,7 +109,6 @@ pub fn scan_file(path: &Path) -> Option<FileInfo> {
         path: path.to_path_buf(),
         name,
         extension,
-        size: metadata.len(),
     })
 }
 
@@ -151,17 +151,11 @@ pub fn find_matching_rule(file: &FileInfo) -> Option<Rule> {
     rules.into_iter().find(|rule| matches_rule(file, rule))
 }
 
+#[cfg(test)]
 fn move_file_cross_device(src: &Path, dst: &Path) -> Result<(), std::io::Error> {
-    // Try a fast atomic rename first (same filesystem).
-    match fs::rename(src, dst) {
-        Ok(()) => Ok(()),
-        Err(_) => {
-            // Fallback: copy and remove for cross-device / cross-drive moves.
-            fs::copy(src, dst)?;
-            fs::remove_file(src)?;
-            Ok(())
-        }
-    }
+    crate::safe_fs::move_file_checked(src, dst)
+        .map(|_| ())
+        .map_err(std::io::Error::other)
 }
 
 /// The directory a rule would file `file` into, resolved against `root` — the
@@ -214,112 +208,177 @@ pub fn is_already_filed(root: &Path, path: &Path, file: &FileInfo, rule: &Rule) 
         return false;
     };
     let dest_dir = resolve_dest_dir(root, file, rule);
-    crate::safe_fs::is_within_any_root(base, std::slice::from_ref(&dest_dir))
+    if base.exists() && dest_dir.exists() {
+        crate::safe_fs::directory_contains(base, &dest_dir).unwrap_or(false)
+    } else {
+        // Pure destination planning when the output directory does not exist.
+        // This branch is a skip hint, never filesystem authorization.
+        crate::safe_fs::is_within_any_root(base, std::slice::from_ref(&dest_dir))
+    }
 }
 
-pub fn execute_rule(file_info: &FileInfo, rule: &Rule, root: &Path) -> Result<String, String> {
+#[cfg(test)]
+fn execute_rule(file_info: &FileInfo, rule: &Rule, root: &Path) -> Result<String, String> {
     let dest = resolve_dest_dir(root, file_info, rule);
 
     match rule.action.as_str() {
         "move" => {
-            fs::create_dir_all(&dest).map_err(|e| e.to_string())?;
-            let new_path = crate::safe_fs::unique_destination(&dest, &file_info.name);
-            move_file_cross_device(&file_info.path, &new_path).map_err(|e| e.to_string())?;
-            Ok(new_path.to_string_lossy().to_string())
+            let moved = crate::safe_fs::move_file_checked(&file_info.path, &dest.join(&file_info.name))?;
+            Ok(moved.destination.to_string_lossy().to_string())
         }
         "ignore" => Ok(file_info.path.to_string_lossy().to_string()),
         _ => Err(format!("Unknown action: {}", rule.action)),
     }
 }
 
-pub fn process_file(
+#[derive(Debug)]
+pub enum ProcessOutcome {
+    Organized { rule: Rule, destination: String, warning: Option<String> },
+    Skipped,
+    Retry { reason: String },
+}
+
+pub fn process_file_with_suppression(
     path: &Path,
     bypass_grace: bool,
     root: &Path,
-) -> Result<Option<(Rule, String)>, String> {
-    let (grace_period, lock_check) = get_settings()
-        .map(|s| (s.grace_period_seconds, s.lock_check_enabled))
-        .unwrap_or((300, true));
-
-    if !bypass_grace && !check_grace_period(path, grace_period) {
-        return Ok(None);
+    suppression: &SuppressionSet,
+    ticket: &CancellationTicket,
+    expected_identity: Option<&crate::safe_fs::FileIdentity>,
+    require_auto_root: bool,
+) -> Result<ProcessOutcome, String> {
+    let _operation = suppression.with_operation();
+    if !ticket.is_current() || suppression.is_suppressed(path, Instant::now()) {
+        return Ok(ProcessOutcome::Skipped);
     }
-    if lock_check && is_file_locked(path) {
-        return Ok(None);
+    let settings = get_settings().map_err(|e| format!("Cannot read organizer settings: {e}"))?;
+    let folders = get_watched_folders().map_err(|e| format!("Cannot read watched folders: {e}"))?;
+    if require_auto_root && !folders.iter().any(|folder| {
+        folder.enabled && crate::db::is_folder_auto_mode(&folder.mode)
+            && same_path(Path::new(&folder.path), root)
+    }) {
+        return Ok(ProcessOutcome::Skipped);
     }
-
-    // Safety net: also check .mouziignore inside process_file.
-    if is_file_ignored_by_mouziignore(path) {
-        return Ok(None);
+    crate::safe_fs::validate_root(root)?;
+    if !path.parent().is_some_and(|parent| crate::safe_fs::directory_contains(parent, root).unwrap_or(false)) {
+        return Err(format!("File is outside organizer root: {}", path.display()));
     }
-
-    let file_info = scan_file(path).ok_or("Cannot read file metadata")?;
-    let rule = find_matching_rule(&file_info).ok_or("No matching rule")?;
-
-    if rule.action == "ignore" {
-        return Ok(None);
+    if should_ignore_file(path) || is_file_ignored_by_mouziignore(path)? {
+        return Ok(ProcessOutcome::Skipped);
     }
-
-    // Layer 1, immediately after the rule is known and before the move. Placed
-    // here rather than in `execute_rule` so it is inherited by every caller
-    // automatically — the 500 ms tick, `manual_scan_folder` and therefore
-    // `scan_folder_cmd`, `import_archive_cmd` and the scheduler all funnel
-    // through this one function, so none of them can grow an unguarded move.
-    if is_already_filed(root, path, &file_info, &rule) {
-        return Ok(None);
+    // Read the watched-root protection file too if a future recursive caller
+    // supplies a descendant. Errors pause organization instead of dropping rules.
+    if path.parent().is_some_and(|parent| !same_path(parent, root)) {
+        let patterns = load_mouziignore(&root.to_string_lossy())?;
+        if path.file_name().and_then(|name| name.to_str()).is_some_and(|name| is_ignored(name, &patterns)) {
+            return Ok(ProcessOutcome::Skipped);
+        }
     }
-
-    let dest = execute_rule(&file_info, &rule, root)?;
-
-    let log = ActionLog {
-        id: None,
-        timestamp: Utc::now(),
-        source_path: file_info.path.to_string_lossy().to_string(),
-        destination_path: Some(dest.clone()),
-        action: rule.action.clone(),
-        file_name: file_info.name.clone(),
-        file_type: rule.name.clone(),
-        undone: false,
+    if !bypass_grace && !check_grace_period(path, settings.grace_period_seconds)? {
+        return Ok(ProcessOutcome::Retry { reason: "File is still settling".into() });
+    }
+    if settings.lock_check_enabled && is_file_locked(path) {
+        return Ok(ProcessOutcome::Retry { reason: "File is locked".into() });
+    }
+    let identity = match crate::safe_fs::file_identity(path) {
+        Ok(identity) => identity,
+        Err(error) => return Ok(ProcessOutcome::Retry { reason: error }),
     };
-    let _ = log_action(&log);
-
-    Ok(Some((rule, dest)))
+    if expected_identity.is_some_and(|expected| expected != &identity) {
+        return Ok(ProcessOutcome::Skipped);
+    }
+    let file_info = scan_file(path).ok_or_else(|| format!("Cannot read file metadata: {}", path.display()))?;
+    let rules = get_rules().map_err(|e| format!("Cannot read organizer rules: {e}"))?;
+    let Some(rule) = rules.into_iter().find(|rule| matches_rule(&file_info, rule)) else {
+        return Ok(ProcessOutcome::Skipped);
+    };
+    if rule.action == "ignore" || is_already_filed(root, path, &file_info, &rule)
+        || folders.iter().filter(|folder| folder.enabled).any(|folder| {
+            is_already_filed(Path::new(&folder.path), path, &file_info, &rule)
+        })
+    {
+        return Ok(ProcessOutcome::Skipped);
+    }
+    if rule.action != "move" { return Err(format!("Unknown organizer action: {}", rule.action)); }
+    let requested = resolve_dest_dir(root, &file_info, &rule).join(&file_info.name);
+    let source = path.to_string_lossy().to_string();
+    let requested_string = requested.to_string_lossy().to_string();
+    // If intent cannot be recorded, no filesystem mutation takes place.
+    let intent = crate::db::begin_operation_intent("move", &source, Some(&requested_string))
+        .map_err(|e| format!("Cannot record move intent for {source}: {e}"))?;
+    suppression.arm(&[path.to_path_buf(), requested.clone()], Instant::now(), SUPPRESSION_TTL);
+    let moved = match crate::safe_fs::move_file_checked_expected(path, &requested, &identity) {
+        Ok(moved) => moved,
+        Err(error) => {
+            let recorded = crate::db::finalize_operation_intent(intent, "failed", None, Some(&error));
+            return Err(match recorded {
+                Ok(()) => error,
+                Err(record_error) => format!("{error}; recording the failed move also failed: {record_error}"),
+            });
+        }
+    };
+    let destination = moved.destination.to_string_lossy().to_string();
+    // Renew for the actual collision-selected destination, measured after the
+    // operation so a slow copy does not consume the delivery lease.
+    suppression.arm(&[path.to_path_buf(), requested, moved.destination], Instant::now(), SUPPRESSION_TTL);
+    let log = ActionLog {
+        id: None, timestamp: Utc::now(), source_path: source,
+        destination_path: Some(destination.clone()), action: rule.action.clone(),
+        file_name: file_info.name, file_type: rule.name.clone(), undone: false,
+    };
+    let warning = crate::db::finalize_move_intent(intent, &log, &destination, None, &moved.identity.key())
+        .err().map(|error| format!("Moved to {destination}, but history/inventory recording failed: {error}"));
+    Ok(ProcessOutcome::Organized { rule, destination, warning })
 }
 
-pub fn manual_scan_folder(folder: &str) -> Result<Vec<(String, String, String)>, String> {
-    let mut results = Vec::new();
-    let entries = fs::read_dir(folder).map_err(|e| e.to_string())?;
+pub fn same_path(left: &Path, right: &Path) -> bool {
+    crate::safe_fs::normalize_lexically(left).to_string_lossy().to_lowercase()
+        == crate::safe_fs::normalize_lexically(right).to_string_lossy().to_lowercase()
+}
 
-    for entry in entries {
-        let entry = entry.map_err(|e| e.to_string())?;
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
+pub fn manual_scan_folder_with_suppression(folder: &str, suppression: &SuppressionSet)
+    -> Result<Vec<(String, String, String)>, String>
+{
+    scan_folder(folder, suppression, true, None)
+}
+
+pub fn manual_scan_folder_cancelable(folder: &str, suppression: &SuppressionSet, cancelled: &std::sync::atomic::AtomicBool)
+    -> Result<Vec<(String, String, String)>, String>
+{
+    scan_folder(folder, suppression, true, Some(cancelled))
+}
+
+pub fn scheduled_scan_folder(folder: &str, suppression: &SuppressionSet)
+    -> Result<Vec<(String, String, String)>, String>
+{
+    scan_folder(folder, suppression, false, None)
+}
+
+fn scan_folder(folder: &str, suppression: &SuppressionSet, manual: bool, cancelled: Option<&std::sync::atomic::AtomicBool>)
+    -> Result<Vec<(String, String, String)>, String>
+{
+    let root = Path::new(folder);
+    crate::safe_fs::validate_root(root)?;
+    load_mouziignore(folder)?;
+    let mut results = Vec::new();
+    let mut errors = Vec::new();
+    for entry in fs::read_dir(root).map_err(|e| e.to_string())? {
+        if cancelled.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)) { return Err(format!("Import cancelled after organizing {} files", results.len())); }
+        let path = entry.map_err(|e| e.to_string())?.path();
+        if !path.is_file() { continue; }
         let file_name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
-        if should_ignore_file(&path) {
-            eprintln!("[manual_scan] ignoring system/hidden/temp file: {}", file_name);
-            continue;
-        }
-        if is_file_ignored_by_mouziignore(&path) {
-            eprintln!("[manual_scan] ignoring due to .mouziignore: {}", file_name);
-            continue;
-        }
-        match process_file(&path, true, Path::new(folder)) {
-            Ok(Some((rule, dest))) => {
-                eprintln!("[manual_scan] organized: {} -> {} ({})", file_name, dest, rule.name);
-                results.push((file_name, rule.name, dest));
+        let ticket = suppression.ticket(&path);
+        match process_file_with_suppression(&path, manual, root, suppression, &ticket, None, !manual) {
+            Ok(ProcessOutcome::Organized { rule, destination, warning }) => {
+                results.push((file_name, rule.name, destination));
+                if let Some(warning) = warning { errors.push(warning); }
             }
-            Ok(None) => {
-                eprintln!("[manual_scan] no matching rule or skipped: {}", file_name);
-            }
-            Err(e) => {
-                eprintln!("[manual_scan] error processing {}: {}", file_name, e);
-            }
+            Ok(ProcessOutcome::Skipped | ProcessOutcome::Retry { .. }) => {}
+            Err(error) => errors.push(format!("{file_name}: {error}")),
         }
     }
-
-    Ok(results)
+    if errors.is_empty() { Ok(results) }
+    else { Err(format!("Organized {} files; {}", results.len(), errors.join("; "))) }
 }
 
 #[cfg(test)]
@@ -356,7 +415,6 @@ mod tests {
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default(),
-            size: 0,
             path,
         }
     }
@@ -501,6 +559,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("mouzi-t1-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).expect("create fixture root");
+        let root = fs::canonicalize(root).expect("resolve fixture root");
 
         for (destination, file_name) in [
             ("Documents", "report.pdf"),
@@ -573,7 +632,7 @@ mod tests {
     }
 
     #[test]
-    fn test_move_file_cross_device() {
+    fn test_move_file_between_directories_on_the_same_volume() {
         let test_root = std::env::temp_dir().join(format!(
             "mouzi-move-test-{}",
             std::process::id()
@@ -600,5 +659,48 @@ mod tests {
         let _ = fs::remove_file(&dst);
         let _ = fs::remove_file(&src);
         let _ = fs::remove_dir_all(&test_root);
+    }
+
+    #[test]
+    fn custom_rule_labels_finalize_moves_without_becoming_categories() {
+        let _serial = crate::db::serialise_test_db();
+        crate::db::init_test_db();
+        let root = std::env::temp_dir().join(format!("mouzi-custom-rule-{}-{}", std::process::id(), chrono::Utc::now().timestamp_nanos_opt().unwrap()));
+        fs::create_dir(&root).unwrap();
+        let root = fs::canonicalize(root).unwrap();
+        let folder_id = crate::db::add_watched_folder(&root.to_string_lossy(), crate::db::FOLDER_MODE_MANUAL).unwrap();
+        let mut custom = rule("Documents");
+        custom.name = "My receipts".into();
+        custom.extensions = vec!["auditx".into()];
+        custom.priority = i32::MAX;
+        custom.folder_id = folder_id;
+        let rule_id = crate::db::add_rule(&custom).unwrap();
+        struct Fixture { root: PathBuf, folder_id: i64, rule_id: i64 }
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = crate::db::delete_rule(self.rule_id);
+                let _ = crate::db::remove_watched_folder(self.folder_id);
+                let _ = fs::remove_dir_all(&self.root);
+            }
+        }
+        let _fixture = Fixture { root: root.clone(), folder_id, rule_id };
+        let source = root.join("receipt.auditx");
+        fs::write(&source, b"receipt").unwrap();
+        let suppression = SuppressionSet::new();
+        let ticket = suppression.ticket(&source);
+        let outcome = process_file_with_suppression(&source, true, &root, &suppression, &ticket, None, false).unwrap();
+        let ProcessOutcome::Organized { destination, warning, .. } = outcome else { panic!("custom rule did not move the file"); };
+        assert!(warning.is_none(), "successful custom rules must finalize history: {warning:?}");
+        assert_eq!(fs::read(&destination).unwrap(), b"receipt");
+        assert!(!source.exists());
+        let conn = crate::db::lock_db().unwrap();
+        let (label, identity): (String, Option<String>) = conn.query_row("SELECT file_type,file_identity FROM action_logs WHERE source_path=?1", [source.to_string_lossy().as_ref()], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+        assert_eq!(label, "My receipts");
+        assert!(identity.is_some());
+        let category: String = conn.query_row("SELECT category FROM file_inventory WHERE path=?1", [&destination], |row| row.get(0)).unwrap();
+        assert_eq!(category, "Other", "rule labels must not become canonical categories");
+        let status: String = conn.query_row("SELECT status FROM operation_intents WHERE source_path=?1", [source.to_string_lossy().as_ref()], |row| row.get(0)).unwrap();
+        assert_eq!(status, "completed");
+        conn.execute("DELETE FROM action_logs WHERE source_path=?1", [source.to_string_lossy().as_ref()]).unwrap();
     }
 }

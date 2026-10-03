@@ -1,6 +1,6 @@
 import { useTranslation } from "react-i18next";
 import { formatBytes } from "../../utils/format";
-import { categoryClass, formatShare, leadCategory, percentOf, type CategoryShare } from "../../utils/dashboard";
+import { categoryClass, categoryLabel, formatShare, leadCategory, percentOf, type CategoryShare } from "../../utils/dashboard";
 
 interface StorageRibbonProps {
   data: CategoryShare[];
@@ -34,7 +34,7 @@ export default function StorageRibbon({
       </p>
       <h2 className="text-lg font-semibold text-text leading-snug mb-3">
         {t("dashboard.lead", {
-          category: lead?.category ?? "",
+          category: lead ? categoryLabel(lead.category, t) : "",
           percent: lead?.percent ?? 0,
           size: formatBytes(totalBytes),
         })}
@@ -55,8 +55,8 @@ export default function StorageRibbon({
               key={item.category}
               type="button"
               aria-pressed={isOn}
-              aria-label={`${item.category} · ${share} · ${formatBytes(item.bytes)}`}
-              title={`${item.category} · ${share} · ${formatBytes(item.bytes)}`}
+              aria-label={`${categoryLabel(item.category, t)} · ${share} · ${formatBytes(item.bytes)}`}
+              title={`${categoryLabel(item.category, t)} · ${share} · ${formatBytes(item.bytes)}`}
               onClick={() => onSelect?.(item.category)}
               className={`storage-ribbon-seg ${categoryClass(item.category)}`}
               style={{
@@ -85,7 +85,7 @@ export default function StorageRibbon({
                 className={`inline-block w-2 h-2 rounded-[2px] ${categoryClass(item.category)}`}
                 aria-hidden="true"
               />
-              <span className="font-medium text-text">{item.category}</span>
+              <span className="font-medium text-text">{categoryLabel(item.category, t)}</span>
               <span>{share}</span>
             </button>
           );

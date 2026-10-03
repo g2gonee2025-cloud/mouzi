@@ -1,22 +1,19 @@
-use crate::db;
-use crate::safe_fs;
-use chrono::Utc;
+use crate::{db, safe_fs};
+use chrono::{Duration as ChronoDuration, Utc};
+use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::Mutex;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-/// Files larger than this are hashed on a 64 KB sample first (if the 64 KB
-/// samples of two same-size files differ there is no need to hash the full
-/// file).  Files at or below this size are always hashed in full.
-const FULL_HASH_MAX_BYTES: u64 = 100 * 1024 * 1024; // 100 MB
-const SAMPLE_BYTES: u64 = 64 * 1024; // 64 KB
-
-// ---------------------------------------------------------------------------
-// Public types
-// ---------------------------------------------------------------------------
+const PLAN_LIFETIME: Duration = Duration::from_secs(10 * 60);
+const MAX_PENDING_PLANS: usize = 128;
+const UNVERIFIED_MESSAGE: &str = "Source removed; Recycle Bin recovery could not be verified";
+const PERMANENTLY_DELETED_STATUS: &str = "permanently_deleted";
+const PERMANENTLY_DELETED_MESSAGE: &str = "Deleted permanently; this item cannot be restored from the Recycle Bin";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -30,17 +27,20 @@ pub struct DuplicateFile {
 #[serde(rename_all = "camelCase")]
 pub struct DuplicateGroup {
     pub hash: String,
-    /// Total reclaimable bytes if one copy of this group is kept.
     pub files: Vec<DuplicateFile>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CleanupRequest {
     pub kind: String,
     pub path: String,
-    #[serde(rename = "keepPath")]
     pub keep_path: Option<String>,
+    /// Finder criteria are captured with the selection, before confirmation.
+    #[serde(default)]
+    pub min_bytes: Option<i64>,
+    #[serde(default)]
+    pub days: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -51,979 +51,1034 @@ pub struct CleanupOutcome {
     pub message: Option<String>,
 }
 
-/// A fourth status, and the reason it is a named constant: this exact string is
-/// a contract, not an internal detail. `src/utils/cleanup.ts` declares the
-/// result status as a closed union and `ResultsPanel` counts and colours on
-/// each member, and `cleanup_actions.status` in the database is read back
-/// verbatim by `HistoryPanel`. Change or rename the string and the frontend
-/// stops compiling or silently draws the result in no bucket — the half of this
-/// change that lives in TypeScript has to be made at the same time.
-const PERMANENTLY_DELETED_STATUS: &str = "permanently_deleted";
-
-const PERMANENTLY_DELETED_MESSAGE: &str = "Deleted permanently — Windows did not put this in the \
-                                         Recycle Bin, so it cannot be restored";
-const UNVERIFIED_MESSAGE: &str = "The Recycle Bin could not be read to confirm this one, so \
-                                  whether it can be undone is unknown";
-
 impl CleanupOutcome {
-    /// Fold an observed Recycle Bin verdict into this outcome.
-    ///
-    /// The fourth status, `PERMANENTLY_DELETED_STATUS`, exists because
-    /// "Windows shredded this and I cannot get it back" and "the move failed
-    /// and nothing was destroyed" are different facts and the user needs to be
-    /// able to tell them apart. Folding the first into "failed" hid the one
-    /// case in this function where data is genuinely gone.
-    ///
-    /// `status` is still a closed union shared with `src/utils/cleanup.ts`, so
-    /// that file declares this string too; the two are edited together. The
-    /// `Unverified` arm below is deliberately *not* a fifth value — it is a
-    /// caveat on a success, and inventing a status for "we could not check"
-    /// would report uncertainty as an outcome.
     fn apply_trash_verdict(&mut self, verdict: safe_fs::TrashVerdict) {
         match verdict {
             safe_fs::TrashVerdict::InRecycleBin => {}
+            safe_fs::TrashVerdict::Unverified => self.message = Some(UNVERIFIED_MESSAGE.into()),
             safe_fs::TrashVerdict::PermanentlyDeleted => {
-                self.status = PERMANENTLY_DELETED_STATUS.to_string();
-                self.message = Some(PERMANENTLY_DELETED_MESSAGE.to_string());
-            }
-            safe_fs::TrashVerdict::Unverified => {
-                // Left as ok, with the caveat spelled out. The call succeeded and
-                // there is no evidence it did not; reporting a missing reading as
-                // a failure would cry wolf on a cleanup that in all likelihood
-                // worked. The un-recoverable case above is the one that must
-                // never be counted as a success.
-                self.message = Some(UNVERIFIED_MESSAGE.to_string());
+                // Only an explicit, proven verdict may use this historical wire
+                // status. A bin-count shortfall is not such proof.
+                self.status = PERMANENTLY_DELETED_STATUS.into();
+                self.message = Some(PERMANENTLY_DELETED_MESSAGE.into());
             }
         }
     }
 }
 
-/// Re-export the DB LargestFile type so callers don't need to import db.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CleanupPlanPreview {
+    pub plan_id: String,
+    pub expires_at: String,
+    pub actions: Vec<CleanupRequest>,
+    pub total_bytes: i64,
+}
+
 pub use db::LargestFile as CleanupFile;
 
-// ---------------------------------------------------------------------------
-// Inventory guard
-// ---------------------------------------------------------------------------
-
 pub fn has_inventory() -> bool {
-    db::count_inventory_files().map(|c| c > 0).unwrap_or(false)
+    db::count_inventory_files().map(|count| count > 0).unwrap_or(false)
 }
 
-// ---------------------------------------------------------------------------
-// Duplicate detection
-// ---------------------------------------------------------------------------
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileFingerprint {
+    identity: safe_fs::FileIdentity,
+    size: u64,
+    modified: SystemTime,
+    links: u64,
+    hash: String,
+}
 
-/// Compute a full-content blake3 hash of the file at `path`.
-/// Returns a hex string or an error message.
-fn hash_full(path: &Path) -> Result<String, String> {
-    let mut file = fs::File::open(path).map_err(|e| {
-        format!("Failed to open {}: {}", path.to_string_lossy(), e)
-    })?;
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RootConfig {
+    id: Option<i64>,
+    path: String,
+    enabled: bool,
+    mode: String,
+}
+
+fn root_configuration() -> Result<Vec<RootConfig>, String> {
+    let mut configuration: Vec<_> = db::get_watched_folders()
+        .map_err(|error| format!("Cannot read watched folders: {error}"))?
+        .into_iter()
+        .map(|folder| RootConfig {
+            id: folder.id,
+            path: folder.path,
+            enabled: folder.enabled,
+            mode: folder.mode,
+        })
+        .collect();
+    configuration.sort_by(|left, right| left.id.cmp(&right.id).then(left.path.cmp(&right.path)));
+    Ok(configuration)
+}
+
+fn current_scope() -> Result<safe_fs::RootScope, String> {
+    safe_fs::eligible_scope(
+        &db::get_watched_folders().map_err(|error| format!("Cannot read watched folders: {error}"))?,
+    )
+}
+
+fn modified_epoch(modified: SystemTime) -> i64 {
+    modified.duration_since(UNIX_EPOCH).map(|duration| duration.as_secs() as i64).unwrap_or(0)
+}
+
+/// Persistent hashes and inventory timestamps never authorize a removal.
+/// Hash the live handle, then confirm both its metadata and the path identity.
+fn fingerprint_guard(scope: &safe_fs::RootScope, path: &Path) -> Result<(FileFingerprint, safe_fs::ValidatedFile), String> {
+    let mut target = scope.validate_file(path)?;
+    let before = target.file.metadata().map_err(|error| format!("Cannot inspect file: {error}"))?;
+    let modified = before.modified().map_err(|error| format!("Cannot read file time: {error}"))?;
     let mut hasher = blake3::Hasher::new();
-    let mut buf = [0u8; 64 * 1024];
+    let mut buffer = [0u8; 64 * 1024];
     loop {
-        let n = file.read(&mut buf).map_err(|e| {
-            format!("Failed to read {}: {}", path.to_string_lossy(), e)
-        })?;
-        if n == 0 {
-            break;
+        let count = target.file.read(&mut buffer).map_err(|error| format!("Cannot hash file: {error}"))?;
+        if count == 0 { break; }
+        hasher.update(&buffer[..count]);
+    }
+    let after = target.file.metadata().map_err(|error| format!("Cannot recheck file: {error}"))?;
+    if before.len() != after.len() || after.modified().ok() != Some(modified)
+        || safe_fs::identity_from_handle(&target.file)? != target.identity
+    {
+        return Err("File changed while its contents were being read".into());
+    }
+    let live = scope.validate_file(path)?;
+    if live.identity != target.identity || live.link_count != target.link_count {
+        return Err("File was replaced while its contents were being read".into());
+    }
+    Ok((FileFingerprint {
+        identity: target.identity.clone(),
+        size: after.len(),
+        modified,
+        links: target.link_count,
+        hash: hasher.finalize().to_hex().to_string(),
+    }, target))
+}
+
+fn fingerprint(scope: &safe_fs::RootScope, path: &Path) -> Result<FileFingerprint, String> {
+    fingerprint_guard(scope, path).map(|(fingerprint, _guard)| fingerprint)
+}
+
+fn inventory_paths() -> Result<Vec<CleanupFile>, String> {
+    db::get_large_files_from_inventory(0).map_err(|error| format!("Cannot read file inventory: {error}"))
+}
+
+fn duplicate_candidates(scope: &safe_fs::RootScope) -> Result<Vec<(String, FileFingerprint)>, String> {
+    let mut seen = HashSet::new();
+    let mut by_size: HashMap<u64, Vec<String>> = HashMap::new();
+    for row in inventory_paths()? {
+        if let Ok(current) = scope.validate_file(Path::new(&row.path)) {
+            // A hard-link entry does not independently reclaim a file's bytes.
+            if current.link_count == 1 && seen.insert(current.identity) {
+                by_size.entry(current.metadata.len()).or_default().push(row.path);
+            }
         }
-        hasher.update(&buf[..n]);
     }
-    Ok(hasher.finalize().to_hex().to_string())
-}
-
-/// Compute a hash of the first `SAMPLE_BYTES` of the file.
-/// Returns a hex string or an error message.
-fn hash_sample(path: &Path) -> Result<String, String> {
-    let mut file = fs::File::open(path).map_err(|e| {
-        format!("Failed to open {}: {}", path.to_string_lossy(), e)
-    })?;
-    let mut hasher = blake3::Hasher::new();
-    let mut buf = vec![0u8; SAMPLE_BYTES as usize];
-    let mut total = 0usize;
-    while total < SAMPLE_BYTES as usize {
-        let n = file.read(&mut buf[total..]).map_err(|e| {
-            format!("Failed to read {}: {}", path.to_string_lossy(), e)
-        })?;
-        if n == 0 {
-            break;
+    let mut files = Vec::new();
+    let mut seen = HashSet::new();
+    // Size is a live, cheap candidate filter; every reported match still uses
+    // one full-content digest domain and no persisted hash evidence.
+    for paths in by_size.into_values().filter(|paths| paths.len() > 1) {
+        for path in paths {
+            if let Ok(current) = fingerprint(scope, Path::new(&path)) {
+                if current.links == 1 && seen.insert(current.identity.clone()) {
+                    files.push((path, current));
+                }
+            }
         }
-        total += n;
     }
-    hasher.update(&buf[..total]);
-    Ok(hasher.finalize().to_hex().to_string())
+    Ok(files)
 }
 
-/// Check the cache for a matching (path, size, mtime) entry.
-/// Returns Some((hash, is_full)) on cache hit, None on miss.
-fn cache_lookup(path: &str, size: i64, mtime: i64) -> Option<(String, bool)> {
-    db::get_cached_hash(path, size, mtime).ok().flatten()
-}
-
-/// Store a hash in the cache.
-fn cache_store(path: &str, size: i64, mtime: i64, hash: &str, is_full: bool) {
-    let _ = db::set_cached_hash(path, size, mtime, hash, is_full);
-}
-
-/// Hash a file, using the cache when possible.  For small files (≤100 MB)
-/// the returned hash is always a full-file hash.  For large files the
-/// returned hash is a sample hash unless the caller requests a full hash.
-fn hash_path(path: &str, size: i64, mtime: i64, want_full: bool) -> Result<String, String> {
-    if let Some((hash, is_full)) = cache_lookup(path, size, mtime) {
-        if is_full || !want_full {
-            return Ok(hash);
-        }
-        // Cached sample only but we need full — fall through to compute.
-    }
-    let path_obj = Path::new(path);
-    if size as u64 <= FULL_HASH_MAX_BYTES || want_full {
-        let hash = hash_full(path_obj)?;
-        cache_store(path, size, mtime, &hash, true);
-        Ok(hash)
-    } else {
-        let hash = hash_sample(path_obj)?;
-        cache_store(path, size, mtime, &hash, false);
-        Ok(hash)
-    }
-}
-
-/// Find duplicate files across the scanned inventory.
-///
-/// 1.  Query `file_inventory` for size groups with >1 file.
-/// 2.  Hash each file in every size group (cache-aware).
-/// 3.  For large files (≥100 MB): first gather sample (64 KB) hashes; if
-///     two files share the same sample hash, a full hash is computed to
-///     confirm.
-/// 4.  Return groups of files sharing the same (full) hash, sorted by
-///     potential reclaimable bytes descending.
 pub fn find_duplicates() -> Result<Vec<DuplicateGroup>, String> {
-    let size_groups = db::get_inventory_size_groups().map_err(|e| e.to_string())?;
-    if size_groups.is_empty() {
-        return Ok(Vec::new());
+    let scope = current_scope()?;
+    let mut grouped: HashMap<(u64, String), Vec<DuplicateFile>> = HashMap::new();
+    for (path, current) in duplicate_candidates(&scope)? {
+        grouped.entry((current.size, current.hash)).or_default().push(DuplicateFile {
+            path,
+            size: current.size as i64,
+            mtime: modified_epoch(current.modified),
+        });
     }
+    let mut groups: Vec<_> = grouped.into_iter().filter_map(|((_, hash), mut files)| {
+        if files.len() < 2 { return None; }
+        files.sort_by(|left, right| left.path.cmp(&right.path));
+        Some(DuplicateGroup { hash, files })
+    }).collect();
+    groups.sort_by(|left, right| {
+        let reclaim = |group: &DuplicateGroup| group.files[0].size.saturating_mul(group.files.len() as i64 - 1);
+        reclaim(right).cmp(&reclaim(left)).then(left.hash.cmp(&right.hash))
+    });
+    Ok(groups)
+}
 
-    let mut all_groups: Vec<DuplicateGroup> = Vec::new();
-
-    for (size, paths_and_mtimes) in size_groups {
-        let is_large = (size as u64) > FULL_HASH_MAX_BYTES;
-
-        if !is_large {
-            // Small files: hash everything in full, group by hash.
-            let mut by_hash: HashMap<String, Vec<DuplicateFile>> = HashMap::new();
-            for (path, mtime) in &paths_and_mtimes {
-                if let Ok(hash) = hash_path(path, size, *mtime, true) {
-                    by_hash.entry(hash).or_default().push(DuplicateFile {
-                        path: path.clone(),
-                        size,
-                        mtime: *mtime,
-                    });
-                }
-            }
-            for (hash, files) in by_hash {
-                if files.len() > 1 {
-                    all_groups.push(DuplicateGroup { hash, files });
-                }
-            }
-        } else {
-            // Large files: phase 1 — sample hashes only.
-            let mut sample_map: HashMap<String, Vec<(String, i64)>> = HashMap::new();
-            for (path, mtime) in &paths_and_mtimes {
-                if let Ok(sample) = hash_path(path, size, *mtime, false) {
-                    sample_map.entry(sample).or_default().push((path.clone(), *mtime));
-                }
-            }
-            // Phase 2 — for sample groups with >1 file, compute full hash.
-            for (_sample, candidates) in sample_map {
-                if candidates.len() < 2 {
-                    continue;
-                }
-                let mut full_map: HashMap<String, Vec<DuplicateFile>> = HashMap::new();
-                for (path, mtime) in &candidates {
-                    if let Ok(full) = hash_path(path, size, *mtime, true) {
-                        full_map.entry(full).or_default().push(DuplicateFile {
-                            path: path.clone(),
-                            size,
-                            mtime: *mtime,
-                        });
-                    }
-                }
-                for (hash, files) in full_map {
-                    if files.len() > 1 {
-                        all_groups.push(DuplicateGroup { hash, files });
-                    }
+fn current_inventory_files(scope: &safe_fs::RootScope) -> Result<Vec<CleanupFile>, String> {
+    let mut seen = HashSet::new();
+    let mut files = Vec::new();
+    for row in inventory_paths()? {
+        if let Ok(target) = scope.validate_file(Path::new(&row.path)) {
+            if target.link_count != 1 { continue; }
+            if !seen.insert(target.identity) { continue; }
+            if let Ok(metadata) = target.file.metadata() {
+                if let Ok(modified) = metadata.modified() {
+                    files.push(CleanupFile { path: row.path, size: metadata.len() as i64, mtime: modified_epoch(modified) });
                 }
             }
         }
     }
-
-    // Sort groups by reclaimable bytes descending.
-    all_groups.sort_by(|a, b| {
-        let reclaim_a = a.files[0].size * (a.files.len() as i64 - 1);
-        let reclaim_b = b.files[0].size * (b.files.len() as i64 - 1);
-        reclaim_b.cmp(&reclaim_a)
-    });
-
-    Ok(all_groups)
+    Ok(files)
 }
-
-// ---------------------------------------------------------------------------
-// Large / stale file finders
-// ---------------------------------------------------------------------------
 
 pub fn find_large_files(min_bytes: i64) -> Result<Vec<CleanupFile>, String> {
-    db::get_large_files_from_inventory(min_bytes).map_err(|e| e.to_string())
+    if min_bytes < 1 { return Err("The minimum file size must be positive".into()); }
+    let mut files = current_inventory_files(&current_scope()?)?;
+    files.retain(|file| file.size >= min_bytes);
+    files.sort_by(|left, right| right.size.cmp(&left.size).then(left.path.cmp(&right.path)));
+    Ok(files)
+}
+
+fn stale_cutoff(days: i64, now: SystemTime) -> Result<i64, String> {
+    if days < 1 { return Err("The file age must be at least one day".into()); }
+    let seconds = days.checked_mul(86_400).ok_or("The file age is too large")?;
+    Ok(modified_epoch(now).saturating_sub(seconds))
 }
 
 pub fn find_stale_files(days: i64) -> Result<Vec<CleanupFile>, String> {
-    let days = days.max(1);
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    let cutoff = now - days * 86_400;
-    db::get_stale_files_from_inventory(cutoff).map_err(|e| e.to_string())
+    let cutoff = stale_cutoff(days, SystemTime::now())?;
+    let mut files = current_inventory_files(&current_scope()?)?;
+    files.retain(|file| file.mtime < cutoff);
+    files.sort_by(|left, right| left.mtime.cmp(&right.mtime).then(left.path.cmp(&right.path)));
+    Ok(files)
 }
 
-// ---------------------------------------------------------------------------
-// Empty directory finder
-// ---------------------------------------------------------------------------
-
-/// Recursively walk `dir` and return `(has_files_below, deepest_empty_leaf_dirs)`.
-/// A directory is a "deepest empty leaf" if it contains no files at any depth
-/// and has no subdirectories (or all subdirectories are themselves empty
-/// leaves).  Only the deepest empty dirs are returned so that deleting them
-/// does not cascade duplicates.
-fn walk_empty_dirs(dir: &Path) -> (bool, Vec<String>) {
-    let mut has_files = false;
-    let mut leaves = Vec::new();
-    let mut has_subdirs = false;
-
-    let entries = match fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return (false, Vec::new()),
-    };
-
-    for entry in entries.flatten() {
-        let ft = match entry.file_type() {
-            Ok(t) => t,
-            Err(_) => continue,
-        };
-        // Skip symlinks (safety / cycle guard).
-        if ft.is_symlink() {
-            continue;
-        }
-        if ft.is_dir() {
-            has_subdirs = true;
-            let (sub_has_files, mut sub_leaves) = walk_empty_dirs(&entry.path());
-            has_files |= sub_has_files;
-            leaves.append(&mut sub_leaves);
-        } else if ft.is_file() {
-            has_files = true;
+fn empty_leaves(scope: &safe_fs::RootScope, directory: &Path, result: &mut Vec<String>) {
+    let entries = match fs::read_dir(directory) { Ok(entries) => entries, Err(_) => return };
+    let mut has_entries = false;
+    for entry in entries {
+        has_entries = true;
+        let entry = match entry { Ok(entry) => entry, Err(_) => continue };
+        // Validation rejects links, configured roots and inactive nested scope.
+        if scope.validate_dir(&entry.path()).is_ok() {
+            empty_leaves(scope, &entry.path(), result);
         }
     }
-
-    // If we have no files below and no subdirs, this dir is a deepest empty leaf.
-    if !has_files && !has_subdirs {
-        leaves.push(dir.to_string_lossy().into_owned());
+    if !has_entries && scope.validate_dir(directory).is_ok() {
+        result.push(directory.to_string_lossy().into_owned());
     }
-    // If we have no files below but have subdirs, those subdirs are already in
-    // `leaves` — we do NOT push this dir (it is not deepest).
-    (has_files, leaves)
 }
 
+/// Uses eligible registered roots directly, including an entirely empty scan.
 pub fn find_empty_dirs() -> Result<Vec<String>, String> {
-    let folders = db::get_watched_folders().map_err(|e| e.to_string())?;
+    let scope = current_scope()?;
     let mut result = Vec::new();
-    for folder in folders {
-        if !folder.enabled || db::is_folder_paused_mode(&folder.mode) {
-            continue;
-        }
-        let (_, mut leaves) = walk_empty_dirs(Path::new(&folder.path));
-        result.append(&mut leaves);
+    for root in scope.active_roots() {
+        empty_leaves(&scope, &root, &mut result);
     }
     result.sort();
     result.dedup();
     Ok(result)
 }
 
-// ---------------------------------------------------------------------------
-// Cleanup execution
-// ---------------------------------------------------------------------------
-
-/// The action kinds whose payload ends up in the Recycle Bin, and so whose
-/// outcome the bin snapshot gets a vote on. Must list every kind `execute_one`
-/// trashes: a kind missing here gets no snapshot and every file in its batch is
-/// reported unverified.
-fn is_trash_kind(kind: &str) -> bool {
-    matches!(kind, "trash_duplicate" | "trash_large" | "trash_stale")
+#[derive(Debug, Clone)]
+struct PlannedAction {
+    request: CleanupRequest,
+    identity: safe_fs::FileIdentity,
+    /// All members of the reviewed duplicate group, including the keeper and
+    /// members the user did not select, remain required evidence.
+    group_members: Vec<String>,
 }
 
-/// One action's result, plus whether the Recycle Bin has to arbitrate it.
-struct ExecutedOne {
-    outcome: CleanupOutcome,
-    /// True only when `trash::delete` returned `Ok`. Its unit return value says
-    /// nothing about whether Windows used the bin, so these are exactly the
-    /// items a before/after snapshot has to rule on.
-    trash_call_succeeded: bool,
+#[derive(Debug, Clone)]
+struct ReviewedPlan {
+    actions: Vec<PlannedAction>,
+    files: HashMap<String, FileFingerprint>,
+    roots: Vec<RootConfig>,
+    root_identities: Vec<safe_fs::FileIdentity>,
+    created: Instant,
 }
 
-fn execute_one(action: &CleanupRequest) -> ExecutedOne {
-    let path = &action.path;
-    let path_obj = Path::new(path);
+static PLANS: Lazy<Mutex<HashMap<String, ReviewedPlan>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 
-    match action.kind.as_str() {
-        "trash_duplicate" | "trash_large" | "trash_stale" => {
-            // Guard: if this file is marked as the keeper, skip it.
-            if let Some(ref keep) = action.keep_path {
-                if keep == path {
-                    return ExecutedOne {
-                        outcome: CleanupOutcome {
-                            path: path.clone(),
-                            status: "skipped".to_string(),
-                            message: Some("Kept file".to_string()),
-                        },
-                        trash_call_succeeded: false,
-                    };
-                }
-            }
-            if !path_obj.exists() {
-                return ExecutedOne {
-                    outcome: CleanupOutcome {
-                        path: path.clone(),
-                        status: "skipped".to_string(),
-                        message: Some("File not found".to_string()),
-                    },
-                    trash_call_succeeded: false,
-                };
-            }
-            return match safe_fs::delete_to_trash(path_obj) {
-                Ok(()) => ExecutedOne {
-                    outcome: CleanupOutcome {
-                        path: path.clone(),
-                        status: "ok".to_string(),
-                        message: None,
-                    },
-                    trash_call_succeeded: true,
-                },
-                Err(e) => ExecutedOne {
-                    outcome: CleanupOutcome {
-                        path: path.clone(),
-                        status: "failed".to_string(),
-                        message: Some(e),
-                    },
-                    trash_call_succeeded: false,
-                },
-            };
-        }
-        "remove_empty_dir" => {
-            if !path_obj.exists() {
-                return ExecutedOne {
-                    outcome: CleanupOutcome {
-                        path: path.clone(),
-                        status: "skipped".to_string(),
-                        message: Some("Directory not found".to_string()),
-                    },
-                    trash_call_succeeded: false,
-                };
-            }
-            // Recheck: the dir must still be empty (no files at any depth).
-            let (has_files, _) = walk_empty_dirs(path_obj);
-            if has_files {
-                return ExecutedOne {
-                    outcome: CleanupOutcome {
-                        path: path.clone(),
-                        status: "skipped".to_string(),
-                        message: Some("Directory not empty".to_string()),
-                    },
-                    trash_call_succeeded: false,
-                };
-            }
-            return match fs::remove_dir(path_obj) {
-                Ok(()) => ExecutedOne {
-                    outcome: CleanupOutcome {
-                        path: path.clone(),
-                        status: "ok".to_string(),
-                        message: None,
-                    },
-                    trash_call_succeeded: false,
-                },
-                Err(e) => ExecutedOne {
-                    outcome: CleanupOutcome {
-                        path: path.clone(),
-                        status: "failed".to_string(),
-                        message: Some(format!("Failed to remove directory: {}", e)),
-                    },
-                    trash_call_succeeded: false,
-                },
-            };
-        }
-        other => ExecutedOne {
-            outcome: CleanupOutcome {
-                path: path.clone(),
-                status: "failed".to_string(),
-                message: Some(format!("Unknown cleanup action kind: {}", other)),
-            },
-            trash_call_succeeded: false,
-        },
+fn new_plan_id() -> Result<String, String> {
+    let mut bytes = [0u8; 32];
+    #[cfg(windows)]
+    {
+        #[link(name = "bcrypt")]
+        extern "system" { fn BCryptGenRandom(algorithm: *mut std::ffi::c_void, buffer: *mut u8, length: u32, flags: u32) -> i32; }
+        // BCRYPT_USE_SYSTEM_PREFERRED_RNG; no algorithm handle is required.
+        let status = unsafe { BCryptGenRandom(std::ptr::null_mut(), bytes.as_mut_ptr(), bytes.len() as u32, 2) };
+        if status < 0 { return Err("Cannot create a secure cleanup plan token".into()); }
+    }
+    #[cfg(not(windows))]
+    fs::File::open("/dev/urandom").and_then(|mut file| file.read_exact(&mut bytes))
+        .map_err(|error| format!("Cannot create cleanup plan token: {error}"))?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+fn directory_is_empty(path: &Path) -> Result<(), String> {
+    let mut entries = fs::read_dir(path).map_err(|error| format!("Cannot read directory: {error}"))?;
+    match entries.next() {
+        None => Ok(()),
+        Some(Ok(_)) => Err("Directory is no longer empty".into()),
+        Some(Err(error)) => Err(format!("Cannot confirm directory is empty: {error}")),
     }
 }
 
-/// Execute a batch of cleanup actions.  Each action is processed
-/// individually; failures do not abort the batch.
-///
-/// For every action an audit row is inserted into `cleanup_actions`.
-/// Empty-dir removals are marked as not undoable (trash deletions are not
-/// app-undoable either — the Recycle Bin provides native restore).
-pub fn execute_cleanup(actions: &[CleanupRequest]) -> Vec<CleanupOutcome> {
-    let roots: Vec<PathBuf> = db::get_watched_folders()
-        .unwrap_or_default()
-        .into_iter()
-        .map(|folder| PathBuf::from(folder.path))
-        .collect();
+pub fn prepare_cleanup(actions: &[CleanupRequest]) -> Result<CleanupPlanPreview, String> {
+    if actions.is_empty() { return Err("Select at least one cleanup action".into()); }
+    if actions.len() > 10_000 { return Err("Too many cleanup actions in one review".into()); }
+    let roots = root_configuration()?;
+    let scope = current_scope()?;
+    let root_identities = scope.root_identities();
+    let inventory: HashSet<String> = inventory_paths()?.into_iter().map(|file| file.path).collect();
+    let candidates = if actions.iter().any(|action| action.kind == "trash_duplicate") {
+        duplicate_candidates(&scope)?
+    } else { Vec::new() };
+    let mut by_content: HashMap<(u64, String), Vec<String>> = HashMap::new();
+    let mut files: HashMap<String, FileFingerprint> = candidates.into_iter().map(|(path, file)| {
+        by_content.entry((file.size, file.hash.clone())).or_default().push(path.clone());
+        (path, file)
+    }).collect();
+    let mut planned = Vec::new();
+    let mut victims = HashSet::new();
+    let mut keepers = HashSet::new();
+    let mut total_bytes = 0i64;
+    for request in actions {
+        let path = Path::new(&request.path);
+        let (identity, group_members) = match request.kind.as_str() {
+            "trash_duplicate" => {
+                if request.min_bytes.is_some() || request.days.is_some() {
+                    return Err("Duplicate actions cannot include size or age criteria".into());
+                }
+                let keep = request.keep_path.as_ref().filter(|keep| !keep.is_empty())
+                    .ok_or("A duplicate action requires its reviewed keeper")?;
+                let victim = files.get(&request.path).ok_or("The selected file is no longer an eligible duplicate")?;
+                let keeper = files.get(keep).ok_or("The keeper is no longer an eligible duplicate")?;
+                if victim.identity == keeper.identity { return Err("The victim and keeper are the same physical file".into()); }
+                if victim.size != keeper.size || victim.hash != keeper.hash { return Err("The victim and keeper no longer have identical contents".into()); }
+                keepers.insert(keeper.identity.clone());
+                total_bytes = total_bytes.saturating_add(victim.size as i64);
+                (victim.identity.clone(), by_content[&(victim.size, victim.hash.clone())].clone())
+            }
+            "trash_large" | "trash_stale" => {
+                if request.keep_path.is_some() { return Err("Only duplicate actions may name a keeper".into()); }
+                if !inventory.contains(&request.path) { return Err("The selected file is not in the current inventory".into()); }
+                let current = fingerprint(&scope, path)?;
+                if current.links != 1 { return Err("Hard-linked files are not eligible for ordinary cleanup".into()); }
+                if request.kind == "trash_large" {
+                    if request.days.is_some() { return Err("A large-file action cannot include an age criterion".into()); }
+                    let minimum = request.min_bytes.filter(|minimum| *minimum > 0).ok_or("A large-file action requires its reviewed minimum size")?;
+                    if current.size < minimum as u64 { return Err("The file is no longer large enough for the reviewed search".into()); }
+                } else {
+                    if request.min_bytes.is_some() { return Err("A stale-file action cannot include a size criterion".into()); }
+                    let days = request.days.ok_or("A stale-file action requires its reviewed age")?;
+                    if modified_epoch(current.modified) >= stale_cutoff(days, SystemTime::now())? {
+                        return Err("The file is no longer old enough for the reviewed search".into());
+                    }
+                }
+                total_bytes = total_bytes.saturating_add(current.size as i64);
+                let identity = current.identity.clone();
+                files.insert(request.path.clone(), current);
+                (identity, Vec::new())
+            }
+            "remove_empty_dir" => {
+                if request.keep_path.is_some() || request.min_bytes.is_some() || request.days.is_some() {
+                    return Err("An empty-directory action cannot include file criteria".into());
+                }
+                let current = scope.validate_dir(path)?;
+                directory_is_empty(path)?;
+                (current.identity, Vec::new())
+            }
+            _ => return Err(format!("Unknown cleanup action kind: {}", request.kind)),
+        };
+        if !victims.insert(identity.clone()) { return Err("The same physical target occurs more than once in the cleanup plan".into()); }
+        planned.push(PlannedAction { request: request.clone(), identity, group_members });
+    }
+    if !victims.is_disjoint(&keepers) {
+        return Err("A retained duplicate is also targeted for cleanup in this plan".into());
+    }
+    // Only evidence belonging to selected groups or actions needs revalidation.
+    let required: HashSet<_> = planned.iter().flat_map(|action| {
+        action.group_members.iter().cloned().chain(std::iter::once(action.request.path.clone()))
+    }).collect();
+    files.retain(|path, _| required.contains(path));
+    if roots != root_configuration()? || root_identities != current_scope()?.root_identities() {
+        return Err("Watched folders changed while the cleanup review was being prepared".into());
+    }
+    let mut plans = PLANS.lock().map_err(|_| "Cleanup plan storage is unavailable")?;
+    plans.retain(|_, plan| plan.created.elapsed() < PLAN_LIFETIME);
+    if plans.len() >= MAX_PENDING_PLANS { return Err("Too many cleanup reviews are pending; close an older review and try again".into()); }
+    let plan_id = new_plan_id()?;
+    plans.insert(plan_id.clone(), ReviewedPlan { actions: planned, files, roots, root_identities, created: Instant::now() });
+    Ok(CleanupPlanPreview {
+        plan_id,
+        expires_at: (Utc::now() + ChronoDuration::minutes(10)).to_rfc3339(),
+        actions: actions.to_vec(),
+        total_bytes,
+    })
+}
 
-    // One reading either side of the whole batch, never one per file: listing
-    // the bin walks every trashed item on the machine, so a per-file reading
-    // makes a large cleanup quadratic. A batch with no trash action in it never
-    // touches the bin at all.
-    let before = if actions.iter().any(|a| is_trash_kind(&a.kind)) {
-        Some(safe_fs::trash_snapshot())
-    } else {
-        None
-    };
+trait CleanupIo {
+    fn begin_intent(&mut self, kind: &str, path: &str) -> Result<i64, String>;
+    fn finish_intent(&mut self, id: i64, outcome: &CleanupOutcome, removed: bool) -> Result<(), String>;
+    fn prepare_trash(&mut self) {}
+    fn trash(&mut self, path: &Path, identity: &safe_fs::FileIdentity) -> Result<safe_fs::TrashVerdict, String>;
+    fn remove_empty_dir(&mut self, path: &Path, identity: &safe_fs::FileIdentity) -> Result<(), String>;
+}
 
-    let mut results = Vec::with_capacity(actions.len());
-    // Indices into `results` whose `trash::delete` call succeeded, so the bin
-    // still has to say whether the file is recoverable.
-    let mut awaiting_verdict: Vec<usize> = Vec::new();
-    for (index, action) in actions.iter().enumerate() {
-        // Nothing outside a watched folder may be destroyed. These paths arrive
-        // from the frontend, and app-defined commands are callable from every
-        // window, so without this check the command can name any path on the
-        // machine. An empty or unreadable folder list authorises nothing.
-        let executed = if safe_fs::is_within_any_root(Path::new(&action.path), &roots) {
-            execute_one(action)
-        } else {
-            ExecutedOne {
-                outcome: CleanupOutcome {
-                    path: action.path.clone(),
-                    status: "skipped".to_string(),
-                    message: Some("Outside every watched folder".to_string()),
-                },
-                trash_call_succeeded: false,
+#[derive(Default)]
+struct NativeCleanupIo { before: Option<safe_fs::TrashSnapshot> }
+
+impl CleanupIo for NativeCleanupIo {
+    fn begin_intent(&mut self, kind: &str, path: &str) -> Result<i64, String> {
+        db::begin_cleanup_intent(kind, path).map_err(|error| error.to_string())
+    }
+    fn finish_intent(&mut self, id: i64, outcome: &CleanupOutcome, removed: bool) -> Result<(), String> {
+        db::finalize_cleanup_intent(id, &outcome.status, outcome.message.as_deref(), removed).map_err(|error| error.to_string())
+    }
+    fn prepare_trash(&mut self) {
+        self.before = Some(safe_fs::trash_snapshot());
+    }
+    fn trash(&mut self, path: &Path, identity: &safe_fs::FileIdentity) -> Result<safe_fs::TrashVerdict, String> {
+        let before = self.before.take().ok_or("The trash observation was not prepared")?;
+        safe_fs::delete_to_trash(path)?;
+        let after = safe_fs::trash_snapshot();
+        Ok(safe_fs::classify_trash_outcomes_with_identity(&before, &after, &[(path.to_path_buf(), identity.clone())])
+            .into_iter().next().unwrap_or(safe_fs::TrashVerdict::Unverified))
+    }
+    fn remove_empty_dir(&mut self, path: &Path, identity: &safe_fs::FileIdentity) -> Result<(), String> {
+        safe_fs::remove_empty_directory_expected(path, identity)
+    }
+}
+
+fn plan_scope(plan: &ReviewedPlan) -> Result<safe_fs::RootScope, String> {
+    if plan.roots != root_configuration()? { return Err("Watched folders changed; review cleanup again".into()); }
+    let scope = current_scope()?;
+    if plan.root_identities != scope.root_identities() { return Err("A watched folder was replaced; review cleanup again".into()); }
+    Ok(scope)
+}
+
+fn check_file(plan: &ReviewedPlan, scope: &safe_fs::RootScope, path: &str) -> Result<(), String> {
+    let reviewed = plan.files.get(path).ok_or("Cleanup plan is missing file evidence")?;
+    if &fingerprint(scope, Path::new(path))? != reviewed {
+        return Err(format!("File changed since cleanup review: {path}"));
+    }
+    Ok(())
+}
+
+fn validate_action(plan: &ReviewedPlan, scope: &safe_fs::RootScope, action: &PlannedAction, removed: &HashSet<String>) -> Result<(), String> {
+    if action.request.kind == "remove_empty_dir" {
+        if scope.validate_dir(Path::new(&action.request.path))?.identity != action.identity {
+            return Err("Directory changed since cleanup review".into());
+        }
+        return directory_is_empty(Path::new(&action.request.path));
+    }
+    check_file(plan, scope, &action.request.path)?;
+    for member in &action.group_members {
+        if !removed.contains(member) { check_file(plan, scope, member)?; }
+    }
+    Ok(())
+}
+
+fn source_absent(path: &Path) -> Result<bool, String> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(format!("Cannot confirm source removal: {error}")),
+    }
+}
+
+fn add_message(outcome: &mut CleanupOutcome, message: String) {
+    outcome.message = Some(match outcome.message.take() {
+        Some(existing) => format!("{existing}. {message}"),
+        None => message,
+    });
+}
+
+struct MutationGuards {
+    path: PathBuf,
+    _parents: safe_fs::AncestorGuard,
+    _keeper: Option<safe_fs::ValidatedFile>,
+}
+
+fn mutation_guards(plan: &ReviewedPlan, scope: &safe_fs::RootScope, action: &PlannedAction) -> Result<MutationGuards, String> {
+    let request = &action.request;
+    if request.kind == "remove_empty_dir" {
+        let target = scope.validate_dir(Path::new(&request.path))?;
+        if target.identity != action.identity { return Err("Directory changed since cleanup review".into()); }
+        directory_is_empty(&target.canonical_path)?;
+        return Ok(MutationGuards {
+            path: target.canonical_path.clone(),
+            _parents: target.into_parent_guard(),
+            _keeper: None,
+        });
+    }
+    let (current, target) = fingerprint_guard(scope, Path::new(&request.path))?;
+    if plan.files.get(&request.path) != Some(&current) { return Err("File changed since cleanup review".into()); }
+    let keeper = if let Some(path) = &request.keep_path {
+        let (current, target) = fingerprint_guard(scope, Path::new(path))?;
+        if plan.files.get(path) != Some(&current) { return Err("Keeper changed since cleanup review".into()); }
+        Some(target)
+    } else { None };
+    Ok(MutationGuards {
+        path: target.canonical_path.clone(),
+        // Windows Shell needs permission to delete the victim. Keep every
+        // ancestor locked against replacement while releasing that one handle.
+        // Shell deletion is still path based: the release-to-Shell interval is
+        // a residual victim-entry race, not an identity-bound guarantee.
+        _parents: target.into_parent_guard(),
+        _keeper: keeper,
+    })
+}
+
+fn execute_cleanup_plan_with(plan_id: &str, io: &mut impl CleanupIo) -> Result<Vec<CleanupOutcome>, String> {
+    // Consume before validation. Expired/stale/failed plans are never reusable.
+    let plan = PLANS.lock().map_err(|_| "Cleanup plan storage is unavailable")?
+        .remove(plan_id).ok_or("Cleanup review expired or has already been used; review cleanup again")?;
+    if plan.created.elapsed() >= PLAN_LIFETIME { return Err("Cleanup review expired; review cleanup again".into()); }
+    let scope = plan_scope(&plan)?;
+    let mut removed = HashSet::new();
+    // All reviewed members are checked before the first mutation, including
+    // members in another group or retained copies not selected for removal.
+    for action in &plan.actions { validate_action(&plan, &scope, action, &removed)?; }
+    let mut outcomes = Vec::with_capacity(plan.actions.len());
+    for action in &plan.actions {
+        let request = &action.request;
+        let mut outcome = CleanupOutcome { path: request.path.clone(), status: "skipped".into(), message: None };
+        let validation = plan_scope(&plan).and_then(|scope| validate_action(&plan, &scope, action, &removed));
+        if let Err(error) = validation {
+            outcome.message = Some(error);
+            outcomes.push(outcome);
+            continue;
+        }
+        let intent = match io.begin_intent(&request.kind, &request.path) {
+            Ok(intent) => intent,
+            Err(error) => {
+                outcome.status = "failed".into();
+                outcome.message = Some(format!("Cleanup did not start because its recovery record could not be saved: {error}"));
+                outcomes.push(outcome);
+                continue;
             }
         };
-        if executed.trash_call_succeeded {
-            awaiting_verdict.push(index);
-        }
-        results.push(executed.outcome);
-    }
-
-    match before {
-        Some(before) if !awaiting_verdict.is_empty() => {
-            let after = safe_fs::trash_snapshot();
-            let attempted: Vec<PathBuf> = awaiting_verdict
-                .iter()
-                .map(|&i| PathBuf::from(&actions[i].path))
-                .collect();
-            for (position, verdict) in awaiting_verdict
-                .iter()
-                .zip(safe_fs::classify_trash_outcomes(&before, &after, &attempted))
-            {
-                results[*position].apply_trash_verdict(verdict);
+        // Reading a large bin can take time. Do it before the final live hash
+        // guards, so it does not lengthen the victim-handle release interval.
+        if request.kind != "remove_empty_dir" { io.prepare_trash(); }
+        // Intent writes can take time. Validate again immediately before the
+        // path-based platform operation, and hold keeper guards while it runs.
+        let mutation_scope = plan_scope(&plan);
+        let validation = mutation_scope.as_ref().map_err(|error| error.clone())
+            .and_then(|scope| validate_action(&plan, scope, action, &removed));
+        let mut source_removed = false;
+        match validation {
+            Err(error) => outcome.message = Some(error),
+            Ok(()) => {
+                let guards = mutation_guards(&plan, mutation_scope.as_ref().unwrap(), action);
+                match guards {
+                    Err(error) => outcome.message = Some(error),
+                    Ok(guards) => {
+                        let result = if request.kind == "remove_empty_dir" {
+                            io.remove_empty_dir(&guards.path, &action.identity).map(|_| None)
+                        } else { io.trash(&guards.path, &action.identity).map(Some) };
+                        match result {
+                            Err(error) => {
+                                outcome.status = "failed".into();
+                                outcome.message = Some(error);
+                                if source_absent(&guards.path) == Ok(true) {
+                                    source_removed = true;
+                                    removed.insert(request.path.clone());
+                                    add_message(&mut outcome, "The source is absent despite the reported error; recovery remains unverified".into());
+                                }
+                            }
+                            Ok(verdict) => match source_absent(&guards.path) {
+                                Ok(true) => {
+                                    source_removed = true;
+                                    removed.insert(request.path.clone());
+                                    outcome.status = "ok".into();
+                                    if let Some(verdict) = verdict { outcome.apply_trash_verdict(verdict); }
+                                }
+                                Ok(false) => { outcome.status = "failed".into(); outcome.message = Some("The operation returned success but the source still exists; removal was not confirmed".into()); }
+                                Err(error) => { outcome.status = "failed".into(); outcome.message = Some(error); }
+                            },
+                        }
+                    }
+                }
             }
         }
-        _ => {}
-    }
-
-    // The audit rows are written only once the verdict is known, so a file that
-    // Windows deleted permanently is not recorded in the history as a success.
-    let mut outcomes = Vec::with_capacity(results.len());
-    for (action, outcome) in actions.iter().zip(results) {
-        let undoable = false;
-        let _ = db::insert_cleanup_action(&db::CleanupAction {
-            id: None,
-            timestamp: Utc::now(),
-            path: action.path.clone(),
-            prev_path: None,
-            dest: None,
-            action: action.kind.clone(),
-            status: outcome.status.clone(),
-            undoable,
-        });
+        if let Err(error) = io.finish_intent(intent, &outcome, source_removed) {
+            // Retain the actual filesystem status. The pending intent remains
+            // recoverable, and callers see a separate persistence warning.
+            add_message(&mut outcome, format!("Cleanup history could not be finalized; its recovery record remains pending: {error}"));
+        }
         outcomes.push(outcome);
     }
-    outcomes
+    Ok(outcomes)
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
+/// This is the sole destructive cleanup entry point. Paths/kinds/keepers are
+/// obtained from the immutable backend review, never from execution IPC.
+pub fn execute_cleanup_plan(plan_id: &str) -> Result<Vec<CleanupOutcome>, String> {
+    execute_cleanup_plan_with(plan_id, &mut NativeCleanupIo::default())
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
-    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
-    fn temp_root(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("mouzi-cleanup-{}-{}", name, std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        dir
-    }
+    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
-    fn insert_inventory(root: &str, rows: &[db::InventoryRow]) {
-        db::append_inventory_batch(root, rows).unwrap();
-    }
+    struct TestTree(PathBuf);
 
-    fn blake3_hex(data: &[u8]) -> String {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(data);
-        hasher.finalize().to_hex().to_string()
-    }
-
-    // ── Duplicate detection ─────────────────────────────────────
-
-    #[test]
-    fn duplicates_grouped_by_content() {
-        let _guard = db::TEST_DB_LOCK.lock().unwrap();
-        db::init_test_db();
-
-        let root = temp_root("dup_grouped");
-        let a = root.join("a.txt");
-        let b = root.join("b.txt");
-        let c = root.join("c.txt");
-        fs::write(&a, "hello").unwrap();
-        fs::write(&b, "hello").unwrap();
-        fs::write(&c, "world").unwrap();
-
-        let meta_a = a.metadata().unwrap();
-        let meta_b = b.metadata().unwrap();
-        let meta_c = c.metadata().unwrap();
-
-        let root_str = root.to_string_lossy().into_owned();
-        insert_inventory(
-            &root_str,
-            &[
-                db::InventoryRow {
-                    path: a.to_string_lossy().into_owned(),
-                    size: meta_a.len() as i64,
-                    mtime: meta_a.modified().unwrap().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64,
-                    category: "Other".into(),
-                },
-                db::InventoryRow {
-                    path: b.to_string_lossy().into_owned(),
-                    size: meta_b.len() as i64,
-                    mtime: meta_b.modified().unwrap().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64,
-                    category: "Other".into(),
-                },
-                db::InventoryRow {
-                    path: c.to_string_lossy().into_owned(),
-                    size: meta_c.len() as i64,
-                    mtime: meta_c.modified().unwrap().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64,
-                    category: "Other".into(),
-                },
-            ],
-        );
-
-        let groups = find_duplicates().unwrap();
-        assert_eq!(groups.len(), 1, "expected 1 duplicate group");
-        assert_eq!(groups[0].files.len(), 2, "expected 2 files in group");
-        let paths: Vec<&str> = groups[0].files.iter().map(|f| {
-            Path::new(&f.path).file_name().unwrap().to_str().unwrap()
-        }).collect();
-        assert!(paths.contains(&"a.txt"));
-        assert!(paths.contains(&"b.txt"));
-
-        db::clear_inventory_for_root(&root_str).unwrap();
-        fs::remove_dir_all(&root).ok();
-    }
-
-    #[test]
-    fn different_sizes_not_grouped() {
-        let _guard = db::TEST_DB_LOCK.lock().unwrap();
-        db::init_test_db();
-
-        let root = temp_root("diff_sizes");
-        let small = root.join("small.txt");
-        let large = root.join("large.txt");
-        fs::write(&small, "hello").unwrap();
-        let large_data = vec![b'x'; 500];
-        fs::write(&large, &large_data).unwrap();
-
-        let meta_s = small.metadata().unwrap();
-        let meta_l = large.metadata().unwrap();
-
-        let root_str = root.to_string_lossy().into_owned();
-        insert_inventory(
-            &root_str,
-            &[
-                db::InventoryRow {
-                    path: small.to_string_lossy().into_owned(),
-                    size: meta_s.len() as i64,
-                    mtime: 1,
-                    category: "Other".into(),
-                },
-                db::InventoryRow {
-                    path: large.to_string_lossy().into_owned(),
-                    size: meta_l.len() as i64,
-                    mtime: 1,
-                    category: "Other".into(),
-                },
-            ],
-        );
-
-        let groups = find_duplicates().unwrap();
-        assert_eq!(groups.len(), 0, "different sizes should not form groups");
-
-        db::clear_inventory_for_root(&root_str).unwrap();
-        fs::remove_dir_all(&root).ok();
-    }
-
-    // ── Hash cache ──────────────────────────────────────────────
-
-    #[test]
-    fn hash_cache_reused_when_unchanged() {
-        let _guard = db::TEST_DB_LOCK.lock().unwrap();
-        db::init_test_db();
-
-        let root = temp_root("cache_reuse");
-        let f1 = root.join("f1.txt");
-        let f2 = root.join("f2.txt");
-        fs::write(&f1, "AAAA").unwrap();
-        fs::write(&f2, "BBBB").unwrap();
-        let meta1 = f1.metadata().unwrap();
-        let meta2 = f2.metadata().unwrap();
-        let mtime1 = meta1.modified().unwrap().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
-        let mtime2 = meta2.modified().unwrap().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
-        let size = meta1.len() as i64;
-
-        // Pre-populate cache for f1 with a deliberately wrong hash (f2's hash).
-        // If find_duplicates reuses the cache, f1's hash will match f2's real
-        // hash and the group will form.
-        let f2_real_hash = blake3_hex(b"BBBB");
-        let f1_path = f1.to_string_lossy().into_owned();
-        let f2_path = f2.to_string_lossy().into_owned();
-        db::set_cached_hash(&f1_path, size, mtime1, &f2_real_hash, true).unwrap();
-
-        let root_str = root.to_string_lossy().into_owned();
-        insert_inventory(
-            &root_str,
-            &[
-                db::InventoryRow {
-                    path: f1_path.clone(),
-                    size,
-                    mtime: mtime1,
-                    category: "Other".into(),
-                },
-                db::InventoryRow {
-                    path: f2_path.clone(),
-                    size,
-                    mtime: mtime2,
-                    category: "Other".into(),
-                },
-            ],
-        );
-
-        let groups = find_duplicates().unwrap();
-        // f1's cached hash matches f2's real hash → they appear as duplicates.
-        assert_eq!(groups.len(), 1, "expected group from cache reuse");
-        assert_eq!(groups[0].hash, f2_real_hash);
-
-        db::clear_inventory_for_root(&root_str).unwrap();
-        fs::remove_dir_all(&root).ok();
-    }
-
-    #[test]
-    fn hash_cache_invalidated_on_mtime_change() {
-        let _guard = db::TEST_DB_LOCK.lock().unwrap();
-        db::init_test_db();
-
-        let root = temp_root("cache_inval");
-        let f1 = root.join("f1.txt");
-        let f2 = root.join("f2.txt");
-        fs::write(&f1, "AAAA").unwrap();
-        fs::write(&f2, "BBBB").unwrap();
-        let meta1 = f1.metadata().unwrap();
-        let meta2 = f2.metadata().unwrap();
-        let mtime1 = meta1.modified().unwrap().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
-        let mtime2 = meta2.modified().unwrap().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
-        let size = meta1.len() as i64;
-
-        let f1_path = f1.to_string_lossy().into_owned();
-        let f2_path = f2.to_string_lossy().into_owned();
-        let root_str = root.to_string_lossy().into_owned();
-
-        // Insert inventory with a fake mtime for f1 (different from the file's
-        // real mtime).  The cache key uses the inventory mtime, so this will
-        // cause a cache miss.
-        insert_inventory(
-            &root_str,
-            &[
-                db::InventoryRow {
-                    path: f1_path.clone(),
-                    size,
-                    mtime: mtime1 + 9999, // altered mtime
-                    category: "Other".into(),
-                },
-                db::InventoryRow {
-                    path: f2_path.clone(),
-                    size,
-                    mtime: mtime2,
-                    category: "Other".into(),
-                },
-            ],
-        );
-
-        // Pre-populate cache for f1's original (mtime1) key — won't match
-        // because the inventory now has mtime1+9999.
-        db::set_cached_hash(&f1_path, size, mtime1, &blake3_hex(b"BBBB"), true).unwrap();
-
-        let groups = find_duplicates().unwrap();
-        // The cache miss means f1 gets freshly hashed → blake3("AAAA") which
-        // differs from f2's blake3("BBBB") → no group.
-        assert_eq!(groups.len(), 0, "mtime change should invalidate cache");
-
-        db::clear_inventory_for_root(&root_str).unwrap();
-        fs::remove_dir_all(&root).ok();
-    }
-
-    // ── Empty directory detection ───────────────────────────────
-
-    #[test]
-    fn empty_dirs_deepest_only() {
-        // Structure:
-        //   root/
-        //     a/          ← empty leaf → reported
-        //     b/
-        //       c/        ← empty leaf → reported
-        //       file.txt  ← file → b is NOT empty
-        //     d/          ← has file.txt → NOT empty
-        //       file.txt
-        //     e/          ← empty leaf → reported
-        let root = temp_root("empty_deepest");
-        fs::create_dir_all(root.join("a")).unwrap();
-        fs::create_dir_all(root.join("b").join("c")).unwrap();
-        fs::write(root.join("b").join("file.txt"), "hello").unwrap();
-        fs::create_dir_all(root.join("d")).unwrap();
-        fs::write(root.join("d").join("file.txt"), "world").unwrap();
-        fs::create_dir_all(root.join("e")).unwrap();
-
-        let (has_files, leaves) = walk_empty_dirs(&root);
-        assert!(has_files, "root has files below");
-        let mut leaf_names: Vec<String> = leaves
-            .iter()
-            .map(|p| Path::new(p).file_name().unwrap().to_string_lossy().into_owned())
-            .collect();
-        leaf_names.sort();
-        assert_eq!(leaf_names, vec!["a", "c", "e"], "deepest empty dirs: a, c, e");
-
-        fs::remove_dir_all(&root).ok();
-    }
-
-    #[test]
-    fn empty_dirs_entirely_empty_root() {
-        let root = temp_root("empty_root");
-        fs::create_dir_all(root.join("sub1")).unwrap();
-        fs::create_dir_all(root.join("sub1").join("sub2")).unwrap();
-
-        // The entire tree has no files.  Deepest leaves: sub2.
-        let (has_files, leaves) = walk_empty_dirs(&root);
-        assert!(!has_files);
-        let leaves: Vec<String> = leaves
-            .iter()
-            .map(|p| {
-                let rel = Path::new(p)
-                    .strip_prefix(&root)
-                    .unwrap()
-                    .to_string_lossy()
-                    .into_owned();
-                rel
-            })
-            .collect();
-        assert_eq!(leaves, vec!["sub1\\sub2"], "deepest empty dir: sub2");
-
-        fs::remove_dir_all(&root).ok();
-    }
-
-    // ── Large file finder (integration-light) ───────────────────
-
-    #[test]
-    fn find_large_files_returns_only_over_threshold() {
-        let _guard = db::TEST_DB_LOCK.lock().unwrap();
-        db::init_test_db();
-
-        let root = temp_root("large");
-        let small = root.join("small.txt");
-        let big = root.join("big.txt");
-        fs::write(&small, "small").unwrap();
-        fs::write(&big, &vec![b'x'; 200]).unwrap();
-
-        let root_str = root.to_string_lossy().into_owned();
-        insert_inventory(
-            &root_str,
-            &[
-                db::InventoryRow {
-                    path: small.to_string_lossy().into_owned(),
-                    size: 5,
-                    mtime: 1,
-                    category: "Other".into(),
-                },
-                db::InventoryRow {
-                    path: big.to_string_lossy().into_owned(),
-                    size: 200,
-                    mtime: 1,
-                    category: "Other".into(),
-                },
-            ],
-        );
-
-        let large = find_large_files(100).unwrap();
-        assert_eq!(large.len(), 1, "only the 200-byte file should appear");
-        assert!(large[0].path.contains("big.txt"));
-
-        db::clear_inventory_for_root(&root_str).unwrap();
-        fs::remove_dir_all(&root).ok();
-    }
-
-    // ── Stale file finder ───────────────────────────────────────
-
-    #[test]
-    fn find_stale_files_returns_old_files() {
-        let _guard = db::TEST_DB_LOCK.lock().unwrap();
-        db::init_test_db();
-
-        let root = temp_root("stale");
-        let old = root.join("old.txt");
-        let fresh = root.join("fresh.txt");
-        fs::write(&old, "old").unwrap();
-        fs::write(&fresh, "fresh").unwrap();
-
-        let root_str = root.to_string_lossy().into_owned();
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
-        insert_inventory(
-            &root_str,
-            &[
-                db::InventoryRow {
-                    path: old.to_string_lossy().into_owned(),
-                    size: 3,
-                    mtime: now - 200_000, // ~2.3 days ago
-                    category: "Other".into(),
-                },
-                db::InventoryRow {
-                    path: fresh.to_string_lossy().into_owned(),
-                    size: 5,
-                    mtime: now - 10_000, // ~2.8 hours ago
-                    category: "Other".into(),
-                },
-            ],
-        );
-
-        // Find files older than 1 day (86400 seconds).
-        let stale = find_stale_files(1).unwrap();
-        assert_eq!(stale.len(), 1, "only the old file should be stale");
-        assert!(stale[0].path.contains("old.txt"));
-
-        db::clear_inventory_for_root(&root_str).unwrap();
-        fs::remove_dir_all(&root).ok();
-    }
-
-    // ── Recycle Bin verdict → outcome mapping ──────────────────
-    //
-    // Pure: no DB, no filesystem, so these cannot interfere with the shared
-    // test database the other modules in this crate share.
-
-    fn outcome_with_verdict(verdict: safe_fs::TrashVerdict) -> CleanupOutcome {
-        let mut outcome = CleanupOutcome {
-            path: "C:/Users/Me/victim.txt".to_string(),
-            status: "ok".to_string(),
-            message: None,
-        };
-        outcome.apply_trash_verdict(verdict);
-        outcome
-    }
-
-    /// The invariant the frontend depends on: a status outside this set is
-    /// counted in no `ResultsPanel` bucket and, read back out of
-    /// `cleanup_actions`, mislabelled in `HistoryPanel`. The fourth member is
-    /// the constant, not a second literal, so the guard cannot be widened here
-    /// while the TypeScript union is left behind.
-    fn assert_status_is_in_the_frontend_vocabulary(outcome: &CleanupOutcome) {
-        assert!(
-            matches!(
-                outcome.status.as_str(),
-                "ok" | "failed" | "skipped" | PERMANENTLY_DELETED_STATUS
-            ),
-            "status {:?} is outside the union declared in src/utils/cleanup.ts",
-            outcome.status
-        );
-    }
-
-    #[test]
-    fn a_file_found_in_the_bin_stays_a_plain_success() {
-        let outcome = outcome_with_verdict(safe_fs::TrashVerdict::InRecycleBin);
-        assert_status_is_in_the_frontend_vocabulary(&outcome);
-        assert_eq!(outcome.status, "ok");
-        assert_eq!(outcome.message, None);
-    }
-
-    /// The defect: this file is gone forever, so it must not be counted as a
-    /// success anywhere the frontend reads status — and it must not be
-    /// indistinguishable from a move that failed and destroyed nothing.
-    #[test]
-    fn a_permanently_deleted_file_gets_its_own_status() {
-        let outcome = outcome_with_verdict(safe_fs::TrashVerdict::PermanentlyDeleted);
-        assert_status_is_in_the_frontend_vocabulary(&outcome);
-        // Spelled as a literal on purpose: this is the cross-language contract
-        // with the union in src/utils/cleanup.ts, so renaming the string has to
-        // break this test rather than ride along on the constant.
-        assert_eq!(outcome.status, "permanently_deleted");
-        assert_ne!(outcome.status, "ok");
-        assert_ne!(outcome.status, "failed");
-        assert_eq!(outcome.message.as_deref(), Some(PERMANENTLY_DELETED_MESSAGE));
-    }
-
-    #[test]
-    fn an_unverified_file_keeps_its_success_but_carries_the_caveat() {
-        let outcome = outcome_with_verdict(safe_fs::TrashVerdict::Unverified);
-        assert_status_is_in_the_frontend_vocabulary(&outcome);
-        assert_eq!(outcome.status, "ok");
-        assert_eq!(outcome.message.as_deref(), Some(UNVERIFIED_MESSAGE));
-    }
-
-    /// A guard that accepts everything is worse than no guard. Pinned against a
-    /// value the union does not declare.
-    #[test]
-    fn the_vocabulary_guard_still_rejects_an_unknown_status() {
-        let outcome = CleanupOutcome {
-            path: "C:/Users/Me/victim.txt".to_string(),
-            status: "moved_to_recycle_bin".to_string(),
-            message: None,
-        };
-        let verdict = std::panic::catch_unwind(|| assert_status_is_in_the_frontend_vocabulary(&outcome));
-        assert!(
-            verdict.is_err(),
-            "a status the TypeScript union does not declare must be rejected"
-        );
-    }
-
-    /// The spelling is agreed with the frontend agent; `PERMANENTLY_DELETED_STATUS`
-    /// and the union in `src/utils/cleanup.ts` are two halves of one contract and
-    /// a typo on either side compiles fine and renders nothing.
-    #[test]
-    fn the_permanent_status_is_the_string_the_frontend_declares() {
-        assert_eq!(PERMANENTLY_DELETED_STATUS, "permanently_deleted");
-    }
-
-    #[test]
-    fn every_trash_kind_is_covered_by_the_snapshot_gate() {
-        for kind in ["trash_duplicate", "trash_large", "trash_stale"] {
-            assert!(is_trash_kind(kind), "{} must take a bin reading", kind);
+    impl TestTree {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "mouzi-cleanup-{}-{}-{}",
+                std::process::id(),
+                SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos(),
+                NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&root).unwrap();
+            Self(fs::canonicalize(root).unwrap())
         }
-        assert!(!is_trash_kind("remove_empty_dir"));
+
+        fn register(&self) {
+            db::add_watched_folder(&self.0.to_string_lossy(), "manual").unwrap();
+        }
+
+        fn file(&self, name: &str, contents: &[u8]) -> String {
+            let path = self.0.join(name);
+            fs::write(&path, contents).unwrap();
+            path.to_string_lossy().into_owned()
+        }
+
+        fn inventory(&self, paths: &[&str]) {
+            let rows: Vec<_> = paths.iter().map(|path| {
+                let metadata = fs::metadata(path).unwrap();
+                db::InventoryRow {
+                    path: (*path).to_string(),
+                    size: metadata.len() as i64,
+                    mtime: modified_epoch(metadata.modified().unwrap()),
+                    category: "Other".into(),
+                }
+            }).collect();
+            db::append_inventory_batch(&self.0.to_string_lossy(), &rows).unwrap();
+        }
+    }
+
+    impl Drop for TestTree {
+        fn drop(&mut self) {
+            // Only the unique test-owned tree, never an existing user path.
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn init() {
+        db::init_test_db();
+        // The test database is shared across modules. A deleted root from a
+        // previous fixture must not become configuration for the next test.
+        db::lock_db().unwrap().execute_batch("DELETE FROM watched_folders; DELETE FROM file_inventory; DELETE FROM hash_cache;").unwrap();
+        PLANS.lock().unwrap().clear();
+    }
+
+    fn duplicate(path: &str, keeper: &str) -> CleanupRequest {
+        CleanupRequest { kind: "trash_duplicate".into(), path: path.into(), keep_path: Some(keeper.into()), min_bytes: None, days: None }
+    }
+
+    fn large(path: &str) -> CleanupRequest {
+        CleanupRequest { kind: "trash_large".into(), path: path.into(), keep_path: None, min_bytes: Some(1), days: None }
+    }
+
+    fn directory(path: &str) -> CleanupRequest {
+        CleanupRequest { kind: "remove_empty_dir".into(), path: path.into(), keep_path: None, min_bytes: None, days: None }
+    }
+
+    #[derive(Default)]
+    struct FakeIo {
+        trash_calls: usize,
+        directory_calls: usize,
+        intent_calls: usize,
+        finalized: Vec<(String, bool)>,
+        fail_intent: bool,
+        fail_finalize: bool,
+        leave_source: bool,
+        fail_after_removal: bool,
+        change_keeper_after_first: Option<String>,
+    }
+
+    impl CleanupIo for FakeIo {
+        fn begin_intent(&mut self, _kind: &str, _path: &str) -> Result<i64, String> {
+            self.intent_calls += 1;
+            if self.fail_intent { Err("injected intent failure".into()) } else { Ok(self.intent_calls as i64) }
+        }
+        fn finish_intent(&mut self, _id: i64, outcome: &CleanupOutcome, removed: bool) -> Result<(), String> {
+            self.finalized.push((outcome.status.clone(), removed));
+            if self.finalized.len() == 1 {
+                if let Some(keeper) = &self.change_keeper_after_first {
+                    fs::write(keeper, b"changed keeper").unwrap();
+                }
+            }
+            if self.fail_finalize { Err("injected history failure".into()) } else { Ok(()) }
+        }
+        fn trash(&mut self, path: &Path, _identity: &safe_fs::FileIdentity) -> Result<safe_fs::TrashVerdict, String> {
+            self.trash_calls += 1;
+            if !self.leave_source {
+                // Model a removal by moving to another test-owned path. This
+                // adapter never calls the native trash implementation.
+                let destination = path.with_file_name(format!("removed-{}", self.trash_calls));
+                fs::rename(path, destination).map_err(|error| error.to_string())?;
+            }
+            if self.fail_after_removal { return Err("injected failure after source removal".into()); }
+            Ok(safe_fs::TrashVerdict::Unverified)
+        }
+        fn remove_empty_dir(&mut self, path: &Path, _identity: &safe_fs::FileIdentity) -> Result<(), String> {
+            self.directory_calls += 1;
+            let destination = path.with_file_name(format!("removed-dir-{}", self.directory_calls));
+            fs::rename(path, destination).map_err(|error| error.to_string())
+        }
+    }
+
+    #[test]
+    fn duplicate_discovery_uses_live_contents_and_ignores_poisoned_cache() {
+        let _guard = db::serialise_test_db();
+        init();
+        let tree = TestTree::new();
+        tree.register();
+        let a = tree.file("a.txt", b"AAAA");
+        let b = tree.file("b.txt", b"BBBB");
+        tree.inventory(&[&a, &b]);
+        let metadata = fs::metadata(&a).unwrap();
+        db::set_cached_hash(&a, 4, modified_epoch(metadata.modified().unwrap()), &blake3::hash(b"BBBB").to_hex().to_string(), true).unwrap();
+        assert!(find_duplicates().unwrap().is_empty(), "a cached digest cannot turn different live contents into duplicates");
+        fs::write(&a, b"BBBB").unwrap();
+        let groups = find_duplicates().unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].files.len(), 2);
+    }
+
+    #[test]
+    fn duplicate_groups_exclude_hard_links_and_physical_aliases() {
+        let _guard = db::serialise_test_db();
+        init();
+        let tree = TestTree::new();
+        tree.register();
+        let original = tree.file("a.txt", b"same");
+        let linked = tree.0.join("linked.txt");
+        fs::hard_link(&original, &linked).unwrap();
+        let other = tree.file("b.txt", b"same");
+        let linked = linked.to_string_lossy().into_owned();
+        tree.inventory(&[&original, &linked, &other]);
+        assert!(find_duplicates().unwrap().is_empty());
+        assert!(prepare_cleanup(&[duplicate(&linked, &original)]).is_err());
+    }
+
+    #[test]
+    fn finder_returns_current_sizes_and_times_in_eligible_roots() {
+        let _guard = db::serialise_test_db();
+        init();
+        let tree = TestTree::new();
+        tree.register();
+        let old = tree.file("old.txt", b"old");
+        let fresh = tree.file("fresh.txt", b"fresh");
+        let old_time = SystemTime::now() - Duration::from_secs(2 * 86_400);
+        fs::OpenOptions::new().write(true).open(&old).unwrap().set_times(fs::FileTimes::new().set_modified(old_time)).unwrap();
+        tree.inventory(&[&old, &fresh]);
+        fs::write(&fresh, vec![b'x'; 200]).unwrap();
+        let large = find_large_files(100).unwrap();
+        assert_eq!(large.len(), 1);
+        assert_eq!(large[0].path, fresh);
+        assert_eq!(large[0].size, 200, "inventory size is not live evidence");
+        let stale = find_stale_files(1).unwrap();
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0].path, old);
+    }
+
+    #[test]
+    fn empty_discovery_excludes_roots_without_requiring_inventory() {
+        let _guard = db::serialise_test_db();
+        init();
+        let tree = TestTree::new();
+        tree.register();
+        assert!(!has_inventory());
+        assert!(find_empty_dirs().unwrap().is_empty(), "registered root itself is protected");
+        fs::create_dir_all(tree.0.join("a").join("deep")).unwrap();
+        fs::create_dir(tree.0.join("b")).unwrap();
+        let leaves = find_empty_dirs().unwrap();
+        assert_eq!(leaves.len(), 2);
+        assert!(leaves.iter().any(|path| Path::new(path) == tree.0.join("a").join("deep")));
+        assert!(leaves.iter().any(|path| Path::new(path) == tree.0.join("b")));
+        assert!(prepare_cleanup(&[directory(&tree.0.to_string_lossy())]).is_err());
+    }
+
+    #[test]
+    fn invalid_payloads_and_cross_kind_keeper_intersections_never_mutate() {
+        let _guard = db::serialise_test_db();
+        init();
+        let tree = TestTree::new();
+        tree.register();
+        let a = tree.file("a.txt", b"same");
+        let b = tree.file("b.txt", b"same");
+        tree.inventory(&[&a, &b]);
+        let outside = TestTree::new();
+        let outside_file = outside.file("outside.txt", b"same");
+        let mut no_keeper = duplicate(&a, &b);
+        no_keeper.keep_path = None;
+        let mut unknown = large(&a);
+        unknown.kind = "recursive_delete".into();
+        for actions in [
+            vec![no_keeper],
+            vec![unknown],
+            vec![large(&outside_file)],
+            vec![large(&tree.0.to_string_lossy())],
+            vec![duplicate(&a, &b), duplicate(&b, &a)],
+            vec![duplicate(&a, &b), large(&b)],
+            vec![large(&a), large(&a)],
+        ] {
+            assert!(prepare_cleanup(&actions).is_err());
+        }
+        let mut io = FakeIo::default();
+        assert!(execute_cleanup_plan_with("client-created-token", &mut io).is_err());
+        assert_eq!(io.trash_calls, 0);
+        assert_eq!(io.directory_calls, 0);
+    }
+
+    #[test]
+    fn paused_nested_root_cannot_borrow_active_parent_authority() {
+        let _guard = db::serialise_test_db();
+        init();
+        let tree = TestTree::new();
+        tree.register();
+        let nested = tree.0.join("nested");
+        fs::create_dir(&nested).unwrap();
+        db::add_watched_folder(&nested.to_string_lossy(), "paused").unwrap();
+        let path = tree.file("nested/a.txt", b"same");
+        tree.inventory(&[&path]);
+        assert!(find_large_files(1).unwrap().is_empty());
+        assert!(prepare_cleanup(&[large(&path)]).is_err());
+        assert!(prepare_cleanup(&[directory(&nested.to_string_lossy())]).is_err());
+    }
+
+    #[test]
+    fn same_size_preserved_time_victim_rewrite_rejects_whole_batch() {
+        let _guard = db::serialise_test_db();
+        init();
+        let tree = TestTree::new();
+        tree.register();
+        let a = tree.file("a.txt", b"same");
+        let b = tree.file("b.txt", b"same");
+        tree.inventory(&[&a, &b]);
+        let preview = prepare_cleanup(&[duplicate(&b, &a)]).unwrap();
+        let modified = fs::metadata(&b).unwrap().modified().unwrap();
+        fs::write(&b, b"diff").unwrap();
+        fs::OpenOptions::new().write(true).open(&b).unwrap().set_times(fs::FileTimes::new().set_modified(modified)).unwrap();
+        let mut io = FakeIo::default();
+        assert!(execute_cleanup_plan_with(&preview.plan_id, &mut io).is_err());
+        assert_eq!(io.trash_calls, 0);
+        assert_eq!(io.intent_calls, 0);
+        fs::write(&b, b"same").unwrap();
+        let preview = prepare_cleanup(&[duplicate(&b, &a)]).unwrap();
+        let modified = fs::metadata(&a).unwrap().modified().unwrap();
+        fs::write(&a, b"diff").unwrap();
+        fs::OpenOptions::new().write(true).open(&a).unwrap().set_times(fs::FileTimes::new().set_modified(modified)).unwrap();
+        assert!(execute_cleanup_plan_with(&preview.plan_id, &mut io).is_err());
+        assert_eq!(io.trash_calls, 0, "a same-size, preserved-time keeper rewrite must also be detected");
+    }
+
+    #[test]
+    fn missing_keeper_and_changed_unselected_group_member_prevent_every_removal() {
+        let _guard = db::serialise_test_db();
+        init();
+        let tree = TestTree::new();
+        tree.register();
+        let keeper = tree.file("keeper.txt", b"same");
+        let victim = tree.file("victim.txt", b"same");
+        let other = tree.file("unselected.txt", b"same");
+        tree.inventory(&[&keeper, &victim, &other]);
+        let changed_plan = prepare_cleanup(&[duplicate(&victim, &keeper)]).unwrap();
+        fs::write(&other, b"diff").unwrap();
+        let mut io = FakeIo::default();
+        assert!(execute_cleanup_plan_with(&changed_plan.plan_id, &mut io).is_err());
+        assert_eq!(io.trash_calls, 0);
+        fs::write(&other, b"same").unwrap();
+        let missing_plan = prepare_cleanup(&[duplicate(&victim, &keeper)]).unwrap();
+        fs::rename(&keeper, tree.0.join("keeper-moved.txt")).unwrap();
+        assert!(execute_cleanup_plan_with(&missing_plan.plan_id, &mut io).is_err());
+        assert_eq!(io.trash_calls, 0);
+    }
+
+    #[test]
+    fn root_configuration_change_and_expired_plan_are_single_use_rejections() {
+        let _guard = db::serialise_test_db();
+        init();
+        let tree = TestTree::new();
+        tree.register();
+        let file = tree.file("a.txt", b"one");
+        tree.inventory(&[&file]);
+        let expired = prepare_cleanup(&[large(&file)]).unwrap();
+        PLANS.lock().unwrap().get_mut(&expired.plan_id).unwrap().created = Instant::now() - PLAN_LIFETIME;
+        let mut io = FakeIo::default();
+        assert!(execute_cleanup_plan_with(&expired.plan_id, &mut io).is_err());
+        assert!(execute_cleanup_plan_with(&expired.plan_id, &mut io).is_err());
+        let changed = prepare_cleanup(&[large(&file)]).unwrap();
+        let id = db::get_watched_folders().unwrap()[0].id.unwrap();
+        db::update_folder_mode(id, "paused").unwrap();
+        assert!(execute_cleanup_plan_with(&changed.plan_id, &mut io).is_err());
+        assert_eq!(io.trash_calls, 0);
+    }
+
+    #[test]
+    fn directory_gaining_a_child_is_rejected_before_fake_remover() {
+        let _guard = db::serialise_test_db();
+        init();
+        let tree = TestTree::new();
+        tree.register();
+        let empty = tree.0.join("empty");
+        fs::create_dir(&empty).unwrap();
+        let preview = prepare_cleanup(&[directory(&empty.to_string_lossy())]).unwrap();
+        fs::write(empty.join("new.txt"), b"keep").unwrap();
+        let mut io = FakeIo::default();
+        assert!(execute_cleanup_plan_with(&preview.plan_id, &mut io).is_err());
+        assert_eq!(io.directory_calls, 0);
+    }
+
+    #[test]
+    fn file_and_root_identity_replacements_are_rejected() {
+        let _guard = db::serialise_test_db();
+        init();
+        let tree = TestTree::new();
+        let watched = tree.0.join("watched");
+        fs::create_dir(&watched).unwrap();
+        db::add_watched_folder(&watched.to_string_lossy(), "manual").unwrap();
+        let path = watched.join("a.txt").to_string_lossy().into_owned();
+        fs::write(&path, b"same").unwrap();
+        let row = db::InventoryRow { path: path.clone(), size: 4, mtime: modified_epoch(fs::metadata(&path).unwrap().modified().unwrap()), category: "Other".into() };
+        db::append_inventory_batch(&watched.to_string_lossy(), &[row]).unwrap();
+        let changed_file = prepare_cleanup(&[large(&path)]).unwrap();
+        fs::rename(&path, watched.join("original.txt")).unwrap();
+        fs::write(&path, b"same").unwrap();
+        let mut io = FakeIo::default();
+        assert!(execute_cleanup_plan_with(&changed_file.plan_id, &mut io).is_err());
+        let changed_type = prepare_cleanup(&[large(&path)]).unwrap();
+        fs::rename(&path, watched.join("second-original.txt")).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert!(execute_cleanup_plan_with(&changed_type.plan_id, &mut io).is_err());
+        // A newly created watched root at the same spelling is a new scope.
+        let another = watched.join("b.txt").to_string_lossy().into_owned();
+        fs::write(&another, b"same").unwrap();
+        let row = db::InventoryRow { path: another.clone(), size: 4, mtime: modified_epoch(fs::metadata(&another).unwrap().modified().unwrap()), category: "Other".into() };
+        db::append_inventory_batch(&watched.to_string_lossy(), &[row]).unwrap();
+        let changed_root = prepare_cleanup(&[large(&another)]).unwrap();
+        fs::rename(&watched, tree.0.join("old-watched")).unwrap();
+        fs::create_dir(&watched).unwrap();
+        fs::write(&another, b"same").unwrap();
+        assert!(execute_cleanup_plan_with(&changed_root.plan_id, &mut io).is_err());
+        assert_eq!(io.trash_calls, 0);
+    }
+
+    #[test]
+    fn successful_duplicate_retains_keeper_and_consumes_exact_plan() {
+        let _guard = db::serialise_test_db();
+        init();
+        let tree = TestTree::new();
+        tree.register();
+        let keeper = tree.file("keeper.txt", b"same");
+        let victim = tree.file("victim.txt", b"same");
+        tree.inventory(&[&keeper, &victim]);
+        let preview = prepare_cleanup(&[duplicate(&victim, &keeper)]).unwrap();
+        let mut io = FakeIo::default();
+        let result = execute_cleanup_plan_with(&preview.plan_id, &mut io).unwrap();
+        assert_eq!(io.trash_calls, 1);
+        assert_eq!(result[0].path, victim);
+        assert_eq!(result[0].status, "ok");
+        assert_eq!(result[0].message.as_deref(), Some(UNVERIFIED_MESSAGE));
+        assert_eq!(fs::read(&keeper).unwrap(), b"same");
+        assert!(execute_cleanup_plan_with(&preview.plan_id, &mut io).is_err());
+        assert_eq!(io.trash_calls, 1);
+    }
+
+    #[test]
+    fn keeper_change_after_one_success_stops_remaining_group_members() {
+        let _guard = db::serialise_test_db();
+        init();
+        let tree = TestTree::new();
+        tree.register();
+        let keeper = tree.file("keeper.txt", b"same");
+        let first = tree.file("first.txt", b"same");
+        let second = tree.file("second.txt", b"same");
+        tree.inventory(&[&keeper, &first, &second]);
+        let preview = prepare_cleanup(&[duplicate(&first, &keeper), duplicate(&second, &keeper)]).unwrap();
+        let mut io = FakeIo { change_keeper_after_first: Some(keeper.clone()), ..FakeIo::default() };
+        let results = execute_cleanup_plan_with(&preview.plan_id, &mut io).unwrap();
+        assert_eq!(io.trash_calls, 1);
+        assert_eq!(results[0].status, "ok");
+        assert_eq!(results[1].status, "skipped");
+        assert!(Path::new(&second).exists());
+    }
+
+    #[test]
+    fn intent_failure_prevents_mutation_and_finalize_failure_keeps_actual_success() {
+        let _guard = db::serialise_test_db();
+        init();
+        let tree = TestTree::new();
+        tree.register();
+        let file = tree.file("a.txt", b"one");
+        tree.inventory(&[&file]);
+        let rejected = prepare_cleanup(&[large(&file)]).unwrap();
+        let mut failed = FakeIo { fail_intent: true, ..FakeIo::default() };
+        let outcomes = execute_cleanup_plan_with(&rejected.plan_id, &mut failed).unwrap();
+        assert_eq!(failed.trash_calls, 0);
+        assert_eq!(outcomes[0].status, "failed");
+        let accepted = prepare_cleanup(&[large(&file)]).unwrap();
+        let mut partial = FakeIo { fail_finalize: true, ..FakeIo::default() };
+        let outcomes = execute_cleanup_plan_with(&accepted.plan_id, &mut partial).unwrap();
+        assert_eq!(partial.trash_calls, 1);
+        assert_eq!(outcomes[0].status, "ok");
+        assert!(outcomes[0].message.as_deref().unwrap().contains("recovery record remains pending"));
+        assert_eq!(partial.finalized, vec![("ok".into(), true)]);
+    }
+
+    #[test]
+    fn trash_success_with_source_still_present_is_not_reported_as_removed() {
+        let _guard = db::serialise_test_db();
+        init();
+        let tree = TestTree::new();
+        tree.register();
+        let file = tree.file("a.txt", b"one");
+        tree.inventory(&[&file]);
+        let preview = prepare_cleanup(&[large(&file)]).unwrap();
+        let mut io = FakeIo { leave_source: true, ..FakeIo::default() };
+        let outcomes = execute_cleanup_plan_with(&preview.plan_id, &mut io).unwrap();
+        assert_eq!(outcomes[0].status, "failed");
+        assert_eq!(io.finalized, vec![("failed".into(), false)]);
+        assert!(Path::new(&file).exists());
+    }
+
+    #[test]
+    fn reported_trash_error_with_missing_source_records_actual_removal() {
+        let _guard = db::serialise_test_db();
+        init();
+        let tree = TestTree::new();
+        tree.register();
+        let file = tree.file("a.txt", b"one");
+        tree.inventory(&[&file]);
+        let preview = prepare_cleanup(&[large(&file)]).unwrap();
+        let mut io = FakeIo { fail_after_removal: true, ..FakeIo::default() };
+        let outcomes = execute_cleanup_plan_with(&preview.plan_id, &mut io).unwrap();
+        assert_eq!(outcomes[0].status, "failed");
+        assert!(outcomes[0].message.as_deref().unwrap().contains("source is absent"));
+        assert_eq!(io.finalized, vec![("failed".into(), true)]);
+    }
+
+    #[test]
+    fn explicit_trash_verdicts_keep_the_frontend_status_vocabulary() {
+        for (verdict, expected) in [
+            (safe_fs::TrashVerdict::InRecycleBin, "ok"),
+            (safe_fs::TrashVerdict::Unverified, "ok"),
+            (safe_fs::TrashVerdict::PermanentlyDeleted, "permanently_deleted"),
+        ] {
+            let mut outcome = CleanupOutcome { path: "victim".into(), status: "ok".into(), message: None };
+            outcome.apply_trash_verdict(verdict);
+            assert_eq!(outcome.status, expected);
+            assert!(matches!(outcome.status.as_str(), "ok" | "failed" | "skipped" | "permanently_deleted"));
+        }
     }
 }

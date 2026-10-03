@@ -61,7 +61,8 @@
       "undone": "Revertido",
       "empty": "Sin historial",
       "revertAll": "Deshacer todo",
-      "revertAllDisabled": "Sin acciones para deshacer"
+      "revertAllDisabled": "Sin acciones para deshacer",
+      "showing": "Mostrando {{shown}} de {{total}} entradas del historial"
     },
     "general": {
       "title": "General",
@@ -80,7 +81,11 @@
       "gracePeriodMinutes": "Minutos",
       "gracePeriodHours": "Horas",
       "gracePeriodCustom": "Personalizado",
-      "gracePeriodMaxError": "El período de gracia no puede exceder los 7 días"
+      "gracePeriodMaxError": "El período de gracia no puede exceder los 7 días",
+      "localAi": "Activar sugerencias de IA local",
+      "localAiModel": "Modelo de Ollama",
+      "localAiPrivacy": "Desactivado de forma predeterminada. Al activarlo, los nombres de los archivos se envían a Ollama en este equipo. No se envía el contenido de los archivos.",
+      "gracePeriodUnit": "Unidad de tiempo"
     },
     "ignore": {
       "title": "Excluir",
@@ -95,13 +100,17 @@
       "tips": "Consejos:",
       "save": "Guardar .mouziignore",
       "saved": "¡Guardado!",
-      "remove": "Eliminar"
+      "remove": "Eliminar",
+      "extensionTip": "ignorar todos los archivos .tmp",
+      "folderTip": "ignorar la carpeta",
+      "officeTip": "ignorar los archivos temporales de Office",
+      "exactTip": "ignorar este nombre de archivo exacto"
     },
     "about": {
       "title": "Acerca de",
       "tagline": "Tus descargas, bajo control.",
-      "description": "Mouzi es un organizador de archivos silencioso y elegante que vive en tu bandeja del sistema y mantiene tu carpeta de Descargas (y cualquier otra carpeta) automáticamente ordenada. Se ejecuta silenciosamente en segundo plano, monitorea las carpetas seleccionadas y mueve, renombra u organiza archivos según reglas personalizables.",
-      "checkUpdates": "Buscar actualizaciones",
+      "description": "Mouzi organiza los archivos de las carpetas seleccionadas mediante reglas. Mueve archivos y conserva un historial para deshacer las operaciones.",
+      "checkUpdates": "Descargas del proyecto original",
       "support": "Apoya a Mouzi en Ko-fi",
       "supportDesc": "Tu apoyo mantiene a Mouzi mejorando. ¡Gracias! 🙏",
       "versionLabel": "Versión",
@@ -127,7 +136,8 @@
       "importingShort": "Importando...",
       "importSuccess": "Se extrajeron {{extracted}} archivo(s) y se organizaron {{count}} archivo(s).",
       "importError": "No se pudo importar el archivo: {{error}}",
-      "openImportFolder": "Abrir la carpeta de importación"
+      "openImportFolder": "Abrir la carpeta de importación",
+      "progress": "{{files}} archivos extraídos · {{bytes}}"
     }
   },
   "notifications": {
@@ -135,13 +145,20 @@
   },
   "common": {
     "cancel": "Cancelar",
-    "off": "DESACTIVADO"
+    "off": "DESACTIVADO",
+    "retry": "Reintentar",
+    "save": "Guardar",
+    "saving": "Guardando…",
+    "loading": "Cargando…",
+    "dismiss": "Cerrar",
+    "close": "Cerrar",
+    "back": "Volver"
   },
   "dashboard": {
     "title": "Panel de control",
     "totalFiles": "Archivos totales",
     "totalBytes": "Tamaño total",
-    "watchedRoots": "Carpetas monitorizadas",
+    "watchedRoots": "Carpetas configuradas",
     "lastScan": "Último escaneo",
     "neverScanned": "Nunca",
     "scanNow": "Escanear ahora",
@@ -169,11 +186,11 @@
     "largeFiles": "Archivos grandes",
     "staleFiles": "Archivos viejos",
     "possibleDuplicates": "Posibles duplicados",
-    "uncategorized": "Sin categoría",
+    "uncategorized": "Otros archivos",
     "largeHint": "más de 100 MB",
     "staleHint": "sin tocar 1 año+",
     "duplicatesHint": "mismo tamaño",
-    "uncategorizedHint": "sin regla",
+    "uncategorizedHint": "extensión sin categoría asignada",
     "insightClear": "Todo en orden",
     "open": "Abrir",
     "openSuggestions": "Sugerencias",
@@ -186,7 +203,13 @@
     "ageOlder": "Más antiguos",
     "filterBy": "{{name}}",
     "scanRoots": "{{done}} / {{total}} carpetas",
-    "noFiles": "Ningún archivo coincide"
+    "noFiles": "Ningún archivo coincide",
+    "loadingFiles": "Cargando archivos…",
+    "rootPending": "Sin analizar",
+    "rootStale": "El análisis anterior está desactualizado",
+    "rootFailed": "Error de análisis",
+    "rootLastScan": "Último análisis: {{date}}",
+    "scanFailed": "El análisis no se completó correctamente."
   },
   "cleanup": {
     "title": "Limpieza inteligente",
@@ -230,7 +253,11 @@
     "historyEmptyDirs": "Las eliminaciones de carpetas vacías no se pueden deshacer.",
     "refresh": "Actualizar",
     "openFolder": "Abrir carpeta",
-    "scanFirstHint": "Ejecuta un escaneo primero"
+    "scanFirstHint": "Ejecuta un escaneo primero",
+    "historyLoading": "Cargando el historial de limpieza…",
+    "historyError": "No se pudo cargar el historial de limpieza.",
+    "notSearched": "Ejecuta una búsqueda para revisar los candidatos.",
+    "historyUnknown": "Resultado desconocido"
   },
   "suggestions": {
     "title": "Sugerencias",
@@ -254,7 +281,21 @@
     "failed": "Fallido",
     "missing": "El archivo ya no existe",
     "resultsTitle": "Resultados",
-    "backToList": "Volver a la lista"
+    "backToList": "Volver a la lista",
+    "resetDismissed": "Volver a mostrar los archivos descartados",
+    "rulePreview": "Automatización futura",
+    "ruleScope": "Se aplica a",
+    "rulePriority": "Prioridad",
+    "ruleExtension": "Extensión",
+    "ruleDestination": "Destino",
+    "ruleAlreadyCovered": "Una regla existente ya cubre esta extensión.",
+    "ruleConflict": "Una regla anterior puede tener prioridad.",
+    "ruleNotApplicable": "No se creará ninguna regla futura.",
+    "partial": "No se pudieron procesar algunos archivos.",
+    "preparing": "Preparando el plan para confirmar…",
+    "ruleCount": "Reglas nuevas: {{count}}",
+    "planChanged": "El archivo o la configuración ha cambiado. Revisa un plan nuevo.",
+    "alreadyFiled": "Ya archivado; categoría guardada"
   },
   "confirm": {
     "impactItems": "{{count}} elemento",
@@ -330,5 +371,14 @@
     "allFailed_one": "{{count}} archivo no restaurado",
     "allFailed_other": "{{count}} archivos no restaurados",
     "allFailed_many": "{{count}} archivos no restaurados"
+  },
+  "categories": {
+    "Documents": "Documentos",
+    "Images": "Imágenes",
+    "Videos": "Vídeos",
+    "Audio": "Audio",
+    "Archives": "Archivos comprimidos",
+    "Code": "Código",
+    "Other": "Otros"
   }
 }

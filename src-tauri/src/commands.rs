@@ -1,7 +1,7 @@
 use crate::db::*;
 use crate::ignore::{load_mouziignore, save_mouziignore};
-use crate::rules::manual_scan_folder;
-use crate::safe_fs::{is_within_any_root, move_file, MoveOutcome};
+use crate::rules::manual_scan_folder_with_suppression;
+use crate::safe_fs::move_file_checked;
 use crate::scan::{self, ScanEvent};
 use crate::suppress::{SuppressionSet, SUPPRESSION_TTL};
 use crate::AppState;
@@ -10,6 +10,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
+use std::collections::HashMap;
+use once_cell::sync::Lazy;
+use std::sync::Mutex as PlanMutex;
 // `MOVE_OBSERVER` and the two test modules that read it are the only users.
 #[cfg(test)]
 use std::sync::{Mutex, MutexGuard};
@@ -30,6 +33,7 @@ pub fn get_system_language() -> String {
         "ja" => "ja".to_string(),
         "es" => "es".to_string(),
         "uk" => "uk".to_string(),
+        "vi" => "vi".to_string(),
         _ => "en".to_string(),
     }
 }
@@ -54,6 +58,18 @@ pub fn get_rules_cmd() -> Result<Vec<Rule>, String> {
 /// An absolute destination is exempt: it is resolved as written, so pointing at
 /// a fixed folder is a legitimate thing to ask for.
 fn validate_rule_destination(rule: &Rule) -> Result<(), String> {
+    if !matches!(rule.action.as_str(), "move" | "ignore") {
+        return Err(format!("Unsupported rule action: {}", rule.action));
+    }
+    if rule.name.trim().is_empty() {
+        return Err("Rule name cannot be empty".into());
+    }
+    if rule.extensions.is_empty() || rule.extensions.iter().any(|ext| ext.trim().trim_start_matches('.').is_empty()) {
+        return Err("Provide at least one extension or *".into());
+    }
+    if let Some(pattern) = rule.pattern.as_deref().filter(|p| !p.is_empty()) {
+        regex::Regex::new(pattern).map_err(|e| format!("Invalid filename pattern: {e}"))?;
+    }
     if rule.action != "move" {
         return Ok(());
     }
@@ -65,24 +81,35 @@ fn validate_rule_destination(rule: &Rule) -> Result<(), String> {
             rule.destination
         ));
     }
+    if !Path::new(destination).is_absolute()
+        && Path::new(destination).components().any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err("Relative destinations cannot contain parent traversal".into());
+    }
     Ok(())
 }
 
-#[tauri::command]
-pub fn add_rule_cmd(rule: Rule) -> Result<i64, String> {
-    validate_rule_destination(&rule)?;
-    add_rule(&rule).map_err(|e| e.to_string())
+fn with_configuration<T>(app: &AppHandle, write: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    let state = app.try_state::<AppState>().ok_or("Application coordinator is unavailable")?;
+    let _operation = state.ignored_files.with_operation();
+    write()
 }
 
-#[tauri::command]
-pub fn update_rule_cmd(rule: Rule) -> Result<(), String> {
+#[tauri::command(async)]
+pub fn add_rule_cmd(app: AppHandle, rule: Rule) -> Result<i64, String> {
     validate_rule_destination(&rule)?;
-    update_rule(&rule).map_err(|e| e.to_string())
+    with_configuration(&app, || add_rule(&rule).map_err(|e| e.to_string()))
 }
 
-#[tauri::command]
-pub fn delete_rule_cmd(id: i64) -> Result<(), String> {
-    delete_rule(id).map_err(|e| e.to_string())
+#[tauri::command(async)]
+pub fn update_rule_cmd(app: AppHandle, rule: Rule) -> Result<(), String> {
+    validate_rule_destination(&rule)?;
+    with_configuration(&app, || update_rule(&rule).map_err(|e| e.to_string()))
+}
+
+#[tauri::command(async)]
+pub fn delete_rule_cmd(app: AppHandle, id: i64) -> Result<(), String> {
+    with_configuration(&app, || delete_rule(id).map_err(|e| e.to_string()))
 }
 
 #[tauri::command]
@@ -90,42 +117,42 @@ pub fn get_folders_cmd() -> Result<Vec<WatchedFolder>, String> {
     get_watched_folders().map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn add_folder_cmd(app: tauri::AppHandle, path: String, mode: String) -> Result<i64, String> {
     if !is_valid_folder_mode(&mode) {
         return Err(format!("Invalid folder mode: {}", mode));
     }
-    let folder = std::path::Path::new(&path);
-    if !folder.is_absolute() {
-        return Err(format!("Path must be absolute: {}", path));
+    let folder = crate::safe_fs::validate_root(Path::new(&path))?;
+    let identity = crate::safe_fs::file_identity(&folder)?;
+    let id = with_configuration(&app, || {
+    for existing in get_watched_folders().map_err(|e| e.to_string())? {
+        if crate::safe_fs::file_identity(Path::new(&existing.path)).ok().as_ref() == Some(&identity) {
+            return existing.id.ok_or_else(|| "Existing folder has no identifier".into());
+        }
     }
-    // A drive or filesystem root has no parent. Watching one would make the
-    // scanner walk the entire volume, which the design rules out.
-    if folder.parent().is_none() {
-        return Err(format!("Refusing to watch a whole drive: {}", path));
-    }
-    if !folder.is_dir() {
-        return Err(format!("Not an existing folder: {}", path));
-    }
-    let id = add_watched_folder(&path, &mode).map_err(|e| e.to_string())?;
+    add_watched_folder(&path, &mode).map_err(|e| e.to_string())
+    })?;
     if let Some(state) = app.try_state::<crate::AppState>() {
         let mut watcher = state.watcher.lock().unwrap();
-        let _ = watcher.refresh(app.clone());
+        watcher.refresh(app.clone()).map_err(|e| format!("Folder saved; watcher refresh failed: {e}"))?;
     }
+    let _ = app.emit("folders-changed", ());
     Ok(id)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn remove_folder_cmd(app: tauri::AppHandle, id: i64) -> Result<(), String> {
-    remove_watched_folder(id).map_err(|e| e.to_string())?;
+    with_configuration(&app, || remove_watched_folder(id).map_err(|e| e.to_string()))?;
     if let Some(state) = app.try_state::<crate::AppState>() {
         let mut watcher = state.watcher.lock().unwrap();
-        let _ = watcher.refresh(app.clone());
+        watcher.refresh(app.clone()).map_err(|e| format!("Folder removed; watcher refresh failed: {e}"))?;
     }
+    let _ = app.emit("folders-changed", ());
+    let _ = app.emit("mutation-completed", ());
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn update_folder_mode_cmd(app: tauri::AppHandle, id: i64, mode: String) -> Result<(), String> {
     if !is_valid_folder_mode(&mode) {
         return Err(format!("Invalid folder mode: {}", mode));
@@ -136,7 +163,7 @@ pub fn update_folder_mode_cmd(app: tauri::AppHandle, id: i64, mode: String) -> R
         .and_then(|folders| folders.into_iter().find(|f| f.id == Some(id)))
         .map(|f| f.mode);
 
-    update_folder_mode(id, &mode).map_err(|e| e.to_string())?;
+    with_configuration(&app, || update_folder_mode(id, &mode).map_err(|e| e.to_string()))?;
 
     if let Some(state) = app.try_state::<crate::AppState>() {
         let mut watcher = state.watcher.lock().unwrap();
@@ -155,14 +182,20 @@ pub fn update_folder_mode_cmd(app: tauri::AppHandle, id: i64, mode: String) -> R
             }
         }
 
-        let _ = watcher.refresh(app.clone());
+        watcher.refresh(app.clone()).map_err(|e| format!("Mode saved; watcher refresh failed: {e}"))?;
     }
+    let _ = app.emit("folders-changed", ());
     Ok(())
 }
 
 #[tauri::command]
 pub fn get_logs_cmd(limit: i64) -> Result<Vec<ActionLog>, String> {
-    get_recent_logs(limit).map_err(|e| e.to_string())
+    get_recent_logs(limit.clamp(1, 500)).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn get_history_counts_cmd() -> Result<HistoryCounts, String> {
+    history_counts().map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -209,6 +242,7 @@ struct UndoTarget {
     id: i64,
     source: String,
     dest: Option<String>,
+    file_identity: Option<String>,
 }
 
 /// What phase 2 intends to do with a target, decided while holding no lock.
@@ -265,23 +299,23 @@ fn plan_undo(target: &UndoTarget) -> UndoPlan {
 
 /// The filesystem half of an undo. Takes no lock of any kind: the caller has
 /// armed suppression already and writes the log row afterwards.
-fn execute_undo_move(plan: &UndoPlan) -> UndoMove {
+fn execute_undo_move(plan: &UndoPlan, expected: Option<&str>) -> UndoMove {
     let (dest, source) = match plan {
         UndoPlan::Gone => return UndoMove::Gone,
         UndoPlan::Restore { dest, source } => (dest.as_path(), source.as_str()),
     };
     let source_path = Path::new(source);
-    match move_file(dest, source_path) {
-        Ok(MoveOutcome::Moved) => UndoMove::Restored {
-            actual: source.to_string(),
-            status: "ok",
-        },
-        Ok(MoveOutcome::MovedWithNewName(name)) => UndoMove::Restored {
-            actual: source_path
-                .with_file_name(&name)
-                .to_string_lossy()
-                .to_string(),
-            status: "collision",
+    let moved = if let Some(expected) = expected {
+        match crate::safe_fs::file_identity(dest) {
+            Ok(identity) if identity.key() == expected => crate::safe_fs::move_file_checked_expected(dest, source_path, &identity),
+            Ok(_) => Err("The file at the recorded destination was replaced; undo stopped".into()),
+            Err(error) => Err(error),
+        }
+    } else { move_file_checked(dest, source_path) }; // Legacy records have no saved identity.
+    match moved {
+        Ok(result) => UndoMove::Restored {
+            actual: result.destination.to_string_lossy().into_owned(),
+            status: if result.renamed { "collision" } else { "ok" },
         },
         Err(e) => UndoMove::Failed(e),
     }
@@ -294,16 +328,48 @@ fn finish_undo(
     plan: &UndoPlan,
     ignored_files: &IgnoredFiles,
 ) -> UndoResult {
+    let _operation = ignored_files.with_operation();
+    if let UndoPlan::Restore { dest, source } = plan {
+        ignored_files.invalidate(&[dest.clone(), PathBuf::from(source)]);
+        if let Err(e) = arm_suppression(ignored_files, &[dest.to_string_lossy().into_owned(), source.clone()]) {
+            return failed_undo(e);
+        }
+    }
+    let intent = match plan {
+        UndoPlan::Restore { dest, source } => match begin_operation_intent("undo", &dest.to_string_lossy(), Some(source)) {
+            Ok(id) => Some(id),
+            Err(e) => return failed_undo(format!("Undo was not started: could not persist operation intent: {e}")),
+        },
+        UndoPlan::Gone => None,
+    };
     notify_move_observer();
-    let moved = execute_undo_move(plan);
+    let moved = execute_undo_move(plan, target.file_identity.as_deref());
 
     // A collision renames the file, so the path the watcher will report is not
     // knowable until the move has run. Arm it the moment it exists.
     if let UndoMove::Restored { actual, .. } = &moved {
-        if actual != &target.source {
-            if let Err(e) = arm_suppression(ignored_files, std::slice::from_ref(actual)) {
-                return failed_undo(e);
+        if let Err(e) = arm_suppression(ignored_files, &[actual.clone(), target.source.clone()]) {
+            return failed_undo(e);
+        }
+    }
+
+    if let Some(intent) = intent {
+        match &moved {
+            UndoMove::Restored { actual, status } => {
+                let old = target.dest.as_deref().unwrap_or_default();
+                return match finalize_undo_intent(intent, target.id, old, actual) {
+                    Ok(()) => UndoResult { status: (*status).into(), message: None, restored_to: Some(actual.clone()) },
+                    Err(e) => UndoResult {
+                        status: "failed".into(),
+                        message: Some(format!("File restored to {actual}; history or inventory finalization failed: {e}. Recovery intent retained.")),
+                        restored_to: Some(actual.clone()),
+                    },
+                };
             }
+            UndoMove::Failed(e) => {
+                let _ = finalize_operation_intent(intent, "failed", None, Some(e));
+            }
+            UndoMove::Gone => { let _ = finalize_operation_intent(intent, "missing", None, None); }
         }
     }
 
@@ -352,11 +418,11 @@ fn failed_undo(message: String) -> UndoResult {
 fn read_undo_target(id: i64) -> Result<UndoTarget, String> {
     let conn = lock_db()?;
     conn.query_row(
-        "SELECT source_path, destination_path FROM action_logs WHERE id=?1 AND undone=0",
+        "SELECT source_path, destination_path, file_identity FROM action_logs WHERE id=?1 AND undone=0 AND action IN ('move','rename','accept')",
         [id],
-        |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?, row.get::<_, Option<String>>(2)?)),
     )
-    .map(|(source, dest)| UndoTarget { id, source, dest })
+    .map(|(source, dest, file_identity)| UndoTarget { id, source, dest, file_identity })
     .map_err(|e| format!("No undoable action found for id={}: {}", id, e))
 }
 
@@ -385,7 +451,7 @@ fn undo_all_with(ignored_files: &IgnoredFiles) -> Result<UndoAllResult, String> 
     let targets: Vec<UndoTarget> = crate::db::get_undoable_logs()
         .map_err(|e| e.to_string())?
         .into_iter()
-        .map(|(id, source, dest)| UndoTarget { id, source, dest })
+        .map(|(id, source, dest, file_identity)| UndoTarget { id, source, dest, file_identity })
         .collect();
 
     // Phase 2a — decide what each row needs, holding nothing.
@@ -448,13 +514,26 @@ fn notify_move_observer() {
 fn notify_move_observer() {}
 
 #[tauri::command(async)]
-pub fn undo_action_cmd(id: i64, state: tauri::State<AppState>) -> Result<UndoResult, String> {
-    undo_action_with(id, &state.ignored_files)
+pub fn undo_action_cmd(app: AppHandle, id: i64, state: tauri::State<AppState>) -> Result<UndoResult, String> {
+    let target = read_undo_target(id)?;
+    let mut paths = vec![PathBuf::from(&target.source)];
+    if let Some(dest) = target.dest { paths.push(PathBuf::from(dest)); }
+    state.watcher.lock().map_err(|_| "Watcher state unavailable")?.cancel_paths(&paths);
+    let result = undo_action_with(id, &state.ignored_files);
+    let _ = app.emit("mutation-completed", ());
+    result
 }
 
 #[tauri::command(async)]
-pub fn undo_all_cmd(state: tauri::State<AppState>) -> Result<UndoAllResult, String> {
-    undo_all_with(&state.ignored_files)
+pub fn undo_all_cmd(app: AppHandle, state: tauri::State<AppState>) -> Result<UndoAllResult, String> {
+    let targets = get_undoable_logs().map_err(|e| e.to_string())?;
+    let paths: Vec<PathBuf> = targets.iter().flat_map(|(_, source, dest, _)| {
+        std::iter::once(PathBuf::from(source)).chain(dest.as_ref().map(PathBuf::from))
+    }).collect();
+    state.watcher.lock().map_err(|_| "Watcher state unavailable")?.cancel_paths(&paths);
+    let result = undo_all_with(&state.ignored_files);
+    let _ = app.emit("mutation-completed", ());
+    result
 }
 
 #[tauri::command]
@@ -466,7 +545,7 @@ pub fn get_cleanup_logs_cmd(limit: i64) -> Result<Vec<CleanupAction>, String> {
 #[tauri::command]
 pub fn get_version_cmd(app: AppHandle) -> Result<(String, String), String> {
     let version = app.package_info().version.to_string();
-    let release_date = "2026-08-06".to_string();
+    let release_date = "2026-09-27".to_string();
     Ok((version, release_date))
 }
 
@@ -476,27 +555,48 @@ pub fn get_settings_cmd() -> Result<AppSettings, String> {
 }
 
 #[tauri::command]
-pub fn update_settings_cmd(settings: AppSettings) -> Result<(), String> {
-    update_settings(&settings).map_err(|e| e.to_string())
+pub fn update_settings_cmd(app: AppHandle, settings: PreferencesPatch) -> Result<AppSettings, String> {
+    if settings.theme.as_deref().is_some_and(|theme| !matches!(theme, "light" | "dark" | "system")) { return Err("Choose a supported theme".into()); }
+    if settings.language.as_deref().is_some_and(|language| !matches!(language, "en" | "de" | "es" | "fr" | "it" | "ja" | "pl" | "ru" | "uk" | "vi")) { return Err("Choose a supported language".into()); }
+    if settings.grace_period_seconds.is_some_and(|seconds| !(0..=86_400).contains(&seconds)) { return Err("Grace period must be between 0 and 86400 seconds".into()); }
+    if settings.local_ai_model.as_deref().is_some_and(|model| model.trim().is_empty() || model.len() > 128 || model.chars().any(char::is_control)) { return Err("Choose a valid local model name".into()); }
+    let committed = update_preferences(&settings).map_err(|e| e.to_string())?;
+    let _ = app.emit("settings-changed", &committed);
+    crate::tray::update_tray_language(&app, &committed.language);
+    Ok(committed)
 }
 
 #[tauri::command]
-pub fn clear_logs_cmd() -> Result<(), String> {
-    clear_logs().map_err(|e| e.to_string())
+pub fn clear_logs_cmd(app: AppHandle) -> Result<(), String> {
+    clear_logs().map_err(|e| e.to_string())?;
+    let _ = app.emit("mutation-completed", ());
+    Ok(())
 }
 
-#[tauri::command]
-pub fn scan_folder_cmd(path: String) -> Result<Vec<(String, String, String)>, String> {
+#[tauri::command(async)]
+pub fn scan_folder_cmd(app: AppHandle, path: String, state: tauri::State<AppState>) -> Result<Vec<(String, String, String)>, String> {
     let folders = get_watched_folders().map_err(|e| e.to_string())?;
-    if folders
-        .iter()
-        .find(|f| f.path == path)
-        .map(|f| is_folder_paused_mode(&f.mode))
-        .unwrap_or(false)
-    {
-        return Ok(vec![]);
+    let resolved = crate::safe_fs::validate_root(Path::new(&path))?;
+    let identity = crate::safe_fs::file_identity(&resolved)?;
+    let eligible = folders.into_iter().find(|folder| {
+        folder.enabled && !is_folder_paused_mode(&folder.mode)
+            && crate::safe_fs::file_identity(Path::new(&folder.path)).ok().as_ref() == Some(&identity)
+    }).ok_or("Folder is no longer an eligible watched root")?;
+    let results = manual_scan_folder_with_suppression(&eligible.path, &state.ignored_files)?;
+    let _ = app.emit("mutation-completed", ());
+    Ok(results)
+}
+
+#[tauri::command(async)]
+pub fn clean_now_cmd(app: AppHandle, state: tauri::State<AppState>) -> Result<Vec<(String, String, String)>, String> {
+    let folders = get_watched_folders().map_err(|e| e.to_string())?;
+    let mut results = Vec::new();
+    for folder in folders.into_iter().filter(|f| f.enabled && !is_folder_paused_mode(&f.mode)) {
+        crate::safe_fs::validate_root(Path::new(&folder.path))?;
+        results.extend(manual_scan_folder_with_suppression(&folder.path, &state.ignored_files)?);
     }
-    manual_scan_folder(&path)
+    let _ = app.emit("mutation-completed", ());
+    Ok(results)
 }
 
 #[derive(Debug, Serialize)]
@@ -509,10 +609,35 @@ pub struct ArchiveImportSummary {
 }
 
 #[tauri::command(async)]
-pub fn import_archive_cmd(path: String) -> Result<ArchiveImportSummary, String> {
-    let extraction = crate::archive::extract_archive(Path::new(&path))?;
+pub fn import_archive_cmd(app: AppHandle, path: String, state: tauri::State<AppState>) -> Result<ArchiveImportSummary, String> {
+    let job = crate::archive::ImportJob::start()?;
+    let intent = begin_operation_intent("archive_import", &path, None).map_err(|e| format!("Import was not started: cannot persist intent: {e}"))?;
+    let extraction = match crate::archive::extract_archive(Path::new(&path), &job.cancelled, |bytes, files| {
+        let _ = app.emit("archive-import-progress", serde_json::json!({"bytes":bytes,"files":files}));
+    }) {
+        Ok(extraction) => extraction,
+        Err(error) => {
+            let journal = finalize_operation_intent(intent, "failed", None, Some(&error));
+            return Err(match journal { Ok(()) => error, Err(e) => format!("{error}; import journal finalization failed: {e}") });
+        }
+    };
     let staging_path = extraction.staging_dir.to_string_lossy().to_string();
-    let results = manual_scan_folder(&staging_path)?;
+    let results = match crate::rules::manual_scan_folder_cancelable(&staging_path, &state.ignored_files, &job.cancelled) {
+        Ok(results) => results,
+        Err(error) => {
+            let message = format!("{error}. Import data retained at {staging_path}");
+            let manifest = crate::archive::save_manifest(&extraction.staging_dir, None, "partial", &[], Some(&message));
+            let journal = finalize_operation_intent(intent, "partial", Some(&staging_path), Some(&message));
+            let _ = app.emit("mutation-completed", ());
+            let message = match manifest { Ok(()) => message, Err(e) => format!("{message}; manifest finalization failed: {e}") };
+            return Err(match journal { Ok(()) => message, Err(e) => format!("{message}; import journal finalization failed: {e}") });
+        }
+    };
+    crate::archive::save_manifest(&extraction.staging_dir, None, "completed", &results, None)
+        .map_err(|e| format!("Imported {} files; data retained at {staging_path}; manifest finalization failed: {e}", extraction.extracted_files))?;
+    finalize_operation_intent(intent, "completed", Some(&staging_path), None)
+        .map_err(|e| format!("Imported {} files; data retained at {staging_path}; import journal finalization failed: {e}", extraction.extracted_files))?;
+    let _ = app.emit("mutation-completed", ());
 
     Ok(ArchiveImportSummary {
         extracted_count: extraction.extracted_files,
@@ -523,45 +648,64 @@ pub fn import_archive_cmd(path: String) -> Result<ArchiveImportSummary, String> 
 }
 
 #[tauri::command]
+pub fn cancel_archive_import_cmd() -> Result<(), String> { crate::archive::cancel_import() }
+
+#[tauri::command]
 pub fn open_folder_cmd(path: String) -> Result<(), String> {
+    if path.starts_with("http://") || path.starts_with("https://") {
+        return open_web_url(&path);
+    }
+    let requested = Path::new(&path);
+    if requested.is_file() {
+        return open_folder_path(&requested.parent().ok_or("File has no parent")?.to_string_lossy());
+    }
+    open_folder_path(&path)
+}
+
+/// All notification and direct-folder entry points use argument passing.
+pub fn open_folder_path(path: &str) -> Result<(), String> {
     if path.is_empty() {
         return Err("Path is empty".to_string());
     }
-    eprintln!("[open_folder_cmd] opening: {}", path);
+    let folder = Path::new(path);
+    if !folder.is_absolute() || !folder.is_dir() {
+        return Err("Choose an existing absolute folder path".into());
+    }
+    folder_open_command(path).spawn().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn folder_open_command(path: &str) -> std::process::Command {
     #[cfg(target_os = "windows")]
     {
-        if path.starts_with("http://") || path.starts_with("https://") {
-            // No shell: a URL carrying " & " would otherwise run a second command.
-            std::process::Command::new("rundll32")
-                .args(["url.dll,FileProtocolHandler", &path])
-                .spawn()
-                .map_err(|e| e.to_string())?;
-        } else {
-            // Normalize to backslashes - Windows Explorer requires them
-            let win_path = path.replace('/', "\\");
-            // Pass the path as an argument rather than building a shell command.
-            // A path containing a single quote would otherwise close the quoted
-            // string and everything after it would execute as PowerShell.
-            std::process::Command::new("explorer")
-                .arg(&win_path)
-                .spawn()
-                .map_err(|e| e.to_string())?;
-        }
+        let mut command = std::process::Command::new("explorer.exe");
+        command.arg(path.replace('/', "\\"));
+        command
     }
     #[cfg(target_os = "macos")]
     {
-        std::process::Command::new("open")
-            .arg(&path)
-            .spawn()
-            .map_err(|e| e.to_string())?;
+        let mut command = std::process::Command::new("open");
+        command.arg(path);
+        command
     }
     #[cfg(target_os = "linux")]
     {
-        std::process::Command::new("xdg-open")
-            .arg(&path)
-            .spawn()
-            .map_err(|e| e.to_string())?;
+        let mut command = std::process::Command::new("xdg-open");
+        command.arg(path);
+        command
     }
+}
+
+fn open_web_url(url: &str) -> Result<(), String> {
+    if !(url.starts_with("https://") || url.starts_with("http://")) || url.chars().any(char::is_control) {
+        return Err("Only HTTP(S) web links are supported".into());
+    }
+    #[cfg(target_os = "windows")]
+    std::process::Command::new("rundll32.exe").args(["url.dll,FileProtocolHandler", url]).spawn().map_err(|e| e.to_string())?;
+    #[cfg(target_os = "macos")]
+    std::process::Command::new("open").arg(url).spawn().map_err(|e| e.to_string())?;
+    #[cfg(target_os = "linux")]
+    std::process::Command::new("xdg-open").arg(url).spawn().map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -578,12 +722,11 @@ pub fn get_downloads_folder() -> String {
         })
 }
 
-#[tauri::command]
-pub fn initialize_defaults_cmd() -> Result<(), String> {
+#[tauri::command(async)]
+pub fn initialize_defaults_cmd(app: AppHandle) -> Result<(), String> {
     let downloads = get_downloads_folder();
-    add_watched_folder(&downloads, FOLDER_MODE_SILENT).map_err(|e| e.to_string())?;
-    insert_default_rules(&downloads).map_err(|e| e.to_string())?;
-    Ok(())
+    crate::safe_fs::validate_root(Path::new(&downloads))?;
+    with_configuration(&app, || initialize_defaults_atomic(&downloads, FOLDER_MODE_MANUAL).map_err(|e| e.to_string()))
 }
 
 #[tauri::command]
@@ -605,11 +748,13 @@ pub fn show_notification(app: AppHandle, title: String, body: String) {
 
 #[tauri::command]
 pub fn enable_autostart_cmd(app: AppHandle) -> Result<(), String> {
+    if cfg!(debug_assertions) { return Err("Autostart is unavailable in the isolated development profile".into()); }
     app.autolaunch().enable().map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub fn disable_autostart_cmd(app: AppHandle) -> Result<(), String> {
+    if cfg!(debug_assertions) { return Err("Autostart is unavailable in the isolated development profile".into()); }
     app.autolaunch().disable().map_err(|e| e.to_string())
 }
 
@@ -620,19 +765,20 @@ pub fn is_autostart_enabled_cmd(app: AppHandle) -> Result<bool, String> {
 
 #[tauri::command]
 pub fn load_mouziignore_cmd(folder_path: String) -> Result<Vec<String>, String> {
-    Ok(load_mouziignore(&folder_path))
+    load_mouziignore(&folder_path)
 }
 
-#[tauri::command]
-pub fn save_mouziignore_cmd(folder_path: String, patterns: Vec<String>) -> Result<(), String> {
-    save_mouziignore(&folder_path, &patterns)
-}
-
-/// Returns and clears the pending folder path that should be opened after a notification click.
-/// The frontend calls this when the popup is shown/focused to handle the in-app flow as a backup.
-#[tauri::command]
-pub fn get_pending_open_folder_cmd(state: tauri::State<AppState>) -> Option<String> {
-    state.pending_open_folder.lock().unwrap().take()
+#[tauri::command(async)]
+pub fn save_mouziignore_cmd(app: AppHandle, folder_path: String, patterns: Vec<String>) -> Result<(), String> {
+    with_configuration(&app, || {
+        let root = crate::safe_fs::validate_root(Path::new(&folder_path))?;
+        let identity = crate::safe_fs::file_identity(&root)?;
+        if !get_watched_folders().map_err(|e| e.to_string())?.iter().any(|folder| crate::safe_fs::file_identity(Path::new(&folder.path)).ok().as_ref() == Some(&identity)) {
+            return Err("Folder is no longer registered".into());
+        }
+        let _guard = crate::safe_fs::guard_directory(&root)?;
+        save_mouziignore(&root.to_string_lossy(), &patterns)
+    })
 }
 
 #[tauri::command]
@@ -650,7 +796,7 @@ pub fn get_pending_files_cmd(
 }
 
 /// Refresh all folder watchers. Useful after changing folder modes.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn refresh_watcher_cmd(app: AppHandle) -> Result<(), String> {
     if let Some(state) = app.try_state::<crate::AppState>() {
         let mut watcher = state.watcher.lock().unwrap();
@@ -675,15 +821,11 @@ pub fn get_schedule_cmd() -> Result<ScheduleSettings, String> {
 
 /// Update scheduled-clean settings.
 #[tauri::command]
-pub fn update_schedule_cmd(schedule: ScheduleSettings) -> Result<(), String> {
-    let mut settings = get_settings().map_err(|e| e.to_string())?;
-    settings.schedule_enabled = schedule.schedule_enabled;
-    settings.schedule_times_per_day = schedule.schedule_times_per_day.clamp(1, 4);
-    settings.schedule_time_1 = schedule.schedule_time_1;
-    settings.schedule_time_2 = schedule.schedule_time_2;
-    settings.schedule_time_3 = schedule.schedule_time_3;
-    settings.schedule_time_4 = schedule.schedule_time_4;
-    update_settings(&settings).map_err(|e| e.to_string())
+pub fn update_schedule_cmd(app: AppHandle, schedule: ScheduleSettings) -> Result<AppSettings, String> {
+    crate::scheduler::validate_schedule_times(&schedule)?;
+    let committed = update_schedule_settings(&schedule).map_err(|e| e.to_string())?;
+    let _ = app.emit("settings-changed", &committed);
+    Ok(committed)
 }
 
 /// Export all rules to a JSON file at the given path.
@@ -697,8 +839,8 @@ pub fn export_rules_cmd(path: String) -> Result<(), String> {
 
 /// Import rules from a JSON file at the given path.
 /// If `replace` is true, all existing rules are removed before inserting.
-#[tauri::command]
-pub fn import_rules_cmd(path: String, replace: bool) -> Result<usize, String> {
+#[tauri::command(async)]
+pub fn import_rules_cmd(app: AppHandle, path: String, replace: bool) -> Result<usize, String> {
     let data = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
     let rules: Vec<Rule> = serde_json::from_str(&data).map_err(|e| e.to_string())?;
 
@@ -710,17 +852,7 @@ pub fn import_rules_cmd(path: String, replace: bool) -> Result<usize, String> {
             .map_err(|e| format!("Rule {} of {} ({}) is not usable: {e}", index + 1, rules.len(), rule.name))?;
     }
 
-    if replace {
-        delete_all_rules().map_err(|e| e.to_string())?;
-    }
-
-    let mut count = 0;
-    for mut rule in rules {
-        rule.id = None;
-        add_rule(&rule).map_err(|e| e.to_string())?;
-        count += 1;
-    }
-    Ok(count)
+    with_configuration(&app, || import_rules_atomic(&rules, replace).map_err(|e| e.to_string()))
 }
 
 // ---------------------------------------------------------------------------
@@ -732,6 +864,7 @@ pub fn import_rules_cmd(path: String, replace: bool) -> Result<usize, String> {
 pub struct ScanStarted {
     pub started: bool,
     pub reason: Option<String>,
+    pub run_id: Option<String>,
 }
 
 /// Scan all watched (non-paused) folders in the background.
@@ -742,13 +875,14 @@ pub fn start_scan_cmd(app: AppHandle, state: tauri::State<'_, AppState>) -> Resu
     let roots: Vec<String> = get_watched_folders()
         .map_err(|e| e.to_string())?
         .into_iter()
-        .filter(|f| !is_folder_paused_mode(&f.mode))
+        .filter(|f| f.enabled && !is_folder_paused_mode(&f.mode))
         .map(|f| f.path)
         .collect();
     if roots.is_empty() {
         return Ok(ScanStarted {
             started: false,
             reason: Some("no_roots".into()),
+            run_id: None,
         });
     }
     let is_scanning = state.is_scanning.clone();
@@ -756,22 +890,39 @@ pub fn start_scan_cmd(app: AppHandle, state: tauri::State<'_, AppState>) -> Resu
         return Ok(ScanStarted {
             started: false,
             reason: Some("already_running".into()),
+            run_id: None,
         });
     }
+    let run_id = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0).to_string();
+    let response_run_id = run_id.clone();
     std::thread::spawn(move || {
-        scan::scan_roots(&roots, |event| match event {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| scan::scan_roots(&roots, |event| match event {
             ScanEvent::Progress(p) => {
-                let _ = app.emit("scan-progress", p);
+                let mut payload = serde_json::to_value(p).unwrap_or_default();
+                payload["runId"] = serde_json::Value::String(run_id.clone());
+                let _ = app.emit("scan-progress", payload);
             }
             ScanEvent::Complete(s) => {
-                let _ = app.emit("scan-complete", s);
+                let mut payload = serde_json::to_value(s).unwrap_or_default();
+                payload["runId"] = serde_json::Value::String(run_id.clone());
+                let _ = app.emit("scan-complete", payload);
             }
-        });
+        })));
         is_scanning.store(false, Ordering::SeqCst);
+        let errors = match &result {
+            Ok(summaries) => summaries.iter().filter_map(|summary| summary.error.clone()).collect::<Vec<_>>(),
+            Err(_) => vec!["Scan worker panicked; previous snapshots retained".into()],
+        };
+        let _ = app.emit("scan-finished", serde_json::json!({
+            "runId": run_id,
+            "status": if errors.is_empty() { "finished" } else { "failed" },
+            "errors": errors,
+        }));
     });
     Ok(ScanStarted {
         started: true,
         reason: None,
+        run_id: Some(response_run_id),
     })
 }
 
@@ -793,28 +944,24 @@ pub struct DashboardStats {
     pub last_scan_at: Option<i64>,
     pub insights: DashboardInsights,
     pub age_buckets: Vec<AgeBucket>,
+    pub revision: i64,
 }
 
 /// Aggregate stats for the dashboard view.
 #[tauri::command(async)]
 pub fn get_dashboard_stats_cmd() -> Result<DashboardStats, String> {
-    let stats = get_inventory_stats().map_err(|e| e.to_string())?;
-    let category_breakdown = get_category_distribution().map_err(|e| e.to_string())?;
-    let largest_files = get_inventory_files("size", None, None, None, 50).map_err(|e| e.to_string())?;
-    let recent_files = get_inventory_files("mtime", None, None, None, 50).map_err(|e| e.to_string())?;
-    let watched_roots = get_root_summaries().map_err(|e| e.to_string())?;
-    let insights = get_dashboard_insights().map_err(|e| e.to_string())?;
-    let age_buckets = get_age_buckets().map_err(|e| e.to_string())?;
+    let snapshot = get_dashboard_snapshot().map_err(|e| e.to_string())?;
     Ok(DashboardStats {
-        total_files: stats.total_files,
-        total_bytes: stats.total_bytes,
-        category_breakdown,
-        largest_files,
-        recent_files,
-        watched_roots,
-        last_scan_at: stats.last_scan_at,
-        insights,
-        age_buckets,
+        total_files: snapshot.total_files,
+        total_bytes: snapshot.total_bytes,
+        category_breakdown: snapshot.category_breakdown,
+        largest_files: snapshot.largest_files,
+        recent_files: snapshot.recent_files,
+        watched_roots: snapshot.watched_roots,
+        last_scan_at: snapshot.last_scan_at,
+        insights: snapshot.insights,
+        age_buckets: snapshot.age_buckets,
+        revision: snapshot.revision,
     })
 }
 
@@ -869,18 +1016,26 @@ pub fn find_stale_files_cmd(days: i64) -> Result<Vec<crate::cleanup::CleanupFile
 /// Find deepest empty directories under watched roots.
 #[tauri::command(async)]
 pub fn find_empty_dirs_cmd() -> Result<Vec<String>, String> {
-    if !crate::cleanup::has_inventory() {
-        return Err("No scan data — run a scan first".to_string());
-    }
     crate::cleanup::find_empty_dirs()
+}
+
+#[tauri::command(async)]
+pub fn prepare_cleanup_cmd(actions: Vec<crate::cleanup::CleanupRequest>, state: tauri::State<AppState>) -> Result<crate::cleanup::CleanupPlanPreview, String> {
+    let _operation = state.ignored_files.with_operation();
+    crate::cleanup::prepare_cleanup(&actions)
 }
 
 /// Execute a batch of cleanup actions (trash files / remove empty dirs).
 #[tauri::command(async)]
 pub fn execute_cleanup_cmd(
-    actions: Vec<crate::cleanup::CleanupRequest>,
+    app: AppHandle,
+    plan_id: String,
+    state: tauri::State<AppState>,
 ) -> Result<Vec<crate::cleanup::CleanupOutcome>, String> {
-    Ok(crate::cleanup::execute_cleanup(&actions))
+    let _operation = state.ignored_files.with_operation();
+    let result = crate::cleanup::execute_cleanup_plan(&plan_id);
+    let _ = app.emit("mutation-completed", ());
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -890,9 +1045,9 @@ pub fn execute_cleanup_cmd(
 /// Get category suggestions for unclassified files in the inventory.
 #[tauri::command(async)]
 pub fn get_suggestions_cmd(limit: i64) -> Result<Vec<crate::classify::Suggestion>, String> {
-    let provider = crate::classify::detect_provider();
+    let provider = crate::classify::detect_provider()?;
     let limit = limit.clamp(1, 200) as usize;
-    Ok(crate::classify::get_suggestions(limit, provider.as_ref()))
+    crate::classify::get_suggestions(limit, provider.as_ref())
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -904,55 +1059,166 @@ pub struct AcceptOutcome {
     pub dest: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SuggestionRulePreview {
+    pub extension: Option<String>,
+    pub destination: String,
+    pub scope: String,
+    pub priority: i32,
+    pub disposition: String,
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SuggestionPlanPreview {
+    pub plan_id: String,
+    pub path: String,
+    pub category: String,
+    pub destination: String,
+    pub rule: Option<SuggestionRulePreview>,
+}
+
+struct SuggestionPlan {
+    preview: SuggestionPlanPreview,
+    root: PathBuf,
+    identity: crate::safe_fs::FileIdentity,
+    digest: String,
+    configuration: String,
+    expires: Instant,
+    create_rule: bool,
+}
+
+static SUGGESTION_PLANS: Lazy<PlanMutex<HashMap<String, SuggestionPlan>>> = Lazy::new(|| PlanMutex::new(HashMap::new()));
+
+fn suggestion_configuration() -> Result<String, String> {
+    serde_json::to_string(&get_watched_folders().map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())
+}
+
+fn live_suggestion_fingerprint(path: &Path, scope: &crate::safe_fs::RootScope) -> Result<(crate::safe_fs::FileIdentity, String), String> {
+    use std::io::Read;
+    let mut validated = scope.validate_file(path)?;
+    let identity = validated.identity.clone();
+    let before = validated.file.metadata().map_err(|e| e.to_string())?;
+    let mut digest = blake3::Hasher::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = validated.file.read(&mut buffer).map_err(|e| e.to_string())?;
+        if read == 0 { break; }
+        digest.update(&buffer[..read]);
+    }
+    let after = validated.file.metadata().map_err(|e| e.to_string())?;
+    if before.len() != after.len() || before.modified().ok() != after.modified().ok()
+        || crate::safe_fs::file_identity(path)? != identity
+    { return Err("File changed while its suggestion was being reviewed".into()); }
+    Ok((identity, digest.finalize().to_hex().to_string()))
+}
+
+fn suggestion_rule_preview(file_name: &str, category: &str) -> Result<SuggestionRulePreview, String> {
+    let extension = Path::new(file_name).extension().map(|e| e.to_string_lossy().to_lowercase()).filter(|e| !e.is_empty());
+    let mut preview = SuggestionRulePreview {
+        extension: extension.clone(), destination: category.into(),
+        scope: "All eligible watched folders, including folders added later".into(),
+        priority: 10, disposition: "create".into(), message: None,
+    };
+    let Some(extension) = extension else { preview.disposition = "not_applicable".into(); preview.message = Some("An extensionless file cannot create an extension rule".into()); return Ok(preview); };
+    let rules = get_rules().map_err(|e| e.to_string())?;
+    for rule in rules.iter().filter(|r| r.enabled) {
+        if rule.extensions.iter().any(|e| e == &extension || e == "*") {
+            // Lower-priority catch-all rules remain fallbacks after this rule.
+            if !rule.extensions.contains(&extension) && rule.priority > preview.priority && rule.destination != category { continue; }
+            if rule.action == "move" && rule.destination == category && rule.pattern.is_none() {
+                preview.disposition = "already_covered".into();
+                preview.message = Some(format!("Already covered by {}", rule.name));
+                return Ok(preview);
+            }
+            preview.disposition = "conflict".into();
+            preview.message = Some(format!("Existing rule '{}' can affect .{} files; edit the rules explicitly before adding conflicting automation", rule.name, extension));
+            return Ok(preview);
+        }
+    }
+    Ok(preview)
+}
+
+fn prepare_suggestion(path: String, suggested_category: String, create_rule: bool) -> Result<SuggestionPlanPreview, String> {
+    if !crate::categories::is_valid_category(&suggested_category) || suggested_category == "Other" {
+        return Err("Choose a supported category".into());
+    }
+    let folders = get_watched_folders().map_err(|e| e.to_string())?;
+    let scope = crate::safe_fs::eligible_scope(&folders)?;
+    let root = scope.validate_file(Path::new(&path))?.owning_root;
+    {
+        let conn = lock_db()?;
+        let present: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM file_inventory WHERE path=?1)", [&path], |r| r.get(0)).map_err(|e| e.to_string())?;
+        if !present { return Err("Suggestion is no longer in the inventory; scan again".into()); }
+    }
+    let (identity, digest) = live_suggestion_fingerprint(Path::new(&path), &scope)?;
+    let file_name = Path::new(&path).file_name().ok_or("Suggestion has no filename")?.to_string_lossy().into_owned();
+    let category_dir = root.join(&suggested_category);
+    let canonical_source = scope.validate_file(Path::new(&path))?.canonical_path;
+    let already_filed = canonical_source.parent().is_some_and(|parent| crate::safe_fs::directory_contains(parent, &category_dir).unwrap_or(false));
+    let destination = if already_filed { path.clone() } else { crate::safe_fs::try_unique_destination(&category_dir, &file_name)?.to_string_lossy().into_owned() };
+    let rule = if create_rule { Some(suggestion_rule_preview(&file_name, &suggested_category)?) } else { None };
+    let serial = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+    static NEXT_PLAN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let plan_id = format!("suggestion-{serial}-{}-{}", std::process::id(), NEXT_PLAN.fetch_add(1, Ordering::Relaxed));
+    let preview = SuggestionPlanPreview { plan_id: plan_id.clone(), path, category: suggested_category, destination, rule };
+    let mut plans = SUGGESTION_PLANS.lock().map_err(|_| "Suggestion plan store unavailable")?;
+    plans.retain(|_, p| p.expires > Instant::now());
+    if plans.len() >= 512 { return Err("Too many pending previews; close older previews and retry".into()); }
+    plans.insert(plan_id, SuggestionPlan { preview: preview.clone(), root, identity, digest, configuration: suggestion_configuration()?, expires: Instant::now() + std::time::Duration::from_secs(600), create_rule });
+    Ok(preview)
+}
+
+#[tauri::command(async)]
+pub fn prepare_suggestion_cmd(path: String, suggested_category: String, create_rule: bool, state: tauri::State<AppState>) -> Result<SuggestionPlanPreview, String> {
+    let _operation = state.ignored_files.with_operation();
+    prepare_suggestion(path, suggested_category, create_rule)
+}
+
+#[tauri::command]
+pub fn reset_dismissed_suggestions_cmd() -> Result<(), String> {
+    reset_dismissed_suggestions().map_err(|e| e.to_string())
+}
+
 /// Dismiss a suggestion so it no longer appears in the list.
 #[tauri::command]
 pub fn dismiss_suggestion_cmd(path: String) -> Result<(), String> {
     crate::db::dismiss_suggestion(&path).map_err(|e| e.to_string())
 }
 
-/// The watched root that contains `path`, most specific first.
-///
-/// Containment rather than parent equality, because the file may sit in a
-/// subfolder — that is the normal case once the watch is recursive, and
-/// ambiguous the moment two watched roots nest. Of the roots that contain the
-/// file, the one with the most path components is the one it "belongs" to, so
-/// the answer does not depend on the order rows happen to come back in.
-///
-/// `None` when no watched root contains the file. The caller then falls back to
-/// the file's own parent, which is the pre-existing behaviour for a file outside
-/// every watched folder.
-fn owning_watched_root(path: &Path) -> Option<PathBuf> {
-    let roots: Vec<PathBuf> = get_watched_folders()
-        .ok()?
-        .into_iter()
-        .map(|f| PathBuf::from(f.path))
-        .collect();
-    roots
-        .iter()
-        .filter(|root| is_within_any_root(path, std::slice::from_ref(*root)))
-        .max_by_key(|root| root.components().count())
-        .cloned()
-}
-
 /// Move a file into its suggested category folder and optionally create a
 /// matching rule. Returns a per-file status; never panics on missing files.
 #[tauri::command(async)]
 pub fn accept_suggestion_cmd(
-    path: String,
-    suggested_category: String,
-    create_rule: bool,
+    app: AppHandle,
+    plan_id: String,
     state: tauri::State<AppState>,
 ) -> Result<AcceptOutcome, String> {
-    let root = owning_watched_root(Path::new(&path))
-        .or_else(|| Path::new(&path).parent().map(|p| p.to_path_buf()))
-        .unwrap_or_default();
-    accept_suggestion_with(
-        path,
-        suggested_category,
-        create_rule,
-        &state.ignored_files,
-        &root,
-    )
+    let result = accept_reviewed_suggestion(&plan_id, &state.ignored_files);
+    let _ = app.emit("mutation-completed", ());
+    result
+}
+
+fn accept_reviewed_suggestion(plan_id: &str, suppression: &IgnoredFiles) -> Result<AcceptOutcome, String> {
+    let plan = SUGGESTION_PLANS.lock().map_err(|_| "Suggestion plan store unavailable")?.remove(plan_id).ok_or("Suggestion preview expired or was already used; preview again")?;
+    let _operation = suppression.with_operation();
+    if plan.expires <= Instant::now() || plan.configuration != suggestion_configuration()? {
+        return Err("Suggestion configuration changed; preview again".into());
+    }
+    if let Some(reviewed) = &plan.preview.rule {
+        let name = Path::new(&plan.preview.path).file_name().ok_or("Suggestion has no filename")?.to_string_lossy();
+        let current = suggestion_rule_preview(&name, &plan.preview.category)?;
+        let compatible = current.disposition == reviewed.disposition
+            || (reviewed.disposition == "create" && current.disposition == "already_covered");
+        if !compatible { return Err("Future rule coverage changed; preview again".into()); }
+    }
+    let scope = crate::safe_fs::eligible_scope(&get_watched_folders().map_err(|e| e.to_string())?)?;
+    let (identity, digest) = live_suggestion_fingerprint(Path::new(&plan.preview.path), &scope)?;
+    if identity != plan.identity || digest != plan.digest { return Err("Suggestion file changed; preview again".into()); }
+    accept_suggestion_validated_with(plan.preview.path, plan.preview.category, plan.create_rule, suppression, &plan.root, Some(&identity), Some(&plan.digest), Some(Path::new(&plan.preview.destination)))
 }
 
 /// The body of `accept_suggestion_cmd`, callable without a Tauri state.
@@ -964,6 +1230,7 @@ pub fn accept_suggestion_cmd(
 /// suggestion for `C:\W\Documents\report.pdf` would file it at
 /// `C:\W\Documents\Documents\report.pdf`, the app's own output feeding its own
 /// input.
+#[cfg(test)]
 fn accept_suggestion_with(
     path: String,
     suggested_category: String,
@@ -971,6 +1238,23 @@ fn accept_suggestion_with(
     ignored_files: &IgnoredFiles,
     root: &Path,
 ) -> Result<AcceptOutcome, String> {
+    let _operation = ignored_files.with_operation();
+    accept_suggestion_validated_with(path, suggested_category, create_rule, ignored_files, root, None, None, None)
+}
+
+fn accept_suggestion_validated_with(
+    path: String,
+    suggested_category: String,
+    create_rule: bool,
+    ignored_files: &IgnoredFiles,
+    root: &Path,
+    expected_identity: Option<&crate::safe_fs::FileIdentity>,
+    expected_digest: Option<&str>,
+    reviewed_destination: Option<&Path>,
+) -> Result<AcceptOutcome, String> {
+    if !crate::categories::is_valid_category(&suggested_category) || suggested_category == "Other" {
+        return Err("Choose a supported category".into());
+    }
     let src = Path::new(&path);
     if !src.exists() {
         return Ok(AcceptOutcome {
@@ -981,30 +1265,35 @@ fn accept_suggestion_with(
         });
     }
 
+    let validated_root = crate::safe_fs::validate_root(root)?;
+    let trusted_scope = crate::safe_fs::eligible_scope(&[WatchedFolder { id: None, path: validated_root.to_string_lossy().into_owned(), enabled: true, mode: FOLDER_MODE_MANUAL.into() }])?;
+    let validated = trusted_scope.validate_file(src)?;
+    let identity = validated.identity.clone();
+    let canonical_source = validated.canonical_path.clone();
+    if expected_identity.is_some_and(|expected| expected != &identity) { return Err("Suggestion file was replaced".into()); }
     let file_name = src
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let dest = src
-        .parent()
-        .map(|p| p.join(&suggested_category).join(&file_name))
-        .unwrap_or_else(|| Path::new(&suggested_category).join(&file_name));
+    let dest = reviewed_destination.map(Path::to_path_buf).unwrap_or_else(||validated_root.join(&suggested_category).join(&file_name));
 
     // Layer 1, applied by hand because this path never reaches
     // `rules::is_already_filed`. `suggested_category` is a bare folder name, so
     // the destination directory has the same shape `resolve_dest_dir` produces:
     // the category under the watched root.
-    let dest_dir = root.join(&suggested_category);
-    if let Some(src_parent) = src.parent() {
-        if is_within_any_root(src_parent, std::slice::from_ref(&dest_dir)) {
+    let dest_dir = validated_root.join(&suggested_category);
+    if let Some(src_parent) = canonical_source.parent() {
+        if crate::safe_fs::directory_contains(src_parent, &dest_dir).unwrap_or(false) {
             // Already filed, so nothing moves and nothing is logged. The early
             // return is the point: falling through to `log_action` would write
             // the exact row this check exists to prevent — `source` equal to
             // `destination`.
+            record_suggestion_feedback(&path, &suggested_category, None)?;
+            let message = if create_rule { match create_suggestion_rule(&file_name, &suggested_category) { Ok(message) => message, Err(error) => Some(error) } } else { None };
             return Ok(AcceptOutcome {
                 path: path.clone(),
                 status: "ok".to_string(),
-                message: None,
+                message,
                 // Where the file actually is, which is where it stays. The UI
                 // shows this next to "accepted", and "no arrow" would read as a
                 // failure rather than as "nothing needed doing".
@@ -1017,29 +1306,27 @@ fn accept_suggestion_with(
     // the way `unique_destination` does, so the predicted name can differ from
     // the name the move actually takes. That is why the real path is armed again
     // afterwards rather than only predicted now.
-    let predicted = crate::safe_fs::unique_destination(&dest_dir, &file_name);
+    drop(validated);
+    let predicted = if reviewed_destination.is_some() { dest.clone() } else { crate::safe_fs::try_unique_destination(&dest_dir, &file_name)? };
     arm_suppression(
         ignored_files,
         &[src.to_string_lossy().into_owned(), predicted.to_string_lossy().into_owned()],
     )?;
 
+    let intent = begin_operation_intent("suggestion", &path, Some(&dest.to_string_lossy())).map_err(|e| format!("Suggestion was not started: could not persist intent: {e}"))?;
     notify_move_observer();
-    let outcome = match move_file(src, &dest) {
-        Ok(MoveOutcome::Moved) => AcceptOutcome {
+    let moved = match expected_digest {
+        Some(digest) => crate::safe_fs::move_reviewed_file(src, &dest, &identity, digest),
+        None => crate::safe_fs::move_file_checked_expected(src, &dest, &identity),
+    };
+    let moved_identity = moved.as_ref().ok().map(|result| result.identity.key());
+    let mut outcome = match moved {
+        Ok(result) => AcceptOutcome {
             path: path.clone(),
             status: "ok".to_string(),
             message: None,
-            dest: Some(dest.to_string_lossy().into_owned()),
+            dest: Some(result.destination.to_string_lossy().into_owned()),
         },
-        Ok(MoveOutcome::MovedWithNewName(name)) => {
-            let actual = dest.with_file_name(&name);
-            AcceptOutcome {
-                path: path.clone(),
-                status: "ok".to_string(),
-                message: None,
-                dest: Some(actual.to_string_lossy().into_owned()),
-            }
-        }
         Err(e) => AcceptOutcome {
             path: path.clone(),
             status: "failed".to_string(),
@@ -1055,23 +1342,31 @@ fn accept_suggestion_with(
     }
 
     if outcome.status == "ok" {
-        let _ = crate::db::log_action(&ActionLog {
+        let log = ActionLog {
             id: None,
             timestamp: chrono::Utc::now(),
             source_path: path.clone(),
             destination_path: outcome.dest.clone(),
-            action: "move".to_string(),
+            action: "accept".to_string(),
             file_name: file_name.clone(),
             file_type: suggested_category.clone(),
             undone: false,
-        });
-
-        if create_rule {
-            create_suggestion_rule(&file_name, &suggested_category);
+        };
+        if let Some(actual) = outcome.dest.as_deref() {
+            if let Err(e) = finalize_suggestion_intent(intent, &log, actual, &suggested_category, moved_identity.as_deref().unwrap_or("")) {
+                outcome.status = "partial".into();
+                outcome.message = Some(format!("File moved to {actual}; history or classification finalization failed: {e}. Recovery intent retained."));
+            } else if create_rule {
+                match create_suggestion_rule(&file_name, &suggested_category) {
+                    Ok(message) => outcome.message = message,
+                    Err(e) => { outcome.status = "partial".into(); outcome.message = Some(format!("File moved; future rule was not created: {e}")); }
+                }
+            }
         }
-
-        let _ = crate::db::update_inventory_category(&path, &suggested_category);
-        let _ = crate::db::clear_dismissed_suggestion(&path);
+    } else {
+        if let Err(e) = finalize_operation_intent(intent, "failed", None, outcome.message.as_deref()) {
+            outcome.message = Some(format!("{}; recovery journal finalization failed: {e}", outcome.message.unwrap_or_default()));
+        }
     }
 
     Ok(outcome)
@@ -1079,14 +1374,18 @@ fn accept_suggestion_with(
 
 /// Create a rule from a suggestion acceptance. Skips insertion if an enabled
 /// move rule already covers the same extension with the same destination.
-fn create_suggestion_rule(file_name: &str, category: &str) {
+fn create_suggestion_rule(file_name: &str, category: &str) -> Result<Option<String>, String> {
+    let preview = suggestion_rule_preview(file_name, category)?;
+    if preview.disposition != "create" {
+        return Ok(preview.message);
+    }
     let ext = file_name
         .rfind('.')
         .and_then(|dot| file_name.get(dot + 1..))
         .map(str::to_lowercase);
     let ext = match ext {
         Some(e) if !e.is_empty() => e,
-        _ => return,
+        _ => return Ok(Some("Extensionless file accepted; no extension rule created".into())),
     };
 
     let already_covered = get_rules()
@@ -1100,20 +1399,21 @@ fn create_suggestion_rule(file_name: &str, category: &str) {
         })
         .unwrap_or(false);
     if already_covered {
-        return;
+        return Ok(Some("Already covered by an existing rule".into()));
     }
 
-    let _ = add_rule(&Rule {
+    add_rule(&Rule {
         id: None,
         name: category.to_string(),
         priority: 10,
         enabled: true,
-        extensions: vec![ext],
+        extensions: vec![ext.clone()],
         pattern: None,
         destination: category.to_string(),
         action: "move".to_string(),
         folder_id: 0,
-    });
+    }).map_err(|e| e.to_string())?;
+    Ok(Some(format!("Created global .{ext} rule to {category}")))
 }
 
 #[cfg(test)]
@@ -1158,7 +1458,7 @@ mod undo_tests {
                 .join(format!("mouzi-undo-{}-{}", name, std::process::id()));
             let _ = std::fs::remove_dir_all(&root);
             std::fs::create_dir_all(&root).expect("create test root");
-            UndoFixture { _serialised: serialised, root }
+            UndoFixture { _serialised: serialised, root: std::fs::canonicalize(root).unwrap() }
         }
 
         fn root(&self) -> &Path {
@@ -1263,9 +1563,7 @@ mod undo_tests {
     /// Normalising the expectation with the same function the map uses keeps the
     /// assertion about what it was always about: this path was guarded.
     fn guarded_key(path: &str) -> String {
-        crate::safe_fs::normalize_lexically(Path::new(path))
-            .to_string_lossy()
-            .to_lowercase()
+        crate::suppress::key(Path::new(path))
     }
 
     #[test]
@@ -1552,7 +1850,7 @@ mod accept_tests {
                 .join(format!("mouzi-accept-{}-{}", name, std::process::id()));
             let _ = std::fs::remove_dir_all(&root);
             std::fs::create_dir_all(&root).expect("create test root");
-            AcceptFixture { _serialised: serialised, root }
+            AcceptFixture { _serialised: serialised, root: std::fs::canonicalize(root).unwrap() }
         }
 
         fn root(&self) -> &Path {
@@ -1638,13 +1936,13 @@ mod accept_tests {
         assert!(*db_free, "the global DB mutex was held while a file was being moved");
         assert!(*watcher_free, "the suppression set was held while a file was being moved");
 
-        let source_key = crate::safe_fs::normalize_lexically(&source).to_string_lossy().to_lowercase();
+        let source_key = crate::suppress::key(&source);
         assert!(
             guarded.contains(&source_key),
             "the source had no guard when the rename ran: {guarded:?}"
         );
         assert!(
-            guarded.contains(&dest.to_string_lossy().to_lowercase()),
+            guarded.contains(&crate::suppress::key(&dest)),
             "the predicted destination had no guard when the rename ran: {guarded:?}"
         );
     }
@@ -1720,5 +2018,110 @@ mod accept_tests {
         assert_eq!(outcome.status, "missing");
         assert!(outcome.dest.is_none());
         assert!(ignored.guarded_keys().is_empty());
+    }
+
+    fn inventory_fixture(fixture: &AcceptFixture) -> PathBuf {
+        lock_db().unwrap().execute_batch("DELETE FROM watched_folders; DELETE FROM file_inventory; DELETE FROM inventory_fingerprints; DELETE FROM accepted_suggestion_feedback;").unwrap();
+        add_watched_folder(&fixture.root().to_string_lossy(), FOLDER_MODE_MANUAL).unwrap();
+        let path = fixture.put("report.xyz");
+        let summary = crate::scan::scan_roots(&[fixture.root().to_string_lossy().into_owned()], |_| {});
+        assert_eq!(summary[0].status,"complete");
+        path
+    }
+
+    fn ignored_files() -> IgnoredFiles { Arc::new(SuppressionSet::new()) }
+
+    #[test]
+    fn reviewed_suggestion_rejects_preserved_time_edits_and_is_single_use() {
+        let fixture=AcceptFixture::new("review_content");let path=inventory_fixture(&fixture);
+        let preview=prepare_suggestion(path.to_string_lossy().into_owned(),"Documents".into(),false).unwrap();
+        let modified=std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::fs::write(&path,b"changed").unwrap();
+        std::fs::File::options().write(true).open(&path).unwrap().set_times(std::fs::FileTimes::new().set_modified(modified)).unwrap();
+        let ignored=ignored_files();
+        assert!(accept_reviewed_suggestion(&preview.plan_id,&ignored).unwrap_err().contains("changed"));
+        assert!(path.exists());
+        assert!(accept_reviewed_suggestion(&preview.plan_id,&ignored).is_err());
+    }
+
+    #[test]
+    fn reviewed_suggestion_keeps_exact_destination_and_reconciles_real_acceptance() {
+        let fixture=AcceptFixture::new("review_destination");let path=inventory_fixture(&fixture);
+        let occupied=fixture.put("Documents/report.xyz");
+        let preview=prepare_suggestion(path.to_string_lossy().into_owned(),"Documents".into(),false).unwrap();
+        assert!(preview.destination.ends_with("report_0.xyz"));
+        let ignored=ignored_files();
+        let outcome=accept_reviewed_suggestion(&preview.plan_id,&ignored).unwrap();
+        assert_eq!(outcome.status,"ok");assert_eq!(outcome.dest.as_deref(),Some(preview.destination.as_str()));
+        assert_eq!(std::fs::read(&occupied).unwrap(),b"payload");
+        let undoable=get_undoable_logs().unwrap();assert_eq!(undoable.len(),1,"accepted moves must support Undo All");
+        assert_eq!(crate::db::get_accepted_suggestion_feedback().unwrap().len(),1);
+        crate::scan::scan_roots(&[fixture.root().to_string_lossy().into_owned()], |_| {});
+        let category:String=lock_db().unwrap().query_row("SELECT category FROM file_inventory WHERE path=?1",[&preview.destination],|row|row.get(0)).unwrap();
+        assert_eq!(category,"Documents","explicit category must survive a scan");
+        assert_eq!(undo_action_with(undoable[0].0,&ignored).unwrap().status,"ok");
+        assert!(crate::db::get_accepted_suggestion_feedback().unwrap().is_empty(),"undone acceptance must not train the model");
+    }
+
+    #[test]
+    fn reviewed_suggestion_refuses_new_collisions_and_paused_roots() {
+        let fixture=AcceptFixture::new("review_scope");let path=inventory_fixture(&fixture);
+        let preview=prepare_suggestion(path.to_string_lossy().into_owned(),"Documents".into(),false).unwrap();
+        fixture.put("Documents/report.xyz");
+        let ignored=ignored_files();
+        let result=accept_reviewed_suggestion(&preview.plan_id,&ignored).unwrap();
+        assert_eq!(result.status,"failed");assert!(path.exists());
+        let preview=prepare_suggestion(path.to_string_lossy().into_owned(),"Documents".into(),false).unwrap();
+        let id=get_watched_folders().unwrap()[0].id.unwrap();update_folder_mode(id,FOLDER_MODE_PAUSED).unwrap();
+        assert!(accept_reviewed_suggestion(&preview.plan_id,&ignored).is_err());
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn undo_rejects_a_replacement_at_the_recorded_destination() {
+        let fixture = AcceptFixture::new("undo_replacement");
+        let source = inventory_fixture(&fixture);
+        let preview = prepare_suggestion(source.to_string_lossy().into_owned(), "Documents".into(), false).unwrap();
+        let ignored = ignored_files();
+        assert_eq!(accept_reviewed_suggestion(&preview.plan_id, &ignored).unwrap().status, "ok");
+        let undoable = get_undoable_logs().unwrap();
+        assert_eq!(undoable.len(), 1);
+        assert!(undoable[0].3.is_some(), "new history must save physical identity");
+
+        let destination = Path::new(&preview.destination);
+        let preserved = fixture.root().join("preserved-original.xyz");
+        std::fs::rename(destination, &preserved).unwrap();
+        std::fs::write(destination, b"another file").unwrap();
+
+        let result = undo_action_with(undoable[0].0, &ignored).unwrap();
+        assert_eq!(result.status, "failed");
+        assert!(result.message.unwrap().contains("replaced"));
+        assert_eq!(std::fs::read(destination).unwrap(), b"another file");
+        assert_eq!(std::fs::read(&preserved).unwrap(), b"payload");
+        assert!(!source.exists());
+        let undone: bool = lock_db().unwrap().query_row("SELECT undone FROM action_logs WHERE id=?1", [undoable[0].0], |row| row.get(0)).unwrap();
+        assert!(!undone, "a refused Undo must remain retryable");
+    }
+
+    #[test]
+    fn finalization_never_records_a_foreign_destination_as_the_moved_file() {
+        let fixture = AcceptFixture::new("finalize_replacement");
+        let source = inventory_fixture(&fixture);
+        let destination = fixture.root().join("Documents/report.xyz");
+        let source_string = source.to_string_lossy().into_owned();
+        let intent = begin_operation_intent("accept", &source_string, Some(&destination.to_string_lossy())).unwrap();
+        let moved = crate::safe_fs::move_file_checked(&source, &destination).unwrap();
+        let preserved = fixture.root().join("preserved-original.xyz");
+        std::fs::rename(&moved.destination, &preserved).unwrap();
+        std::fs::write(&moved.destination, b"foreign file").unwrap();
+        let actual = moved.destination.to_string_lossy().into_owned();
+        let log = ActionLog { id: None, timestamp: chrono::Utc::now(), source_path: source_string,
+            destination_path: Some(actual.clone()), action: "accept".into(), file_name: "report.xyz".into(), file_type: "Documents".into(), undone: false };
+        assert!(finalize_suggestion_intent(intent, &log, &actual, "Documents", &moved.identity.key()).unwrap_err().contains("replaced"));
+        assert!(get_undoable_logs().unwrap().is_empty());
+        let status: String = lock_db().unwrap().query_row("SELECT status FROM operation_intents WHERE id=?1", [intent], |row| row.get(0)).unwrap();
+        assert_eq!(status, "pending");
+        assert_eq!(std::fs::read(&preserved).unwrap(), b"payload");
+        assert_eq!(std::fs::read(&moved.destination).unwrap(), b"foreign file");
     }
 }
