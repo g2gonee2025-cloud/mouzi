@@ -314,9 +314,21 @@ impl WatchedRoot {
 enum FolderAuthority<'a> {
     Automatic,
     RegisteredWatch(&'a WatchedRoot),
-    Scheduled { run_id: i64, is_current: &'a dyn Fn() -> bool, revoked: &'a std::cell::Cell<bool> },
+    Scheduled {
+        root: &'a WatchedRoot,
+        run_id: i64,
+        is_current: &'a dyn Fn() -> bool,
+        revoked: &'a std::cell::Cell<bool>,
+    },
     WatchedManual(&'a WatchedManualRoot),
     ArchiveStaging,
+}
+
+impl FolderAuthority<'_> {
+    fn uses_folder_protection(self) -> bool {
+        // Imported payloads cannot supply the organizer's folder policy.
+        !matches!(self, Self::ArchiveStaging)
+    }
 }
 
 pub fn process_file_with_suppression(
@@ -363,14 +375,14 @@ fn process_file(
     }
     let settings = get_settings().map_err(|e| format!("Cannot read organizer settings: {e}"))?;
     let folders = get_watched_folders().map_err(|e| format!("Cannot read watched folders: {e}"))?;
-    if matches!(authority, FolderAuthority::Automatic | FolderAuthority::Scheduled { .. }) && !folders.iter().any(|folder| {
+    if matches!(authority, FolderAuthority::Automatic) && !folders.iter().any(|folder| {
         folder.enabled && crate::db::is_folder_auto_mode(&folder.mode)
             && same_path(Path::new(&folder.path), root)
     }) {
         return Ok(ProcessOutcome::Skipped);
     }
     let _root_guard = match authority {
-        FolderAuthority::RegisteredWatch(watched) => {
+        FolderAuthority::RegisteredWatch(watched) | FolderAuthority::Scheduled { root: watched, .. } => {
             if !folders.iter().any(|folder| watched.matches_registration(folder)
                 && folder.enabled && crate::db::is_folder_auto_mode(&folder.mode)) {
                 return Ok(ProcessOutcome::Skipped);
@@ -386,12 +398,13 @@ fn process_file(
     if !path.parent().is_some_and(|parent| crate::safe_fs::directory_contains(parent, root).unwrap_or(false)) {
         return Err(format!("File is outside organizer root: {}", path.display()));
     }
-    if should_ignore_file(path) || is_file_ignored_by_mouziignore(path)? {
+    let use_folder_protection = authority.uses_folder_protection();
+    if should_ignore_file(path) || (use_folder_protection && is_file_ignored_by_mouziignore(path)?) {
         return Ok(ProcessOutcome::Skipped);
     }
     // Read the watched-root protection file too if a future recursive caller
     // supplies a descendant. Errors pause organization instead of dropping rules.
-    if path.parent().is_some_and(|parent| !same_path(parent, root)) {
+    if use_folder_protection && path.parent().is_some_and(|parent| !same_path(parent, root)) {
         let patterns = load_mouziignore(&root.to_string_lossy())?;
         if path.file_name().and_then(|name| name.to_str()).is_some_and(|name| is_ignored(name, &patterns)) {
             return Ok(ProcessOutcome::Skipped);
@@ -526,32 +539,44 @@ pub fn scheduled_scan_folder(folder: &str, suppression: &SuppressionSet)
 }
 
 pub(crate) fn scheduled_scan_folder_if_current(
-    folder: &str, suppression: &SuppressionSet, run_id: i64, is_current: &dyn Fn() -> bool,
+    root: &WatchedRoot, suppression: &SuppressionSet, run_id: i64, is_current: &dyn Fn() -> bool,
     progress: &mut ScheduleRunProgress,
 ) {
-    if let Err(error) = scan_scheduled_folder(Path::new(folder), suppression, run_id, is_current, progress, |_| {}) {
-        progress.record_error(format!("{folder}: {error}"));
+    if let Err(error) = scan_scheduled_folder(root, suppression, run_id, is_current, progress, |_| {}) {
+        progress.record_error(format!("{}: {error}", root.path.display()));
     }
 }
 
 fn scan_scheduled_folder(
-    root: &Path, suppression: &SuppressionSet, run_id: i64, is_current: &dyn Fn() -> bool,
-    progress: &mut ScheduleRunProgress, mut before_file: impl FnMut(&Path),
+    root: &WatchedRoot, suppression: &SuppressionSet, run_id: i64, is_current: &dyn Fn() -> bool,
+    progress: &mut ScheduleRunProgress, before_file: impl FnMut(&Path),
 ) -> Result<(), String> {
-    crate::safe_fs::validate_root(root)?;
-    load_mouziignore(&root.to_string_lossy())?;
+    let entries = {
+        let _guard = root.guard_physical()?;
+        load_mouziignore(&root.path.to_string_lossy())?;
+        fs::read_dir(&root.path).map_err(|error| error.to_string())?
+    };
+    let entries = entries.map(|entry| entry.map(|entry| entry.path()).map_err(|error| error.to_string()));
+    scan_scheduled_entries(root, suppression, run_id, is_current, progress, entries, before_file);
+    Ok(())
+}
+
+fn scan_scheduled_entries(
+    root: &WatchedRoot, suppression: &SuppressionSet, run_id: i64, is_current: &dyn Fn() -> bool,
+    progress: &mut ScheduleRunProgress, entries: impl IntoIterator<Item = Result<PathBuf, String>>,
+    mut before_file: impl FnMut(&Path),
+) {
     let revoked = std::cell::Cell::new(false);
-    let authority = FolderAuthority::Scheduled { run_id, is_current, revoked: &revoked };
-    for entry in fs::read_dir(root).map_err(|error| error.to_string())? {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(error) => { progress.record_error(format!("{}: {error}", root.display())); continue; }
+    let authority = FolderAuthority::Scheduled { root, run_id, is_current, revoked: &revoked };
+    for entry in entries {
+        let path = match entry {
+            Ok(path) => path,
+            Err(error) => { progress.record_error(format!("{}: {error}", root.path.display())); continue; }
         };
-        let path = entry.path();
         if !path.is_file() { continue; }
         let ticket = suppression.ticket(&path);
         before_file(&path);
-        match process_file(&path, false, root, suppression, &ticket, None, authority) {
+        match process_file(&path, false, &root.path, suppression, &ticket, None, authority) {
             Ok(ProcessOutcome::Organized { warning, .. }) => {
                 progress.organized += 1;
                 if let Some(warning) = warning { progress.record_error(warning); }
@@ -567,7 +592,6 @@ fn scan_scheduled_folder(
             break;
         }
     }
-    Ok(())
 }
 
 fn scan_folder(root: &Path, suppression: &SuppressionSet, authority: FolderAuthority<'_>, cancelled: Option<&std::sync::atomic::AtomicBool>)
@@ -575,7 +599,9 @@ fn scan_folder(root: &Path, suppression: &SuppressionSet, authority: FolderAutho
 {
     let entries = (|| {
         crate::safe_fs::validate_root(root)?;
-        load_mouziignore(&root.to_string_lossy())?;
+        if authority.uses_folder_protection() {
+            load_mouziignore(&root.to_string_lossy())?;
+        }
         fs::read_dir(root).map_err(|error| error.to_string())
     })().map_err(|message| FolderScanError { results: Vec::new(), message })?;
     let bypass_grace = matches!(authority, FolderAuthority::WatchedManual(_) | FolderAuthority::ArchiveStaging);
@@ -751,7 +777,9 @@ mod tests {
             .set_modified(SystemTime::now() - Duration::from_secs(86_401)).unwrap();
         let checks = std::cell::Cell::new(0);
         let mut scheduled = ScheduleRunProgress::default();
-        scheduled_scan_folder_if_current(&root.to_string_lossy(), &suppression, 0, &|| {
+        let row = get_watched_folders().unwrap().into_iter().find(|folder| folder.id == Some(folder_id)).unwrap();
+        let scheduled_root = WatchedRoot::capture(&row).unwrap();
+        scheduled_scan_folder_if_current(&scheduled_root, &suppression, 0, &|| {
             checks.set(checks.get() + 1);
             false
         }, &mut scheduled);
@@ -759,6 +787,70 @@ mod tests {
         assert!(scheduled.revoked);
         assert_eq!(scheduled.organized, 0);
         assert_eq!(fs::read(&second).unwrap(), b"replacement");
+    }
+
+    #[test]
+    fn archive_sort_preserves_ignore_payload_without_applying_it() {
+        const FILE_NAME: &str = "entry.archiveignorex";
+        const CASES: [(&str, &[u8]); 2] = [("wildcard", b"*\n"), ("malformed", &[0xff, 0xfe])];
+
+        struct Fixture { root: PathBuf, folder: i64, rule: i64 }
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                if let Ok(conn) = crate::db::lock_db() {
+                    for (case, _) in CASES {
+                        let source = self.root.join(case).join(FILE_NAME);
+                        let source = source.to_string_lossy();
+                        let _ = conn.execute("DELETE FROM action_logs WHERE source_path=?1", [source.as_ref()]);
+                        let _ = conn.execute("DELETE FROM operation_intents WHERE source_path=?1", [source.as_ref()]);
+                    }
+                }
+                let _ = crate::db::delete_rule(self.rule);
+                let _ = crate::db::remove_watched_folder(self.folder);
+                let _ = fs::remove_dir_all(&self.root);
+            }
+        }
+
+        let _serial = crate::db::serialise_test_db();
+        crate::db::init_test_db();
+        let root = std::env::temp_dir().join(format!(
+            "mouzi-archive-ignore-{}-{}", std::process::id(), Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        fs::create_dir(&root).unwrap();
+        let root = fs::canonicalize(root).unwrap();
+        let watched = root.join("watched");
+        fs::create_dir(&watched).unwrap();
+        let folder = crate::db::add_watched_folder(&watched.to_string_lossy(), crate::db::FOLDER_MODE_MANUAL).unwrap();
+        let mut custom = rule("Filed");
+        custom.extensions = vec!["archiveignorex".into()];
+        custom.priority = i32::MIN;
+        let rule_id = crate::db::add_rule(&custom).unwrap();
+        let _fixture = Fixture { root: root.clone(), folder, rule: rule_id };
+        let suppression = SuppressionSet::new();
+        let cancelled = std::sync::atomic::AtomicBool::new(false);
+
+        for (case, policy) in CASES {
+            let staging = root.join(case);
+            fs::create_dir(&staging).unwrap();
+            let control = staging.join(".mouziignore");
+            fs::write(&control, policy).unwrap();
+            fs::write(staging.join(FILE_NAME), b"archive payload").unwrap();
+
+            assert_eq!(manual_scan_folder_cancelable(&staging, &suppression, &cancelled).unwrap().len(), 1);
+            assert_eq!(fs::read(staging.join("Filed").join(FILE_NAME)).unwrap(), b"archive payload");
+            assert_eq!(fs::read(control).unwrap(), policy);
+        }
+
+        let row = get_watched_folders().unwrap().into_iter().find(|row| row.id == Some(folder)).unwrap();
+        let watched_root = WatchedManualRoot::capture(&row).unwrap();
+        let watched_source = watched.join(FILE_NAME);
+        let watched_control = watched.join(".mouziignore");
+        fs::write(&watched_source, b"watched payload").unwrap();
+        fs::write(&watched_control, CASES[0].1).unwrap();
+        assert!(scan_watched_manual_folder(&watched_root, &suppression).unwrap().is_empty());
+        fs::write(&watched_control, CASES[1].1).unwrap();
+        assert!(scan_watched_manual_folder(&watched_root, &suppression).unwrap_err().contains(".mouziignore"));
+        assert_eq!(fs::read(watched_source).unwrap(), b"watched payload");
     }
 
     #[test]
@@ -1228,7 +1320,9 @@ mod tests {
         db::start_schedule_run(run).unwrap();
         let mut selected = Vec::new();
         let mut progress = ScheduleRunProgress::default();
-        scan_scheduled_folder(&path, &suppression, run, &|| scheduler.revision() == revision, &mut progress, |file| {
+        let row = get_watched_folders().unwrap().into_iter().find(|row| row.id == Some(folder)).unwrap();
+        let root = WatchedRoot::capture(&row).unwrap();
+        scan_scheduled_folder(&root, &suppression, run, &|| scheduler.revision() == revision, &mut progress, |file| {
             selected.push(file.to_path_buf());
             if selected.len() == 2 {
                 assert!(!selected[0].exists(), "first move must finish before disable");
@@ -1251,5 +1345,82 @@ mod tests {
         let history: i64 = conn.query_row("SELECT COUNT(*) FROM action_logs WHERE source_path=?1", [selected[0].to_string_lossy().as_ref()], |row| row.get(0)).unwrap();
         let denied: i64 = conn.query_row("SELECT COUNT(*) FROM operation_intents WHERE source_path=?1", [selected[1].to_string_lossy().as_ref()], |row| row.get(0)).unwrap();
         assert_eq!((linked, history, denied), (1, 1, 0));
+    }
+
+    #[test]
+    fn scheduled_scan_rejects_a_directory_replaced_between_moves() {
+        use crate::db;
+        let _serial = db::serialise_test_db();
+        db::init_test_db();
+        let fixture = std::env::temp_dir().join(format!(
+            "mouzi-schedule-root-{}-{}", std::process::id(), Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        fs::create_dir(&fixture).unwrap();
+        let fixture = fs::canonicalize(fixture).unwrap();
+        let root = fixture.join("watched");
+        let original = fixture.join("original");
+        fs::create_dir(&root).unwrap();
+        let folder = db::add_watched_folder(&root.to_string_lossy(), db::FOLDER_MODE_SILENT).unwrap();
+        let mut custom = rule("Filed");
+        custom.extensions = vec!["scheduledroot".into()];
+        custom.priority = i32::MIN;
+        let rule_id = db::add_rule(&custom).unwrap();
+        let run = {
+            let conn = db::lock_db().unwrap();
+            conn.execute("INSERT INTO schedule_runs(status,claimed_at,occurrences) VALUES('claimed','fixture',1)", []).unwrap();
+            conn.last_insert_rowid()
+        };
+        struct Fixture { path: PathBuf, folder: i64, rule: i64, run: i64 }
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                if let Ok(conn) = db::lock_db() {
+                    let _ = conn.execute("DELETE FROM action_logs WHERE source_path IN (SELECT source_path FROM operation_intents WHERE schedule_run_id=?1)", [self.run]);
+                    let _ = conn.execute("DELETE FROM operation_intents WHERE schedule_run_id=?1", [self.run]);
+                    let _ = conn.execute("DELETE FROM schedule_runs WHERE id=?1", [self.run]);
+                }
+                let _ = db::delete_rule(self.rule);
+                let _ = db::remove_watched_folder(self.folder);
+                let _ = fs::remove_dir_all(&self.path);
+            }
+        }
+        let _fixture = Fixture { path: fixture, folder, rule: rule_id, run };
+        let row = get_watched_folders().unwrap().into_iter().find(|row| row.id == Some(folder)).unwrap();
+        let captured = WatchedRoot::capture(&row).unwrap();
+        let first = root.join("first.scheduledroot");
+        let second = root.join("second.scheduledroot");
+        let write_aged = |path: &Path, contents: &[u8]| {
+            fs::write(path, contents).unwrap();
+            fs::OpenOptions::new().write(true).open(path).unwrap()
+                .set_modified(SystemTime::now() - Duration::from_secs(86_401)).unwrap();
+        };
+        write_aged(&first, b"first");
+        write_aged(&second, b"original second");
+        db::start_schedule_run(run).unwrap();
+        let suppression = SuppressionSet::new();
+        let mut progress = ScheduleRunProgress::default();
+        // Supply the two enumerated paths without keeping a Windows directory
+        // iterator open across the injected rename.
+        scan_scheduled_entries(&captured, &suppression, run, &|| true, &mut progress,
+            [Ok(first.clone()), Ok(second.clone())], |path| {
+                if path == second.as_path() {
+                    assert!(!first.exists(), "first move must finish before replacement");
+                    fs::rename(&root, &original).unwrap();
+                    fs::create_dir(&root).unwrap();
+                    write_aged(&second, b"replacement second");
+                }
+            });
+        assert_eq!((progress.organized, progress.errors, progress.revoked), (1, 1, false));
+        assert!(progress.message.as_deref().is_some_and(|message| message.contains("changed identity")));
+        assert_eq!(fs::read(original.join("Filed/first.scheduledroot")).unwrap(), b"first");
+        assert_eq!(fs::read(original.join("second.scheduledroot")).unwrap(), b"original second");
+        assert_eq!(fs::read(&second).unwrap(), b"replacement second");
+        assert!(!root.join("Filed").exists());
+        db::finish_schedule_run(run, &progress).unwrap();
+        let receipt = db::recent_schedule_runs().unwrap().into_iter().find(|row| row.id == run).unwrap();
+        assert_eq!((receipt.status.as_str(), receipt.organized, receipt.errors), ("failed", 1, 1));
+        let conn = db::lock_db().unwrap();
+        let linked: i64 = conn.query_row("SELECT COUNT(*) FROM operation_intents WHERE schedule_run_id=?1", [run], |row| row.get(0)).unwrap();
+        let denied: i64 = conn.query_row("SELECT COUNT(*) FROM operation_intents WHERE source_path=?1", [second.to_string_lossy().as_ref()], |row| row.get(0)).unwrap();
+        assert_eq!((linked, denied), (1, 0));
     }
 }

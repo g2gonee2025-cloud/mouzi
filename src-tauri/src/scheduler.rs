@@ -3,7 +3,7 @@ use crate::db::{
     get_watched_folders, is_folder_auto_mode, start_schedule_run, update_schedule_settings,
     AppSettings, ScheduleRunProgress, ScheduleSettings,
 };
-use crate::rules::scheduled_scan_folder_if_current;
+use crate::rules::{scheduled_scan_folder_if_current, WatchedRoot};
 use crate::suppress::SuppressionSet;
 use chrono::{DateTime, Days, Duration, Local, LocalResult, NaiveDate, NaiveTime, Offset, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
@@ -328,17 +328,23 @@ fn perform_scheduled_clean(
             return progress;
         }
     };
-    for folder in folders {
-        if !folder.enabled || !is_folder_auto_mode(&folder.mode) {
-            continue;
+    // Capture every root before the first move so a later folder cannot be
+    // replaced and acquire authority partway through this run.
+    let mut roots = Vec::new();
+    for folder in folders.iter().filter(|folder| folder.enabled && is_folder_auto_mode(&folder.mode)) {
+        match WatchedRoot::capture(folder) {
+            Ok(root) => roots.push(root),
+            Err(error) => progress.record_error(format!("{}: {error}", folder.path)),
         }
+    }
+    for root in roots {
         if !is_current() {
             progress.revoked = true;
             break;
         }
         // This unattended path applies grace and settling checks and rechecks
         // current root eligibility for each file. Never use Clean Now's bypass.
-        scheduled_scan_folder_if_current(&folder.path, suppression, run_id, is_current, &mut progress);
+        scheduled_scan_folder_if_current(&root, suppression, run_id, is_current, &mut progress);
         if progress.revoked {
             break;
         }
