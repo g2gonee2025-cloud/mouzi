@@ -1,10 +1,13 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { invoke } from "@tauri-apps/api/core";
-import { Copy, ExternalLink, Search } from "lucide-react";
+import { Copy, ExternalLink, Search, X } from "lucide-react";
 import { formatBytes, formatTimestamp } from "../../utils/format";
 import { fileName, parentDir } from "../../utils/paths";
-import { categoryClass, categoryLabel, createInventoryBrowserLoader } from "../../utils/dashboard";
+import {
+  categoryClass, categoryLabel, createInventoryBrowserLoader, inventoryBrowserScope,
+  type InventoryBrowserView,
+} from "../../utils/dashboard";
 import type { InventoryFile } from "../../store/useDashboardStore";
 
 interface FileBrowserProps {
@@ -12,7 +15,11 @@ interface FileBrowserProps {
   initialRecent: InventoryFile[];
   category: string | null;
   root: string | null;
+  rootScope: string;
+  totalFiles: number;
   revision: number;
+  onClearCategory: () => void;
+  onClearRoot: () => void;
 }
 
 type Mode = "size" | "mtime";
@@ -22,40 +29,37 @@ export default function FileBrowser({
   initialRecent,
   category,
   root,
+  rootScope,
+  totalFiles,
   revision,
+  onClearCategory,
+  onClearRoot,
 }: FileBrowserProps) {
   const { t } = useTranslation();
   const [mode, setMode] = useState<Mode>("size");
   const [query, setQuery] = useState("");
-  const [files, setFiles] = useState<InventoryFile[]>(initialLargest);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [view, setView] = useState<InventoryBrowserView>();
   const [copied, setCopied] = useState<string | null>(null);
+  const searchId = useId();
   const searchRef = useRef<HTMLInputElement>(null);
   const copyTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const mounted = useRef(true);
   const [loader] = useState(() => createInventoryBrowserLoader(
     (query) => invoke<InventoryFile[]>("get_inventory_files_cmd", { ...query }),
-    { rows: setFiles, loading: setLoading, error: setError },
+    setView,
   ));
+  const search = query.trim();
+  const filtered = Boolean(search || category || root);
+  const scope = inventoryBrowserScope({ sort: mode, query: search, category, root, rootScope });
+  const activeView = view?.scope === scope ? view : undefined;
+  const files = filtered ? activeView?.rows ?? [] : mode === "size" ? initialLargest : initialRecent;
+  const loading = filtered && (activeView?.loading ?? true);
+  const error = filtered ? activeView?.error : null;
 
   useEffect(() => {
-    const request = { sort: mode, query, category, root, initialLargest, initialRecent };
-    const filtered = Boolean(query.trim() || category || root);
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    setError(null);
-    if (filtered) {
-      setFiles([]);
-      setLoading(true);
-      timer = setTimeout(() => { void loader.load(request); }, query.trim() ? 200 : 0);
-    } else {
-      void loader.load(request);
-    }
-    return () => {
-      if (timer) clearTimeout(timer);
-      loader.cancel();
-    };
-  }, [mode, query, category, root, initialLargest, initialRecent, revision, loader]);
+    void loader.load({ sort: mode, query: search, category, root, rootScope, initialLargest, initialRecent }, 200);
+    return loader.cancel;
+  }, [mode, search, category, root, rootScope, initialLargest, initialRecent, revision, loader]);
 
   useEffect(() => {
     mounted.current = true;
@@ -67,12 +71,11 @@ export default function FileBrowser({
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "/" && document.activeElement !== searchRef.current) {
-        const tag = (document.activeElement as HTMLElement | null)?.tagName;
-        if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
-        e.preventDefault();
-        searchRef.current?.focus();
-      }
+      if (e.key !== "/" || e.defaultPrevented || e.isComposing || e.ctrlKey || e.metaKey || e.altKey) return;
+      const active = document.activeElement as HTMLElement | null;
+      if (active?.matches("input, textarea, select") || active?.isContentEditable) return;
+      e.preventDefault();
+      searchRef.current?.focus();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
@@ -98,8 +101,36 @@ export default function FileBrowser({
     }
   };
 
+  const isEmpty = !loading && !error && files.length === 0;
+  const shown = files.length.toLocaleString();
+  const status = loading
+    ? t(files.length ? "dashboard.refreshingFiles" : "dashboard.loadingFiles")
+    : isEmpty
+      ? t(totalFiles === 0 ? "dashboard.noIndexedFiles" : "dashboard.noFiles")
+      : filtered && !error
+        ? t(activeView?.limited ? "dashboard.limitedFiles" : "dashboard.filesShown", { shown })
+        : "";
+
   return (
     <div className="rounded-xl border border-border bg-surface-dark p-4">
+      <div className="mb-3" role="search">
+        <label htmlFor={searchId} className="block text-sm font-semibold mb-1.5">
+          {t("dashboard.searchFiles")} <kbd aria-hidden="true" className="text-text-muted text-xs">/</kbd>
+        </label>
+        <div className="relative">
+          <Search size={13} aria-hidden="true" className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-text-muted" />
+          <input
+            ref={searchRef}
+            id={searchId}
+            type="search"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            aria-keyshortcuts="/"
+            className="w-full rounded-md border border-border bg-surface pl-8 pr-3 py-1.5 text-sm text-text focus:outline-none focus:border-primary"
+          />
+        </div>
+      </div>
+
       <div className="flex flex-wrap items-center gap-2 mb-3">
         <h3 className="text-sm font-semibold text-text mr-auto">
           {mode === "size" ? t("dashboard.largestFiles") : t("dashboard.recentFiles")}
@@ -124,47 +155,47 @@ export default function FileBrowser({
         </div>
       </div>
 
-      <div className="relative mb-3" role="search">
-        <Search size={13} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-text-muted" />
-        <input
-          ref={searchRef}
-          type="search"
-          value={query}
-          onChange={(e) => setQuery(e.target.value)}
-          placeholder={t("dashboard.searchFiles")}
-          aria-label={t("dashboard.searchFiles")}
-          className="w-full rounded-md border border-border bg-surface pl-8 pr-3 py-1.5 text-sm text-text placeholder:text-text-muted focus:outline-none focus:border-primary"
-        />
-      </div>
-
       {(category || root) && (
         <div className="flex flex-wrap gap-2 mb-3 text-[11px]">
           {category && (
-            <span className="rounded-full border border-border px-2 py-0.5 text-text">
-              {t("dashboard.filterBy", { name: categoryLabel(category, t) })}
-            </span>
+            <button
+              type="button"
+              onClick={() => {
+                onClearCategory();
+                searchRef.current?.focus();
+              }}
+              aria-label={t("dashboard.clearFilter", { name: categoryLabel(category, t) })}
+              className="inline-flex items-center gap-1 rounded-full border border-border px-2 py-0.5 text-text hover:bg-border"
+            >
+              {categoryLabel(category, t)} <X size={12} aria-hidden="true" />
+            </button>
           )}
           {root && (
-            <span className="rounded-full border border-border px-2 py-0.5 text-text truncate max-w-[240px]">
-              {t("dashboard.filterBy", { name: fileName(root) || root })}
-            </span>
+            <button
+              type="button"
+              onClick={() => {
+                onClearRoot();
+                searchRef.current?.focus();
+              }}
+              aria-label={t("dashboard.clearFilter", { name: root })}
+              title={root}
+              className="inline-flex items-center gap-1 rounded-full border border-border px-2 py-0.5 text-text max-w-[240px] hover:bg-border"
+            >
+              <span className="truncate">{fileName(root) || root}</span> <X size={12} aria-hidden="true" />
+            </button>
           )}
         </div>
       )}
 
-      {loading && (
-        <div className="text-xs text-text-muted mb-2" role="status" aria-live="polite">
-          {t("dashboard.loadingFiles")}
-        </div>
-      )}
-
+      <div
+        role="status"
+        className={isEmpty ? "flex items-center justify-center h-28 text-xs text-text-muted" : "text-xs text-text-muted"}
+      >
+        {status && <p className={isEmpty ? undefined : "mb-2"}>{status}</p>}
+      </div>
       {error && <div className="text-xs text-red-700 dark:text-red-400 mb-2" role="alert">{error}</div>}
-      {!loading && !error && files.length === 0 ? (
-        <div className="flex items-center justify-center h-28 text-xs text-text-muted">
-          {t("dashboard.noFiles")}
-        </div>
-      ) : (
-        <div className="space-y-0.5 max-h-[28rem] overflow-auto">
+      {files.length > 0 && (
+        <div className="space-y-0.5 max-h-[18rem] overflow-auto">
           {files.map((file) => (
             <div
               key={file.path}

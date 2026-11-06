@@ -64,10 +64,24 @@ jobs:
         working-directory: src-tauri
         run: cargo test --lib --locked --jobs 2 -- --test-threads=2
 
-      # --no-bundle builds the executable without producing installers, so
-      # nothing distributable is generated or uploaded.
+      # --no-bundle builds the executable without producing installers.
       - name: Build app executable, unsigned
         run: npm run tauri build -- --no-bundle --ci -- --locked --jobs 2
+
+      - name: Record unsigned executable provenance
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $executable = Get-Item -LiteralPath 'src-tauri/target/release/mouzi.exe'
+          $hash = Get-FileHash -LiteralPath $executable.FullName -Algorithm SHA256
+          Write-Host "Git commit: $(git rev-parse --verify HEAD)"
+          Write-Host "Runner: $env:RUNNER_OS $env:RUNNER_ARCH ($env:ImageOS $env:ImageVersion)"
+          Write-Host "Node: $(node --version)"
+          Write-Host "npm: $(npm --version)"
+          rustc --version --verbose
+          cargo --version
+          Write-Host "Executable: src-tauri/target/release/mouzi.exe ($($executable.Length) bytes)"
+          Write-Host "Executable SHA-256: $($hash.Hash)"
 
   native-trash:
     name: Explicit Windows Recycle Bin integration

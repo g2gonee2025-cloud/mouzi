@@ -32,49 +32,106 @@ interface InventoryQuery {
   limit: number;
 }
 
-interface BrowserRequest extends Omit<InventoryQuery, "category" | "root" | "limit"> {
+interface BrowserScope extends Omit<InventoryQuery, "category" | "root" | "limit"> {
   category: string | null;
   root: string | null;
+  rootScope: string;
+}
+
+interface BrowserRequest extends BrowserScope {
   initialLargest: InventoryFile[];
   initialRecent: InventoryFile[];
 }
 
-/** Owns response eligibility, including requests invalidated before debounce fires. */
+export interface InventoryBrowserView {
+  scope: string;
+  rows: InventoryFile[];
+  limited: boolean;
+  loading: boolean;
+  error: string | null;
+}
+
+export const INVENTORY_MATCH_LIMIT = 80;
+
+export function inventoryBrowserScope({ sort, query, category, root, rootScope }: BrowserScope): string {
+  return JSON.stringify([sort, query.trim(), category, root, rootScope]);
+}
+
 export function createInventoryBrowserLoader(
   fetchRows: (query: InventoryQuery) => Promise<InventoryFile[]>,
-  updates: {
-    rows: (rows: InventoryFile[]) => void;
-    loading: (loading: boolean) => void;
-    error: (error: string | null) => void;
-  },
+  update: (view: InventoryBrowserView) => void,
 ) {
   let generation = 0;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let view: InventoryBrowserView | undefined;
+
+  const publish = (next: InventoryBrowserView) => {
+    view = next;
+    update(next);
+  };
+  const cancel = () => {
+    ++generation;
+    if (timer !== undefined) {
+      clearTimeout(timer);
+      timer = undefined;
+    }
+  };
+
   return {
-    cancel: () => { ++generation; },
-    load: async (request: BrowserRequest) => {
-      const current = ++generation;
+    cancel,
+    load: (request: BrowserRequest, debounceMs = 0) => {
+      cancel();
+      const current = generation;
+      const scope = inventoryBrowserScope(request);
       const query = request.query.trim();
-      updates.error(null);
       if (!query && !request.category && !request.root) {
-        updates.rows(request.sort === "size" ? request.initialLargest : request.initialRecent);
-        updates.loading(false);
+        publish({
+          scope,
+          rows: request.sort === "size" ? request.initialLargest : request.initialRecent,
+          limited: false,
+          loading: false,
+          error: null,
+        });
         return;
       }
-      updates.loading(true);
-      try {
-        const rows = await fetchRows({
-          sort: request.sort,
-          query,
-          category: request.category ?? "",
-          root: request.root ?? "",
-          limit: 80,
-        });
-        if (current === generation) updates.rows(rows);
-      } catch (error) {
-        if (current === generation) updates.error(String(error));
-      } finally {
-        if (current === generation) updates.loading(false);
+
+      const previous = view?.scope === scope ? view : undefined;
+      const pending = {
+        scope, rows: previous?.rows ?? [], limited: previous?.limited ?? false, loading: true, error: null,
+      };
+      publish(pending);
+
+      const fetch = async () => {
+        try {
+          const rows = await fetchRows({
+            sort: request.sort,
+            query,
+            category: request.category ?? "",
+            root: request.root ?? "",
+            limit: INVENTORY_MATCH_LIMIT + 1,
+          });
+          if (current === generation) {
+            publish({
+              scope,
+              rows: rows.slice(0, INVENTORY_MATCH_LIMIT),
+              limited: rows.length > INVENTORY_MATCH_LIMIT,
+              loading: false,
+              error: null,
+            });
+          }
+        } catch (error) {
+          if (current === generation) publish({ ...pending, loading: false, error: String(error) });
+        }
+      };
+
+      if (query && !previous && debounceMs > 0) {
+        timer = setTimeout(() => {
+          timer = undefined;
+          void fetch();
+        }, debounceMs);
+        return;
       }
+      return fetch();
     },
   };
 }

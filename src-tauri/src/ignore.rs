@@ -1,30 +1,70 @@
-use std::fs;
-use std::io::ErrorKind;
+use std::fs::{self, File, Metadata, OpenOptions};
+use std::io::{ErrorKind, Read, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+const IGNORE_FILE: &str = ".mouziignore";
+
+fn is_regular_file(metadata: &Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return false;
+        }
+    }
+    metadata.is_file()
+}
+
+fn open_ignore_file(path: &Path) -> Result<Option<File>, String> {
+    let error = |cause: &dyn std::fmt::Display| {
+        format!("Cannot open ignore protection file {}: {cause}", path.display())
+    };
+    let before = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(cause) if cause.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(cause) => return Err(error(&cause)),
+    };
+    let unsafe_file = || error(&"expected a regular file with one link");
+    if !is_regular_file(&before) {
+        return Err(unsafe_file());
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x00200000;
+        const FILE_SHARE_READ: u32 = 1;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT).share_mode(FILE_SHARE_READ);
+    }
+    let file = options.open(path).map_err(|cause| error(&cause))?;
+    let opened = file.metadata().map_err(|cause| error(&cause))?;
+    if !is_regular_file(&opened) || crate::safe_fs::link_count(&file).map_err(|cause| error(&cause))? != 1 {
+        return Err(unsafe_file());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if (before.dev(), before.ino()) != (opened.dev(), opened.ino()) {
+            return Err(error(&"file changed while opening"));
+        }
+    }
+    Ok(Some(file))
+}
 
 /// Load non-empty, non-comment patterns from a folder's protection file.
 /// An absent file has no rules; an existing file that cannot be read is an error.
 pub fn load_mouziignore(folder_path: &str) -> Result<Vec<String>, String> {
-    let path = Path::new(folder_path).join(".mouziignore");
-    let content = match fs::read_to_string(&path) {
-        Ok(content) => content,
-        Err(error) => {
-            // A dangling symlink is an existing protection file, even though reading
-            // its missing target reports NotFound. Do not silently disable its rules.
-            if error.kind() == ErrorKind::NotFound {
-                match fs::symlink_metadata(&path) {
-                    Err(metadata_error) if metadata_error.kind() == ErrorKind::NotFound => {
-                        return Ok(Vec::new());
-                    }
-                    _ => {}
-                }
-            }
-            return Err(format!(
-                "Unable to read ignore protection file {}: {error}",
-                path.display()
-            ));
-        }
+    let path = Path::new(folder_path).join(IGNORE_FILE);
+    let Some(mut file) = open_ignore_file(&path)? else {
+        return Ok(Vec::new());
     };
+    let mut content = String::new();
+    file.read_to_string(&mut content).map_err(|error| {
+        format!("Unable to read ignore protection file {}: {error}", path.display())
+    })?;
 
     Ok(content
         .lines()
@@ -74,13 +114,32 @@ impl IgnorePatterns {
 /// Save patterns to .mouziignore in the given folder.
 /// Writes a header comment, then one pattern per line.
 pub fn save_mouziignore(folder_path: &str, patterns: &[String]) -> Result<(), String> {
-    let path = Path::new(folder_path).join(".mouziignore");
+    let folder = Path::new(folder_path);
+    let path = folder.join(IGNORE_FILE);
+    let existing = open_ignore_file(&path)?;
     let mut content = String::from("# Mouzi ignore rules\n# https://mouzi.cc/docs\n\n");
     for p in patterns {
         content.push_str(&p.replace('#', r"\#"));
         content.push('\n');
     }
-    fs::write(&path, content).map_err(|e| e.to_string())
+    // Stage the full replacement before publishing it. Never truncate a path
+    // supplied by the filesystem, even when the checked leaf is regular.
+    static NEXT_STAGE: AtomicU64 = AtomicU64::new(0);
+    let serial = NEXT_STAGE.fetch_add(1, Ordering::Relaxed);
+    let stage = folder.join(format!("{IGNORE_FILE}.{}.{serial}.tmp", std::process::id()));
+    let mut file = OpenOptions::new().write(true).create_new(true).open(&stage)
+        .map_err(|error| format!("Cannot stage ignore protection file: {error}"))?;
+    let written = file.write_all(content.as_bytes()).and_then(|()| file.sync_all());
+    drop(file);
+    // Windows must release the checked leaf before renaming over its name.
+    // The rename updates the entry itself, never writes through a leaf link.
+    drop(existing);
+    let result = written.and_then(|()| fs::rename(&stage, &path));
+    if let Err(error) = result {
+        let _ = fs::remove_file(&stage);
+        return Err(format!("Cannot save ignore protection file {}: {error}", path.display()));
+    }
+    Ok(())
 }
 
 /// Check if a file name matches any of the ignore patterns.
@@ -194,6 +253,8 @@ mod tests {
             load_mouziignore(folder.to_str().unwrap()).unwrap(),
             vec!["report#final.pdf"]
         );
+        save_mouziignore(folder.to_str().unwrap(), &["replacement".to_string()]).unwrap();
+        assert_eq!(load_mouziignore(folder.to_str().unwrap()).unwrap(), vec!["replacement"]);
 
         fs::remove_dir_all(folder).unwrap();
     }
@@ -278,6 +339,8 @@ mod tests {
         let error = load_mouziignore(folder.to_str().unwrap()).unwrap_err();
         assert!(error.contains(".mouziignore"));
         assert!(IgnorePatterns::from_folder(folder.to_str().unwrap()).is_err());
+        assert!(save_mouziignore(folder.to_str().unwrap(), &[]).is_err());
+        assert!(folder.join(IGNORE_FILE).is_dir());
         fs::remove_dir_all(folder).unwrap();
     }
 
@@ -290,12 +353,29 @@ mod tests {
     }
 
     #[test]
+    fn hard_linked_ignore_file_is_rejected_without_touching_its_target() {
+        let parent = temporary_folder();
+        let folder = parent.join("watched");
+        fs::create_dir(&folder).unwrap();
+        let sentinel = parent.join("sentinel.txt");
+        fs::write(&sentinel, "private value").unwrap();
+        fs::hard_link(&sentinel, folder.join(IGNORE_FILE)).unwrap();
+
+        let folder_path = folder.to_str().unwrap();
+        assert!(load_mouziignore(folder_path).is_err());
+        assert!(save_mouziignore(folder_path, &["replacement".into()]).is_err());
+        assert_eq!(fs::read_to_string(sentinel).unwrap(), "private value");
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
     #[cfg(unix)]
     fn dangling_ignore_symlink_is_an_error() {
         let folder = temporary_folder();
         std::os::unix::fs::symlink(folder.join("missing"), folder.join(".mouziignore"))
             .unwrap();
         assert!(load_mouziignore(folder.to_str().unwrap()).is_err());
+        assert!(save_mouziignore(folder.to_str().unwrap(), &[]).is_err());
         fs::remove_dir_all(folder).unwrap();
     }
 }

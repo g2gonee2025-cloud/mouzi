@@ -14,7 +14,8 @@ import {
   CheckSquare,
   XSquare,
 } from "lucide-react";
-import ConfirmDialog, { type ConfirmRequest } from "../components/cleanup/ConfirmDialog";
+import ConfirmDialog, { type ConfirmDialogProps } from "../components/cleanup/ConfirmDialog";
+import { usePreviewOwner } from "../components/cleanup/usePreviewOwner";
 
 function confidenceColor(conf: number): string {
   if (conf >= 0.7) return "text-green-600 dark:text-green-400";
@@ -60,7 +61,6 @@ export default function Suggestions() {
     loadSuggestions,
     prepareSuggestions,
     preparedPlans,
-    cancelPlans,
     dismissSuggestion,
     acceptAll,
     dismissAll,
@@ -70,7 +70,8 @@ export default function Suggestions() {
   } = useSuggestionsStore();
 
   const [createRule, setCreateRule] = useState(createRuleDefault);
-  const [pending, setPending] = useState<ConfirmRequest | null>(null);
+  const [pending, setPending] = useState<ConfirmDialogProps | null>(null);
+  const beginPreview = usePreviewOwner();
 
   useEffect(() => {
     loadSuggestions();
@@ -95,22 +96,28 @@ export default function Suggestions() {
   // and lets the rule half be called out even when the box is unticked.
   const reviewSuggestions = async (captured: readonly Suggestion[]) => {
     if (!captured.length || busy || loading || pending) return;
+    const owner = beginPreview();
+    if (!owner) return;
     try {
-    const plans = await prepareSuggestions(captured, createRule);
-    const rules = distinctSuggestionRules(plans);
-    const ruleNotes = rules.map((rule) => {
-      const operation = rule.disposition === "create" ? t("suggestions.rulePreview") : rule.disposition === "already_covered" ? t("suggestions.ruleAlreadyCovered") : t("suggestions.ruleNotApplicable");
-      return `${operation}: .${rule.extension ?? "—"} → ${t(`categories.${rule.destination}`, { defaultValue: rule.destination })}. ${rule.scope}. ${rule.message ?? ""}`;
-    });
-    setPending({
-      title: captured.length === 1 ? t("suggestions.accept") : t("confirm.op.acceptAll"),
-      count: plans.length,
-      notice: "move",
-      note: ruleNotes.length ? [t("suggestions.ruleCount", { count: rules.filter((r) => r.disposition === "create").length }), ...ruleNotes].join("\n") : undefined,
-      preview: plans.map((plan) => `${plan.path} → ${plan.destination}`),
-      onConfirm: () => acceptAll(plans),
-    });
-    } catch { /* The store keeps the concrete preview error visible. */ }
+      const plans = await prepareSuggestions(captured, createRule, owner.signal);
+      if (owner.signal.aborted) return;
+      const rules = distinctSuggestionRules(plans);
+      const ruleNotes = rules.map((rule) => {
+        const operation = rule.disposition === "create" ? t("suggestions.rulePreview") : rule.disposition === "already_covered" ? t("suggestions.ruleAlreadyCovered") : t("suggestions.ruleNotApplicable");
+        return `${operation}: .${rule.extension ?? "—"} → ${t(`categories.${rule.destination}`, { defaultValue: rule.destination })}. ${rule.scope}. ${rule.message ?? ""}`;
+      });
+      setPending({
+        title: captured.length === 1 ? t("suggestions.accept") : t("confirm.op.acceptAll"),
+        count: plans.length,
+        notice: "move",
+        note: ruleNotes.length ? [t("suggestions.ruleCount", { count: rules.filter((r) => r.disposition === "create").length }), ...ruleNotes].join("\n") : undefined,
+        preview: plans.map((plan) => `${plan.path} → ${plan.destination}`),
+        onConfirm: () => acceptAll(plans),
+        onClose: () => { owner.abort(); setPending(null); },
+      });
+    } catch {
+      owner.abort();
+    }
   };
   const handleAcceptAllClick = () => reviewSuggestions(suggestions.map((s) => ({ ...s })));
 
@@ -338,9 +345,7 @@ export default function Suggestions() {
         )}
       </div>
 
-      {pending && (
-        <ConfirmDialog {...pending} onClose={() => { cancelPlans(); setPending(null); }} />
-      )}
+      {pending && <ConfirmDialog {...pending} />}
     </div>
   );
 }

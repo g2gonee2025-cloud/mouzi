@@ -4,14 +4,16 @@ import { useCleanupStore } from "../../store/useCleanupStore";
 import type { CleanupRequest } from "../../utils/cleanup";
 import { Search, Trash2, FolderX } from "lucide-react";
 import ResultsPanel from "./ResultsPanel";
-import ConfirmDialog, { type ConfirmRequest } from "./ConfirmDialog";
+import ConfirmDialog, { type ConfirmDialogProps } from "./ConfirmDialog";
+import { usePreviewOwner } from "./usePreviewOwner";
 
 export default function EmptyDirsTab() {
   const { t } = useTranslation();
   const store = useCleanupStore();
   const [checked, setChecked] = useState<Set<string>>(new Set());
   const [showResults, setShowResults] = useState(false);
-  const [pending, setPending] = useState<ConfirmRequest | null>(null);
+  const [pending, setPending] = useState<ConfirmDialogProps | null>(null);
+  const beginPreview = usePreviewOwner();
 
   const handleFind = () => {
     store.findEmptyDirs();
@@ -44,18 +46,24 @@ export default function EmptyDirsTab() {
       kind: "remove_empty_dir",
       path,
     }));
+    const owner = beginPreview();
+    if (!owner) return;
     try {
-    const plan = await store.prepareCleanup(actions);
-    setPending({
-      title: t("confirm.op.removeEmptyDirs"),
-      count: plan.actions.length,
-      // `remove_empty_dir` is a bare `fs::remove_dir`, not a trash: there is no
-      // byte figure to quote and no Recycle Bin copy to fall back on.
-      notice: "permanent",
-      preview: plan.actions.map((action) => action.path),
-      onConfirm: async () => { await store.executeCleanup(plan.planId); setShowResults(true); },
-    });
-    } catch { /* The store displays the preparation error. */ }
+      const plan = await store.prepareCleanup(actions, owner.signal);
+      if (owner.signal.aborted) return;
+      setPending({
+        title: t("confirm.op.removeEmptyDirs"),
+        count: plan.actions.length,
+        // `remove_empty_dir` is a bare `fs::remove_dir`, not a trash: there is no
+        // byte figure to quote and no Recycle Bin copy to fall back on.
+        notice: "permanent",
+        preview: plan.actions.map((action) => action.path),
+        onConfirm: async () => { await store.executeCleanup(plan.planId); setShowResults(true); },
+        onClose: () => { owner.abort(); setPending(null); },
+      });
+    } catch {
+      owner.abort();
+    }
   };
 
   const handleResultsDone = () => {
@@ -148,9 +156,7 @@ export default function EmptyDirsTab() {
         </>
       )}
 
-      {pending && (
-        <ConfirmDialog {...pending} onClose={() => { store.cancelPlan(); setPending(null); }} />
-      )}
+      {pending && <ConfirmDialog {...pending} />}
     </div>
   );
 }

@@ -33,7 +33,6 @@ export default function Dashboard() {
     scanProgress,
     completedRoots,
     rootCount,
-    isLoading,
     error,
     scanReason,
     scanErrors,
@@ -45,37 +44,36 @@ export default function Dashboard() {
 
   const [category, setCategory] = useState<string | null>(null);
   const [root, setRoot] = useState<string | null>(null);
+  const [scanListenersReady, setScanListenersReady] = useState(false);
+  const [scanListenerError, setScanListenerError] = useState<string | null>(null);
+  const [scanListenerAttempt, setScanListenerAttempt] = useState(0);
 
   useEffect(() => {
     const controller = new AbortController();
-    let unsub: (() => void) | undefined;
-    let cancelled = false;
-    subscribeDashboardEvents(controller.signal).then((u) => {
-      if (cancelled) {
-        u();
-      } else {
-        unsub = u;
+    void subscribeDashboardEvents(controller.signal).then(() => {
+      if (!controller.signal.aborted) {
+        setScanListenersReady(true);
         void refresh();
         void syncScanState();
       }
     }).catch((error) => {
-      if (!cancelled) useDashboardStore.setState({ error: String(error) });
+      if (!controller.signal.aborted) {
+        setScanListenerError(String(error));
+        void refresh();
+      }
     });
-    return () => {
-      cancelled = true;
-      controller.abort();
-      unsub?.();
-    };
-  }, [refresh, syncScanState]);
+    return () => controller.abort();
+  }, [refresh, scanListenerAttempt, syncScanState]);
 
+  const activeRoot = stats?.watchedRoots.some((item) => item.path === root) ? root : null;
   useEffect(() => {
-    if (root && stats && !stats.watchedRoots.some((item) => item.path === root)) setRoot(null);
-  }, [root, stats]);
+    if (root && stats && !activeRoot) setRoot(null);
+  }, [root, stats, activeRoot]);
 
   const handleFocus = useCallback(() => {
-    refresh();
-    syncScanState();
-  }, [refresh, syncScanState]);
+    void refresh();
+    if (scanListenersReady) void syncScanState();
+  }, [refresh, scanListenersReady, syncScanState]);
 
   useEffect(() => {
     window.addEventListener("focus", handleFocus);
@@ -85,8 +83,9 @@ export default function Dashboard() {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== "r" && e.key !== "R") return;
-      const tag = (document.activeElement as HTMLElement | null)?.tagName;
-      if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+      if (e.defaultPrevented || e.isComposing || e.ctrlKey || e.metaKey || e.altKey) return;
+      const active = document.activeElement as HTMLElement | null;
+      if (active?.matches("input, textarea, select") || active?.isContentEditable) return;
       e.preventDefault();
       refresh();
     };
@@ -113,7 +112,7 @@ export default function Dashboard() {
         ? t("dashboard.scanAlready")
         : null;
 
-  const hasData = Boolean(stats && (stats.totalFiles > 0 || stats.watchedRoots.length > 0));
+  const hasRoots = Boolean(stats?.watchedRoots.length);
   const scanFailed = scanStatus === "failed";
 
   return (
@@ -144,7 +143,7 @@ export default function Dashboard() {
           <button
             type="button"
             onClick={startScan}
-            disabled={isScanning}
+            disabled={isScanning || !scanListenersReady || Boolean(stats && !hasRoots)}
             className="rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-on-primary hover:bg-primary-hover disabled:opacity-50 transition-colors inline-flex items-center gap-1.5"
           >
             <RefreshCw size={13} className={isScanning ? "animate-spin" : ""} />
@@ -168,6 +167,22 @@ export default function Dashboard() {
       )}
 
       <div className="flex-1 overflow-auto p-5 space-y-4">
+        {scanListenerError && (
+          <div role="alert" className="rounded-lg border border-red-200 dark:border-red-800 px-4 py-3 text-sm text-red-700 dark:text-red-400">
+            <p>{t("dashboard.scanConnectionFailed")}</p>
+            <p className="mt-1 break-words">{scanListenerError}</p>
+            <button
+              type="button"
+              onClick={() => {
+                setScanListenerError(null);
+                setScanListenerAttempt((attempt) => attempt + 1);
+              }}
+              className="mt-2 rounded-md border border-current px-3 py-1 font-medium"
+            >
+              {t("common.retry")}
+            </button>
+          </div>
+        )}
         {error && (
           <div role="alert" className="rounded-lg bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 px-4 py-3 text-sm text-red-700 dark:text-red-400">
             {error}
@@ -195,7 +210,7 @@ export default function Dashboard() {
           </div>
         )}
 
-        {isLoading && !stats ? (
+        {!stats && !error ? (
           <div className="flex items-center justify-center h-64">
             <div className="animate-pulse text-sm text-text-muted">{t("app.loading")}</div>
           </div>
@@ -205,30 +220,32 @@ export default function Dashboard() {
               {t("common.retry")}
             </button>
           </div>
-        ) : !hasData ? (
+        ) : !hasRoots ? (
           <div className="flex flex-col items-center justify-center h-64 text-center px-6">
             <LayoutDashboard size={32} className="text-text-muted mb-2" />
-            <p className="text-sm text-text-muted mb-4">{t("dashboard.noData")}</p>
-            <div className="flex gap-2">
-              <button
-                type="button"
-                onClick={startScan}
-                disabled={isScanning}
-                className="rounded-md bg-primary px-4 py-1.5 text-sm font-medium text-on-primary hover:bg-primary-hover disabled:opacity-50 transition-colors"
-              >
-                {isScanning ? t("dashboard.scanning") : t("dashboard.scanNow")}
-              </button>
-              <button
-                type="button"
-                onClick={() => navigateHash("settings")}
-                className="rounded-md border border-border px-4 py-1.5 text-sm hover:bg-surface-dark transition-colors"
-              >
-                {t("dashboard.openSettings")}
-              </button>
-            </div>
+            <p className="text-sm text-text-muted mb-4">{t("dashboard.scanNoRoots")}</p>
+            <button
+              type="button"
+              onClick={() => navigateHash("settings")}
+              className="rounded-md bg-primary px-4 py-1.5 text-sm font-medium text-on-primary hover:bg-primary-hover transition-colors"
+            >
+              {t("dashboard.openSettings")}
+            </button>
           </div>
         ) : (
           <>
+            <FileBrowser
+              initialLargest={stats!.largestFiles ?? []}
+              initialRecent={stats!.recentFiles ?? []}
+              category={category}
+              root={activeRoot}
+              rootScope={JSON.stringify(stats!.watchedRoots.map((item) => item.path).sort())}
+              totalFiles={stats!.totalFiles}
+              revision={stats!.revision}
+              onClearCategory={() => setCategory(null)}
+              onClearRoot={() => setRoot(null)}
+            />
+
             <StorageRibbon
               data={stats!.categoryBreakdown}
               totalBytes={stats!.totalBytes}
@@ -280,7 +297,7 @@ export default function Dashboard() {
               <StorageTreemap
                 data={stats!.watchedRoots}
                 totalBytes={stats!.totalBytes}
-                selected={root}
+                selected={activeRoot}
                 onSelect={toggleRoot}
               />
             </div>
@@ -289,14 +306,6 @@ export default function Dashboard() {
               <AgeHistogram data={stats!.ageBuckets ?? []} />
               <ActivityTimeline data={weeklyStats} />
             </div>
-
-            <FileBrowser
-              initialLargest={stats!.largestFiles ?? []}
-              initialRecent={stats!.recentFiles ?? []}
-              category={category}
-              root={root}
-              revision={stats!.revision}
-            />
           </>
         )}
       </div>

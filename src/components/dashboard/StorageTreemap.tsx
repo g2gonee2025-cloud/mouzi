@@ -90,7 +90,7 @@ export default function StorageTreemap({
                     {item.status === "failed" && t("dashboard.rootFailed")}
                     {item.stale && <span className="ml-1">{t("dashboard.rootStale")}</span>}
                     {item.lastScanAt !== null && (
-                      <span className="block">{t("dashboard.rootLastScan", { time: formatTimestamp(item.lastScanAt) })}</span>
+                      <span className="block">{t("dashboard.rootLastScan", { date: formatTimestamp(item.lastScanAt) })}</span>
                     )}
                     {item.error && <span className="block text-red-700 dark:text-red-400 break-words">{item.error}</span>}
                   </div>

@@ -1,7 +1,7 @@
 use chrono::{DateTime, TimeZone, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Result as SqliteResult};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 use once_cell::sync::OnceCell;
@@ -141,12 +141,17 @@ pub struct ScheduleSettings {
 static DB: OnceCell<Arc<Mutex<Connection>>> = OnceCell::new();
 
 pub fn init_db(app_dir: PathBuf) -> SqliteResult<()> {
-    let db_path = app_dir.join("mouzi.db");
-    let conn = Connection::open(db_path)?;
-    initialize_schema(&conn)?;
+    let conn = open_database(&app_dir.join("mouzi.db"))?;
     DB.set(Arc::new(Mutex::new(conn)))
         .map_err(|_| rusqlite::Error::ExecuteReturnedResults)?;
     Ok(())
+}
+
+fn open_database(db_path: &Path) -> SqliteResult<Connection> {
+    let mut conn = Connection::open(db_path)?;
+    initialize_schema(&conn)?;
+    recover_interrupted_inventory_on(&mut conn, "Inventory scan was interrupted when the app closed")?;
+    Ok(conn)
 }
 
 fn initialize_schema(conn: &Connection) -> SqliteResult<()> {
@@ -364,6 +369,19 @@ fn initialize_schema(conn: &Connection) -> SqliteResult<()> {
         CREATE TABLE IF NOT EXISTS scheduler_state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS schedule_occurrences (key TEXT PRIMARY KEY, claimed_at TEXT NOT NULL);
     ")?;
+    let intent_columns: Vec<String> = conn.prepare("PRAGMA table_info(operation_intents)")?
+        .query_map([], |row| row.get(1))?.collect::<SqliteResult<_>>()?;
+    for (name, column_type) in [
+        ("undo_action_log_id", "INTEGER"),
+        ("undo_expected_identity", "TEXT"),
+        ("undo_observed_identity", "TEXT"),
+    ] {
+        if !intent_columns.iter().any(|column| column == name) {
+            conn.execute(&format!("ALTER TABLE operation_intents ADD COLUMN {name} {column_type}"), [])?;
+        }
+    }
+    conn.execute_batch("CREATE UNIQUE INDEX IF NOT EXISTS pending_undo_action_idx
+        ON operation_intents(undo_action_log_id) WHERE action='undo' AND status='pending'")?;
     let inventory_state_cols:Vec<String>=conn.prepare("PRAGMA table_info(inventory_state)")?.query_map([],|r|r.get(1))?.collect::<SqliteResult<_>>()?;
     if !inventory_state_cols.iter().any(|name|name=="mutation_revision") {
         conn.execute("ALTER TABLE inventory_state ADD COLUMN mutation_revision INTEGER NOT NULL DEFAULT 0",[])?;
@@ -443,9 +461,13 @@ fn insert_default_rules_on(conn:&Connection)->SqliteResult<()> {
 }
 
 pub fn initialize_defaults_atomic(downloads:&str,mode:&str)->SqliteResult<()> {
+    let ancestors = configured_inventory_ancestors(downloads, &get_watched_folders()?);
     let mut conn=sqlite_lock()?;let tx=conn.transaction()?;
-    tx.execute("INSERT OR IGNORE INTO watched_folders(path,enabled,mode) VALUES(?1,1,?2)",params![downloads,mode])?;
+    let changed = tx.execute("INSERT OR IGNORE INTO watched_folders(path,enabled,mode) VALUES(?1,1,?2)",params![downloads,mode])?;
     tx.execute("INSERT OR IGNORE INTO inventory_roots(root_path) VALUES(?1)",[downloads])?;
+    if changed > 0 {
+        mark_inventory_ancestors_stale(&tx, &ancestors)?;
+    }
     insert_default_rules_on(&tx)?;
     tx.execute("UPDATE inventory_state SET revision=revision+1,mutation_revision=mutation_revision+1 WHERE id=1",[])?;
     tx.commit()
@@ -549,7 +571,33 @@ pub fn get_watched_folders() -> SqliteResult<Vec<WatchedFolder>> {
     Ok(folders)
 }
 
+fn configured_inventory_ancestors(path: &str, folders: &[WatchedFolder]) -> Vec<String> {
+    let path = Path::new(path);
+    if !path.is_absolute() {
+        return Vec::new();
+    }
+    // The root being removed may already be gone. Check the closest remaining
+    // directory above it against each registered root's physical identity.
+    let Some(parent) = path.ancestors().skip(1).find(|parent| parent.is_dir()) else {
+        return Vec::new();
+    };
+    folders.iter().filter_map(|folder| {
+        crate::safe_fs::directory_contains(parent, Path::new(&folder.path))
+            .unwrap_or(false)
+            .then(|| folder.path.clone())
+    }).collect()
+}
+
+fn mark_inventory_ancestors_stale(conn: &Connection, ancestors: &[String]) -> SqliteResult<()> {
+    let mut update = conn.prepare("UPDATE inventory_roots SET stale=1 WHERE root_path=?1")?;
+    for path in ancestors {
+        update.execute([path])?;
+    }
+    Ok(())
+}
+
 pub fn add_watched_folder(path: &str, mode: &str) -> SqliteResult<i64> {
+    let ancestors = configured_inventory_ancestors(path, &get_watched_folders()?);
     let mut conn=sqlite_lock()?;let tx=conn.transaction()?;
     let changed=tx.execute(
         "INSERT OR IGNORE INTO watched_folders (path, enabled, mode) VALUES (?1, 1, ?2)",
@@ -557,17 +605,25 @@ pub fn add_watched_folder(path: &str, mode: &str) -> SqliteResult<i64> {
     )?;
     // INSERT OR IGNORE leaves last_insert_rowid unchanged on an existing row.
     let id = tx.query_row("SELECT id FROM watched_folders WHERE path=?1", [path], |row| row.get(0))?;
-    if changed>0 {tx.execute("UPDATE inventory_state SET revision=revision+1,mutation_revision=mutation_revision+1 WHERE id=1", [])?;}
+    if changed > 0 {
+        mark_inventory_ancestors_stale(&tx, &ancestors)?;
+        tx.execute("UPDATE inventory_state SET revision=revision+1,mutation_revision=mutation_revision+1 WHERE id=1", [])?;
+    }
     tx.execute("INSERT OR IGNORE INTO inventory_roots(root_path) VALUES(?1)", [path])?;
     tx.commit()?;
     Ok(id)
 }
 
 pub fn remove_watched_folder(id: i64) -> SqliteResult<()> {
+    let folders = get_watched_folders()?;
+    let ancestors = folders.iter().find(|folder| folder.id == Some(id))
+        .map(|folder| configured_inventory_ancestors(&folder.path, &folders))
+        .unwrap_or_default();
     let mut conn = sqlite_lock()?;
     let tx = conn.transaction()?;
     let path: Option<String> = tx.query_row("SELECT path FROM watched_folders WHERE id=?1", [id], |row| row.get(0)).optional()?;
     if let Some(path) = path {
+        mark_inventory_ancestors_stale(&tx, &ancestors)?;
         tx.execute("DELETE FROM hash_cache WHERE path IN (SELECT path FROM file_inventory WHERE root_path=?1)", [&path])?;
         tx.execute("DELETE FROM dismissed_suggestions WHERE path IN (SELECT path FROM file_inventory WHERE root_path=?1)", [&path])?;
         tx.execute("DELETE FROM inventory_fingerprints WHERE path IN (SELECT path FROM file_inventory WHERE root_path=?1)", [&path])?;
@@ -628,7 +684,7 @@ pub fn get_recent_logs(limit: i64) -> SqliteResult<Vec<ActionLog>> {
 pub fn get_undoable_logs() -> SqliteResult<Vec<(i64, String, Option<String>, Option<String>)>> {
     let conn = sqlite_lock()?;
     let mut stmt = conn.prepare(
-        "SELECT id, source_path, destination_path, file_identity FROM action_logs WHERE undone = 0 AND action IN ('move','rename','accept') ORDER BY timestamp DESC"
+        "SELECT id, source_path, destination_path, file_identity FROM action_logs WHERE undone = 0 AND action IN ('move','rename','accept') ORDER BY timestamp DESC, id DESC"
     )?;
     let logs = stmt.query_map([], |row| {
         Ok((
@@ -740,13 +796,51 @@ pub fn get_schedule_last_check() -> SqliteResult<Option<String>> {
     sqlite_lock()?.query_row("SELECT value FROM scheduler_state WHERE key='last_check'", [], |row| row.get(0)).optional()
 }
 
-pub fn set_schedule_last_check(value: &str) -> SqliteResult<()> {
-    sqlite_lock()?.execute("INSERT INTO scheduler_state(key,value) VALUES('last_check',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[value])?;
-    Ok(())
+pub(crate) fn claim_schedule_occurrences(keys: &[&str], checkpoint: &str) -> SqliteResult<usize> {
+    claim_schedule_occurrences_on(&mut *sqlite_lock()?, keys, checkpoint)
 }
 
-pub fn claim_schedule_occurrence(key: &str) -> SqliteResult<bool> {
-    Ok(sqlite_lock()?.execute("INSERT OR IGNORE INTO schedule_occurrences(key,claimed_at) VALUES(?1,?2)", params![key,Utc::now().to_rfc3339()])? == 1)
+fn claim_schedule_occurrences_on(conn: &mut Connection, keys: &[&str], checkpoint: &str) -> SqliteResult<usize> {
+    let tx = conn.transaction()?;
+    let claimed_at = Utc::now().to_rfc3339();
+    let mut count = 0;
+    {
+        // A legacy key includes a configuration segment before date and time.
+        // Honor any old claim for the slot, regardless of that configuration.
+        let mut insert = tx.prepare(
+            "INSERT OR IGNORE INTO schedule_occurrences(key,claimed_at)
+             SELECT ?1,?2 WHERE NOT EXISTS (
+               SELECT 1 FROM schedule_occurrences WHERE key GLOB ('v1|*' || substr(?1,3))
+             )"
+        )?;
+        for key in keys { count += insert.execute(params![key, &claimed_at])?; }
+    }
+    tx.execute("INSERT INTO scheduler_state(key,value) VALUES('last_check',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [checkpoint])?;
+    tx.commit()?;
+    Ok(count)
+}
+
+#[cfg(test)]
+#[test]
+fn scheduler_claims_legacy_slots_once_and_rolls_back_the_whole_checkpoint() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        "CREATE TABLE schedule_occurrences (key TEXT PRIMARY KEY, claimed_at TEXT NOT NULL);
+         CREATE TABLE scheduler_state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+         INSERT INTO schedule_occurrences VALUES('v1|08:00:00,14:00:00|2026-11-06|14:00:00','legacy');"
+    ).unwrap();
+    let today = ["v2|2026-11-06|10:00:00", "v2|2026-11-06|14:00:00"];
+    assert_eq!(claim_schedule_occurrences_on(&mut conn, &today, "first").unwrap(), 1);
+    assert_eq!(claim_schedule_occurrences_on(&mut conn, &today, "second").unwrap(), 0);
+    conn.execute_batch(
+        "CREATE TRIGGER fail_second_claim BEFORE INSERT ON schedule_occurrences
+         WHEN NEW.key='v2|2026-11-07|14:00:00' BEGIN SELECT RAISE(ABORT,'fixture failure'); END;"
+    ).unwrap();
+    let tomorrow = ["v2|2026-11-07|10:00:00", "v2|2026-11-07|14:00:00"];
+    assert!(claim_schedule_occurrences_on(&mut conn, &tomorrow, "third").is_err());
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM schedule_occurrences", [], |row| row.get(0)).unwrap();
+    let checkpoint: String = conn.query_row("SELECT value FROM scheduler_state WHERE key='last_check'", [], |row| row.get(0)).unwrap();
+    assert_eq!((count, checkpoint.as_str()), (2, "second"));
 }
 
 pub fn clear_logs() -> SqliteResult<()> {
@@ -831,8 +925,10 @@ fn inventory_paths_for_spelling(conn:&Connection,path:&str)->SqliteResult<Vec<St
     #[cfg(target_os="windows")]
     {
         let normalized=crate::safe_fs::normalize_lexically(std::path::Path::new(path)).to_string_lossy().replace("\\\\?\\UNC\\","//").replace("\\\\?\\","").replace('\\',"/");
-        let mut stmt=conn.prepare(r"SELECT path FROM file_inventory WHERE REPLACE(REPLACE(REPLACE(path,'\\?\UNC\','//'),'\\?\',''),'\','/')=?1 COLLATE NOCASE")?;
-        let mut paths=stmt.query_map([normalized],|r|r.get::<_,String>(0))?.collect::<SqliteResult<Vec<_>>>()?;
+        // Prefix and separator aliases preserve path component spelling. Case
+        // folding would also match different entries in case-sensitive folders.
+        let mut stmt=conn.prepare(r"SELECT path FROM file_inventory WHERE REPLACE(REPLACE(REPLACE(path,'\\?\UNC\','//'),'\\?\',''),'\','/')=?1 COLLATE BINARY ORDER BY (path=?2) DESC, path")?;
+        let mut paths=stmt.query_map(params![normalized,path],|r|r.get::<_,String>(0))?.collect::<SqliteResult<Vec<_>>>()?;
         if !paths.iter().any(|value|value==path) {paths.push(path.to_string());}
         Ok(paths)
     }
@@ -922,7 +1018,7 @@ pub fn reconcile_move(old:&str,new:&str,category:Option<&str>)->Result<(),String
     reconcile_move_on(&tx,old,&prepared,category).map_err(|e|e.to_string())?;tx.commit().map_err(|e|e.to_string())
 }
 
-fn finalize_moved(id:i64,log:&ActionLog,actual_destination:&str,category:Option<&str>,accepted:bool,expected_identity:&str)->Result<(),String> {
+fn finalize_moved(id:i64,log:&ActionLog,actual_destination:&str,category:Option<&str>,accepted:bool,expected_identity:&str,inventory_source:&str)->Result<(),String> {
     if category.is_some_and(|category|!crate::categories::is_valid_category(category)) {return Err("Invalid canonical category".into());}
     let prepared=prepare_move(actual_destination)?;
     if prepared.identity != expected_identity { return Err("Moved file was replaced before history finalization; recovery intent retained".into()); }
@@ -931,27 +1027,102 @@ fn finalize_moved(id:i64,log:&ActionLog,actual_destination:&str,category:Option<
     if changed!=1 {return Err("Operation journal intent is unavailable".into());}
     tx.execute("INSERT INTO action_logs(timestamp,source_path,destination_path,action,file_name,file_type,undone,file_identity) VALUES(?1,?2,?3,?4,?5,?6,0,?7)",params![log.timestamp.to_rfc3339(),log.source_path,actual_destination,log.action,log.file_name,log.file_type,prepared.identity]).map_err(|e|e.to_string())?;
     let log_id=tx.last_insert_rowid();
-    reconcile_move_on(&tx,&log.source_path,&prepared,category).map_err(|e|e.to_string())?;
+    reconcile_move_on(&tx,inventory_source,&prepared,category).map_err(|e|e.to_string())?;
     if accepted {
         tx.execute("INSERT INTO accepted_suggestion_feedback(action_log_id,file_name,category) VALUES(?1,?2,?3)",params![log_id,log.file_name,category]).map_err(|e|e.to_string())?;
     }
     tx.commit().map_err(|e|e.to_string())
 }
 
-pub fn finalize_move_intent(id:i64,log:&ActionLog,actual_destination:&str,category:Option<&str>,expected_identity:&str)->Result<(),String> {
-    finalize_moved(id,log,actual_destination,category,false,expected_identity)
+pub(crate) fn finalize_move_intent_with_inventory_source(id:i64,log:&ActionLog,actual_destination:&str,category:Option<&str>,expected_identity:&str,inventory_source:&str)->Result<(),String> {
+    finalize_moved(id,log,actual_destination,category,false,expected_identity,inventory_source)
 }
 
 pub fn finalize_suggestion_intent(id:i64,log:&ActionLog,actual_destination:&str,category:&str,expected_identity:&str)->Result<(),String> {
-    finalize_moved(id,log,actual_destination,Some(category),true,expected_identity)
+    finalize_moved(id,log,actual_destination,Some(category),true,expected_identity,&log.source_path)
 }
 
-pub fn finalize_undo_intent(id:i64,action_log_id:i64,old:&str,new:&str)->Result<(),String> {
-    let prepared=prepare_move(new)?;let mut conn=lock_db()?;let tx=conn.transaction().map_err(|e|e.to_string())?;
-    let changed=tx.execute("UPDATE operation_intents SET completed_at=?2,status='completed',actual_destination=?3 WHERE id=?1 AND status='pending'",params![id,Utc::now().to_rfc3339(),new]).map_err(|e|e.to_string())?;
-    if changed!=1 {return Err("Operation journal intent is unavailable".into());}
-    tx.execute("UPDATE action_logs SET undone=1 WHERE id=?1",[action_log_id]).map_err(|e|e.to_string())?;
-    let accepted:bool=tx.query_row("SELECT action='accept' FROM action_logs WHERE id=?1",[action_log_id],|row|row.get(0)).map_err(|e|e.to_string())?;
+pub(crate) struct PendingUndo {
+    pub id: i64,
+    pub action_log_id: Option<i64>,
+    pub source: String,
+    pub requested: Option<String>,
+    pub observed: Option<String>,
+    pub expected_identity: Option<String>,
+    pub observed_identity: Option<String>,
+}
+
+pub(crate) fn pending_undos() -> Result<Vec<PendingUndo>, String> {
+    let conn = lock_db()?;
+    let mut stmt = conn.prepare(
+        "SELECT id, undo_action_log_id, source_path, requested_destination, actual_destination,
+                undo_expected_identity, undo_observed_identity
+         FROM operation_intents WHERE action='undo' AND status='pending' ORDER BY id",
+    ).map_err(|error| error.to_string())?;
+    let rows = stmt.query_map([], |row| Ok(PendingUndo {
+        id: row.get(0)?,
+        action_log_id: row.get(1)?,
+        source: row.get(2)?,
+        requested: row.get(3)?,
+        observed: row.get(4)?,
+        expected_identity: row.get(5)?,
+        observed_identity: row.get(6)?,
+    })).map_err(|error| error.to_string())?;
+    rows.collect::<SqliteResult<_>>().map_err(|error| error.to_string())
+}
+
+pub fn begin_undo_intent(action_log_id: i64, source: &str, destination: &str, expected: &str) -> SqliteResult<i64> {
+    let conn = sqlite_lock()?;
+    let changed = conn.execute(
+        "INSERT INTO operation_intents(created_at,action,source_path,requested_destination,undo_action_log_id,undo_expected_identity)
+         SELECT ?1,'undo',?2,?3,id,file_identity FROM action_logs
+         WHERE id=?4 AND undone=0 AND destination_path=?2 AND source_path=?3 AND file_identity=?5",
+        params![Utc::now().to_rfc3339(), source, destination, action_log_id, expected],
+    )?;
+    if changed != 1 { return Err(rusqlite::Error::QueryReturnedNoRows); }
+    Ok(conn.last_insert_rowid())
+}
+
+pub fn observe_undo_restore(id: i64, actual: &str, identity: &str) -> Result<(), String> {
+    let changed = lock_db()?.execute(
+        "UPDATE operation_intents SET actual_destination=?2,undo_observed_identity=?3
+         WHERE id=?1 AND action='undo' AND status='pending' AND actual_destination IS NULL",
+        params![id, actual, identity],
+    ).map_err(|error| error.to_string())?;
+    if changed != 1 { return Err("Undo recovery record is unavailable".into()); }
+    Ok(())
+}
+
+pub fn finalize_undo_intent(id: i64, action_log_id: i64, old: &str, new: &str, expected: &str) -> Result<(), String> {
+    let path = std::path::Path::new(new);
+    let _ancestors = crate::safe_fs::guard_directory(path.parent().ok_or("Restore path has no parent")?)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)] {
+        use std::os::windows::fs::OpenOptionsExt;
+        // Hold the restored file against write or replacement through commit.
+        options.share_mode(1).custom_flags(0x00200000); // OPEN_REPARSE_POINT
+    }
+    let restored = options.open(path).map_err(|error| error.to_string())?;
+    if crate::safe_fs::identity_from_handle(&restored)?.key() != expected {
+        return Err("Restored file was replaced before history finalization".into());
+    }
+    let prepared = prepare_move(new)?;
+    if prepared.identity != expected {
+        return Err("Restored file was replaced before history finalization".into());
+    }
+    let mut conn = lock_db()?;
+    let tx = conn.transaction().map_err(|error| error.to_string())?;
+    let changed = tx.execute(
+        "UPDATE operation_intents SET completed_at=?2,status='completed'
+         WHERE id=?1 AND status='pending' AND undo_action_log_id=?3 AND source_path=?4
+         AND actual_destination=?5 AND undo_observed_identity=?6",
+        params![id, Utc::now().to_rfc3339(), action_log_id, old, new, expected],
+    ).map_err(|error| error.to_string())?;
+    if changed != 1 { return Err("Undo recovery record is unavailable".into()); }
+    let accepted: bool = tx.query_row("SELECT action='accept' FROM action_logs WHERE id=?1 AND undone=0", [action_log_id], |row| row.get(0))
+        .map_err(|error| error.to_string())?;
+    tx.execute("UPDATE action_logs SET undone=1 WHERE id=?1", [action_log_id]).map_err(|error| error.to_string())?;
     if accepted {
         for path in inventory_paths_for_spelling(&tx,old).map_err(|e|e.to_string())? { tx.execute("DELETE FROM category_overrides WHERE path=?1",[path]).map_err(|e|e.to_string())?; }
     }
@@ -1296,7 +1467,8 @@ fn get_inventory_files_on(
     let q = query.unwrap_or("").trim();
     let sql = format!(
         "SELECT path, size, mtime, category, root_path FROM file_inventory
-         WHERE (?1 = '' OR category = ?1)
+         WHERE root_path IN (SELECT path FROM watched_folders)
+           AND (?1 = '' OR category = ?1)
            AND (?2 = '' OR root_path = ?2)
            AND (?3 = '' OR INSTR(LOWER(path),LOWER(?3)) > 0)
          ORDER BY {order}
@@ -1431,6 +1603,41 @@ pub struct ScanToken { pub root: String, root_id:i64, generation:i64, revision:i
 #[derive(Debug,Clone)]
 pub struct SnapshotInventoryRow { pub row:InventoryRow, pub identity:String, pub mtime_ns:String }
 
+fn recover_interrupted_inventory_on(conn: &mut Connection, error: &str) -> SqliteResult<()> {
+    let tx = conn.transaction()?;
+    let changed = tx.execute(
+        "UPDATE inventory_roots SET status='failed',stale=1,error=?1 WHERE status='scanning'",
+        [error],
+    )?;
+    // Only startup and the unwound, still-exclusive scan worker call this.
+    tx.execute("DELETE FROM inventory_scan_stage", [])?;
+    if changed > 0 {
+        tx.execute("UPDATE inventory_state SET revision=revision+1 WHERE id=1", [])?;
+    }
+    tx.commit()
+}
+
+pub(crate) fn recover_interrupted_inventory(error: &str) -> Result<(), String> {
+    recover_interrupted_inventory_on(&mut *lock_db()?, error).map_err(|error| error.to_string())
+}
+
+fn require_current_inventory_scan(conn: &Connection, token: &ScanToken) -> Result<(), String> {
+    let current: bool = conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM watched_folders w JOIN inventory_roots r ON r.root_path=w.path
+            WHERE w.id=?1 AND w.path=?2 AND w.enabled=1 AND w.mode<>'paused'
+              AND r.generation=?3 AND r.status='scanning'
+         ) AND (SELECT mutation_revision FROM inventory_state WHERE id=1)=?4",
+        params![token.root_id, token.root, token.generation, token.revision],
+        |row| row.get(0),
+    ).map_err(|error| error.to_string())?;
+    if current {
+        Ok(())
+    } else {
+        Err("Inventory changed during scan; previous snapshot retained. Scan again.".into())
+    }
+}
+
 pub fn begin_inventory_scan(root:&str)->Result<ScanToken,String> {
     let mut conn=lock_db()?;
     let tx=conn.transaction().map_err(|e|e.to_string())?;
@@ -1447,6 +1654,7 @@ pub fn begin_inventory_scan(root:&str)->Result<ScanToken,String> {
 pub fn stage_inventory_batch(token:&ScanToken,rows:&[SnapshotInventoryRow])->Result<(),String> {
     let mut conn=lock_db()?;
     let tx=conn.transaction().map_err(|e|e.to_string())?;
+    require_current_inventory_scan(&tx, token)?;
     for item in rows {
         tx.execute("INSERT INTO inventory_scan_stage(root_path,generation,path,size,mtime,category,identity,mtime_ns) VALUES(?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(root_path,generation,path) DO UPDATE SET size=excluded.size,mtime=excluded.mtime,category=excluded.category,identity=excluded.identity,mtime_ns=excluded.mtime_ns",params![token.root,token.generation,item.row.path,item.row.size,item.row.mtime,item.row.category,item.identity,item.mtime_ns]).map_err(|e|e.to_string())?;
     }
@@ -1456,8 +1664,7 @@ pub fn stage_inventory_batch(token:&ScanToken,rows:&[SnapshotInventoryRow])->Res
 pub fn publish_inventory_scan(token:&ScanToken)->Result<(),String> {
     let mut conn=lock_db()?;
     let tx=conn.transaction().map_err(|e|e.to_string())?;
-    let current:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM watched_folders w JOIN inventory_roots r ON r.root_path=w.path WHERE w.id=?1 AND w.path=?2 AND w.enabled=1 AND w.mode<>'paused' AND r.generation=?3) AND (SELECT mutation_revision FROM inventory_state WHERE id=1)=?4",params![token.root_id,token.root,token.generation,token.revision],|r|r.get(0)).map_err(|e|e.to_string())?;
-    if !current {return Err("Inventory changed during scan; previous snapshot retained. Scan again.".into());}
+    require_current_inventory_scan(&tx, token)?;
     let scanned_at=now_epoch();
     tx.execute("DELETE FROM hash_cache WHERE path IN (SELECT path FROM file_inventory WHERE root_path=?1)",[&token.root]).map_err(|e|e.to_string())?;
     tx.execute("DELETE FROM inventory_fingerprints WHERE path IN (SELECT path FROM file_inventory WHERE root_path=?1)",[&token.root]).map_err(|e|e.to_string())?;
@@ -1474,9 +1681,16 @@ pub fn publish_inventory_scan(token:&ScanToken)->Result<(),String> {
 
 pub fn fail_inventory_scan(token:&ScanToken,error:&str)->Result<(),String> {
     let mut conn=lock_db()?;let tx=conn.transaction().map_err(|e|e.to_string())?;
-    tx.execute("UPDATE inventory_roots SET status='failed',stale=1,error=?3 WHERE root_path=?1 AND generation=?2",params![token.root,token.generation,error]).map_err(|e|e.to_string())?;
-    tx.execute("DELETE FROM inventory_scan_stage WHERE root_path=?1 AND generation=?2",params![token.root,token.generation]).map_err(|e|e.to_string())?;
-    tx.execute("UPDATE inventory_state SET revision=revision+1 WHERE id=1",[]).map_err(|e|e.to_string())?;
+    let changed = tx.execute(
+        "UPDATE inventory_roots SET status='failed',stale=1,error=?3
+         WHERE root_path=?1 AND generation=?2 AND status='scanning'
+           AND EXISTS(SELECT 1 FROM watched_folders WHERE id=?4 AND path=?1)",
+        params![token.root, token.generation, error, token.root_id],
+    ).map_err(|e|e.to_string())?;
+    if changed > 0 {
+        tx.execute("DELETE FROM inventory_scan_stage WHERE root_path=?1 AND generation=?2",params![token.root,token.generation]).map_err(|e|e.to_string())?;
+        tx.execute("UPDATE inventory_state SET revision=revision+1 WHERE id=1",[]).map_err(|e|e.to_string())?;
+    }
     tx.commit().map_err(|e|e.to_string())
 }
 
@@ -1889,6 +2103,7 @@ mod tests {
     #[test]
     fn inventory_files_filter_sort_and_query() {
         let mut conn = mem_conn_with_inventory();
+        conn.execute("INSERT INTO watched_folders(path) VALUES('/docs'),('/pics')", []).unwrap();
         let rows = vec![
             InventoryRow { path: "/docs/a.pdf".into(), size: 30, mtime: 3, category: "Documents".into() },
             InventoryRow { path: "/docs/b.pdf".into(), size: 10, mtime: 9, category: "Documents".into() },
@@ -1939,10 +2154,79 @@ mod tests {
     #[test]
     fn literal_search_keeps_percent_underscore_and_windows_separator() {
         let mut conn=mem_conn_with_inventory();
+        conn.execute("INSERT INTO watched_folders(path,mode) VALUES('root','paused')", []).unwrap();
         let paths=[r"C:\docs\100%_ready.txt",r"C:\docs\100Xready.txt",r"C:\other\100%_ready.txt"];
         let rows:Vec<_>=paths.iter().map(|path|InventoryRow{path:path.to_string(),size:1,mtime:1,category:"Other".into()}).collect();
         replace_inventory_on(&mut conn,"root",&rows).unwrap();
-        let result=get_inventory_files_on(&conn,"size",None,None,Some(r"\docs\100%_"),10).unwrap();assert_eq!(result.len(),1);assert_eq!(result[0].path,paths[0]);
+        let orphan = InventoryRow {
+            path: r"D:\docs\100%_ready.txt".into(),
+            size: 100,
+            mtime: 1,
+            category: "Other".into(),
+        };
+        replace_inventory_on(&mut conn, "removed-root", &[orphan]).unwrap();
+        let result = get_inventory_files_on(&conn, "size", Some("Other"), None, Some(r"\docs\100%_"), 1).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].path, paths[0]);
+        assert!(get_inventory_files_on(&conn, "size", None, Some("removed-root"), None, 10).unwrap().is_empty());
+        assert_eq!(get_inventory_stats_on(&conn).unwrap().total_files, 4);
+    }
+
+    #[test]
+    fn database_reopen_discards_abandoned_staging_but_keeps_published_rows() {
+        struct TemporaryDatabase(PathBuf);
+        impl Drop for TemporaryDatabase {
+            fn drop(&mut self) { let _ = std::fs::remove_file(&self.0); }
+        }
+        let path = TemporaryDatabase(std::env::temp_dir().join(format!(
+            "mouzi-interrupted-{}-{}.db",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap(),
+        )));
+        {
+            let conn = open_database(&path.0).unwrap();
+            conn.execute_batch("
+                INSERT INTO watched_folders(path) VALUES('/work'),('/finished');
+                INSERT INTO inventory_roots(root_path,generation,status,stale,last_scan_at)
+                    VALUES('/work',7,'scanning',1,100),('/finished',2,'complete',0,200);
+                INSERT INTO file_inventory(root_path,path) VALUES('/work','/work/previous.txt');
+                INSERT INTO inventory_scan_stage(root_path,generation,path,size,mtime,category,identity,mtime_ns)
+                    VALUES('/work',7,'/work/staged.txt',5,1,'Other','staged-identity','1');
+            ").unwrap();
+        }
+        let conn = open_database(&path.0).unwrap();
+        let state: (i64, String, bool, i64, String) = conn.query_row(
+            "SELECT generation,status,stale,last_scan_at,error FROM inventory_roots WHERE root_path='/work'",
+            [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        ).unwrap();
+        assert_eq!((state.0, state.1.as_str(), state.2, state.3), (7, "failed", true, 100));
+        assert!(state.4.contains("interrupted"));
+        assert_eq!(conn.query_row::<i64, _, _>("SELECT COUNT(*) FROM inventory_scan_stage", [], |row| row.get(0)).unwrap(), 0);
+        assert_eq!(conn.query_row::<String, _, _>("SELECT status FROM inventory_roots WHERE root_path='/finished'", [], |row| row.get(0)).unwrap(), "complete");
+        let rows = get_inventory_files_on(&conn, "size", None, Some("/work"), None, 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].path, "/work/previous.txt");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn inventory_removal_keeps_case_distinct_sibling_and_its_metadata() {
+        let conn = mem_conn_with_inventory();
+        let removed = r"\\?\C:\docs\A.txt";
+        let sibling = r"\\?\C:\docs\a.txt";
+        for (path, identity) in [(removed, "removed"), (sibling, "sibling")] {
+            conn.execute("INSERT INTO file_inventory(root_path,path) VALUES('root',?1)", [path]).unwrap();
+            conn.execute("INSERT INTO inventory_fingerprints(path,identity,size,mtime_ns) VALUES(?1,?2,1,'1')", params![path, identity]).unwrap();
+            conn.execute("INSERT INTO category_overrides(path,identity,size,mtime_ns,category) VALUES(?1,?2,1,'1','Code')", params![path, identity]).unwrap();
+            conn.execute("INSERT INTO dismissed_suggestions(path,identity,size,mtime_ns) VALUES(?1,?2,1,'1')", params![path, identity]).unwrap();
+            conn.execute("INSERT INTO hash_cache(path,size,mtime,hash) VALUES(?1,1,1,'hash')", [path]).unwrap();
+        }
+        remove_inventory_path_on(&conn, r"C:/docs/A.txt").unwrap();
+        for table in ["file_inventory", "inventory_fingerprints", "category_overrides", "dismissed_suggestions", "hash_cache"] {
+            let path: String = conn.query_row(&format!("SELECT path FROM {table}"), [], |row| row.get(0)).unwrap();
+            assert_eq!(path, sibling, "{table}");
+            assert_eq!(conn.query_row::<i64, _, _>(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0)).unwrap(), 1);
+        }
     }
 
     #[test]

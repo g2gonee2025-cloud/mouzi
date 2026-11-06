@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { createInventoryBrowserLoader } from "../utils/dashboard";
+import { createInventoryBrowserLoader, INVENTORY_MATCH_LIMIT } from "../utils/dashboard";
 import type { InventoryFile } from "../store/useDashboardStore";
 
 function deferred<T>() {
@@ -10,56 +10,109 @@ function deferred<T>() {
 }
 
 const file = (path: string): InventoryFile => ({ path, size: 1, mtime: 1, category: "Other", rootPath: "C:/work" });
-const request = { sort: "size" as const, category: null, root: null, query: "old", initialLargest: [file("initial")], initialRecent: [] };
+const request = {
+  sort: "size" as const, category: null, root: null, rootScope: "C:/work",
+  query: "old", initialLargest: [file("initial")], initialRecent: [],
+};
 
 describe("inventory browser response ordering", () => {
   it("ignores older filter results and their loading completion", async () => {
     const old = deferred<InventoryFile[]>();
     const latest = deferred<InventoryFile[]>();
-    const updates = { rows: vi.fn(), loading: vi.fn(), error: vi.fn() };
+    const update = vi.fn();
     const fetchRows = vi.fn().mockReturnValueOnce(old.promise).mockReturnValueOnce(latest.promise);
-    const loader = createInventoryBrowserLoader(fetchRows, updates);
+    const loader = createInventoryBrowserLoader(fetchRows, update);
     const first = loader.load(request);
     const second = loader.load({ ...request, query: "new" });
     old.resolve([file("old")]);
     await first;
-    expect(updates.rows).not.toHaveBeenCalled();
-    expect(updates.loading).not.toHaveBeenCalledWith(false);
+    expect(update).toHaveBeenCalledTimes(2);
+    expect(update).toHaveBeenLastCalledWith(expect.objectContaining({ rows: [], loading: true }));
     latest.resolve([file("new")]);
     await second;
-    expect(updates.rows).toHaveBeenCalledExactlyOnceWith([file("new")]);
-    expect(updates.loading).toHaveBeenLastCalledWith(false);
+    expect(update).toHaveBeenLastCalledWith(expect.objectContaining({ rows: [file("new")], loading: false }));
   });
 
   it("restores initial data immediately when filters clear and ignores the old request", async () => {
     const old = deferred<InventoryFile[]>();
-    const updates = { rows: vi.fn(), loading: vi.fn(), error: vi.fn() };
-    const loader = createInventoryBrowserLoader(() => old.promise, updates);
+    const update = vi.fn();
+    const loader = createInventoryBrowserLoader(() => old.promise, update);
     const first = loader.load(request);
     await loader.load({ ...request, query: "" });
     old.resolve([file("old")]);
     await first;
-    expect(updates.rows).toHaveBeenCalledExactlyOnceWith(request.initialLargest);
+    expect(update).toHaveBeenCalledTimes(2);
+    expect(update).toHaveBeenLastCalledWith(expect.objectContaining({ rows: request.initialLargest, loading: false }));
   });
 
   it("ignores delayed errors after filter change or unmount", async () => {
     const old = deferred<InventoryFile[]>();
-    const updates = { rows: vi.fn(), loading: vi.fn(), error: vi.fn() };
-    const loader = createInventoryBrowserLoader(() => old.promise, updates);
+    const update = vi.fn();
+    const loader = createInventoryBrowserLoader(() => old.promise, update);
     const first = loader.load(request);
-    updates.error.mockClear();
+    update.mockClear();
     loader.cancel();
     old.reject(new Error("old failure"));
     await first;
-    expect(updates.error).not.toHaveBeenCalled();
-    expect(updates.loading).not.toHaveBeenCalledWith(false);
+    expect(update).not.toHaveBeenCalled();
   });
 
   it("reports the current request failure rather than presenting it as an empty success", async () => {
-    const updates = { rows: vi.fn(), loading: vi.fn(), error: vi.fn() };
-    const loader = createInventoryBrowserLoader(async () => { throw new Error("database unavailable"); }, updates);
+    const update = vi.fn();
+    const loader = createInventoryBrowserLoader(async () => { throw new Error("database unavailable"); }, update);
     await loader.load(request);
-    expect(updates.error).toHaveBeenLastCalledWith("Error: database unavailable");
-    expect(updates.loading).toHaveBeenLastCalledWith(false);
+    expect(update).toHaveBeenLastCalledWith(expect.objectContaining({
+      rows: [], error: "Error: database unavailable", loading: false,
+    }));
+  });
+
+  it("keeps rows during a same-scope refresh and discards them when watched roots change", async () => {
+    const refresh = deferred<InventoryFile[]>();
+    const newScope = deferred<InventoryFile[]>();
+    const update = vi.fn();
+    const fetchRows = vi.fn()
+      .mockResolvedValueOnce([file("retained")])
+      .mockReturnValueOnce(refresh.promise)
+      .mockReturnValueOnce(newScope.promise);
+    const loader = createInventoryBrowserLoader(fetchRows, update);
+    await loader.load(request);
+    const refreshing = loader.load(request);
+    expect(update).toHaveBeenLastCalledWith(expect.objectContaining({ rows: [file("retained")], loading: true }));
+    const changed = loader.load({ ...request, rootScope: "D:/work" });
+    expect(update).toHaveBeenLastCalledWith(expect.objectContaining({ rows: [], loading: true }));
+    refresh.resolve([file("obsolete")]);
+    await refreshing;
+    expect(update).toHaveBeenLastCalledWith(expect.objectContaining({ rows: [], loading: true }));
+    newScope.resolve([file("new")]);
+    await changed;
+    expect(update).toHaveBeenLastCalledWith(expect.objectContaining({ rows: [file("new")], loading: false }));
+  });
+
+  it("cancels a pending debounce and fetches only the final query", async () => {
+    vi.useFakeTimers();
+    try {
+      const fetchRows = vi.fn().mockResolvedValue([]);
+      const loader = createInventoryBrowserLoader(fetchRows, vi.fn());
+      loader.load(request, 200);
+      loader.load({ ...request, query: "new" }, 200);
+      await vi.advanceTimersByTimeAsync(199);
+      expect(fetchRows).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(fetchRows).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ query: "new" }));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([INVENTORY_MATCH_LIMIT, INVENTORY_MATCH_LIMIT + 1])("shows at most 80 out of %i matches", async (count) => {
+    const rows = Array.from({ length: count }, (_, i) => file(String(i)));
+    const update = vi.fn();
+    const fetchRows = vi.fn().mockResolvedValue(rows);
+    const loader = createInventoryBrowserLoader(fetchRows, update);
+    await loader.load(request);
+    expect(fetchRows).toHaveBeenCalledWith(expect.objectContaining({ limit: INVENTORY_MATCH_LIMIT + 1 }));
+    expect(update).toHaveBeenLastCalledWith(expect.objectContaining({
+      rows: rows.slice(0, INVENTORY_MATCH_LIMIT), limited: count > INVENTORY_MATCH_LIMIT, loading: false,
+    }));
   });
 });

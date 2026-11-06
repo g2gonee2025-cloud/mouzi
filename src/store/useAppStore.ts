@@ -86,6 +86,8 @@ export interface UndoAllResult {
   results: UndoResult[];
 }
 
+type ActionRefreshErrors = Record<'history' | 'historyCounts' | 'stats', string | null>;
+
 interface AppState {
   rules: Rule[];
   folders: WatchedFolder[];
@@ -96,6 +98,7 @@ interface AppState {
   schedule: ScheduleSettings | null;
   pendingFiles: [string, string][];
   isLoading: boolean;
+  actionRefreshErrors: ActionRefreshErrors;
 
   loadSettings: () => Promise<void>;
   applySettings: (settings: AppSettings) => void;
@@ -103,9 +106,10 @@ interface AppState {
   setAutostart: (enabled: boolean) => Promise<void>;
   loadRules: () => Promise<void>;
   loadFolders: () => Promise<void>;
-  loadLogs: () => Promise<void>;
-  loadHistoryCounts: () => Promise<HistoryCounts>;
-  loadStats: () => Promise<void>;
+  loadLogs: (reportActionWarning?: boolean) => Promise<void>;
+  loadHistoryCounts: (reportActionWarning?: boolean) => Promise<HistoryCounts>;
+  loadStats: (reportActionWarning?: boolean) => Promise<void>;
+  refreshActionViews: () => Promise<void>;
   cleanNow: () => Promise<{ file: string; rule: string; destination: string }[]>;
   undoAction: (id: number) => Promise<UndoResult>;
   undoAll: () => Promise<UndoAllResult>;
@@ -139,6 +143,13 @@ let logsRequest = 0;
 let countsRequest = 0;
 let statsRequest = 0;
 let pendingRequest = 0;
+const noActionRefreshErrors: ActionRefreshErrors = { history: null, historyCounts: null, stats: null };
+
+function withActionRefreshError(state: AppState, key: keyof ActionRefreshErrors, value: string | null) {
+  return state.actionRefreshErrors[key] === value
+    ? state.actionRefreshErrors
+    : { ...state.actionRefreshErrors, [key]: value };
+}
 
 export const useAppStore = create<AppState>((set, get) => ({
   rules: [],
@@ -150,6 +161,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   schedule: null,
   pendingFiles: [],
   isLoading: false,
+  actionRefreshErrors: noActionRefreshErrors,
 
   loadSettings: async () => {
     const settings = await invoke<AppSettings>('get_settings_cmd');
@@ -202,32 +214,64 @@ export const useAppStore = create<AppState>((set, get) => ({
     if (request === foldersRequest) set({ folders });
   },
 
-  loadLogs: async () => {
+  loadLogs: async (reportActionWarning = false) => {
     const request = ++logsRequest;
-    const logs = await invoke<ActionLog[]>('get_logs_cmd', { limit: 50 });
-    if (request === logsRequest) set({ logs });
-    await get().loadHistoryCounts();
+    try {
+      const logs = await invoke<ActionLog[]>('get_logs_cmd', { limit: 50 });
+      if (request !== logsRequest) return;
+      set((state) => ({ logs, actionRefreshErrors: withActionRefreshError(state, 'history', null) }));
+    } catch (error) {
+      if (reportActionWarning && request === logsRequest) {
+        set((state) => ({ actionRefreshErrors: withActionRefreshError(state, 'history', String(error)) }));
+      }
+      throw error;
+    }
+    await get().loadHistoryCounts(reportActionWarning);
   },
 
-  loadHistoryCounts: async () => {
+  loadHistoryCounts: async (reportActionWarning = false) => {
     const request = ++countsRequest;
-    const historyCounts = await invoke<HistoryCounts>('get_history_counts_cmd');
-    if (request === countsRequest) set({ historyCounts });
-    return historyCounts;
+    try {
+      const historyCounts = await invoke<HistoryCounts>('get_history_counts_cmd');
+      if (request === countsRequest) {
+        set((state) => ({ historyCounts, actionRefreshErrors: withActionRefreshError(state, 'historyCounts', null) }));
+      }
+      return historyCounts;
+    } catch (error) {
+      if (reportActionWarning && request === countsRequest) {
+        set((state) => ({ actionRefreshErrors: withActionRefreshError(state, 'historyCounts', String(error)) }));
+      }
+      throw error;
+    }
   },
 
-  loadStats: async () => {
+  loadStats: async (reportActionWarning = false) => {
     const request = ++statsRequest;
-    const raw = await invoke<[string, number][]>('get_stats_cmd');
-    if (request === statsRequest) set({ stats: raw.map(([file_type, count]) => ({ file_type, count })) });
+    try {
+      const raw = await invoke<[string, number][]>('get_stats_cmd');
+      if (request === statsRequest) {
+        set((state) => ({
+          stats: raw.map(([file_type, count]) => ({ file_type, count })),
+          actionRefreshErrors: withActionRefreshError(state, 'stats', null),
+        }));
+      }
+    } catch (error) {
+      if (reportActionWarning && request === statsRequest) {
+        set((state) => ({ actionRefreshErrors: withActionRefreshError(state, 'stats', String(error)) }));
+      }
+      throw error;
+    }
+  },
+
+  refreshActionViews: async () => {
+    await Promise.allSettled([get().loadLogs(true), get().loadStats(true)]);
   },
 
   cleanNow: async () => {
     set({ isLoading: true });
     try {
       const results = await invoke<[string, string, string][]>('clean_now_cmd');
-      await get().loadLogs();
-      await get().loadStats();
+      await get().refreshActionViews();
       return results.map(([file, rule, destination]) => ({ file, rule, destination }));
     } finally {
       set({ isLoading: false });
@@ -236,16 +280,14 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   undoAction: async (id) => {
     const result = await invoke<UndoResult>('undo_action_cmd', { id });
-    await get().loadLogs();
-    await get().loadStats();
+    await get().refreshActionViews();
     return result;
   },
 
   undoAll: async () => {
     const result = await invoke<UndoAllResult>('undo_all_cmd');
     if (result.count > 0) {
-      await get().loadLogs();
-      await get().loadStats();
+      await get().refreshActionViews();
     }
     return result;
   },
@@ -300,7 +342,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     ++logsRequest;
     ++countsRequest;
     ++statsRequest;
-    set({ logs: [], stats: [], historyCounts: { total: 0, undoable: 0 } });
+    set({ logs: [], stats: [], historyCounts: { total: 0, undoable: 0 }, actionRefreshErrors: noActionRefreshErrors });
   },
 
   getPendingFiles: async () => {

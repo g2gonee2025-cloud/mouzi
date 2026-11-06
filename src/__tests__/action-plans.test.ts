@@ -47,6 +47,43 @@ it("discards a late finder and refuses a preview invalidated during preparation"
   expect(useCleanupStore.getState().preparedPlan).toBeNull();
 });
 
+it("releases an abandoned cleanup review without letting its response replace a newer review", async () => {
+  const abandoned = deferred<CleanupPlan>();
+  const next = deferred<CleanupPlan>();
+  ipc.invoke.mockReturnValueOnce(abandoned.promise).mockReturnValueOnce(next.promise);
+  const firstOwner = new AbortController();
+  const first = useCleanupStore.getState().prepareCleanup(cleanupPlan.actions, firstOwner.signal);
+  const rejection = expect(first).rejects.toMatchObject({ name: "AbortError" });
+  firstOwner.abort();
+  expect(useCleanupStore.getState()).toMatchObject({ busy: false, preparedPlan: null });
+
+  const nextOwner = new AbortController();
+  const second = useCleanupStore.getState().prepareCleanup(cleanupPlan.actions, nextOwner.signal);
+  abandoned.resolve(cleanupPlan);
+  await rejection;
+  expect(useCleanupStore.getState()).toMatchObject({ busy: true, preparedPlan: null, error: null });
+  const nextPlan = { ...cleanupPlan, planId: "cleanup:next" };
+  next.resolve(nextPlan);
+  await second;
+  expect(useCleanupStore.getState().preparedPlan).toBe(nextPlan);
+
+  nextOwner.abort();
+  expect(useCleanupStore.getState()).toMatchObject({ busy: false, preparedPlan: null });
+});
+
+it("retains confirmed cleanup results after the preview owner leaves", async () => {
+  const executing = deferred<{ path: string; status: "ok" }[]>();
+  const owner = new AbortController();
+  ipc.invoke.mockResolvedValueOnce(cleanupPlan).mockReturnValueOnce(executing.promise).mockResolvedValueOnce([]);
+  const reviewed = await useCleanupStore.getState().prepareCleanup(cleanupPlan.actions, owner.signal);
+  const execution = useCleanupStore.getState().executeCleanup(reviewed.planId);
+  owner.abort();
+  expect(useCleanupStore.getState()).toMatchObject({ busy: true, preparedPlan: null });
+  executing.resolve([{ path: "a", status: "ok" }]);
+  await execution;
+  expect(useCleanupStore.getState().results).toEqual([{ path: "a", status: "ok" }]);
+});
+
 it("executes frozen suggestion plans even if a later list is substituted", async () => {
   const selected = [suggestion("a"), suggestion("b")];
   useSuggestionsStore.setState({ suggestions: selected });
@@ -63,6 +100,31 @@ it("executes frozen suggestion plans even if a later list is substituted", async
   expect(ipc.invoke).not.toHaveBeenCalledWith("accept_suggestion_cmd", { planId: "plan:new-file" });
   expect(useSuggestionsStore.getState().suggestions[0].path).toBe("new-file");
   expect(useSuggestionsStore.getState().results).toHaveLength(2);
+});
+
+it("stops preparing an abandoned suggestion batch and preserves a later confirmed batch", async () => {
+  const abandoned = deferred<SuggestionPlan>();
+  ipc.invoke.mockReturnValueOnce(abandoned.promise).mockResolvedValueOnce(plan("next"));
+  const firstOwner = new AbortController();
+  const first = useSuggestionsStore.getState().prepareSuggestions([suggestion("a"), suggestion("b")], false, firstOwner.signal);
+  const rejection = expect(first).rejects.toMatchObject({ name: "AbortError" });
+  firstOwner.abort();
+  const nextOwner = new AbortController();
+  const reviewed = await useSuggestionsStore.getState().prepareSuggestions([suggestion("next")], false, nextOwner.signal);
+
+  abandoned.resolve(plan("a"));
+  await rejection;
+  expect(ipc.invoke).toHaveBeenCalledTimes(2);
+  expect(useSuggestionsStore.getState()).toMatchObject({ busy: false, preparedPlans: reviewed, error: null });
+
+  const executing = deferred<{ path: string; status: "ok"; dest: string; message: null }>();
+  ipc.invoke.mockReturnValueOnce(executing.promise);
+  const execution = useSuggestionsStore.getState().acceptAll(reviewed);
+  nextOwner.abort();
+  expect(useSuggestionsStore.getState()).toMatchObject({ busy: true, preparedPlans: null });
+  executing.resolve({ path: "next", status: "ok", dest: "root/Documents/next", message: null });
+  await execution;
+  expect(useSuggestionsStore.getState().results?.[0]).toMatchObject({ path: "next", status: "ok" });
 });
 
 it("preserves failed cards for retry and reports a moved file with partial finalization", async () => {

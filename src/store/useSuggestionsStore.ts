@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
+import { createPreviewSlot } from "./previewRequest";
 
 export interface Suggestion {
   path: string;
@@ -47,8 +48,7 @@ interface SuggestionsState {
   preparedPlans: readonly SuggestionPlan[] | null;
   results: AcceptOutcome[] | null;
   loadSuggestions: () => Promise<void>;
-  prepareSuggestions: (suggestions: readonly Suggestion[], createRule: boolean) => Promise<readonly SuggestionPlan[]>;
-  cancelPlans: () => void;
+  prepareSuggestions: (suggestions: readonly Suggestion[], createRule: boolean, owner?: AbortSignal) => Promise<readonly SuggestionPlan[]>;
   acceptAll: (plans: readonly SuggestionPlan[]) => Promise<void>;
   dismissSuggestion: (path: string) => Promise<void>;
   dismissAll: () => Promise<void>;
@@ -58,6 +58,7 @@ interface SuggestionsState {
 }
 
 let loadGeneration = 0;
+const preview = createPreviewSlot();
 export const useSuggestionsStore = create<SuggestionsState>((set, get) => ({
   suggestions: [], loading: false, busy: false, error: null,
   createRuleDefault: false, preparedPlans: null, results: null,
@@ -72,8 +73,9 @@ export const useSuggestionsStore = create<SuggestionsState>((set, get) => ({
       if (generation === loadGeneration) set({ error: String(error), loading: false });
     }
   },
-  prepareSuggestions: async (suggestions, createRule) => {
+  prepareSuggestions: async (suggestions, createRule, owner) => {
     if (!suggestions.length || get().busy || get().preparedPlans) throw new Error("Another suggestion is being reviewed or processed");
+    const isCurrent = preview.begin(owner, () => set({ busy: false, preparedPlans: null }));
     ++loadGeneration;
     const captured = suggestions.map((s) => ({ ...s }));
     set({ busy: true, loading: false, error: null });
@@ -81,6 +83,7 @@ export const useSuggestionsStore = create<SuggestionsState>((set, get) => ({
       const plans: SuggestionPlan[] = [];
       for (const s of captured) {
         const plan = await invoke<SuggestionPlan>("prepare_suggestion_cmd", { path: s.path, suggestedCategory: s.suggestedCategory, createRule });
+        owner?.throwIfAborted();
         plans.push(Object.freeze({ ...plan, rule: plan.rule ? Object.freeze({ ...plan.rule }) : null }));
       }
       const plannedExtensions = new Map<string, string>();
@@ -91,16 +94,19 @@ export const useSuggestionsStore = create<SuggestionsState>((set, get) => ({
         plannedExtensions.set(rule.extension, rule.destination);
       }
       const frozen = Object.freeze(plans);
-      set({ preparedPlans: frozen });
+      set({ preparedPlans: frozen, busy: false });
       return frozen;
     } catch (error) {
-      set({ error: String(error) });
+      if (isCurrent()) {
+        preview.clear();
+        set({ error: String(error), busy: false });
+      }
       throw error;
-    } finally { set({ busy: false }); }
+    }
   },
-  cancelPlans: () => set({ preparedPlans: null }),
   acceptAll: async (plans) => {
     if (get().busy || get().preparedPlans !== plans) throw new Error("Suggestion preview changed; review again");
+    preview.clear();
     ++loadGeneration;
     set({ busy: true, loading: false, preparedPlans: null, error: null });
     const errors: string[] = [];

@@ -60,15 +60,15 @@ New imports live under the application's data directory in `archive-imports/`, w
 
 SQLite stores an operation intent before app-managed file mutations and finalizes history/inventory afterward. Persistence failures are surfaced with actual filesystem outcomes and pending recovery evidence. The journal is recovery evidence, not automatic crash rollback or a finished recovery UI.
 
-Move history supports single Undo and Undo All, including accepted suggestions. Original names occupied by other files are preserved with a suffix. New move records save physical identity so Undo can reject a replacement at the destination. Legacy records retain their old behavior because they lack that identity. Missing historical files are reported as missing; the interface counts actual restored files separately. Cleanup trash is restored through Windows, not through organizer Undo.
+Move history supports single Undo and Undo All, including accepted suggestions. If the original name is occupied, Undo restores the file with a suffix. Move records with a saved file identity let Undo verify the file at the recorded destination. Older records without that identity remain visible and require manual restoration when a file is present. An interrupted Undo keeps a recovery record and asks you to inspect the recorded paths before restoring manually. The interface counts restored files and missing files separately. Restore cleanup trash from the Windows Recycle Bin.
 
 ## Scheduling and settings
 
-Settings writes patch only the changed preferences. Schedule writes update only schedule fields; committed revisions keep retained windows synchronized. Scheduled times are validated and persisted. The scheduler checks the elapsed interval, catches up missed occurrences, and claims each local-date/time occurrence before work so a restart cannot repeat it. Duplicate local times are rejected. A failed claimed occurrence is not automatically retried; use Clean Now or the next occurrence.
+Settings writes patch only the changed preferences. Schedule writes update only schedule fields; committed revisions keep retained windows synchronized. Scheduled cleaning coalesces due slots from the current local date and the preceding six dates into one scan of current files. It claims each local date and time once and saves the check time in the same transaction before scanning. Saving the schedule stops a previous batch from starting more moves. Failed or interrupted claims are not retried automatically. If the clock moves backward, the scheduler revisits today's due slots and keeps existing claims.
 
 ## Build and verification
 
-Install Node.js **22.12 or newer**, Rust **1.98.0**, Visual Studio C++ Build Tools/Windows SDK and WebView2. Compiler selection is recorded in `rust-toolchain.toml`; npm and Cargo lockfiles are committed.
+Install Node.js **22.12 through 22.x, or 24.0 and newer**, Rust **1.98.0**, Visual Studio C++ Build Tools with the Windows SDK, and WebView2. `rust-toolchain.toml` pins the Rust compiler. The npm and Cargo lockfiles are committed.
 
 ```powershell
 npm ci
@@ -80,7 +80,7 @@ Pop-Location
 npm run tauri build -- --no-bundle --ci -- --locked --jobs 2
 ```
 
-The final command produces an unsigned executable without installers or publishing it. Tauri performs the frontend build itself; CI does not duplicate that build. CI covers `main`, `wip/**`, pull requests and manual dispatch, and runs both test suites.
+The final command produces an unsigned executable at `src-tauri/target/release/mouzi.exe`. Tauri builds the frontend as part of this command. CI runs both test suites on `main`, `wip/**`, pull requests and manual dispatch. Its log records the checked-out commit, runner and toolchain versions, and the executable's size and SHA-256 digest.
 
 The real Recycle Bin integration test is ignored by default. Run it only on disposable fixtures through the explicit manual CI input or an explicitly chosen local test. Passing ordinary tests does not establish Shell recycling, real cross-volume movement, desktop event timing or installer upgrade behavior.
 

@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useAppStore } from "../store/useAppStore";
+import ActionRefreshWarnings from "./ActionRefreshWarnings";
 import {
   FolderOpen,
   Sparkles,
@@ -123,12 +124,12 @@ export default function Popup() {
     const allResults = await cleanNow();
     setScanResults(allResults);
     setCleanCompleted(true);
-    await getPendingFiles();
+    void getPendingFiles();
     if (allResults.length > 0) {
-      await invoke("show_notification", {
+      void invoke("show_notification", {
         title: t("app.name"),
         body: t("notifications.cleaned", { count: allResults.length }),
-      });
+      }).catch((error) => console.warn("Clean Now notification failed:", error));
     }
   };
 
@@ -368,6 +369,8 @@ export default function Popup() {
           </div>
         </div>
       )}
+
+      <div className="px-3"><ActionRefreshWarnings /></div>
 
       {pending && (
         <ConfirmDialog {...pending} onClose={() => setPending(null)} />

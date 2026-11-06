@@ -35,6 +35,14 @@ mod windows_fs {
     }
     #[repr(C)]
     struct RenameInfo { replace: u8, root: *mut c_void, length: u32, name: [u16; 1] }
+    #[repr(C)]
+    struct StreamInfo {
+        next_entry_offset: u32,
+        name_length: u32,
+        stream_size: i64,
+        allocation_size: i64,
+        name: [u16; 500],
+    }
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn GetFileInformationByHandleEx(handle: *mut c_void, class: i32, info: *mut c_void, size: u32) -> i32;
@@ -64,6 +72,41 @@ mod windows_fs {
         let mut info: ByHandleInfo = unsafe { std::mem::zeroed() };
         if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 { return Err(io::Error::last_os_error()); }
         Ok(info.links as u64)
+    }
+
+    pub(super) fn require_unnamed_stream(file: &File) -> Result<(), String> {
+        const FILE_STREAM_INFO: i32 = 7;
+        const UNNAMED_DATA: &str = "::$DATA";
+        let mut info = StreamInfo {
+            next_entry_offset: 0,
+            name_length: u32::MAX,
+            stream_size: 0,
+            allocation_size: 0,
+            name: [0; 500],
+        };
+        // Only a complete listing with one unnamed stream is safe to copy.
+        // An unsupported query or a listing that does not fit also fails closed.
+        let ok = unsafe {
+            GetFileInformationByHandleEx(
+                file.as_raw_handle(),
+                FILE_STREAM_INFO,
+                (&mut info as *mut StreamInfo).cast(),
+                std::mem::size_of::<StreamInfo>() as u32,
+            )
+        };
+        if ok == 0 {
+            return Err(format!(
+                "Cannot verify source data streams; source preserved: {}",
+                io::Error::last_os_error(),
+            ));
+        }
+        let unnamed = info.name_length == 0
+            || (info.name_length as usize == UNNAMED_DATA.len() * 2
+                && info.name[..UNNAMED_DATA.len()].iter().copied().eq(UNNAMED_DATA.encode_utf16()));
+        if info.next_entry_offset != 0 || !unnamed {
+            return Err("Cross-volume copy cannot preserve named or unrecognized data streams; source preserved".into());
+        }
+        Ok(())
     }
 
     pub(super) fn rename(file: &File, destination: &Path) -> io::Result<()> {
@@ -123,7 +166,7 @@ pub fn file_identity(path: &Path) -> Result<FileIdentity, String> {
     identity_from_handle(&file)
 }
 
-fn link_count(file: &File) -> Result<u64, String> {
+pub(crate) fn link_count(file: &File) -> Result<u64, String> {
     #[cfg(windows)] { windows_fs::links(file).map_err(|e| e.to_string()) }
     #[cfg(unix)] { use std::os::unix::fs::MetadataExt; Ok(file.metadata().map_err(|e| e.to_string())?.nlink()) }
     #[cfg(not(any(windows, unix)))] { let _ = file; Err("Link count unavailable".into()) }
@@ -140,16 +183,38 @@ fn has_dot_component(path: &Path) -> bool {
 }
 
 fn pin_ancestry(path: &Path) -> Result<Vec<File>, String> {
-    let mut guards = Vec::new();
-    for ancestor in path.ancestors() {
-        if ancestor.as_os_str().is_empty() { continue; }
-        let metadata = std::fs::symlink_metadata(ancestor).map_err(|e| format!("Cannot inspect {}: {}", ancestor.display(), e))?;
+    pin_ancestry_with(path, None::<fn(&Path) -> io::Result<()>>)
+}
+
+fn pin_ancestry_with(
+    path: &Path,
+    mut create_missing: Option<impl FnMut(&Path) -> io::Result<()>>,
+) -> Result<Vec<File>, String> {
+    let ancestors: Vec<_> = path.ancestors().filter(|part| !part.as_os_str().is_empty()).collect();
+    let mut guards = Vec::with_capacity(ancestors.len());
+    for ancestor in ancestors.into_iter().rev() {
+        let metadata = match (std::fs::symlink_metadata(ancestor), &mut create_missing) {
+            (Err(error), Some(create))
+                if error.kind() == io::ErrorKind::NotFound && ancestor.file_name().is_some() =>
+            {
+                match create(ancestor) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(format!("Cannot create {}: {}", ancestor.display(), error)),
+                }
+                std::fs::symlink_metadata(ancestor)
+            }
+            (metadata, _) => metadata,
+        }.map_err(|e| format!("Cannot inspect {}: {}", ancestor.display(), e))?;
         if is_link(&metadata) { return Err(format!("Linked ancestry is not allowed: {}", ancestor.display())); }
         if !metadata.is_dir() { return Err(format!("An ancestor is not a directory: {}", ancestor.display())); }
         let guard = open_guard(ancestor, true, false).map_err(|e| format!("Cannot protect {}: {}", ancestor.display(), e))?;
-        if is_link(&guard.metadata().map_err(|e| e.to_string())?) { return Err("An ancestor changed to a link".into()); }
+        let metadata = guard.metadata().map_err(|e| e.to_string())?;
+        if is_link(&metadata) || !metadata.is_dir() { return Err("An ancestor changed type or became a link".into()); }
         guards.push(guard);
     }
+    // Consumers match the closest owning root first.
+    guards.reverse();
     Ok(guards)
 }
 
@@ -252,6 +317,35 @@ pub fn directory_contains(directory: &Path, ancestor: &Path) -> Result<bool, Str
 
 pub(crate) fn guard_directory(path: &Path) -> Result<AncestorGuard, String> {
     Ok(AncestorGuard { _files: pin_ancestry(path)? })
+}
+
+pub(crate) fn create_guarded_directory(path: &Path) -> Result<AncestorGuard, String> {
+    if !path.is_absolute() || has_dot_component(path) {
+        return Err("Directory must be absolute without dot segments".into());
+    }
+    let files = pin_ancestry_with(path, Some(|part: &Path| std::fs::create_dir(part)))?;
+    Ok(AncestorGuard { _files: files })
+}
+
+pub(crate) fn open_guarded_regular_file(path: &Path) -> Result<(File, AncestorGuard), String> {
+    if !path.is_absolute() || has_dot_component(path) {
+        return Err("File must be absolute without dot segments".into());
+    }
+    #[cfg(windows)]
+    if path.file_name().is_some_and(|name| name.as_encoded_bytes().contains(&b':')) {
+        return Err("Alternate data streams are not eligible files".into());
+    }
+    let ancestors = guard_directory(path.parent().ok_or("File has no parent")?)?;
+    let metadata = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+    if !metadata.is_file() || is_link(&metadata) {
+        return Err("Expected a regular file without links".into());
+    }
+    let file = open_guard(path, false, false).map_err(|e| e.to_string())?;
+    let metadata = file.metadata().map_err(|e| e.to_string())?;
+    if !metadata.is_file() || is_link(&metadata) {
+        return Err("File changed type or became a link".into());
+    }
+    Ok((file, ancestors))
 }
 
 /// Resolve a directory that may not yet exist without accepting linked or
@@ -388,7 +482,12 @@ fn path_occupied(path: &Path) -> Result<bool, String> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MoveResult { pub destination: PathBuf, pub renamed: bool, pub identity: FileIdentity }
+pub struct MoveResult {
+    pub source: PathBuf,
+    pub destination: PathBuf,
+    pub renamed: bool,
+    pub identity: FileIdentity,
+}
 
 fn collision_error(error: &io::Error) -> bool {
     error.kind() == io::ErrorKind::AlreadyExists || {
@@ -438,6 +537,8 @@ fn hash_handle(file: &mut File) -> Result<blake3::Hash, String> {
 }
 
 fn copy_verified(source: &mut File, src: &Path, destination: &Path) -> Result<FileIdentity, String> {
+    #[cfg(windows)]
+    windows_fs::require_unnamed_stream(source)?;
     let before = source.metadata().map_err(|e| e.to_string())?;
     let identity = identity_from_handle(source)?;
     let mut output_options = OpenOptions::new();
@@ -460,6 +561,10 @@ fn copy_verified(source: &mut File, src: &Path, destination: &Path) -> Result<Fi
             return Err("Source changed or transfer verification failed; source preserved".into());
         }
         if file_identity(destination)? != output_identity { return Err("Destination changed during transfer; source preserved".into()); }
+        // Windows sharing is per stream. Check again after the transfer before
+        // marking the source for deletion.
+        #[cfg(windows)]
+        windows_fs::require_unnamed_stream(source)?;
         remove_open_source(source, src).map_err(|e| format!("Verified copy at {}, source remains: {}", destination.display(), e))?;
         Ok(())
     })();
@@ -483,10 +588,8 @@ fn copy_verified(source: &mut File, src: &Path, destination: &Path) -> Result<Fi
 fn prepare_destination_parent(dest: &Path) -> Result<(PathBuf, Vec<File>), String> {
     if !dest.is_absolute() || has_dot_component(dest) { return Err("Move destination must be absolute and have no dot segments".into()); }
     let parent = dest.parent().ok_or("Destination has no parent")?;
-    let existing = parent.ancestors().find(|path| path.exists()).ok_or("No existing destination ancestor")?;
-    let _existing_guards = pin_ancestry(existing)?;
-    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    let guards = pin_ancestry(parent)?;
+    // Inspect and hold each component before looking up or creating its child.
+    let guards = pin_ancestry_with(parent, Some(|path: &Path| std::fs::create_dir(path)))?;
     Ok((std::fs::canonicalize(parent).map_err(|e| e.to_string())?, guards))
 }
 
@@ -539,6 +642,12 @@ fn move_file_checked_content_inner(src: &Path, dest: &Path, expected: Option<&Fi
     if !source.metadata().map_err(|e| e.to_string())?.is_file() { return Err("Move source changed type".into()); }
     let identity = identity_from_handle(&source)?;
     if expected.is_some_and(|expected| *expected != identity) { return Err("Move source changed identity".into()); }
+    // Capture the inventory spelling while the reviewed entry and its
+    // ancestors are still guarded. The caller's spelling stays in history.
+    let canonical_source = std::fs::canonicalize(src).map_err(|error| error.to_string())?;
+    if file_identity(&canonical_source)? != identity {
+        return Err("Move source changed identity during canonicalization".into());
+    }
     if let Some(expected_digest) = expected_digest {
         if hash_handle(&mut source)?.to_hex().as_str() != expected_digest {
             return Err("Reviewed source contents changed; preview again".into());
@@ -565,7 +674,7 @@ fn move_file_checked_content_inner(src: &Path, dest: &Path, expected: Option<&Fi
                 Err(error) => return Err(format!("Cannot move {} to {}: {}", src.display(), actual.display(), error)),
             }
         };
-        return Ok(MoveResult { renamed: actual != requested, destination: actual, identity: actual_identity });
+        return Ok(MoveResult { source: canonical_source, renamed: actual != requested, destination: actual, identity: actual_identity });
     }
     Err("Destination collision allocation exhausted".into())
 }
@@ -1023,11 +1132,50 @@ mod tests {
         fs::remove_dir_all(&root).ok();
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn missing_destination_component_is_pinned_before_creating_its_child() {
+        let root = test_dir("pin_before_descending");
+        let parent = root.join("parent");
+        let child = parent.join("child");
+        let replacement = root.join("renamed");
+        let mut checked_pin = false;
+        let guards = pin_ancestry_with(&child, Some(|path: &Path| {
+            if path == child {
+                assert!(fs::rename(&parent, &replacement).is_err());
+                checked_pin = true;
+            }
+            fs::create_dir(path)
+        })).unwrap();
+        assert!(checked_pin && child.is_dir());
+        drop(guards);
+        fs::rename(&parent, &replacement).unwrap();
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn link_inserted_during_parent_creation_never_reaches_outside() {
+        let root = test_dir("link_during_creation");
+        let missing = root.join("missing");
+        let outside = root.join("outside");
+        fs::create_dir(&outside).unwrap();
+        let error = pin_ancestry_with(&missing.join("child"), Some(|path: &Path| {
+            if path == missing {
+                std::os::unix::fs::symlink(&outside, path)?;
+                Err(io::ErrorKind::AlreadyExists.into())
+            } else {
+                fs::create_dir(path)
+            }
+        })).unwrap_err();
+        assert!(error.contains("Linked ancestry"));
+        assert!(!outside.join("child").exists());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
     #[test]
     fn test_move_file_copy_delete_fallback() {
-        // The copy+delete path is what move_file uses when std::fs::rename fails
-        // (cross-device moves). We cannot reliably provoke a cross-device rename
-        // failure in a unit test, so we exercise the fallback directly.
+        // Exercise the copy-and-delete path without requiring two volumes.
         let root = test_dir("copy_delete");
         let src = root.join("important.bin");
         let dest = root.join("backup").join("important.bin");
@@ -1042,6 +1190,24 @@ mod tests {
         assert_eq!(fs::read_to_string(&dest).unwrap(), "content");
 
         fs::remove_dir_all(&root).ok();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn copy_delete_fallback_preserves_a_source_with_a_named_stream() {
+        let root = test_dir("copy_with_named_stream");
+        let source = root.join("source.bin");
+        let stream = root.join("source.bin:mouzi-test");
+        let destination = root.join("destination.bin");
+        fs::write(&source, b"main").unwrap();
+        fs::write(&stream, b"named").unwrap();
+
+        let error = copy_delete_fallback(&source, &destination).unwrap_err();
+        assert!(error.contains("named or unrecognized data streams"), "{error}");
+        assert_eq!(fs::read(&source).unwrap(), b"main");
+        assert_eq!(fs::read(&stream).unwrap(), b"named");
+        assert!(!destination.exists());
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

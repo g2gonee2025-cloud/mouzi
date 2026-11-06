@@ -6,7 +6,8 @@ import type { CleanupFile, CleanupRequest } from "../../utils/cleanup";
 import { Search, Trash2, ExternalLink } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import ResultsPanel from "./ResultsPanel";
-import ConfirmDialog, { type ConfirmRequest } from "./ConfirmDialog";
+import ConfirmDialog, { type ConfirmDialogProps } from "./ConfirmDialog";
+import { usePreviewOwner } from "./usePreviewOwner";
 
 interface FileListTabProps {
   kind: "large" | "stale";
@@ -35,7 +36,8 @@ export default function FileListTab({
   const [threshold, setThreshold] = useState(defaultThreshold);
   const [checked, setChecked] = useState<Set<string>>(new Set());
   const [showResults, setShowResults] = useState(false);
-  const [pending, setPending] = useState<ConfirmRequest | null>(null);
+  const [pending, setPending] = useState<ConfirmDialogProps | null>(null);
+  const beginPreview = usePreviewOwner();
 
   const data: CleanupFile[] | null =
     kind === "large" ? store.largeFiles : store.staleFiles;
@@ -81,17 +83,23 @@ export default function FileListTab({
       path,
       ...(kind === "large" ? { minBytes: threshold * 1_048_576 } : { days: threshold }),
     }));
+    const owner = beginPreview();
+    if (!owner) return;
     try {
-    const plan = await store.prepareCleanup(actions);
-    setPending({
-      title: t(operationKey),
-      count: plan.actions.length,
-      bytes: plan.totalBytes,
-      notice: "trash",
-      preview: plan.actions.map((f) => f.path),
-      onConfirm: async () => { await store.executeCleanup(plan.planId); setShowResults(true); },
-    });
-    } catch { /* The store displays the preparation error. */ }
+      const plan = await store.prepareCleanup(actions, owner.signal);
+      if (owner.signal.aborted) return;
+      setPending({
+        title: t(operationKey),
+        count: plan.actions.length,
+        bytes: plan.totalBytes,
+        notice: "trash",
+        preview: plan.actions.map((f) => f.path),
+        onConfirm: async () => { await store.executeCleanup(plan.planId); setShowResults(true); },
+        onClose: () => { owner.abort(); setPending(null); },
+      });
+    } catch {
+      owner.abort();
+    }
   };
 
   const handleResultsDone = () => {
@@ -231,9 +239,7 @@ export default function FileListTab({
         </>
       )}
 
-      {pending && (
-        <ConfirmDialog {...pending} onClose={() => { store.cancelPlan(); setPending(null); }} />
-      )}
+      {pending && <ConfirmDialog {...pending} />}
     </div>
   );
 }

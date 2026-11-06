@@ -417,6 +417,76 @@ mod tests {
     }
 
     #[test]
+    fn caught_scan_panic_retires_the_token_without_publishing_its_stage() {
+        let _guard = db::serialise_test_db();
+        let fixture = ScanFixture::new("caught-panic");
+        let root = fixture.root.to_string_lossy().into_owned();
+        fs::write(fixture.root.join("previous.txt"), "previous").unwrap();
+        assert_eq!(scan_roots(std::slice::from_ref(&root), |_| {})[0].status, "complete");
+        let last_scan_at = db::get_root_summaries().unwrap().into_iter().find(|stat| stat.path == root).unwrap().last_scan_at;
+        let token = db::begin_inventory_scan(&root).unwrap();
+        let staged = SnapshotInventoryRow {
+            row: InventoryRow {
+                path: fixture.root.join("staged.txt").to_string_lossy().into_owned(),
+                size: 1,
+                mtime: 1,
+                category: "Other".into(),
+            },
+            identity: "staged-identity".into(),
+            mtime_ns: "1".into(),
+        };
+        db::stage_inventory_batch(&token, std::slice::from_ref(&staged)).unwrap();
+        let worker = std::panic::catch_unwind(|| panic!("injected scan panic"));
+        assert!(worker.is_err());
+        db::recover_interrupted_inventory("Inventory scan worker panicked").unwrap();
+        assert!(db::stage_inventory_batch(&token, &[staged]).is_err());
+        assert!(db::publish_inventory_scan(&token).is_err());
+        let stat = db::get_root_summaries().unwrap().into_iter().find(|stat| stat.path == root).unwrap();
+        assert_eq!(stat.status, "failed");
+        assert!(stat.stale);
+        assert_eq!(stat.last_scan_at, last_scan_at);
+        let rows = db::get_inventory_files("size", None, Some(&root), None, 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].path.ends_with("previous.txt"));
+    }
+
+    #[test]
+    fn adding_and_removing_nested_root_invalidates_parent_coverage() {
+        let _guard = db::serialise_test_db();
+        let parent = ScanFixture::new("nested-topology");
+        let other = ScanFixture::new("nested-topology-other");
+        let root = parent.root.to_string_lossy().into_owned();
+        let other_root = other.root.to_string_lossy().into_owned();
+        let child = parent.root.join("child");
+        fs::create_dir(&child).unwrap();
+        fs::write(child.join("nested.txt"), "nested").unwrap();
+        let child_path = child.to_string_lossy().into_owned();
+        let summary = |path: &str| db::get_root_summaries().unwrap().into_iter().find(|stat| stat.path == path).unwrap();
+
+        assert!(scan_roots(&[root.clone(), other_root.clone()], |_| {}).iter().all(|stat| stat.status == "complete"));
+        assert_eq!(summary(&root).files, 1);
+        assert!(!summary(&root).stale);
+        let child_id = db::add_watched_folder(&child_path, db::FOLDER_MODE_MANUAL).unwrap();
+        struct Child(i64);
+        impl Drop for Child {
+            fn drop(&mut self) { let _ = db::remove_watched_folder(self.0); }
+        }
+        let _child = Child(child_id);
+        assert!(summary(&root).stale);
+        assert!(!summary(&other_root).stale);
+        assert!(scan_roots(&[root.clone(), child_path], |_| {}).iter().all(|stat| stat.status == "complete"));
+        assert!(!summary(&root).stale);
+        assert_eq!(summary(&root).files, 0);
+
+        db::remove_watched_folder(child_id).unwrap();
+        assert!(summary(&root).stale);
+        assert!(!summary(&other_root).stale);
+        assert_eq!(scan_roots(std::slice::from_ref(&root), |_| {})[0].status, "complete");
+        assert_eq!(summary(&root).files, 1);
+        assert!(!summary(&root).stale);
+    }
+
+    #[test]
     fn deepest_registered_root_owns_nested_tree_in_both_orders() {
         let _guard=db::serialise_test_db();let fixture=ScanFixture::new("nested");
         let child=fixture.root.join("child");fs::create_dir(&child).unwrap();fs::write(fixture.root.join("parent.txt"),"p").unwrap();fs::write(child.join("child.txt"),"c").unwrap();

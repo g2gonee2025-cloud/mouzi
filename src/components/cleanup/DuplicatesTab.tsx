@@ -14,14 +14,16 @@ import {
 } from "../../utils/cleanup";
 import { Search, Trash2, Check } from "lucide-react";
 import ResultsPanel from "./ResultsPanel";
-import ConfirmDialog, { type ConfirmRequest } from "./ConfirmDialog";
+import ConfirmDialog, { type ConfirmDialogProps } from "./ConfirmDialog";
+import { usePreviewOwner } from "./usePreviewOwner";
 
 export default function DuplicatesTab() {
   const { t } = useTranslation();
   const store = useCleanupStore();
   const [selected, setSelected] = useState<Record<string, string>>({});
   const [showResults, setShowResults] = useState(false);
-  const [pending, setPending] = useState<ConfirmRequest | null>(null);
+  const [pending, setPending] = useState<ConfirmDialogProps | null>(null);
+  const beginPreview = usePreviewOwner();
 
   const groups = useMemo(
     () => (store.duplicates ? sortGroups(store.duplicates) : []),
@@ -46,17 +48,23 @@ export default function DuplicatesTab() {
 
   const handleConfirm = async () => {
     if (actions.length === 0) return;
+    const owner = beginPreview();
+    if (!owner) return;
     try {
-    const plan = await store.prepareCleanup(actions);
-    setPending({
-      title: t("confirm.op.trashDuplicates"),
-      count: plan.actions.length,
-      bytes: plan.totalBytes,
-      notice: "trash",
-      preview: plan.actions.map((a) => a.path),
-      onConfirm: async () => { await store.executeCleanup(plan.planId); setShowResults(true); },
-    });
-    } catch { /* The store displays the preparation error. */ }
+      const plan = await store.prepareCleanup(actions, owner.signal);
+      if (owner.signal.aborted) return;
+      setPending({
+        title: t("confirm.op.trashDuplicates"),
+        count: plan.actions.length,
+        bytes: plan.totalBytes,
+        notice: "trash",
+        preview: plan.actions.map((a) => a.path),
+        onConfirm: async () => { await store.executeCleanup(plan.planId); setShowResults(true); },
+        onClose: () => { owner.abort(); setPending(null); },
+      });
+    } catch {
+      owner.abort();
+    }
   };
 
   // When results come back, refresh the list
@@ -138,9 +146,7 @@ export default function DuplicatesTab() {
         </>
       )}
 
-      {pending && (
-        <ConfirmDialog {...pending} onClose={() => { store.cancelPlan(); setPending(null); }} />
-      )}
+      {pending && <ConfirmDialog {...pending} />}
     </div>
   );
 }

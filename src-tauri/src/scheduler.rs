@@ -1,18 +1,22 @@
 use crate::db::{
-    claim_schedule_occurrence, get_schedule_last_check, get_settings, get_watched_folders,
-    is_folder_auto_mode, set_schedule_last_check, ScheduleSettings,
+    claim_schedule_occurrences, get_schedule_last_check, get_settings, get_watched_folders,
+    is_folder_auto_mode, ScheduleSettings,
 };
-use crate::rules::scheduled_scan_folder;
+use crate::rules::scheduled_scan_folder_if_current;
 use crate::suppress::SuppressionSet;
-use chrono::{DateTime, Duration, Local, LocalResult, NaiveDate, NaiveTime, TimeZone, Utc};
+use chrono::{DateTime, Days, Duration, Local, LocalResult, NaiveDate, NaiveTime, Offset, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration as StdDuration;
 use tauri::{AppHandle, Emitter};
 
 const CHECK_INTERVAL_SECONDS: u64 = 60;
+// Missed slots trigger a scan of current files. At most one week of slots is
+// needed to trigger that scan, even after a long shutdown or a bad clock jump.
+const CATCH_UP_DAYS: u64 = 7;
 
 /// The persisted watermark is an instant, so suspension and a clock/time-zone
 /// change do not turn the interval into an arbitrary one-minute window.
@@ -20,6 +24,8 @@ const CHECK_INTERVAL_SECONDS: u64 = 60;
 struct ScheduleCheckpoint {
     checked_at: DateTime<Utc>,
     configuration: Option<String>,
+    #[serde(default)]
+    local_offset_seconds: Option<i32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,9 +39,11 @@ struct SchedulePlan {
     checkpoint: ScheduleCheckpoint,
 }
 
-/// Background scheduler. Completion claims live in SQLite rather than in the
+/// Background scheduler. Occurrence claims live in SQLite rather than in the
 /// thread, so restarting the application cannot repeat a claimed occurrence.
-pub struct Scheduler;
+pub struct Scheduler {
+    revision: Arc<AtomicU64>,
+}
 
 impl Default for Scheduler {
     fn default() -> Self {
@@ -45,14 +53,20 @@ impl Default for Scheduler {
 
 impl Scheduler {
     pub fn new() -> Self {
-        Self
+        Self { revision: Arc::new(AtomicU64::new(0)) }
+    }
+
+    /// Called after a schedule save while holding the operation gate.
+    pub(crate) fn invalidate(&self) {
+        self.revision.fetch_add(1, Ordering::AcqRel);
     }
 
     pub fn start(&self, app_handle: AppHandle, suppression: Arc<SuppressionSet>) {
+        let revision = self.revision.clone();
         thread::spawn(move || loop {
             // Check immediately on startup, then include the entire interval
             // since the persisted check on each wake-up.
-            if let Err(e) = check_and_run(&app_handle, &suppression) {
+            if let Err(e) = check_and_run(&app_handle, &suppression, &revision) {
                 eprintln!("[scheduler] error: {}", e);
             }
             thread::sleep(StdDuration::from_secs(CHECK_INTERVAL_SECONDS));
@@ -180,51 +194,51 @@ fn plan_schedule<Tz: TimeZone>(
     let times = active_times(schedule)?;
     let configuration = configuration_key(&times);
     let now_utc = now.with_timezone(&Utc);
-    let continuing = previous.filter(|checkpoint| checkpoint.configuration == configuration);
-    let checked_at = continuing
-        .map(|checkpoint| checkpoint.checked_at.max(now_utc))
-        .unwrap_or(now_utc);
+    let local_offset_seconds = now.offset().fix().local_minus_utc();
+    let continuing = previous.filter(|checkpoint| {
+        checkpoint.configuration == configuration && checkpoint.checked_at <= now_utc
+    });
     let mut plan = SchedulePlan {
         occurrences: Vec::new(),
         checkpoint: ScheduleCheckpoint {
-            checked_at,
-            configuration: configuration.clone(),
+            checked_at: now_utc,
+            configuration,
+            local_offset_seconds: Some(local_offset_seconds),
         },
     };
-    let Some(configuration) = configuration else {
+    if times.is_empty() {
         // Disabling still advances the checkpoint, so enabling later cannot
         // replay several days that were intentionally disabled.
         return Ok(plan);
-    };
+    }
 
     let timezone = now.timezone();
     let today = now.date_naive();
-    let from = match continuing {
-        Some(checkpoint) => checkpoint.checked_at,
-        // First use and edits catch up today's due times. Earlier dates were
-        // never due under this newly observed configuration.
-        None => scheduled_instant(&timezone, today, NaiveTime::MIN)
-            .and_then(|midnight| midnight.checked_sub_signed(Duration::nanoseconds(1)))
-            .ok_or_else(|| "Cannot resolve the start of the local schedule day".to_string())?,
-    };
-    if from >= now_utc {
-        return Ok(plan);
-    }
-
-    let mut date = from.with_timezone(&timezone).date_naive();
+    let from = continuing.map(|checkpoint| checkpoint.checked_at);
+    // First use, a configuration edit, or a future watermark revisits today's
+    // due slots. An offset change also revisits today while preserving the
+    // elapsed interval for older missed dates. Durable claims prevent repeats.
+    let offset_changed = continuing
+        .and_then(|checkpoint| checkpoint.local_offset_seconds)
+        .is_some_and(|offset| offset != local_offset_seconds);
+    let oldest_date = today
+        .checked_sub_days(Days::new(CATCH_UP_DAYS - 1))
+        .unwrap_or(NaiveDate::MIN);
+    let mut date = from
+        .map(|instant| instant.with_timezone(&timezone).date_naive().min(today))
+        .unwrap_or(today)
+        .max(oldest_date);
     while date <= today {
         for time in &times {
             let Some(scheduled_at) = scheduled_instant(&timezone, date, *time) else {
                 continue;
             };
-            if scheduled_at > from && scheduled_at <= now_utc {
+            if scheduled_at <= now_utc
+                && (from.is_none_or(|instant| scheduled_at > instant)
+                    || (offset_changed && date == today))
+            {
                 plan.occurrences.push(ScheduleOccurrence {
-                    key: format!(
-                        "v1|{}|{}|{}",
-                        configuration,
-                        date.format("%Y-%m-%d"),
-                        time.format("%H:%M:%S")
-                    ),
+                    key: format!("v2|{}|{}", date.format("%Y-%m-%d"), time.format("%H:%M:%S")),
                     scheduled_at,
                 });
             }
@@ -240,18 +254,17 @@ fn plan_schedule<Tz: TimeZone>(
 
 fn claim_due_occurrences(
     occurrences: &[ScheduleOccurrence],
-    mut claim: impl FnMut(&str) -> Result<bool, String>,
+    claim: impl FnOnce(&[&str]) -> Result<usize, String>,
 ) -> Result<usize, String> {
-    let mut claimed = 0;
-    for occurrence in occurrences {
-        if claim(&occurrence.key)? {
-            claimed += 1;
-        }
-    }
-    Ok(claimed)
+    let keys = occurrences.iter().map(|occurrence| occurrence.key.as_str()).collect::<Vec<_>>();
+    claim(&keys)
 }
 
-fn check_and_run(app_handle: &AppHandle, suppression: &SuppressionSet) -> Result<(), String> {
+fn check_and_run(app_handle: &AppHandle, suppression: &SuppressionSet, revision: &AtomicU64) -> Result<(), String> {
+    // Snapshot and claim under the same gate used to save the schedule. Each
+    // subsequent file operation checks this revision under that gate again.
+    let operation = suppression.with_operation();
+    let expected_revision = revision.load(Ordering::Acquire);
     let settings = get_settings().map_err(|e| e.to_string())?;
     let schedule = ScheduleSettings {
         schedule_enabled: settings.schedule_enabled,
@@ -268,31 +281,31 @@ fn check_and_run(app_handle: &AppHandle, suppression: &SuppressionSet) -> Result
             .ok()
     });
     let plan = plan_schedule(&schedule, previous.as_ref(), Local::now())?;
-    let claimed = claim_due_occurrences(&plan.occurrences, |key| {
-        claim_schedule_occurrence(key).map_err(|e| e.to_string())
+    let checkpoint = serde_json::to_string(&plan.checkpoint).map_err(|e| e.to_string())?;
+    let claimed = claim_due_occurrences(&plan.occurrences, |keys| {
+        claim_schedule_occurrences(keys, &checkpoint).map_err(|e| e.to_string())
     })?;
+    drop(operation);
 
-    // Claim before moving a file: a crash must never repeat a partly completed
-    // occurrence. Coalesce a missed interval into one current-state scan, rather
-    // than rescanning the same folders once for every missed date.
-    let clean_result = if claimed > 0 {
-        perform_scheduled_clean(app_handle, suppression, claimed)
+    // Commit claims and the checkpoint before moving a file so a crash cannot
+    // repeat a partly completed occurrence. One scan covers all newly due slots.
+    if claimed > 0 {
+        perform_scheduled_clean(app_handle, suppression, claimed, &|| revision.load(Ordering::Acquire) == expected_revision)
     } else {
         Ok(())
-    };
-    let checkpoint = serde_json::to_string(&plan.checkpoint).map_err(|e| e.to_string())?;
-    set_schedule_last_check(&checkpoint).map_err(|e| e.to_string())?;
-    clean_result
+    }
 }
 
 fn perform_scheduled_clean(
     app_handle: &AppHandle,
     suppression: &SuppressionSet,
     occurrences: usize,
+    is_current: &dyn Fn() -> bool,
 ) -> Result<(), String> {
     let folders = get_watched_folders().map_err(|e| e.to_string())?;
     let mut total = 0usize;
     for folder in folders {
+        if !is_current() { break; }
         if !folder.enabled || !is_folder_auto_mode(&folder.mode) {
             continue;
         }
@@ -301,14 +314,14 @@ fn perform_scheduled_clean(
         }
         // This unattended path applies grace and settling checks and rechecks
         // current root eligibility for each file. Never use Clean Now's bypass.
-        match scheduled_scan_folder(&folder.path, suppression) {
+        match scheduled_scan_folder_if_current(&folder.path, suppression, is_current) {
             Ok(results) => total += results.len(),
             Err(e) => eprintln!("[scheduler] failed to clean {}: {}", folder.path, e),
         }
     }
     let _ = app_handle.emit(
         "scheduled-clean-done",
-        json!({ "organized": total, "occurrences": occurrences }),
+        json!({ "organized": total, "occurrences": occurrences, "superseded": !is_current() }),
     );
     let _ = app_handle.emit("mutation-completed", ());
     Ok(())
@@ -336,10 +349,18 @@ mod tests {
     }
 
     fn checkpoint(schedule: &ScheduleSettings, checked_at: &str) -> ScheduleCheckpoint {
+        let checked_at = now(checked_at);
         ScheduleCheckpoint {
-            checked_at: now(checked_at).with_timezone(&Utc),
+            checked_at: checked_at.with_timezone(&Utc),
             configuration: configuration_key(&active_times(schedule).unwrap()),
+            local_offset_seconds: Some(checked_at.offset().local_minus_utc()),
         }
+    }
+
+    fn record_claims(claims: &mut HashSet<String>, keys: &[&str]) -> Result<usize, String> {
+        let before = claims.len();
+        claims.extend(keys.iter().map(|&key| key.to_owned()));
+        Ok(claims.len() - before)
     }
 
     #[test]
@@ -379,13 +400,13 @@ mod tests {
         let plan = plan_schedule(&schedule, Some(&previous), time).unwrap();
         assert_eq!(plan.occurrences.len(), 4);
         let mut claims = HashSet::new();
-        assert_eq!(claim_due_occurrences(&plan.occurrences, |key| Ok(claims.insert(key.to_string()))).unwrap(), 4);
+        assert_eq!(claim_due_occurrences(&plan.occurrences, |keys| record_claims(&mut claims, keys)).unwrap(), 4);
         // Simulate a restart before the new checkpoint was saved. Persistent
         // claims still make the same missed interval a no-op.
         let persisted = serde_json::to_string(&previous).unwrap();
         let restored = serde_json::from_str::<ScheduleCheckpoint>(&persisted).unwrap();
         let replay = plan_schedule(&schedule, Some(&restored), time).unwrap();
-        assert_eq!(claim_due_occurrences(&replay.occurrences, |key| Ok(claims.insert(key.to_string()))).unwrap(), 0);
+        assert_eq!(claim_due_occurrences(&replay.occurrences, |keys| record_claims(&mut claims, keys)).unwrap(), 0);
     }
 
     #[test]
@@ -403,8 +424,15 @@ mod tests {
         let edited = schedule(&["10:00", "14:00"]);
         let edit_plan = plan_schedule(&edited, Some(&fresh.checkpoint), time).unwrap();
         assert_eq!(edit_plan.occurrences.len(), 2);
-        assert_ne!(fresh.occurrences[1].key, edit_plan.occurrences[1].key);
+        assert_eq!(fresh.occurrences[1].key, edit_plan.occurrences[1].key);
         assert!(edit_plan.occurrences.iter().all(|occurrence| occurrence.key.contains("|2026-10-03|")));
+        let mut claims = HashSet::new();
+        assert_eq!(claim_due_occurrences(&fresh.occurrences, |keys| record_claims(&mut claims, keys)).unwrap(), 2);
+        assert_eq!(claim_due_occurrences(&edit_plan.occurrences, |keys| record_claims(&mut claims, keys)).unwrap(), 1);
+
+        let later = schedule(&["08:00", "14:00", "20:00"]);
+        let add_later = plan_schedule(&later, Some(&fresh.checkpoint), time).unwrap();
+        assert_eq!(claim_due_occurrences(&add_later.occurrences, |keys| record_claims(&mut claims, keys)).unwrap(), 0);
     }
 
     #[test]
@@ -423,13 +451,44 @@ mod tests {
     }
 
     #[test]
-    fn clock_rollback_preserves_the_watermark_and_does_not_repeat_an_occurrence() {
+    fn clock_rollback_reanchors_and_durable_claims_prevent_repeating_a_slot() {
         let schedule = schedule(&["08:00"]);
-        let previous = checkpoint(&schedule, "2026-10-03T10:00:00+04:00");
-        let rolled_back = plan_schedule(&schedule, Some(&previous), now("2026-10-03T07:30:00+04:00")).unwrap();
+        let first = plan_schedule(&schedule, None, now("2026-10-03T10:00:00+04:00")).unwrap();
+        let mut claims = HashSet::new();
+        assert_eq!(claim_due_occurrences(&first.occurrences, |keys| record_claims(&mut claims, keys)).unwrap(), 1);
+        let corrected = now("2026-10-03T07:30:00+04:00");
+        let rolled_back = plan_schedule(&schedule, Some(&first.checkpoint), corrected).unwrap();
         assert!(rolled_back.occurrences.is_empty());
-        assert_eq!(rolled_back.checkpoint.checked_at, previous.checked_at);
+        assert_eq!(rolled_back.checkpoint.checked_at, corrected.with_timezone(&Utc));
         let forward = plan_schedule(&schedule, Some(&rolled_back.checkpoint), now("2026-10-03T10:30:00+04:00")).unwrap();
-        assert!(forward.occurrences.is_empty());
+        assert_eq!(claim_due_occurrences(&forward.occurrences, |keys| record_claims(&mut claims, keys)).unwrap(), 0);
+    }
+
+    #[test]
+    fn long_catch_up_is_bounded_and_a_forward_clock_jump_cannot_block_new_slots() {
+        let schedule = schedule(&["00:00", "08:00", "16:00", "23:59:59"]);
+        let original = checkpoint(&schedule, "2026-10-01T07:59:00+04:00");
+        let jumped = plan_schedule(&schedule, Some(&original), now("2027-10-03T23:59:59+04:00")).unwrap();
+        assert_eq!(jumped.occurrences.len(), 28);
+        assert_eq!(jumped.occurrences[0].key, "v2|2027-09-27|00:00:00");
+        let mut claims = HashSet::new();
+        assert_eq!(claim_due_occurrences(&jumped.occurrences, |keys| record_claims(&mut claims, keys)).unwrap(), 28);
+
+        let recovered = plan_schedule(&schedule, Some(&jumped.checkpoint), now("2026-10-01T08:00:00+04:00")).unwrap();
+        assert_eq!(recovered.occurrences.last().unwrap().key, "v2|2026-10-01|08:00:00");
+        assert_eq!(claim_due_occurrences(&recovered.occurrences, |keys| record_claims(&mut claims, keys)).unwrap(), 2);
+    }
+
+    #[test]
+    fn changing_offset_can_make_a_local_slot_due_at_the_same_utc_instant() {
+        let schedule = schedule(&["09:00"]);
+        let old = checkpoint(&schedule, "2026-10-03T08:00:00+04:00");
+        let changed = plan_schedule(&schedule, Some(&old), now("2026-10-03T10:00:00+06:00")).unwrap();
+        assert_eq!(changed.occurrences.len(), 1);
+        assert_eq!(changed.occurrences[0].key, "v2|2026-10-03|09:00:00");
+
+        let legacy = serde_json::json!({ "checked_at": old.checked_at, "configuration": old.configuration });
+        let legacy: ScheduleCheckpoint = serde_json::from_value(legacy).unwrap();
+        assert_eq!(legacy.local_offset_seconds, None);
     }
 }

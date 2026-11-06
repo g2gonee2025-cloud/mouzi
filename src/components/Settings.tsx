@@ -6,6 +6,7 @@ import { listen } from "@tauri-apps/api/event";
 import { formatBytes } from "../utils/format";
 import { save, open } from "@tauri-apps/plugin-dialog";
 import About from "./About";
+import ActionRefreshWarnings from "./ActionRefreshWarnings";
 import ConfirmDialog, { type ConfirmRequest } from "./cleanup/ConfirmDialog";
 import {
   UNDO_TONE_CLASS,
@@ -329,6 +330,15 @@ export default function Settings() {
     await savePreferences({ language: lang });
   };
 
+  const saveGracePeriod = async (seconds: number) => {
+    if (await savePreferences({ grace_period_seconds: seconds })) return;
+    const committed = useAppStore.getState().settings;
+    if (!committed) return;
+    const converted = secondsToUnit(Math.min(committed.grace_period_seconds, MAX_GRACE_SECONDS));
+    setGraceValue(converted.value);
+    setGraceUnit(converted.unit);
+  };
+
   const handleGraceSliderChange = (stepIndex: number) => {
     if (!settings) return;
     const seconds = GRACE_STEPS[stepIndex];
@@ -336,12 +346,13 @@ export default function Settings() {
     setGraceValue(converted.value);
     setGraceUnit(converted.unit);
     setGraceError(null);
-    void savePreferences({ grace_period_seconds: seconds });
+    void saveGracePeriod(seconds);
   };
 
   const handleGraceNumberChange = (value: number, unit: GraceUnit) => {
     if (!settings) return;
-    const seconds = unitToSeconds(value, unit);
+    const nonnegative = Math.max(0, value);
+    const seconds = unitToSeconds(nonnegative, unit);
     if (seconds > MAX_GRACE_SECONDS) {
       setGraceError(t("settings.general.gracePeriodMaxError"));
       setGraceValue(value);
@@ -349,9 +360,9 @@ export default function Settings() {
       return;
     }
     setGraceError(null);
-    setGraceValue(value);
+    setGraceValue(nonnegative);
     setGraceUnit(unit);
-    void savePreferences({ grace_period_seconds: Math.max(0, seconds) });
+    void saveGracePeriod(seconds);
   };
 
   const handleScheduleChange = (patch: Partial<ScheduleSettings>) => {
@@ -865,6 +876,7 @@ export default function Settings() {
               </div>
             </div>
             {historyCounts && <p className="text-xs text-text-muted">{t("settings.history.showing", { shown: logs.length, total: historyCounts.total })}</p>}
+            <ActionRefreshWarnings />
             {undoToast && (
               <div role="status" aria-live="polite" className="space-y-1">
                 {undoToast.map((notice) => (

@@ -83,6 +83,34 @@ describe("dashboard scan lifecycle", () => {
 });
 
 describe("dashboard subscription ownership", () => {
+  it("does not report readiness before the terminal listener is registered", async () => {
+    const normal = mocks.listen.getMockImplementation()!;
+    let reachTerminal!: () => void;
+    let finishRegistration!: () => void;
+    const reached = new Promise<void>((resolve) => { reachTerminal = resolve; });
+    const release = new Promise<void>((resolve) => { finishRegistration = resolve; });
+    mocks.listen.mockImplementation(async (name, handler) => {
+      if (name === "scan-finished") {
+        reachTerminal();
+        await release;
+      }
+      return normal(name, handler);
+    });
+    const ready = vi.fn();
+    const pending = dashboard.subscribeDashboardEvents().then((dispose) => {
+      ready();
+      return dispose;
+    });
+    await reached;
+    expect(ready).not.toHaveBeenCalled();
+    expect(mocks.handlers.get("scan-finished")).toBeUndefined();
+    finishRegistration();
+    const dispose = await pending;
+    expect(ready).toHaveBeenCalledOnce();
+    expect(mocks.handlers.get("scan-finished")?.size).toBe(1);
+    dispose();
+  });
+
   it("cleans successful registrations when a later listener fails", async () => {
     const normal = mocks.listen.getMockImplementation()!;
     mocks.listen.mockReset()
@@ -91,6 +119,10 @@ describe("dashboard subscription ownership", () => {
     await expect(dashboard.subscribeDashboardEvents()).rejects.toThrow("registration failed");
     expect(mocks.unlisteners).toHaveLength(1);
     expect(mocks.unlisteners[0]).toHaveBeenCalledOnce();
+    mocks.listen.mockImplementation(normal);
+    const dispose = await dashboard.subscribeDashboardEvents();
+    expect(mocks.handlers.get("scan-finished")?.size).toBe(1);
+    dispose();
   });
 
   it("disposes each mount's listeners and timer independently", async () => {

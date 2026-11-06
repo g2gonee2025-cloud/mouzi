@@ -1,7 +1,6 @@
 use crate::db::*;
 use crate::ignore::{load_mouziignore, save_mouziignore};
-use crate::rules::manual_scan_folder_with_suppression;
-use crate::safe_fs::move_file_checked;
+use crate::rules::{scan_watched_manual_folder, WatchedManualRoot};
 use crate::scan::{self, ScanEvent};
 use crate::suppress::{SuppressionSet, SUPPRESSION_TTL};
 use crate::AppState;
@@ -73,20 +72,7 @@ fn validate_rule_destination(rule: &Rule) -> Result<(), String> {
     if rule.action != "move" {
         return Ok(());
     }
-    let destination = rule.destination.trim();
-    if destination.is_empty() || destination == "." || destination == ".." {
-        return Err(format!(
-            "Destination '{}' resolves to the folder itself, which would rename files in place forever. \
-             Choose a subfolder, or a fixed path outside it.",
-            rule.destination
-        ));
-    }
-    if !Path::new(destination).is_absolute()
-        && Path::new(destination).components().any(|c| matches!(c, std::path::Component::ParentDir))
-    {
-        return Err("Relative destinations cannot contain parent traversal".into());
-    }
-    Ok(())
+    crate::rules::validate_move_destination_template(&rule.destination)
 }
 
 fn with_configuration<T>(app: &AppHandle, write: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
@@ -245,24 +231,6 @@ struct UndoTarget {
     file_identity: Option<String>,
 }
 
-/// What phase 2 intends to do with a target, decided while holding no lock.
-enum UndoPlan {
-    /// Nothing to move back: no destination was recorded, or the file is no
-    /// longer where the action left it.
-    Gone,
-    /// Move `dest` back onto `source`.
-    Restore { dest: PathBuf, source: String },
-}
-
-/// What the filesystem half of an undo produced, before the database is told.
-enum UndoMove {
-    /// The file is back. `actual` is where it landed, which differs from
-    /// `source` when a collision forced a new name.
-    Restored { actual: String, status: &'static str },
-    Gone,
-    Failed(String),
-}
-
 /// Open the watcher's self-suppression window for `paths`.
 ///
 /// Callers arm before the rename, never after: the watcher can deliver the
@@ -281,130 +249,91 @@ fn arm_suppression(ignored_files: &IgnoredFiles, paths: &[String]) -> Result<(),
     Ok(())
 }
 
-/// Decide what has to happen for one target. `Path::exists` is a stat, so this
-/// needs no lock and does no database work.
-fn plan_undo(target: &UndoTarget) -> UndoPlan {
-    let dest = match target.dest.as_deref() {
-        Some(dest) if !dest.is_empty() => PathBuf::from(dest),
-        _ => return UndoPlan::Gone,
-    };
-    if !dest.exists() {
-        return UndoPlan::Gone;
-    }
-    UndoPlan::Restore {
-        dest,
-        source: target.source.clone(),
-    }
+fn related_pending_undo(target: &UndoTarget) -> Result<Option<PendingUndo>, String> {
+    let pending = pending_undos()?;
+    if pending.is_empty() { return Ok(None); }
+
+    let target_paths: Vec<_> = [Some(target.source.as_str()), target.dest.as_deref()]
+        .into_iter().flatten().filter(|path| !path.is_empty())
+        .map(|path| crate::suppress::key(Path::new(path))).collect();
+    Ok(pending.into_iter().find(|receipt| {
+        receipt.action_log_id == Some(target.id)
+            || target.file_identity.as_deref().is_some_and(|identity| {
+                receipt.expected_identity.as_deref() == Some(identity)
+                    || receipt.observed_identity.as_deref() == Some(identity)
+            })
+            || [Some(receipt.source.as_str()), receipt.requested.as_deref(), receipt.observed.as_deref()]
+                .into_iter().flatten().filter(|path| !path.is_empty())
+                .any(|path| target_paths.contains(&crate::suppress::key(Path::new(path))))
+    }))
 }
 
-/// The filesystem half of an undo. Takes no lock of any kind: the caller has
-/// armed suppression already and writes the log row afterwards.
-fn execute_undo_move(plan: &UndoPlan, expected: Option<&str>) -> UndoMove {
-    let (dest, source) = match plan {
-        UndoPlan::Gone => return UndoMove::Gone,
-        UndoPlan::Restore { dest, source } => (dest.as_path(), source.as_str()),
-    };
-    let source_path = Path::new(source);
-    let moved = if let Some(expected) = expected {
-        match crate::safe_fs::file_identity(dest) {
-            Ok(identity) if identity.key() == expected => crate::safe_fs::move_file_checked_expected(dest, source_path, &identity),
-            Ok(_) => Err("The file at the recorded destination was replaced; undo stopped".into()),
-            Err(error) => Err(error),
-        }
-    } else { move_file_checked(dest, source_path) }; // Legacy records have no saved identity.
-    match moved {
-        Ok(result) => UndoMove::Restored {
-            actual: result.destination.to_string_lossy().into_owned(),
-            status: if result.renamed { "collision" } else { "ok" },
-        },
-        Err(e) => UndoMove::Failed(e),
+/// Evaluate the recorded destination while the caller holds the operation gate.
+/// A prior row in Undo All may have just restored this row's destination.
+fn finish_undo(target: &UndoTarget, ignored_files: &IgnoredFiles) -> Result<UndoResult, String> {
+    if let Some(receipt) = related_pending_undo(target)? {
+        let location = receipt.observed.map(|path| format!(" Observed restore path: {path}.")).unwrap_or_default();
+        let requested = receipt.requested.as_deref().unwrap_or("(unrecorded)");
+        return Err(format!("Undo was interrupted (recovery record {}). Inspect {} and {requested} before restoring manually.{location}", receipt.id, receipt.source));
     }
-}
 
-/// Phases 2c and 3 for one planned undo: move with no lock held, arm any path
-/// the move revealed, then record the outcome under a short lock.
-fn finish_undo(
-    target: &UndoTarget,
-    plan: &UndoPlan,
-    ignored_files: &IgnoredFiles,
-) -> UndoResult {
-    let _operation = ignored_files.with_operation();
-    if let UndoPlan::Restore { dest, source } = plan {
-        ignored_files.invalidate(&[dest.clone(), PathBuf::from(source)]);
-        if let Err(e) = arm_suppression(ignored_files, &[dest.to_string_lossy().into_owned(), source.clone()]) {
-            return failed_undo(e);
-        }
-    }
-    let intent = match plan {
-        UndoPlan::Restore { dest, source } => match begin_operation_intent("undo", &dest.to_string_lossy(), Some(source)) {
-            Ok(id) => Some(id),
-            Err(e) => return failed_undo(format!("Undo was not started: could not persist operation intent: {e}")),
-        },
-        UndoPlan::Gone => None,
+    let Some(dest) = target.dest.as_deref().filter(|path| !path.is_empty()) else {
+        return record_missing_undo(target.id);
     };
+    let dest_path = Path::new(dest);
+    match std::fs::symlink_metadata(dest_path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return record_missing_undo(target.id),
+        Err(error) => return Err(format!("Cannot inspect the recorded destination {dest}: {error}")),
+    }
+    let expected = target.file_identity.as_deref().ok_or_else(|| format!(
+        "This older history entry has no saved file identity. Verify the file at {dest} and restore it manually to {}.",
+        target.source,
+    ))?;
+    let identity = crate::safe_fs::file_identity(dest_path)?;
+    if identity.key() != expected {
+        return Err("The file at the recorded destination was replaced; undo stopped".into());
+    }
+
+    let source_path = Path::new(&target.source);
+    ignored_files.invalidate(&[dest_path.to_path_buf(), source_path.to_path_buf()]);
+    arm_suppression(ignored_files, &[dest.to_owned(), target.source.clone()])?;
+    let intent = begin_undo_intent(target.id, dest, &target.source, expected)
+        .map_err(|error| format!("Undo was not started: could not persist operation intent: {error}"))?;
+
     notify_move_observer();
-    let moved = execute_undo_move(plan, target.file_identity.as_deref());
-
-    // A collision renames the file, so the path the watcher will report is not
-    // knowable until the move has run. Arm it the moment it exists.
-    if let UndoMove::Restored { actual, .. } = &moved {
-        if let Err(e) = arm_suppression(ignored_files, &[actual.clone(), target.source.clone()]) {
-            return failed_undo(e);
-        }
-    }
-
-    if let Some(intent) = intent {
-        match &moved {
-            UndoMove::Restored { actual, status } => {
-                let old = target.dest.as_deref().unwrap_or_default();
-                return match finalize_undo_intent(intent, target.id, old, actual) {
-                    Ok(()) => UndoResult { status: (*status).into(), message: None, restored_to: Some(actual.clone()) },
-                    Err(e) => UndoResult {
-                        status: "failed".into(),
-                        message: Some(format!("File restored to {actual}; history or inventory finalization failed: {e}. Recovery intent retained.")),
-                        restored_to: Some(actual.clone()),
-                    },
-                };
-            }
-            UndoMove::Failed(e) => {
-                let _ = finalize_operation_intent(intent, "failed", None, Some(e));
-            }
-            UndoMove::Gone => { let _ = finalize_operation_intent(intent, "missing", None, None); }
-        }
-    }
-
-    record_undo(target.id, &moved).unwrap_or_else(|e| failed_undo(e))
+    let moved = match crate::safe_fs::move_file_checked_expected(dest_path, source_path, &identity) {
+        Ok(moved) => moved,
+        Err(error) => return Err(match finalize_operation_intent(intent, "failed", None, Some(&error)) {
+            Ok(()) => error,
+            Err(journal) => format!("{error}. Undo recovery record remains pending: {journal}"),
+        }),
+    };
+    let actual = moved.destination.to_string_lossy().into_owned();
+    // A collision can select a new path. Arm it as soon as the move returns.
+    arm_suppression(ignored_files, &[actual.clone(), target.source.clone()])?;
+    let resulting_identity = moved.identity.key();
+    let status = if moved.renamed { "collision" } else { "ok" };
+    let finalized = observe_undo_restore(intent, &actual, &resulting_identity)
+        .and_then(|()| finalize_undo_intent(intent, target.id, dest, &actual, &resulting_identity));
+    Ok(match finalized {
+        Ok(()) => UndoResult {
+            status: status.into(),
+            message: None,
+            restored_to: Some(actual),
+        },
+        Err(error) => UndoResult {
+            status: "failed".into(),
+            message: Some(format!("File moved to {actual}. Undo history or inventory could not be finalized: {error}. Recovery record {intent} remains pending.")),
+            restored_to: Some(actual),
+        },
+    })
 }
 
-/// Phase 3: one short lock acquisition per row, after its move has finished.
-fn record_undo(id: i64, moved: &UndoMove) -> Result<UndoResult, String> {
-    let result = match moved {
-        UndoMove::Restored { actual, status } => UndoResult {
-            status: (*status).to_string(),
-            message: None,
-            restored_to: Some(actual.clone()),
-        },
-        // A row whose file is already gone is still marked undone and reported
-        // as a success. That has always been this command's behaviour; the
-        // audit recorded it separately and it is deliberately unchanged here.
-        UndoMove::Gone => UndoResult {
-            status: "missing".to_string(),
-            message: None,
-            restored_to: None,
-        },
-        UndoMove::Failed(e) => UndoResult {
-            status: "failed".to_string(),
-            message: Some(e.clone()),
-            restored_to: None,
-        },
-    };
-
-    if matches!(moved, UndoMove::Restored { .. } | UndoMove::Gone) {
-        let conn = lock_db()?;
-        conn.execute("UPDATE action_logs SET undone=1 WHERE id=?1", [id])
-            .map_err(|e| e.to_string())?;
-    }
-    Ok(result)
+fn record_missing_undo(id: i64) -> Result<UndoResult, String> {
+    lock_db()?.execute("UPDATE action_logs SET undone=1 WHERE id=?1", [id])
+        .map_err(|error| error.to_string())?;
+    Ok(UndoResult { status: "missing".into(), message: None, restored_to: None })
 }
 
 fn failed_undo(message: String) -> UndoResult {
@@ -427,60 +356,35 @@ fn read_undo_target(id: i64) -> Result<UndoTarget, String> {
 }
 
 fn undo_action_with(id: i64, ignored_files: &IgnoredFiles) -> Result<UndoResult, String> {
-    // Phase 1 — read the row, then let the lock go.
+    let _operation = ignored_files.with_operation();
     let target = read_undo_target(id)?;
-    let plan = plan_undo(&target);
-
-    // Phase 2 — arm before the move. This path used to insert its guard after
-    // the rename, so a fast watcher event could arrive while the restored file
-    // still looked brand new.
-    if let UndoPlan::Restore { dest, source } = &plan {
-        arm_suppression(
-            ignored_files,
-            &[dest.to_string_lossy().to_string(), source.clone()],
-        )?;
-    }
-
-    // Phases 2c and 3.
-    Ok(finish_undo(&target, &plan, ignored_files))
+    Ok(finish_undo(&target, ignored_files).unwrap_or_else(failed_undo))
 }
 
 fn undo_all_with(ignored_files: &IgnoredFiles) -> Result<UndoAllResult, String> {
-    // Phase 1 — read the candidates. The callee takes the DB lock and releases
-    // it before returning.
+    let _operation = ignored_files.with_operation();
     let targets: Vec<UndoTarget> = crate::db::get_undoable_logs()
         .map_err(|e| e.to_string())?
         .into_iter()
         .map(|(id, source, dest, file_identity)| UndoTarget { id, source, dest, file_identity })
         .collect();
 
-    // Phase 2a — decide what each row needs, holding nothing.
-    let plans: Vec<UndoPlan> = targets.iter().map(plan_undo).collect();
-
-    // Phase 2b — arm the whole batch before the first rename, so every path is
-    // covered up front instead of one at a time as the moves land.
-    let mut armed: Vec<String> = Vec::with_capacity(plans.len() * 2);
-    for plan in &plans {
-        if let UndoPlan::Restore { dest, source } = plan {
-            armed.push(dest.to_string_lossy().to_string());
-            armed.push(source.clone());
-        }
-    }
+    // Include currently absent destinations that a preceding restore may create.
+    let armed: Vec<_> = targets.iter().flat_map(|target| {
+        std::iter::once(target.source.clone()).chain(target.dest.iter().filter(|path| !path.is_empty()).cloned())
+    }).collect();
     arm_suppression(ignored_files, &armed)?;
 
-    // Phase 2c + 3 — move, then record, one row at a time in input order.
-    let mut results = Vec::with_capacity(targets.len());
-    for (target, plan) in targets.iter().zip(plans) {
-        results.push(finish_undo(target, &plan, ignored_files));
-    }
+    let results: Vec<_> = targets.iter().map(|target| {
+        finish_undo(target, ignored_files).unwrap_or_else(failed_undo)
+    }).collect();
 
-    // "missing" has always counted towards `count`. Separate audit finding,
-    // deliberately unchanged.
+    // Preserve the wire count of handled rows. The UI counts restores separately.
     let count = results.iter().filter(|r| r.status != "failed").count();
     Ok(UndoAllResult { count, results })
 }
 
-/// Test-only hook, run immediately before each rename with no lock held.
+/// Test-only hook, run before each rename with the DB and suppression map unlocked.
 ///
 /// The concurrency tests read the lock state from inside the undo loop rather
 /// than from another thread racing it, so the assertion lands on the exact
@@ -554,21 +458,24 @@ pub fn get_settings_cmd() -> Result<AppSettings, String> {
     get_settings().map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn update_settings_cmd(app: AppHandle, settings: PreferencesPatch) -> Result<AppSettings, String> {
     if settings.theme.as_deref().is_some_and(|theme| !matches!(theme, "light" | "dark" | "system")) { return Err("Choose a supported theme".into()); }
     if settings.language.as_deref().is_some_and(|language| !matches!(language, "en" | "de" | "es" | "fr" | "it" | "ja" | "pl" | "ru" | "uk" | "vi")) { return Err("Choose a supported language".into()); }
     if settings.grace_period_seconds.is_some_and(|seconds| !(0..=86_400).contains(&seconds)) { return Err("Grace period must be between 0 and 86400 seconds".into()); }
     if settings.local_ai_model.as_deref().is_some_and(|model| model.trim().is_empty() || model.len() > 128 || model.chars().any(char::is_control)) { return Err("Choose a valid local model name".into()); }
-    let committed = update_preferences(&settings).map_err(|e| e.to_string())?;
+    let committed = crate::classify::update_preferences(&settings)?;
     let _ = app.emit("settings-changed", &committed);
     crate::tray::update_tray_language(&app, &committed.language);
     Ok(committed)
 }
 
-#[tauri::command]
-pub fn clear_logs_cmd(app: AppHandle) -> Result<(), String> {
-    clear_logs().map_err(|e| e.to_string())?;
+#[tauri::command(async)]
+pub fn clear_logs_cmd(app: AppHandle, state: tauri::State<AppState>) -> Result<(), String> {
+    {
+        let _operation = state.ignored_files.with_operation();
+        clear_logs().map_err(|e| e.to_string())?;
+    }
     let _ = app.emit("mutation-completed", ());
     Ok(())
 }
@@ -582,21 +489,26 @@ pub fn scan_folder_cmd(app: AppHandle, path: String, state: tauri::State<AppStat
         folder.enabled && !is_folder_paused_mode(&folder.mode)
             && crate::safe_fs::file_identity(Path::new(&folder.path)).ok().as_ref() == Some(&identity)
     }).ok_or("Folder is no longer an eligible watched root")?;
-    let results = manual_scan_folder_with_suppression(&eligible.path, &state.ignored_files)?;
+    let authority = WatchedManualRoot::capture(&eligible)?;
+    let results = scan_watched_manual_folder(&authority, &state.ignored_files);
     let _ = app.emit("mutation-completed", ());
-    Ok(results)
+    results
 }
 
 #[tauri::command(async)]
 pub fn clean_now_cmd(app: AppHandle, state: tauri::State<AppState>) -> Result<Vec<(String, String, String)>, String> {
     let folders = get_watched_folders().map_err(|e| e.to_string())?;
-    let mut results = Vec::new();
-    for folder in folders.into_iter().filter(|f| f.enabled && !is_folder_paused_mode(&f.mode)) {
-        crate::safe_fs::validate_root(Path::new(&folder.path))?;
-        results.extend(manual_scan_folder_with_suppression(&folder.path, &state.ignored_files)?);
-    }
+    let authorities = folders.iter().filter(|f| f.enabled && !is_folder_paused_mode(&f.mode))
+        .map(WatchedManualRoot::capture).collect::<Vec<_>>();
+    let results = (|| {
+        let mut results = Vec::new();
+        for authority in authorities {
+            results.extend(scan_watched_manual_folder(&authority?, &state.ignored_files)?);
+        }
+        Ok(results)
+    })();
     let _ = app.emit("mutation-completed", ());
-    Ok(results)
+    results
 }
 
 #[derive(Debug, Serialize)]
@@ -763,20 +675,30 @@ pub fn is_autostart_enabled_cmd(app: AppHandle) -> Result<bool, String> {
     app.autolaunch().is_enabled().map_err(|e| e.to_string())
 }
 
-#[tauri::command]
-pub fn load_mouziignore_cmd(folder_path: String) -> Result<Vec<String>, String> {
-    load_mouziignore(&folder_path)
+fn registered_ignore_root(folder_path: &str) -> Result<(PathBuf, crate::safe_fs::AncestorGuard), String> {
+    let root = crate::safe_fs::validate_root(Path::new(folder_path))?;
+    let guard = crate::safe_fs::guard_directory(&root)?;
+    let identity = crate::safe_fs::file_identity(&root)?;
+    if !get_watched_folders().map_err(|e| e.to_string())?.iter().any(|folder| {
+        crate::safe_fs::validate_root(Path::new(&folder.path)).ok()
+            .and_then(|path| crate::safe_fs::file_identity(&path).ok()).as_ref() == Some(&identity)
+    }) {
+        return Err("Folder is no longer registered".into());
+    }
+    Ok((root, guard))
+}
+
+#[tauri::command(async)]
+pub fn load_mouziignore_cmd(folder_path: String, state: tauri::State<AppState>) -> Result<Vec<String>, String> {
+    let _operation = state.ignored_files.with_operation();
+    let (root, _guard) = registered_ignore_root(&folder_path)?;
+    load_mouziignore(&root.to_string_lossy())
 }
 
 #[tauri::command(async)]
 pub fn save_mouziignore_cmd(app: AppHandle, folder_path: String, patterns: Vec<String>) -> Result<(), String> {
     with_configuration(&app, || {
-        let root = crate::safe_fs::validate_root(Path::new(&folder_path))?;
-        let identity = crate::safe_fs::file_identity(&root)?;
-        if !get_watched_folders().map_err(|e| e.to_string())?.iter().any(|folder| crate::safe_fs::file_identity(Path::new(&folder.path)).ok().as_ref() == Some(&identity)) {
-            return Err("Folder is no longer registered".into());
-        }
-        let _guard = crate::safe_fs::guard_directory(&root)?;
+        let (root, _guard) = registered_ignore_root(&folder_path)?;
         save_mouziignore(&root.to_string_lossy(), &patterns)
     })
 }
@@ -820,10 +742,15 @@ pub fn get_schedule_cmd() -> Result<ScheduleSettings, String> {
 }
 
 /// Update scheduled-clean settings.
-#[tauri::command]
-pub fn update_schedule_cmd(app: AppHandle, schedule: ScheduleSettings) -> Result<AppSettings, String> {
+#[tauri::command(async)]
+pub fn update_schedule_cmd(app: AppHandle, schedule: ScheduleSettings, state: tauri::State<AppState>) -> Result<AppSettings, String> {
     crate::scheduler::validate_schedule_times(&schedule)?;
-    let committed = update_schedule_settings(&schedule).map_err(|e| e.to_string())?;
+    let committed = {
+        let _operation = state.ignored_files.with_operation();
+        let committed = update_schedule_settings(&schedule).map_err(|e| e.to_string())?;
+        state.scheduler.invalidate();
+        committed
+    };
     let _ = app.emit("settings-changed", &committed);
     Ok(committed)
 }
@@ -908,11 +835,17 @@ pub fn start_scan_cmd(app: AppHandle, state: tauri::State<'_, AppState>) -> Resu
                 let _ = app.emit("scan-complete", payload);
             }
         })));
-        is_scanning.store(false, Ordering::SeqCst);
         let errors = match &result {
             Ok(summaries) => summaries.iter().filter_map(|summary| summary.error.clone()).collect::<Vec<_>>(),
-            Err(_) => vec!["Scan worker panicked; previous snapshots retained".into()],
+            Err(_) => {
+                let error = "Inventory scan worker panicked";
+                match recover_interrupted_inventory(error) {
+                    Ok(()) => vec![format!("{error}. Previous snapshots retained.")],
+                    Err(recovery) => vec![format!("{error}. Could not reconcile interrupted scans: {recovery}")],
+                }
+            }
         };
+        is_scanning.store(false, Ordering::SeqCst);
         let _ = app.emit("scan-finished", serde_json::json!({
             "runId": run_id,
             "status": if errors.is_empty() { "finished" } else { "failed" },
@@ -1045,9 +978,8 @@ pub fn execute_cleanup_cmd(
 /// Get category suggestions for unclassified files in the inventory.
 #[tauri::command(async)]
 pub fn get_suggestions_cmd(limit: i64) -> Result<Vec<crate::classify::Suggestion>, String> {
-    let provider = crate::classify::detect_provider()?;
     let limit = limit.clamp(1, 200) as usize;
-    crate::classify::get_suggestions(limit, provider.as_ref())
+    crate::classify::get_suggestions(limit)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1424,12 +1356,11 @@ mod undo_tests {
     use std::sync::mpsc;
     use std::time::Duration;
 
-    /// Empties `action_logs`. Reports rather than unwraps so `UndoFixture::drop`
+    /// Empties move history and Undo intents. Reports errors so `UndoFixture::drop`
     /// can use it while the test is already unwinding.
     fn clear_logs() -> Result<(), String> {
         lock_db()?
-            .execute("DELETE FROM action_logs", [])
-            .map(|_| ())
+            .execute_batch("DELETE FROM operation_intents WHERE action='undo'; DELETE FROM action_logs;")
             .map_err(|e| e.to_string())
     }
 
@@ -1493,11 +1424,17 @@ mod undo_tests {
     }
 
     fn insert_log(timestamp: &str, source: &str, dest: Option<&str>) -> i64 {
+        let identity = dest.and_then(|path| crate::safe_fs::file_identity(Path::new(path)).ok())
+            .map(|identity| identity.key());
+        insert_log_with_identity(timestamp, source, dest, identity.as_deref())
+    }
+
+    fn insert_log_with_identity(timestamp: &str, source: &str, dest: Option<&str>, identity: Option<&str>) -> i64 {
         let conn = lock_db().expect("lock db");
         conn.execute(
-            "INSERT INTO action_logs (timestamp, source_path, destination_path, action, file_name, file_type, undone)
-             VALUES (?1, ?2, ?3, 'move', 'f.undocheck', 'Other', 0)",
-            rusqlite::params![timestamp, source, dest],
+            "INSERT INTO action_logs (timestamp, source_path, destination_path, action, file_name, file_type, undone, file_identity)
+             VALUES (?1, ?2, ?3, 'move', 'f.undocheck', 'Other', 0, ?4)",
+            rusqlite::params![timestamp, source, dest, identity],
         )
         .expect("insert log");
         conn.last_insert_rowid()
@@ -1534,6 +1471,135 @@ mod undo_tests {
     /// `ORDER BY timestamp DESC` batch.
     fn log_at(rank: u32, source: &str, dest: Option<&str>) {
         insert_log(&format!("2026-01-01T00:00:{rank:02}Z"), source, dest);
+    }
+
+    #[test]
+    fn undo_leaves_present_legacy_destination_and_history_alone() {
+        let fixture = UndoFixture::new("legacy_identity");
+        let (source, dest) = stage(fixture.root(), "legacy.undocheck");
+        let id = insert_log_with_identity("2026-01-01T00:00:00Z", &source, Some(&dest), None);
+        let result = undo_action_with(id, &ignored_files()).unwrap();
+
+        assert_eq!(result.status, "failed");
+        assert!(result.message.unwrap().contains("restore it manually"));
+        assert_eq!(std::fs::read(&dest).unwrap(), b"payload");
+        assert!(!Path::new(&source).exists());
+        assert_eq!(undone_of(&source), 0);
+    }
+
+    #[test]
+    fn undo_lookup_error_keeps_history_retryable() {
+        let fixture = UndoFixture::new("lookup_error");
+        let source = fixture.root().join("source.undocheck");
+        let source = source.to_str().unwrap();
+        let id = insert_log_with_identity("2026-01-01T00:00:00Z", source, Some("invalid\0path"), None);
+        let result = undo_action_with(id, &ignored_files()).unwrap();
+
+        assert_eq!(result.status, "failed");
+        assert!(result.message.unwrap().contains("Cannot inspect"));
+        assert_eq!(undone_of(source), 0);
+    }
+
+    #[test]
+    fn undo_all_rechecks_a_chain_with_tied_timestamps() {
+        let fixture = UndoFixture::new("move_chain");
+        let (source, middle) = stage(fixture.root(), "chain.undocheck");
+        let end = fixture.root().join("latest.undocheck");
+        let time = "2026-01-01T00:00:00Z";
+        insert_log(time, &source, Some(&middle));
+        std::fs::rename(&middle, &end).unwrap();
+        insert_log(time, &middle, Some(end.to_str().unwrap()));
+
+        let results = undo_all_with(&ignored_files()).unwrap().results;
+        assert_eq!(results.iter().map(|row| row.status.as_str()).collect::<Vec<_>>(), ["ok", "ok"]);
+        assert_eq!(std::fs::read(&source).unwrap(), b"payload");
+        assert!(!Path::new(&middle).exists());
+        assert!(!end.exists());
+        assert_eq!(undone_of(&source), 1);
+        assert_eq!(undone_of(&middle), 1);
+    }
+
+    #[test]
+    fn pending_undo_blocks_overlapping_chain_before_and_after_the_move() {
+        let fixture = UndoFixture::new("pending_chain");
+        let (source, middle) = stage(fixture.root(), "chain.undocheck");
+        let end = fixture.root().join("latest.undocheck");
+        let end = end.to_str().unwrap();
+        let middle_path = Path::new(&middle);
+        let old_identity = crate::safe_fs::file_identity(middle_path).unwrap();
+        let separator = std::path::MAIN_SEPARATOR;
+        let middle_alias = format!("{}{separator}{separator}{}",
+            middle_path.parent().unwrap().display(), middle_path.file_name().unwrap().to_string_lossy());
+        let older = insert_log_with_identity("2026-01-01T00:00:01Z", &source, Some(&middle_alias), Some(&old_identity.key()));
+        // A copy-then-remove move gives the newer row a different physical identity.
+        std::fs::copy(&middle, end).unwrap();
+        std::fs::remove_file(&middle).unwrap();
+        let new_identity = crate::safe_fs::file_identity(Path::new(end)).unwrap();
+        assert_ne!(old_identity, new_identity);
+        let newer = insert_log("2026-01-01T00:00:02Z", &middle, Some(end));
+        let intent = begin_undo_intent(newer, end, &middle, &new_identity.key()).unwrap();
+        let (unrelated_source, unrelated_dest) = stage(fixture.root(), "unrelated.undocheck");
+        log_at(0, &unrelated_source, Some(&unrelated_dest));
+        let ignored = ignored_files();
+        let receipt = format!("recovery record {intent}");
+
+        for moved in [false, true] {
+            if moved {
+                crate::safe_fs::move_file_checked_expected(Path::new(end), Path::new(&middle), &new_identity).unwrap();
+            }
+            for id in [older, newer] {
+                let result = undo_action_with(id, &ignored).unwrap();
+                assert_eq!(result.status, "failed");
+                assert!(result.message.unwrap().contains(receipt.as_str()));
+            }
+            let batch = undo_all_with(&ignored).unwrap();
+            assert_eq!(batch.results.len(), if moved { 2 } else { 3 });
+            for result in &batch.results[..2] {
+                assert_eq!(result.status, "failed");
+                assert!(result.message.as_deref().unwrap().contains(receipt.as_str()));
+            }
+            if !moved { assert_eq!(batch.results[2].status, "ok"); }
+            assert_eq!(undone_of(&source), 0);
+            assert_eq!(undone_of(&middle), 0);
+            assert!(!Path::new(&source).exists());
+            assert_eq!(Path::new(&middle).exists(), moved);
+            assert_eq!(Path::new(end).exists(), !moved);
+            assert!(pending_undos().unwrap()[0].observed.is_none());
+        }
+        assert_eq!(std::fs::read(unrelated_source).unwrap(), b"payload");
+    }
+
+    #[test]
+    fn interrupted_undo_preserves_observation_and_blocks_a_blind_retry() {
+        let fixture = UndoFixture::new("interrupted_undo");
+        let (source, dest) = stage(fixture.root(), "interrupted.undocheck");
+        std::fs::write(&source, b"occupied").unwrap();
+        let identity = crate::safe_fs::file_identity(Path::new(&dest)).unwrap();
+        let id = insert_log("2026-01-01T00:00:00Z", &source, Some(&dest));
+        let intent = begin_undo_intent(id, &dest, &source, &identity.key()).unwrap();
+        let moved = crate::safe_fs::move_file_checked_expected(Path::new(&dest), Path::new(&source), &identity).unwrap();
+        let actual = moved.destination.to_str().unwrap();
+        assert!(moved.renamed);
+
+        let retry = undo_action_with(id, &ignored_files()).unwrap();
+        assert_eq!(retry.status, "failed");
+        assert!(retry.message.unwrap().contains("Undo was interrupted"));
+        let pending = pending_undos().unwrap();
+        assert_eq!((pending[0].id, pending[0].observed.as_deref()), (intent, None));
+        assert_eq!(undone_of(&source), 0);
+
+        observe_undo_restore(intent, actual, &moved.identity.key()).unwrap();
+        let rescued = fixture.root().join("rescued.undocheck");
+        std::fs::rename(actual, &rescued).unwrap();
+        std::fs::write(actual, b"replacement").unwrap();
+        let error = finalize_undo_intent(intent, id, &dest, actual, &moved.identity.key()).unwrap_err();
+        assert!(error.contains("replaced"));
+        let pending = pending_undos().unwrap();
+        assert_eq!((pending[0].id, pending[0].observed.as_deref()), (intent, Some(actual)));
+        assert_eq!(undone_of(&source), 0);
+        assert_eq!(std::fs::read(actual).unwrap(), b"replacement");
+        assert_eq!(std::fs::read(&source).unwrap(), b"occupied");
+        assert_eq!(std::fs::read(rescued).unwrap(), b"payload");
     }
 
     /// A hook that records which paths are already guarded the instant the
