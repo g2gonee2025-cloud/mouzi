@@ -1,4 +1,4 @@
-import { useState, useCallback, useMemo } from "react";
+import { useState, useCallback, useMemo, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import { useCleanupStore } from "../../store/useCleanupStore";
 import { formatBytes, formatTimestamp } from "../../utils/format";
@@ -38,6 +38,7 @@ export default function FileListTab({
   const [showResults, setShowResults] = useState(false);
   const [pending, setPending] = useState<ConfirmDialogProps | null>(null);
   const beginPreview = usePreviewOwner();
+  const resultsHeading = useRef<HTMLHeadingElement>(null);
 
   const data: CleanupFile[] | null =
     kind === "large" ? store.largeFiles : store.staleFiles;
@@ -76,7 +77,7 @@ export default function FileListTab({
     }
   }, [data, checked]);
 
-  const handleConfirm = async () => {
+  const handleConfirm = async (opener: HTMLButtonElement) => {
     if (checkedFiles.length === 0) return;
     const actions: CleanupRequest[] = checkedFiles.map(({ path }) => ({
       kind: kind === "large" ? "trash_large" : "trash_stale",
@@ -94,6 +95,8 @@ export default function FileListTab({
         bytes: plan.totalBytes,
         notice: "trash",
         preview: plan.actions.map((f) => f.path),
+        opener,
+        focusFallback: () => resultsHeading.current,
         onConfirm: async () => { await store.executeCleanup(plan.planId); setShowResults(true); },
         onClose: () => { owner.abort(); setPending(null); },
       });
@@ -119,6 +122,7 @@ export default function FileListTab({
   if (showResults && store.results) {
     return (
       <ResultsPanel
+        headingRef={resultsHeading}
         results={store.results}
         onDone={handleResultsDone}
         error={store.error}
@@ -185,7 +189,7 @@ export default function FileListTab({
               {t("cleanup.selectAll")} ({data.length})
             </label>
             <button
-              onClick={handleConfirm}
+              onClick={(event) => void handleConfirm(event.currentTarget)}
               disabled={store.busy || checked.size === 0}
               className="flex items-center gap-1.5 rounded-md bg-red-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-red-700 disabled:opacity-50 transition-colors"
             >

@@ -110,8 +110,6 @@ mod windows_fs {
     }
 
     pub(super) fn rename(file: &File, destination: &Path) -> io::Result<()> {
-        // The Win32 wrapper resolves a DOS path. Use the canonical absolute
-        // destination while its parent ancestry is pinned by the caller.
         // Include a terminator in the allocation, but not FileNameLength.
         let name: Vec<u16> = destination.as_os_str().encode_wide().collect();
         let offset = std::mem::offset_of!(RenameInfo, name);
@@ -489,6 +487,39 @@ pub struct MoveResult {
     pub identity: FileIdentity,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum MoveFailure {
+    Failed(String),
+    SourceSharingViolation(String),
+    RetainedOutput {
+        path: PathBuf,
+        identity: Option<FileIdentity>,
+        verified: bool,
+        source_preserved: bool,
+        message: String,
+    },
+}
+
+impl From<String> for MoveFailure {
+    fn from(message: String) -> Self { Self::Failed(message) }
+}
+
+impl From<&str> for MoveFailure {
+    fn from(message: &str) -> Self { Self::Failed(message.into()) }
+}
+
+impl std::fmt::Display for MoveFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Failed(message) | Self::SourceSharingViolation(message) => formatter.write_str(message),
+            Self::RetainedOutput { path, verified, message, .. } => {
+                let description = if *verified { "Verified copy" } else { "Unverified output" };
+                write!(formatter, "{description} retained at {}: {message}", path.display())
+            }
+        }
+    }
+}
+
 fn collision_error(error: &io::Error) -> bool {
     error.kind() == io::ErrorKind::AlreadyExists || {
         #[cfg(windows)] { matches!(error.raw_os_error(), Some(80 | 183)) }
@@ -536,53 +567,162 @@ fn hash_handle(file: &mut File) -> Result<blake3::Hash, String> {
     Ok(hash.finalize())
 }
 
-fn copy_verified(source: &mut File, src: &Path, destination: &Path) -> Result<FileIdentity, String> {
-    #[cfg(windows)]
-    windows_fs::require_unnamed_stream(source)?;
-    let before = source.metadata().map_err(|e| e.to_string())?;
-    let identity = identity_from_handle(source)?;
+fn create_staged_copy(parent: &Path) -> Result<(PathBuf, File), String> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT_STAGE: AtomicU64 = AtomicU64::new(0);
     let mut output_options = OpenOptions::new();
     output_options.read(true).write(true).create_new(true);
     #[cfg(windows)] {
         use std::os::windows::fs::OpenOptionsExt;
         output_options.access_mode(0x80000000 | 0x40000000 | 0x00010000).share_mode(1); // deny external write/delete
     }
-    let mut output = output_options.open(destination).map_err(|e| if collision_error(&e) { format!("Destination collision: {}", e) } else { e.to_string() })?;
-    let output_identity = identity_from_handle(&output)?;
-    let transfer: Result<(), String> = (|| {
+    for _ in 0..1024 {
+        let sequence = NEXT_STAGE.fetch_add(1, Ordering::Relaxed);
+        let path = parent.join(format!(".mouzi-transfer-{}-{sequence}.part", std::process::id()));
+        match output_options.open(&path) {
+            Ok(file) => return Ok((path, file)),
+            Err(error) if collision_error(&error) => continue,
+            Err(error) => return Err(format!("Cannot create staging file {}: {error}", path.display())),
+        }
+    }
+    Err("No free cross-volume staging filename".into())
+}
+
+fn discard_copy(output: &File, path: &Path, identity: FileIdentity, message: String) -> MoveFailure {
+    match remove_open_source(output, path) {
+        Ok(()) => MoveFailure::Failed(message),
+        Err(error) => MoveFailure::RetainedOutput {
+            path: path.to_path_buf(),
+            identity: Some(identity),
+            verified: false,
+            source_preserved: true,
+            message: format!("{message}. Could not remove the output: {error}"),
+        },
+    }
+}
+
+// None denotes a publication collision with the stage successfully discarded.
+// Keep the published file open until the caller closes and checks the source.
+fn copy_verified(
+    source: &mut File,
+    src: &Path,
+    destination: &Path,
+    parent: &File,
+    remove_source: impl FnOnce(&File, &Path) -> Result<(), String>,
+) -> Result<Option<(FileIdentity, File)>, MoveFailure> {
+    #[cfg(windows)]
+    windows_fs::require_unnamed_stream(source)?;
+    let before = source.metadata().map_err(|e| e.to_string())?;
+    #[cfg(windows)]
+    let (created, modified) = {
+        use std::os::windows::fs::MetadataExt;
+        const UNSUPPORTED_STORAGE: u32 = 0x0200 | 0x0400 | 0x0800 | 0x1000 | 0x4000 | 0x0004_0000 | 0x0040_0000;
+        if before.file_attributes() & UNSUPPORTED_STORAGE != 0 {
+            return Err("Cross-volume copy does not support this file's storage attributes; source preserved".into());
+        }
+        (before.created().map_err(|e| e.to_string())?, before.modified().map_err(|e| e.to_string())?)
+    };
+    let identity = identity_from_handle(source)?;
+    let parent_path = destination.parent().ok_or("Destination has no parent")?;
+    let parent_identity = identity_from_handle(parent)?;
+    if file_identity(parent_path)? != parent_identity {
+        return Err("Destination parent changed identity; source preserved".into());
+    }
+    let (stage, mut output) = create_staged_copy(parent_path)?;
+    let output_identity = match identity_from_handle(&output) {
+        Ok(identity) => identity,
+        Err(message) => {
+            return Err(match remove_open_source(&output, &stage) {
+                Ok(()) => MoveFailure::Failed(message),
+                Err(error) => MoveFailure::RetainedOutput {
+                    path: stage,
+                    identity: None,
+                    verified: false,
+                    source_preserved: true,
+                    message: format!("{message}. Could not remove the staging file: {error}"),
+                },
+            });
+        }
+    };
+    let prepared = (|| -> Result<(), String> {
         source.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
         io::copy(source, &mut output).map_err(|e| e.to_string())?;
         output.flush().map_err(|e| e.to_string())?;
-        output.sync_all().map_err(|e| e.to_string())?;
         let copied_hash = hash_handle(&mut output)?;
         let source_hash = hash_handle(source)?;
         let after = source.metadata().map_err(|e| e.to_string())?;
         if !stable_metadata(&before, &after) || identity_from_handle(source)? != identity || file_identity(src)? != identity || output.metadata().map_err(|e| e.to_string())?.len() != before.len() || copied_hash != source_hash {
             return Err("Source changed or transfer verification failed; source preserved".into());
         }
-        if file_identity(destination)? != output_identity { return Err("Destination changed during transfer; source preserved".into()); }
-        // Windows sharing is per stream. Check again after the transfer before
-        // marking the source for deletion.
         #[cfg(windows)]
-        windows_fs::require_unnamed_stream(source)?;
-        remove_open_source(source, src).map_err(|e| format!("Verified copy at {}, source remains: {}", destination.display(), e))?;
+        {
+            use std::os::windows::fs::FileTimesExt;
+            let times = std::fs::FileTimes::new().set_created(created).set_modified(modified);
+            output.set_times(times).map_err(|e| format!("Cannot preserve source timestamps: {e}"))?;
+        }
+        output.sync_all().map_err(|e| e.to_string())?;
+        if file_identity(&stage)? != output_identity || file_identity(parent_path)? != parent_identity {
+            return Err("Destination stage or parent changed identity; source preserved".into());
+        }
         Ok(())
     })();
-    if let Err(ref error) = transfer {
-        // Delete only our incomplete copy. A verified copy whose source removal failed
-        // is retained for recovery and the error names both locations.
-        if !error.starts_with("Verified copy at ") && file_identity(destination).ok().as_ref() == Some(&output_identity) {
-            #[cfg(windows)]
-            let cleanup = windows_fs::remove(&output);
-            #[cfg(not(windows))]
-            let cleanup = std::fs::remove_file(destination);
-            if let Err(cleanup_error) = cleanup {
-                return Err(format!("{}; partial destination retained at {}: {}", error, destination.display(), cleanup_error));
-            }
-        }
+    if let Err(message) = prepared {
+        return Err(discard_copy(&output, &stage, output_identity, message));
     }
-    drop(output);
-    transfer.map(|()| output_identity)
+    #[cfg(windows)]
+    let published = windows_fs::rename(&output, destination);
+    #[cfg(not(windows))]
+    let published = std::fs::hard_link(&stage, destination);
+    if let Err(error) = published {
+        let collision = collision_error(&error);
+        let failure = discard_copy(&output, &stage, output_identity, format!("Cannot publish {}: {error}", destination.display()));
+        return match failure {
+            MoveFailure::Failed(_) if collision => Ok(None),
+            _ => Err(failure),
+        };
+    }
+    #[cfg(not(windows))]
+    if let Err(message) = remove_open_source(&output, &stage) {
+        let failure = discard_copy(&output, destination, output_identity.clone(), format!("Cannot remove staging name {}: {message}", stage.display()));
+        return Err(match failure {
+            MoveFailure::Failed(message) => MoveFailure::RetainedOutput {
+                path: stage,
+                identity: Some(output_identity),
+                verified: false,
+                source_preserved: true,
+                message,
+            },
+            failure => failure,
+        });
+    }
+    let verified = (|| -> Result<(), String> {
+        if file_identity(destination)? != output_identity || file_identity(parent_path)? != parent_identity {
+            return Err("Published destination changed identity; source preserved".into());
+        }
+        #[cfg(windows)]
+        {
+            let published = output.metadata().map_err(|e| e.to_string())?;
+            if published.created().ok() != Some(created) || published.modified().ok() != Some(modified) {
+                return Err("Published destination did not preserve source timestamps; source preserved".into());
+            }
+            // Windows sharing is per stream, so check again just before removal.
+            windows_fs::require_unnamed_stream(source)?;
+        }
+        Ok(())
+    })();
+    if let Err(message) = verified {
+        return Err(discard_copy(&output, destination, output_identity, message));
+    }
+    if let Err(error) = remove_source(source, src) {
+        return Err(MoveFailure::RetainedOutput {
+            path: destination.to_path_buf(),
+            identity: Some(output_identity),
+            verified: true,
+            source_preserved: file_identity(src).ok().as_ref() == Some(&identity),
+            message: format!("Could not remove source at {}: {error}", src.display()),
+        });
+    }
+    Ok(Some((output_identity, output)))
 }
 
 fn prepare_destination_parent(dest: &Path) -> Result<(PathBuf, Vec<File>), String> {
@@ -602,13 +742,44 @@ pub fn move_file_checked(src: &Path, dest: &Path) -> Result<MoveResult, String> 
 }
 
 pub fn move_file_checked_expected(src: &Path, dest: &Path, expected: &FileIdentity) -> Result<MoveResult, String> {
-    move_file_checked_inner(src, dest, Some(expected), false)
+    move_file_checked_expected_detailed(src, dest, expected).map_err(|error| error.to_string())
+}
+
+pub(crate) fn move_file_checked_expected_detailed(src: &Path, dest: &Path, expected: &FileIdentity) -> Result<MoveResult, MoveFailure> {
+    move_file_checked_content_inner(src, dest, Some(expected), None, false, true)
 }
 
 /// Validate reviewed contents using the same write-denying source handle that
 /// performs the rename, so closing a preview handle cannot admit an edit.
 pub fn move_file_checked_expected_content(src: &Path, dest: &Path, expected: &FileIdentity, digest: &str) -> Result<MoveResult, String> {
-    move_file_checked_content_inner(src, dest, Some(expected), Some(digest), false, true)
+    move_file_checked_content_inner(src, dest, Some(expected), Some(digest), false, true).map_err(|error| error.to_string())
+}
+
+/// Remove a known regular staging file through a guarded handle.
+pub(crate) fn remove_regular_file_expected(path: &Path, expected: &FileIdentity) -> Result<(), String> {
+    if !path.is_absolute() || has_dot_component(path) {
+        return Err("Removal requires an absolute path without dot segments".into());
+    }
+    #[cfg(windows)]
+    if path.file_name().is_some_and(|name| name.as_encoded_bytes().contains(&b':')) {
+        return Err("Removal requires an ordinary filename".into());
+    }
+    let _parents = pin_ancestry(path.parent().ok_or("File has no parent")?)?;
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+    if is_link(&metadata) || !metadata.is_file() {
+        return Err("Removal requires a regular file without links".into());
+    }
+    let file = open_guard(path, false, true).map_err(|error| error.to_string())?;
+    let metadata = file.metadata().map_err(|error| error.to_string())?;
+    if is_link(&metadata) || !metadata.is_file() || identity_from_handle(&file)? != *expected {
+        return Err("File changed identity or type before removal".into());
+    }
+    remove_open_source(&file, path)?;
+    drop(file);
+    if source_absence(path) != SourceAbsence::Absent {
+        return Err("Removal was requested but source absence could not be verified".into());
+    }
+    Ok(())
 }
 
 pub fn remove_empty_directory_expected(path: &Path, expected: &FileIdentity) -> Result<(), String> {
@@ -626,20 +797,33 @@ pub fn remove_empty_directory_expected(path: &Path, expected: &FileIdentity) -> 
 }
 
 pub fn move_reviewed_file(src: &Path, dest: &Path, expected: &FileIdentity, digest: &str) -> Result<MoveResult, String> {
+    move_reviewed_file_detailed(src, dest, expected, digest).map_err(|error| error.to_string())
+}
+
+pub(crate) fn move_reviewed_file_detailed(src: &Path, dest: &Path, expected: &FileIdentity, digest: &str) -> Result<MoveResult, MoveFailure> {
     move_file_checked_content_inner(src, dest, Some(expected), Some(digest), false, false)
 }
 
 fn move_file_checked_inner(src: &Path, dest: &Path, expected: Option<&FileIdentity>, force_copy: bool) -> Result<MoveResult, String> {
-    move_file_checked_content_inner(src, dest, expected, None, force_copy, true)
+    move_file_checked_content_inner(src, dest, expected, None, force_copy, true).map_err(|error| error.to_string())
 }
 
-fn move_file_checked_content_inner(src: &Path, dest: &Path, expected: Option<&FileIdentity>, expected_digest: Option<&str>, force_copy: bool, allow_rename: bool) -> Result<MoveResult, String> {
+fn move_file_checked_content_inner(src: &Path, dest: &Path, expected: Option<&FileIdentity>, expected_digest: Option<&str>, force_copy: bool, allow_rename: bool) -> Result<MoveResult, MoveFailure> {
     if !src.is_absolute() || has_dot_component(src) { return Err("Move source must be absolute and have no dot segments".into()); }
     let _source_ancestors = pin_ancestry(src.parent().ok_or("Source has no parent")?)?;
     let metadata = std::fs::symlink_metadata(src).map_err(|e| e.to_string())?;
     if !metadata.is_file() || is_link(&metadata) { return Err("Move source must be a regular file without links".into()); }
-    let mut source = open_guard(src, false, true).map_err(|e| e.to_string())?;
-    if !source.metadata().map_err(|e| e.to_string())?.is_file() { return Err("Move source changed type".into()); }
+    let mut source = open_guard(src, false, true).map_err(|error| {
+        // ERROR_SHARING_VIOLATION and ERROR_LOCK_VIOLATION at this open
+        // leave both paths untouched.
+        if cfg!(windows) && matches!(error.raw_os_error(), Some(32 | 33)) {
+            MoveFailure::SourceSharingViolation(error.to_string())
+        } else {
+            MoveFailure::Failed(error.to_string())
+        }
+    })?;
+    let metadata = source.metadata().map_err(|e| e.to_string())?;
+    if !metadata.is_file() || is_link(&metadata) { return Err("Move source changed type or became a link".into()); }
     let identity = identity_from_handle(&source)?;
     if expected.is_some_and(|expected| *expected != identity) { return Err("Move source changed identity".into()); }
     // Capture the inventory spelling while the reviewed entry and its
@@ -655,6 +839,8 @@ fn move_file_checked_content_inner(src: &Path, dest: &Path, expected: Option<&Fi
     }
     let (parent, guards) = prepare_destination_parent(dest)?;
     let requested_name = dest.file_name().and_then(|name| name.to_str()).ok_or("Destination requires a valid Unicode filename")?;
+    #[cfg(windows)]
+    if requested_name.contains(':') { return Err("Destination requires an ordinary filename".into()); }
     let requested = parent.join(requested_name);
     if path_occupied(&requested)? && file_identity(&requested).ok().as_ref() == Some(&identity) { return Err("Source and destination identify the same physical file".into()); }
     for _ in 0..10_001 {
@@ -662,18 +848,30 @@ fn move_file_checked_content_inner(src: &Path, dest: &Path, expected: Option<&Fi
             if path_occupied(&requested)? { return Err("Reviewed destination is now occupied; preview again".into()); }
             requested.clone()
         };
-        let actual_identity = if force_copy {
-            match copy_verified(&mut source, src, &actual) { Err(error) if allow_rename && error.starts_with("Destination collision:") => continue, result => result? }
-        } else {
+        if !force_copy {
             match rename_no_replace(&source, src, &guards[0], &actual) {
-                Ok(()) => identity.clone(),
+                Ok(()) => return Ok(MoveResult { source: canonical_source, renamed: actual != requested, destination: actual, identity }),
                 Err(error) if allow_rename && collision_error(&error) => continue,
-                Err(error) if cross_device_error(&error) => {
-                    match copy_verified(&mut source, src, &actual) { Err(error) if allow_rename && error.starts_with("Destination collision:") => continue, result => result? }
-                },
-                Err(error) => return Err(format!("Cannot move {} to {}: {}", src.display(), actual.display(), error)),
+                Err(error) if cross_device_error(&error) => {}
+                Err(error) => return Err(format!("Cannot move {} to {}: {}", src.display(), actual.display(), error).into()),
             }
+        }
+        let (actual_identity, output_guard) = match copy_verified(&mut source, src, &actual, &guards[0], remove_open_source)? {
+            Some(published) => published,
+            None if allow_rename => continue,
+            None => return Err("Reviewed destination is now occupied; preview again".into()),
         };
+        drop(source);
+        if source_absence(src) != SourceAbsence::Absent {
+            return Err(MoveFailure::RetainedOutput {
+                path: actual,
+                identity: Some(actual_identity),
+                verified: true,
+                source_preserved: false,
+                message: format!("Removal was requested, but source absence could not be verified at {}", src.display()),
+            });
+        }
+        drop(output_guard);
         return Ok(MoveResult { source: canonical_source, renamed: actual != requested, destination: actual, identity: actual_identity });
     }
     Err("Destination collision allocation exhausted".into())
@@ -1208,6 +1406,110 @@ mod tests {
         assert_eq!(fs::read(&stream).unwrap(), b"named");
         assert!(!destination.exists());
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn staged_publication_collision_preserves_both_existing_files() {
+        let root = test_dir("stage_collision");
+        let source = root.join("source.bin");
+        let destination = root.join("destination.bin");
+        fs::write(&source, b"source").unwrap();
+        fs::write(&destination, b"competitor").unwrap();
+        let (parent, guards) = prepare_destination_parent(&destination).unwrap();
+        let destination = parent.join("destination.bin");
+        let mut handle = open_guard(&source, false, true).unwrap();
+        let result = copy_verified(&mut handle, &source, &destination, &guards[0], |_, _| {
+            panic!("collision must not request source removal")
+        }).unwrap();
+        assert!(result.is_none());
+        assert_eq!(fs::read(&source).unwrap(), b"source");
+        assert_eq!(fs::read(&destination).unwrap(), b"competitor");
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 2);
+        drop((handle, guards));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn failed_source_removal_reports_verified_output_and_identity() {
+        let root = test_dir("stage_remove_failure");
+        let source = root.join("source.bin");
+        let destination = root.join("destination.bin");
+        fs::write(&source, b"source").unwrap();
+        let (parent, guards) = prepare_destination_parent(&destination).unwrap();
+        let destination = parent.join("destination.bin");
+        let mut handle = open_guard(&source, false, true).unwrap();
+        let error = copy_verified(&mut handle, &source, &destination, &guards[0], |_, _| {
+            Err("injected source removal failure".into())
+        }).unwrap_err();
+        let MoveFailure::RetainedOutput {
+            path, identity: Some(identity), verified: true, source_preserved: true, ..
+        } = error else { panic!("Unexpected result: {error}") };
+        assert_eq!(path, destination);
+        assert_eq!(identity, file_identity(&destination).unwrap());
+        assert_eq!(fs::read(&source).unwrap(), b"source");
+        assert_eq!(fs::read(&destination).unwrap(), b"source");
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 2);
+        drop((handle, guards));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn guarded_regular_file_removal_rejects_an_unexpected_identity() {
+        let root = test_dir("remove_known_file");
+        let file = root.join("owned.part");
+        let other = root.join("other");
+        fs::write(&file, b"owned").unwrap();
+        fs::write(&other, b"other").unwrap();
+        let identity = file_identity(&file).unwrap();
+        assert!(remove_regular_file_expected(&file, &file_identity(&other).unwrap()).is_err());
+        assert_eq!(fs::read(&file).unwrap(), b"owned");
+        remove_regular_file_expected(&file, &identity).unwrap();
+        assert!(!file.exists());
+        assert_eq!(fs::read(&other).unwrap(), b"other");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires an explicitly provided scratch directory on a second NTFS volume"]
+    fn real_cross_volume_move_preserves_windows_timestamps() {
+        use std::os::windows::fs::FileTimesExt;
+        use std::time::{Duration, SystemTime};
+
+        let destination_root = std::env::var_os("MOUZI_CROSS_VOLUME_TEST_ROOT")
+            .expect("Provide an existing disposable root on a different volume");
+        let destination_root = validate_root(Path::new(&destination_root)).unwrap();
+        let source_root = test_dir("real_cross_volume");
+        let source = source_root.join("source.bin");
+        let source_volume = file_identity(&source_root).unwrap().volume;
+        let destination_volume = file_identity(&destination_root).unwrap().volume;
+        assert_ne!(source_volume, destination_volume, "The test requires two physical volume identities");
+        let created = SystemTime::UNIX_EPOCH + Duration::from_secs(1_600_000_000);
+        let modified = created + Duration::from_secs(12);
+        let mut file = File::create(&source).unwrap();
+        file.write_all(b"cross-volume fixture").unwrap();
+        file.set_times(std::fs::FileTimes::new().set_created(created).set_modified(modified)).unwrap();
+        drop(file);
+        let metadata = fs::metadata(&source).unwrap();
+        assert_eq!(metadata.created().unwrap(), created);
+        assert_eq!(metadata.modified().unwrap(), modified);
+        let destination_root = destination_root.join(format!("fixture-{}", std::process::id()));
+        fs::create_dir(&destination_root).unwrap();
+        let destination = destination_root.join("source.bin");
+        fs::write(&destination, b"occupied").unwrap();
+        let moved = move_file_checked_expected(&source, &destination, &file_identity(&source).unwrap()).unwrap();
+        assert_eq!(moved.identity.volume, destination_volume);
+        assert!(moved.renamed && !source.exists());
+        assert_eq!(fs::read(&destination).unwrap(), b"occupied");
+        assert_eq!(fs::read(&moved.destination).unwrap(), b"cross-volume fixture");
+        let metadata = fs::metadata(&moved.destination).unwrap();
+        assert_eq!(metadata.created().unwrap(), created);
+        assert_eq!(metadata.modified().unwrap(), modified);
+        assert_eq!(fs::read_dir(&destination_root).unwrap().count(), 2);
+        fs::remove_file(&moved.destination).unwrap();
+        fs::remove_file(&destination).unwrap();
+        fs::remove_dir(&destination_root).unwrap();
+        fs::remove_dir(&source_root).unwrap();
     }
 
     #[test]

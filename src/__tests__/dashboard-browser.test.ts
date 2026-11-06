@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { createInventoryBrowserLoader, INVENTORY_MATCH_LIMIT } from "../utils/dashboard";
+import { clearMissingDashboardRoot, createInventoryBrowserLoader, INVENTORY_MATCH_LIMIT } from "../utils/dashboard";
 import type { InventoryFile } from "../store/useDashboardStore";
 
 function deferred<T>() {
@@ -88,6 +88,29 @@ describe("inventory browser response ordering", () => {
     expect(update).toHaveBeenLastCalledWith(expect.objectContaining({ rows: [file("new")], loading: false }));
   });
 
+  it("starts a fresh request when the browser is remounted with the same view options", async () => {
+    const old = deferred<InventoryFile[]>();
+    const oldUpdate = vi.fn();
+    const firstLoader = createInventoryBrowserLoader(() => old.promise, oldUpdate);
+    const activeRequest = { ...request, sort: "mtime" as const, category: "Documents", root: "C:/work" };
+    const pending = firstLoader.load(activeRequest);
+    firstLoader.cancel();
+    oldUpdate.mockClear();
+
+    const newUpdate = vi.fn();
+    const fetchRows = vi.fn().mockResolvedValue([file("current")]);
+    const newLoader = createInventoryBrowserLoader(fetchRows, newUpdate);
+    await newLoader.load(activeRequest);
+    old.resolve([file("obsolete")]);
+    await pending;
+
+    expect(oldUpdate).not.toHaveBeenCalled();
+    expect(fetchRows).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      sort: "mtime", query: "old", category: "Documents", root: "C:/work",
+    }));
+    expect(newUpdate).toHaveBeenLastCalledWith(expect.objectContaining({ rows: [file("current")], loading: false }));
+  });
+
   it("cancels a pending debounce and fetches only the final query", async () => {
     vi.useFakeTimers();
     try {
@@ -114,5 +137,17 @@ describe("inventory browser response ordering", () => {
     expect(update).toHaveBeenLastCalledWith(expect.objectContaining({
       rows: rows.slice(0, INVENTORY_MATCH_LIMIT), limited: count > INVENTORY_MATCH_LIMIT, loading: false,
     }));
+  });
+});
+
+describe("saved Dashboard root selection", () => {
+  it("clears the missing root while keeping the other view options", () => {
+    const view = { sort: "mtime" as const, query: "notes", category: "Documents", root: "C:/old" };
+    expect(clearMissingDashboardRoot(view, "C:/old")).toEqual({ ...view, root: null });
+  });
+
+  it("keeps a newer root chosen while reconciliation is queued", () => {
+    const view = { sort: "size" as const, query: "notes", category: "Documents", root: "D:/new" };
+    expect(clearMissingDashboardRoot(view, "C:/old")).toBe(view);
   });
 });

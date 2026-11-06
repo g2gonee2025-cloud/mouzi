@@ -1,3 +1,4 @@
+import type { Ref } from "react";
 import { useTranslation } from "react-i18next";
 import {
   cleanupStatusMark,
@@ -7,12 +8,14 @@ import {
 import { RotateCcw } from "lucide-react";
 
 interface ResultsPanelProps {
+  headingRef?: Ref<HTMLHeadingElement>;
   results: CleanupOutcome[];
   error: string | null;
   onDone: () => void;
 }
 
 export default function ResultsPanel({
+  headingRef,
   results,
   error,
   onDone,
@@ -22,7 +25,7 @@ export default function ResultsPanel({
   return (
     <div className="space-y-3">
       <div className="flex items-center justify-between">
-        <h3 className="text-sm font-semibold text-text">
+        <h3 ref={headingRef} tabIndex={-1} className="text-sm font-semibold text-text">
           {t("cleanup.resultsTitle")}
         </h3>
         <button

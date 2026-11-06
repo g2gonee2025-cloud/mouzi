@@ -215,6 +215,7 @@ pub fn run() {
             refresh_watcher_cmd,
             get_schedule_cmd,
             update_schedule_cmd,
+            get_recent_scheduler_runs_cmd,
             get_version_cmd,
             export_rules_cmd,
             import_rules_cmd,

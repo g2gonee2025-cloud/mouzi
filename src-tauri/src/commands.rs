@@ -17,6 +17,7 @@ use std::sync::Mutex as PlanMutex;
 use std::sync::{Mutex, MutexGuard};
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_autostart::ManagerExt;
+use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_notification::NotificationExt;
 
 #[tauri::command]
@@ -268,10 +269,36 @@ fn related_pending_undo(target: &UndoTarget) -> Result<Option<PendingUndo>, Stri
     }))
 }
 
+fn record_undo_move_failure(intent: i64, error: crate::safe_fs::MoveFailure, ignored_files: &IgnoredFiles) -> String {
+    use crate::safe_fs::MoveFailure;
+    match error {
+        MoveFailure::Failed(error) | MoveFailure::SourceSharingViolation(error) => match finalize_operation_intent(intent, "failed", None, Some(&error)) {
+            Ok(()) => error,
+            Err(journal) => format!("{error}. Undo recovery record {intent} remains pending. Journal error: {journal}"),
+        },
+        MoveFailure::RetainedOutput { path, identity, verified, source_preserved, message } => {
+            ignored_files.arm(std::slice::from_ref(&path), Instant::now(), SUPPRESSION_TTL);
+            let actual = path.to_string_lossy();
+            let identity = identity.map(|identity| identity.key());
+            let output = if verified { "Verified copy" } else { "Unverified output" };
+            let source = if source_preserved { "The organized file was preserved." }
+                else { "The organized file's state could not be confirmed." };
+            let detail = format!("{output} retained at {actual}. {source} {message}");
+            match observe_undo_retained_output(intent, &actual, identity.as_deref(), &detail) {
+                Ok(()) => format!("{detail} Undo recovery record {intent} remains pending."),
+                Err(journal) => format!("{detail} Undo recovery record {intent} remains pending. Its retained path could not be saved: {journal}"),
+            }
+        }
+    }
+}
+
 /// Evaluate the recorded destination while the caller holds the operation gate.
 /// A prior row in Undo All may have just restored this row's destination.
 fn finish_undo(target: &UndoTarget, ignored_files: &IgnoredFiles) -> Result<UndoResult, String> {
     if let Some(receipt) = related_pending_undo(target)? {
+        if let Some(detail) = receipt.retained_message {
+            return Err(format!("{detail} Inspect both locations before restoring manually. Undo recovery record {} remains pending.", receipt.id));
+        }
         let location = receipt.observed.map(|path| format!(" Observed restore path: {path}.")).unwrap_or_default();
         let requested = receipt.requested.as_deref().unwrap_or("(unrecorded)");
         return Err(format!("Undo was interrupted (recovery record {}). Inspect {} and {requested} before restoring manually.{location}", receipt.id, receipt.source));
@@ -302,12 +329,9 @@ fn finish_undo(target: &UndoTarget, ignored_files: &IgnoredFiles) -> Result<Undo
         .map_err(|error| format!("Undo was not started: could not persist operation intent: {error}"))?;
 
     notify_move_observer();
-    let moved = match crate::safe_fs::move_file_checked_expected(dest_path, source_path, &identity) {
+    let moved = match crate::safe_fs::move_file_checked_expected_detailed(dest_path, source_path, &identity) {
         Ok(moved) => moved,
-        Err(error) => return Err(match finalize_operation_intent(intent, "failed", None, Some(&error)) {
-            Ok(()) => error,
-            Err(journal) => format!("{error}. Undo recovery record remains pending: {journal}"),
-        }),
+        Err(error) => return Err(record_undo_move_failure(intent, error, ignored_files)),
     };
     let actual = moved.destination.to_string_lossy().into_owned();
     // A collision can select a new path. Arm it as soon as the move returns.
@@ -524,35 +548,60 @@ pub struct ArchiveImportSummary {
 pub fn import_archive_cmd(app: AppHandle, path: String, state: tauri::State<AppState>) -> Result<ArchiveImportSummary, String> {
     let job = crate::archive::ImportJob::start()?;
     let intent = begin_operation_intent("archive_import", &path, None).map_err(|e| format!("Import was not started: cannot persist intent: {e}"))?;
-    let extraction = match crate::archive::extract_archive(Path::new(&path), &job.cancelled, |bytes, files| {
-        let _ = app.emit("archive-import-progress", serde_json::json!({"bytes":bytes,"files":files}));
-    }) {
+    let mut observed_staging = None;
+    let extraction = match crate::archive::extract_archive(
+        Path::new(&path),
+        &job.cancelled,
+        |staging| {
+            let path = staging.to_string_lossy().into_owned();
+            let observation = observe_pending_archive_staging(intent, &path);
+            observed_staging = Some(path);
+            observation.map_err(|error| format!("Cannot record import staging before extraction: {error}"))
+        },
+        |bytes, files| {
+            let _ = app.emit("archive-import-progress", serde_json::json!({"bytes":bytes,"files":files}));
+        },
+    ) {
         Ok(extraction) => extraction,
         Err(error) => {
-            let journal = finalize_operation_intent(intent, "failed", None, Some(&error));
+            let journal = finalize_operation_intent(intent, "failed", observed_staging.as_deref(), Some(&error));
             return Err(match journal { Ok(()) => error, Err(e) => format!("{error}; import journal finalization failed: {e}") });
         }
     };
-    let staging_path = extraction.staging_dir.to_string_lossy().to_string();
-    let results = match crate::rules::manual_scan_folder_cancelable(&staging_path, &state.ignored_files, &job.cancelled) {
-        Ok(results) => results,
-        Err(error) => {
-            let message = format!("{error}. Import data retained at {staging_path}");
-            let manifest = crate::archive::save_manifest(&extraction.staging_dir, None, "partial", &[], Some(&message));
-            let journal = finalize_operation_intent(intent, "partial", Some(&staging_path), Some(&message));
-            let _ = app.emit("mutation-completed", ());
-            let message = match manifest { Ok(()) => message, Err(e) => format!("{message}; manifest finalization failed: {e}") };
-            return Err(match journal { Ok(()) => message, Err(e) => format!("{message}; import journal finalization failed: {e}") });
-        }
-    };
-    crate::archive::save_manifest(&extraction.staging_dir, None, "completed", &results, None)
-        .map_err(|e| format!("Imported {} files; data retained at {staging_path}; manifest finalization failed: {e}", extraction.extracted_files))?;
-    finalize_operation_intent(intent, "completed", Some(&staging_path), None)
-        .map_err(|e| format!("Imported {} files; data retained at {staging_path}; import journal finalization failed: {e}", extraction.extracted_files))?;
+    let staging = &extraction.staging_dir;
+    let sorting = crate::rules::manual_scan_folder_cancelable(staging, &state.ignored_files, &job.cancelled);
+    let result = finish_archive_sort(intent, staging, extraction.extracted_files, sorting);
     let _ = app.emit("mutation-completed", ());
+    result
+}
 
+pub(crate) fn finish_archive_sort(
+    intent: i64,
+    staging: &Path,
+    extracted_count: usize,
+    sorting: Result<crate::rules::SortedFiles, crate::rules::FolderScanError>,
+) -> Result<ArchiveImportSummary, String> {
+    let staging_path = staging.to_string_lossy().into_owned();
+    let (status, results, mut errors) = match sorting {
+        Ok(results) => ("completed", results, Vec::new()),
+        Err(error) => ("partial", error.results, vec![error.message]),
+    };
+    let message = errors.first().map(String::as_str);
+    if let Err(error) = crate::archive::save_manifest(staging, None, status, &results, message) {
+        errors.push(format!("Manifest finalization failed: {error}"));
+    }
+    let journal_message = (!errors.is_empty()).then(|| errors.join("; "));
+    if let Err(error) = finalize_operation_intent(intent, status, Some(&staging_path), journal_message.as_deref()) {
+        errors.push(format!("Import journal finalization failed: {error}"));
+    }
+    if !errors.is_empty() {
+        if status == "completed" {
+            errors.insert(0, format!("Organized {} of {extracted_count} extracted files", results.len()));
+        }
+        return Err(format!("{}. Import data retained at {staging_path}", errors.join("; ")));
+    }
     Ok(ArchiveImportSummary {
-        extracted_count: extraction.extracted_files,
+        extracted_count,
         sorted_count: results.len(),
         staging_path,
         results,
@@ -730,56 +779,233 @@ pub fn refresh_watcher_cmd(app: AppHandle) -> Result<(), String> {
 /// Get the current scheduled-clean settings.
 #[tauri::command]
 pub fn get_schedule_cmd() -> Result<ScheduleSettings, String> {
-    let settings = get_settings().map_err(|e| e.to_string())?;
-    Ok(ScheduleSettings {
-        schedule_enabled: settings.schedule_enabled,
-        schedule_times_per_day: settings.schedule_times_per_day,
-        schedule_time_1: settings.schedule_time_1,
-        schedule_time_2: settings.schedule_time_2,
-        schedule_time_3: settings.schedule_time_3,
-        schedule_time_4: settings.schedule_time_4,
-    })
+    get_settings().map(crate::scheduler::schedule_from_settings).map_err(|e| e.to_string())
 }
 
 /// Update scheduled-clean settings.
 #[tauri::command(async)]
 pub fn update_schedule_cmd(app: AppHandle, schedule: ScheduleSettings, state: tauri::State<AppState>) -> Result<AppSettings, String> {
-    crate::scheduler::validate_schedule_times(&schedule)?;
-    let committed = {
-        let _operation = state.ignored_files.with_operation();
-        let committed = update_schedule_settings(&schedule).map_err(|e| e.to_string())?;
-        state.scheduler.invalidate();
-        committed
-    };
+    let committed = state.scheduler.save_schedule(&state.ignored_files, &schedule)?;
     let _ = app.emit("settings-changed", &committed);
     Ok(committed)
 }
 
-/// Export all rules to a JSON file at the given path.
 #[tauri::command]
-pub fn export_rules_cmd(path: String) -> Result<(), String> {
-    let rules = get_rules().map_err(|e| e.to_string())?;
-    let json = serde_json::to_string_pretty(&rules).map_err(|e| e.to_string())?;
-    std::fs::write(&path, json).map_err(|e| e.to_string())?;
+pub fn get_recent_scheduler_runs_cmd() -> Result<Vec<ScheduleRun>, String> {
+    recent_schedule_runs().map_err(|e| e.to_string())
+}
+
+const MAX_RULE_TRANSFER_BYTES: u64 = 16 * 1024 * 1024;
+static RULE_TRANSFER: PlanMutex<()> = PlanMutex::new(());
+
+fn validate_rule_transfer_path(path: &Path) -> Result<(), String> {
+    if !path.is_absolute() || !path.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("json")) {
+        return Err("Choose an absolute path to a JSON file".into());
+    }
+    #[cfg(windows)]
+    if path.file_name().is_some_and(|name| name.as_encoded_bytes().contains(&b':')) {
+        return Err("Alternate data streams are not supported for rule transfers".into());
+    }
     Ok(())
 }
 
-/// Import rules from a JSON file at the given path.
-/// If `replace` is true, all existing rules are removed before inserting.
-#[tauri::command(async)]
-pub fn import_rules_cmd(app: AppHandle, path: String, replace: bool) -> Result<usize, String> {
-    let data = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
-    let rules: Vec<Rule> = serde_json::from_str(&data).map_err(|e| e.to_string())?;
+fn write_rule_export(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    use std::io::{ErrorKind, Write};
 
-    // Validate the whole file before touching the table. A file of rules where
-    // one is unusable has no useful half-applied state, and the alternative is a
-    // `delete_all_rules` that has already run.
-    for (index, rule) in rules.iter().enumerate() {
-        validate_rule_destination(rule)
-            .map_err(|e| format!("Rule {} of {} ({}) is not usable: {e}", index + 1, rules.len(), rule.name))?;
+    validate_rule_transfer_path(path)?;
+    if bytes.len() as u64 > MAX_RULE_TRANSFER_BYTES {
+        return Err("Rules exceed the 16 MiB transfer limit".into());
+    }
+    let parent = path.parent().ok_or("Rule export has no parent folder")?;
+    let _parent_guard = crate::safe_fs::guard_directory(parent)?;
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => return Err("The export file already exists. Choose a new filename.".into()),
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(error.to_string()),
     }
 
-    with_configuration(&app, || import_rules_atomic(&rules, replace).map_err(|e| e.to_string()))
+    static NEXT_STAGE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let serial = NEXT_STAGE.fetch_add(1, Ordering::Relaxed);
+    let stage = parent.join(format!(".mouzi-rules-{}-{serial}.tmp", std::process::id()));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.share_mode(0);
+    }
+    let mut file = options.open(&stage).map_err(|error| format!("Cannot stage rule export: {error}"))?;
+    let identity = crate::safe_fs::identity_from_handle(&file)
+        .map_err(|error| format!("Rule export stage retained at {}: {error}", stage.display()))?;
+    let written = file.write_all(bytes).and_then(|()| file.sync_all());
+    drop(file);
+    let result = written.map_err(|error| error.to_string()).and_then(|()| {
+        let digest = blake3::hash(bytes).to_hex();
+        crate::safe_fs::move_reviewed_file(&stage, path, &identity, digest.as_str()).map(|_| ())
+    });
+    if let Err(error) = result {
+        if crate::safe_fs::file_identity(path).ok().as_ref() == Some(&identity) {
+            return Err(format!("Rule export reached its destination, but finalization failed. Stage may remain at {}: {error}", stage.display()));
+        }
+        return match crate::safe_fs::remove_regular_file_expected(&stage, &identity) {
+            Ok(()) => Err(format!("Rule export failed: {error}")),
+            Err(cleanup) => Err(format!("Rule export failed: {error}. Stage could not be cleaned at {}: {cleanup}", stage.display())),
+        };
+    }
+    Ok(())
+}
+
+fn read_rule_import(path: &Path) -> Result<Vec<Rule>, String> {
+    use std::io::Read;
+
+    validate_rule_transfer_path(path)?;
+    let (file, _parent_guard) = crate::safe_fs::open_guarded_regular_file(path)?;
+    if crate::safe_fs::link_count(&file)? != 1 {
+        return Err("Choose a rule file with one link".into());
+    }
+    let size_error = "Rule import exceeds the 16 MiB transfer limit";
+    if file.metadata().map_err(|error| error.to_string())?.len() > MAX_RULE_TRANSFER_BYTES {
+        return Err(size_error.into());
+    }
+    let mut data = Vec::new();
+    file.take(MAX_RULE_TRANSFER_BYTES + 1).read_to_end(&mut data).map_err(|error| error.to_string())?;
+    if data.len() as u64 > MAX_RULE_TRANSFER_BYTES {
+        return Err(size_error.into());
+    }
+    let rules: Vec<Rule> = serde_json::from_slice(&data).map_err(|error| error.to_string())?;
+    // Validate every rule before offering to replace the saved set.
+    for (index, rule) in rules.iter().enumerate() {
+        validate_rule_destination(rule)
+            .map_err(|error| format!("Rule {} of {} ({}) is not usable: {error}", index + 1, rules.len(), rule.name))?;
+    }
+    Ok(rules)
+}
+
+/// Pick the export destination in Rust, keeping its path outside renderer IPC.
+#[tauri::command]
+pub async fn export_rules_cmd(window: tauri::WebviewWindow) -> Result<bool, String> {
+    if window.label() != "app" {
+        return Err("Rule transfer is available only in the workspace window".into());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let _transfer = RULE_TRANSFER.try_lock().map_err(|_| "A rule transfer is already open")?;
+        let Some(selected) = window.dialog().file()
+            .set_parent(&window).set_title("Export Mouzi rules to a new JSON file")
+            .add_filter("JSON", &["json"]).set_file_name("mouzi-rules.json").blocking_save_file()
+        else { return Ok(false); };
+        let path = selected.into_path().map_err(|error| error.to_string())?;
+        let rules = get_rules().map_err(|error| error.to_string())?;
+        let bytes = serde_json::to_vec_pretty(&rules).map_err(|error| error.to_string())?;
+        write_rule_export(&path, &bytes)?;
+        Ok(true)
+    }).await.map_err(|error| error.to_string())?
+}
+
+#[cfg(windows)]
+fn confirm_rule_replacement(window: &tauri::WebviewWindow, count: usize) -> Result<bool, String> {
+    use std::ffi::c_void;
+
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn MessageBoxW(owner: *mut c_void, text: *const u16, caption: *const u16, flags: u32) -> i32;
+    }
+
+    const MB_YESNOCANCEL: u32 = 0x0003;
+    const MB_ICONWARNING: u32 = 0x0030;
+    const MB_DEFBUTTON2: u32 = 0x0100;
+    const IDYES: i32 = 6;
+
+    let text: Vec<u16> = format!("Remove all saved Mouzi rules and import {count} rules from the selected file?")
+        .encode_utf16().chain(std::iter::once(0)).collect();
+    let caption: Vec<u16> = "Replace all Mouzi rules?".encode_utf16().chain(std::iter::once(0)).collect();
+    let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+    let owner = window.clone();
+    window.run_on_main_thread(move || {
+        let result = owner.hwnd().map_err(|error| error.to_string()).and_then(|hwnd| {
+            // HWND belongs to the workspace, and both UTF-16 buffers live through this call.
+            let answer = unsafe {
+                MessageBoxW(hwnd.0, text.as_ptr(), caption.as_ptr(), MB_YESNOCANCEL | MB_ICONWARNING | MB_DEFBUTTON2)
+            };
+            if answer == 0 {
+                return Err(format!("Cannot confirm rule replacement: {}", std::io::Error::last_os_error()));
+            }
+            Ok(answer == IDYES)
+        });
+        let _ = result_tx.send(result);
+    }).map_err(|error| error.to_string())?;
+    result_rx.recv().map_err(|error| error.to_string())?
+}
+
+#[cfg(not(windows))]
+fn confirm_rule_replacement(window: &tauri::WebviewWindow, count: usize) -> Result<bool, String> {
+    use tauri_plugin_dialog::{MessageDialogButtons, MessageDialogKind, MessageDialogResult};
+
+    let answer = window.dialog()
+        .message(format!("Remove all saved Mouzi rules and import {count} rules from the selected file?"))
+        .parent(window).title("Replace all Mouzi rules?")
+        .kind(MessageDialogKind::Warning).buttons(MessageDialogButtons::YesNo)
+        .blocking_show_with_result();
+    Ok(answer == MessageDialogResult::Yes)
+}
+
+/// Pick and validate a rules file in Rust, and confirm replacement natively.
+#[tauri::command]
+pub async fn import_rules_cmd(window: tauri::WebviewWindow, replace: bool) -> Result<Option<usize>, String> {
+    if window.label() != "app" {
+        return Err("Rule transfer is available only in the workspace window".into());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let _transfer = RULE_TRANSFER.try_lock().map_err(|_| "A rule transfer is already open")?;
+        let Some(selected) = window.dialog().file()
+            .set_parent(&window).set_title("Import Mouzi rules")
+            .add_filter("JSON", &["json"]).blocking_pick_file()
+        else { return Ok(None); };
+        let path = selected.into_path().map_err(|error| error.to_string())?;
+        let rules = read_rule_import(&path)?;
+        if replace && !confirm_rule_replacement(&window, rules.len())? {
+            return Ok(None);
+        }
+        with_configuration(window.app_handle(), || {
+            import_rules_atomic(&rules, replace).map(Some).map_err(|error| error.to_string())
+        })
+    }).await.map_err(|error| error.to_string())?
+}
+
+#[cfg(test)]
+mod rule_transfer_tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn exports_valid_rules_without_replacing_a_selected_file() {
+        let root = std::env::temp_dir().join(format!("mouzi-rule-transfer-{}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        let path = root.join("Rules.JSON");
+        let rules = br#"[{"id":null,"name":"Invoices","priority":10,"enabled":true,"extensions":["pdf"],"pattern":null,"destination":"Documents","action":"move","folder_id":0}]"#;
+        write_rule_export(&path, rules).unwrap();
+        assert_eq!(read_rule_import(&path).unwrap()[0].name, "Invoices");
+        assert!(write_rule_export(&path, b"[]").unwrap_err().contains("already exists"));
+        assert_eq!(fs::read(&path).unwrap().as_slice(), rules);
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rejects_oversized_and_linked_rule_inputs() {
+        let root = std::env::temp_dir().join(format!("mouzi-rule-transfer-limits-{}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        let path = root.join("rules.json");
+        let file = fs::File::create(&path).unwrap();
+        file.set_len(MAX_RULE_TRANSFER_BYTES + 1).unwrap();
+        drop(file);
+        assert!(read_rule_import(&path).unwrap_err().contains("16 MiB"));
+        fs::write(&path, b"[]").unwrap();
+        let linked = root.join("linked.json");
+        fs::hard_link(&path, &linked).unwrap();
+        assert!(read_rule_import(&linked).unwrap_err().contains("one link"));
+        assert_eq!(fs::read(&path).unwrap().as_slice(), b"[]");
+        fs::remove_dir_all(root).unwrap();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1248,8 +1474,8 @@ fn accept_suggestion_validated_with(
     let intent = begin_operation_intent("suggestion", &path, Some(&dest.to_string_lossy())).map_err(|e| format!("Suggestion was not started: could not persist intent: {e}"))?;
     notify_move_observer();
     let moved = match expected_digest {
-        Some(digest) => crate::safe_fs::move_reviewed_file(src, &dest, &identity, digest),
-        None => crate::safe_fs::move_file_checked_expected(src, &dest, &identity),
+        Some(digest) => crate::safe_fs::move_reviewed_file_detailed(src, &dest, &identity, digest),
+        None => crate::safe_fs::move_file_checked_expected_detailed(src, &dest, &identity),
     };
     let moved_identity = moved.as_ref().ok().map(|result| result.identity.key());
     let mut outcome = match moved {
@@ -1259,12 +1485,13 @@ fn accept_suggestion_validated_with(
             message: None,
             dest: Some(result.destination.to_string_lossy().into_owned()),
         },
-        Err(e) => AcceptOutcome {
-            path: path.clone(),
-            status: "failed".to_string(),
-            message: Some(e),
-            dest: None,
-        },
+        Err(error) => {
+            if let Some(message) = crate::rules::record_retained_move(intent, "suggestion", src, &error, ignored_files) {
+                // Only a completed move supplies `dest`; the retained path is in the receipt and message.
+                return Ok(AcceptOutcome { path, status: "partial".into(), message: Some(message), dest: None });
+            }
+            AcceptOutcome { path: path.clone(), status: "failed".into(), message: Some(error.to_string()), dest: None }
+        }
     };
 
     if outcome.status == "ok" {
@@ -1600,6 +1827,68 @@ mod undo_tests {
         assert_eq!(std::fs::read(actual).unwrap(), b"replacement");
         assert_eq!(std::fs::read(&source).unwrap(), b"occupied");
         assert_eq!(std::fs::read(rescued).unwrap(), b"payload");
+    }
+
+    #[test]
+    fn retained_undo_output_stays_pending_and_cannot_finalize_or_retry() {
+        let fixture = UndoFixture::new("retained_output");
+        let (source, dest) = stage(fixture.root(), "retained.undocheck");
+        let input_identity = crate::safe_fs::file_identity(Path::new(&dest)).unwrap();
+        let id = insert_log("2026-01-01T00:00:00Z", &source, Some(&dest));
+        let intent = begin_undo_intent(id, &dest, &source, &input_identity.key()).unwrap();
+        let actual = fixture.root().join("retained_0.undocheck");
+        std::fs::copy(&dest, &actual).unwrap();
+        let retained_identity = crate::safe_fs::file_identity(&actual).unwrap();
+        let ignored = ignored_files();
+        let receipt = format!("record {intent}");
+        let message = record_undo_move_failure(intent, crate::safe_fs::MoveFailure::RetainedOutput {
+            path: actual.clone(), identity: Some(retained_identity.clone()), verified: true,
+            source_preserved: true, message: "Injected source removal failure".into(),
+        }, &ignored);
+
+        assert!(message.contains(receipt.as_str()));
+        assert!(message.contains(actual.to_str().unwrap()));
+        assert!(ignored.guarded_keys().contains(&crate::suppress::key(&actual)));
+        let pending = pending_undos().unwrap();
+        assert_eq!(pending[0].observed.as_deref(), actual.to_str());
+        assert_eq!(pending[0].observed_identity.as_deref(), Some(retained_identity.key().as_str()));
+        assert!(pending[0].retained_message.as_deref().unwrap().contains("Verified copy"));
+        assert!(finalize_undo_intent(intent, id, &dest, actual.to_str().unwrap(), &retained_identity.key()).is_err());
+        let retry = undo_action_with(id, &ignored).unwrap();
+        assert_eq!(retry.status, "failed");
+        assert!(retry.message.unwrap().contains(receipt.as_str()));
+        assert_eq!(undone_of(&source), 0);
+        assert!(!Path::new(&source).exists());
+        assert_eq!(std::fs::read(&dest).unwrap(), b"payload");
+        assert_eq!(std::fs::read(actual).unwrap(), b"payload");
+    }
+
+    #[test]
+    fn unverified_undo_output_reports_path_even_when_observation_cannot_be_saved() {
+        let fixture = UndoFixture::new("unverified_output");
+        let (source, dest) = stage(fixture.root(), "unverified.undocheck");
+        let identity = crate::safe_fs::file_identity(Path::new(&dest)).unwrap();
+        let id = insert_log("2026-01-01T00:00:00Z", &source, Some(&dest));
+        let intent = begin_undo_intent(id, &dest, &source, &identity.key()).unwrap();
+        let ignored = ignored_files();
+        let retained = |path| crate::safe_fs::MoveFailure::RetainedOutput {
+            path, identity: None, verified: false, source_preserved: false,
+            message: "Injected output inspection failure".into(),
+        };
+        let actual = fixture.root().join("unverified-output.undocheck");
+        let message = record_undo_move_failure(intent, retained(actual.clone()), &ignored);
+        assert!(message.contains("Unverified output"));
+        let pending = pending_undos().unwrap();
+        assert_eq!(pending[0].observed.as_deref(), actual.to_str());
+        assert!(pending[0].observed_identity.is_none());
+
+        // The first observation is immutable, so a second write must fail.
+        let other = fixture.root().join("another-output.undocheck");
+        let message = record_undo_move_failure(intent, retained(other.clone()), &ignored);
+        assert!(message.contains(other.to_str().unwrap()));
+        assert!(message.contains(format!("record {intent}").as_str()));
+        assert!(message.contains("could not be saved"));
+        assert_eq!(undone_of(&source), 0);
     }
 
     /// A hook that records which paths are already guarded the instant the
@@ -2096,6 +2385,40 @@ mod accept_tests {
     }
 
     fn ignored_files() -> IgnoredFiles { Arc::new(SuppressionSet::new()) }
+
+    #[test]
+    fn retained_suggestion_records_recovery_without_adopting_the_output() {
+        let fixture = AcceptFixture::new("retained_suggestion");
+        let source = inventory_fixture(&fixture);
+        let output = fixture.put("Documents/.mouzi-transfer-test.part");
+        let source_path = source.to_string_lossy();
+        let output_path = output.to_string_lossy();
+        let requested = fixture.root().join("Documents/report.xyz");
+        let intent = begin_operation_intent("suggestion", &source_path, Some(&requested.to_string_lossy())).unwrap();
+        let suppression = ignored_files();
+        let error = crate::safe_fs::MoveFailure::RetainedOutput {
+            path: output.clone(), identity: None, verified: false, source_preserved: true,
+            message: "Injected staging cleanup failure".into(),
+        };
+
+        let message = crate::rules::record_retained_move(intent, "suggestion", &source, &error, &suppression).unwrap();
+        assert!(message.contains(output_path.as_ref()));
+        assert!(suppression.is_suppressed(&output, Instant::now()));
+        assert!(get_undoable_logs().unwrap().is_empty());
+        assert!(get_accepted_suggestion_feedback().unwrap().is_empty());
+        let conn = lock_db().unwrap();
+        let receipt: (String, String, String) = conn.query_row(
+            "SELECT status,actual_destination,message FROM operation_intents WHERE id=?1",
+            [intent], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).unwrap();
+        assert_eq!(receipt, ("pending".into(), output_path.into_owned(), message));
+        let root = fixture.root().to_string_lossy();
+        let stale: bool = conn.query_row("SELECT stale FROM inventory_roots WHERE root_path=?1", [root.as_ref()], |row| row.get(0)).unwrap();
+        assert!(stale);
+        let inventory: i64 = conn.query_row("SELECT COUNT(*) FROM file_inventory WHERE root_path=?1", [root.as_ref()], |row| row.get(0)).unwrap();
+        assert_eq!(inventory, 1);
+        conn.execute("DELETE FROM operation_intents WHERE id=?1", [intent]).unwrap();
+    }
 
     #[test]
     fn reviewed_suggestion_rejects_preserved_time_edits_and_is_single_use() {

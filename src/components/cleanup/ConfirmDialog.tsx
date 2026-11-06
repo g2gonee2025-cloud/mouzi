@@ -1,4 +1,4 @@
-import { useEffect, useId, useRef, useState } from "react";
+import { useId, useLayoutEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { AlertTriangle } from "lucide-react";
 import { formatBytes } from "../../utils/format";
@@ -16,12 +16,9 @@ export type ConfirmTier = "simple" | "explicit" | "typed";
  * Which reversibility promise the backend actually keeps. These are not
  * interchangeable, and stating the wrong one is worse than stating none:
  *
- * - "trash"     -> `safe_fs::delete_to_trash` -> the `trash` crate. On Windows
- *                  this normally lands in the Recycle Bin, but SHFileOperation
- *                  silently falls back to a permanent delete - still `Ok(())`,
- *                  and `trash::delete` returns unit so there is no flag to
- *                  inspect - when the bin cannot take the item (quota exceeded,
- *                  item too large, network volume).
+ * - "trash"     -> Windows Shell recycling. The outcome is recoverable only
+ *                  when Mouzi can attribute the Recycle Bin entry to the
+ *                  reviewed file.
  * - "permanent" -> `fs::remove_dir` for empty folders, and the plain DELETEs
  *                  behind undo / clear-history. No bin, no recovery at all.
  * - "move"      -> rules MOVE files, so nothing is removed; the only way back
@@ -69,6 +66,8 @@ export interface ConfirmRequest {
   note?: string;
   /** Paths shown so the user sees what they are agreeing to. */
   preview?: readonly string[];
+  opener?: HTMLElement;
+  focusFallback?: () => HTMLElement | null;
   onConfirm: () => void | Promise<void>;
 }
 
@@ -84,6 +83,8 @@ export default function ConfirmDialog({
   notice,
   note,
   preview,
+  opener,
+  focusFallback,
   onConfirm,
   onClose,
 }: ConfirmDialogProps) {
@@ -91,12 +92,15 @@ export default function ConfirmDialog({
   const [typed, setTyped] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const dialogRef = useRef<HTMLDialogElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+  const running = useRef(false);
+  const confirmed = useRef(false);
+  const pressedBackdrop = useRef(false);
   const titleId = useId();
   const bodyId = useId();
   const inputId = useId();
-  const returnFocusRef = useRef<HTMLElement | null>(null);
 
   const tier = confirmTier(count, bytes);
   const word = t("confirm.word");
@@ -107,53 +111,53 @@ export default function ConfirmDialog({
     typed.trim().toLocaleLowerCase() === word.trim().toLocaleLowerCase();
   const confirmDisabled = busy || nothingSelected || (tier === "typed" && !wordMatches);
 
-  useEffect(() => {
-    if (!returnFocusRef.current && document.activeElement instanceof HTMLElement) returnFocusRef.current = document.activeElement;
-    // Land focus in the dialog, not on either button: a focused "Cancel" would
-    // make Enter dismiss, and a focused destructive button would make Enter
-    // destroy. The typed tier is the exception - typing is the whole point.
-    if (tier === "typed") inputRef.current?.focus();
-    else panelRef.current?.focus();
-  }, [tier]);
+  useLayoutEffect(() => {
+    const dialog = dialogRef.current;
+    if (!dialog) return;
+    const document = dialog.ownerDocument;
+    const previous = opener ?? document.activeElement;
+    dialog.showModal();
+    (tier === "typed" ? inputRef.current : panelRef.current)?.focus();
 
-  useEffect(() => {
-    const siblings = Array.from(panelRef.current?.parentElement?.parentElement?.children ?? []).filter((element) => element !== panelRef.current?.parentElement && element instanceof HTMLElement) as HTMLElement[];
-    const previous = siblings.map((element) => element.inert);
-    siblings.forEach((element) => { element.inert = true; });
     return () => {
-      siblings.forEach((element, index) => { element.inert = previous[index]; });
-      returnFocusRef.current?.focus();
+      dialog.close();
+      // Results and newly enabled controls are available after React commits.
+      queueMicrotask(() => {
+        if (dialog.open || document.querySelector("dialog:modal")) return;
+        const fallback = focusFallback?.();
+        const targets = confirmed.current ? [fallback, previous] : [previous, fallback];
+        for (const target of targets) {
+          if (!(target instanceof HTMLElement) || !target.isConnected || target.matches(":disabled")) continue;
+          target.focus();
+          if (document.activeElement === target) break;
+        }
+      });
     };
-  }, []);
+  }, [focusFallback, opener, tier]);
 
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape" && !busy) onClose();
-      if (e.key !== "Tab") return;
-      const panel = panelRef.current;
-      const controls = panel ? Array.from(panel.querySelectorAll<HTMLElement>('button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), a[href], [tabindex="0"]')).filter((element) => !element.hidden) : [];
-      if (!controls.length) { e.preventDefault(); panel?.focus(); return; }
-      const first = controls[0];
-      const last = controls[controls.length - 1];
-      if (e.shiftKey && (document.activeElement === first || document.activeElement === panel)) { e.preventDefault(); last.focus(); }
-      else if (!e.shiftKey && (document.activeElement === last || document.activeElement === panel)) { e.preventDefault(); first.focus(); }
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [busy, onClose]);
+  useLayoutEffect(() => {
+    if (busy) panelRef.current?.focus();
+  }, [busy]);
+
+  const dismiss = () => {
+    if (!running.current) onClose();
+  };
 
   const handleConfirm = async () => {
-    if (confirmDisabled) return;
+    if (confirmDisabled || running.current) return;
+    running.current = true;
     setBusy(true);
     setError(null);
     try {
       await onConfirm();
+      confirmed.current = true;
       onClose();
     } catch (e) {
       // Surfaced here on purpose: these calls used to be fired off from a click
       // handler that ignored the rejection, so a failed destructive action left
       // the user with no idea whether it had happened.
       setError(String(e));
+      running.current = false;
       setBusy(false);
     }
   };
@@ -162,20 +166,36 @@ export default function ConfirmDialog({
   const hiddenCount = (preview?.length ?? 0) - shownPreview.length;
 
   return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50"
+    <dialog
+      ref={dialogRef}
+      aria-labelledby={titleId}
+      aria-describedby={bodyId}
+      className="fixed inset-0 m-0 h-full max-h-none w-full max-w-none items-center justify-center bg-transparent p-4 text-text open:flex backdrop:bg-black/50"
+      onCancel={(e) => {
+        e.preventDefault();
+        dismiss();
+      }}
+      onPointerDown={(e) => { pressedBackdrop.current = e.target === e.currentTarget; }}
       onClick={(e) => {
-        if (e.target === e.currentTarget && !busy) onClose();
+        if (pressedBackdrop.current && e.target === e.currentTarget) dismiss();
+        pressedBackdrop.current = false;
+      }}
+      onKeyDown={(e) => {
+        if (e.key !== "Tab") return;
+        const controls = Array.from(e.currentTarget.querySelectorAll<HTMLElement>("button:not(:disabled), input:not(:disabled)"));
+        const first = controls[0];
+        const last = controls[controls.length - 1];
+        const active = e.currentTarget.ownerDocument.activeElement;
+        if (!controls.some((control) => control === active) || active === (e.shiftKey ? first : last)) {
+          e.preventDefault();
+          ((e.shiftKey ? last : first) ?? panelRef.current)?.focus();
+        }
       }}
     >
       <div
         ref={panelRef}
         tabIndex={-1}
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby={titleId}
-        aria-describedby={bodyId}
-        className="w-full max-w-md rounded-lg border border-border bg-surface p-4 space-y-3 outline-none"
+        className="max-h-full w-full max-w-md space-y-3 overflow-y-auto rounded-lg border border-border bg-surface p-4 outline-none"
       >
         <div className="flex items-start gap-2">
           {tier !== "simple" && (
@@ -240,8 +260,12 @@ export default function ConfirmDialog({
                 value={typed}
                 onChange={(e) => setTyped(e.target.value)}
                 onKeyDown={(e) => {
-                  if (e.key === "Enter" && !confirmDisabled) void handleConfirm();
+                  if (e.key === "Enter" && !e.repeat && !e.nativeEvent.isComposing) {
+                    e.preventDefault();
+                    void handleConfirm();
+                  }
                 }}
+                readOnly={busy}
                 autoComplete="off"
                 spellCheck={false}
                 className="w-full rounded-md border border-border bg-surface px-2 py-1.5 text-sm outline-none focus:border-primary"
@@ -253,7 +277,7 @@ export default function ConfirmDialog({
           )}
 
           {error && (
-            <p className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">
+            <p role="alert" className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">
               {t("confirm.failed", { error })}
             </p>
           )}
@@ -262,7 +286,7 @@ export default function ConfirmDialog({
         <div className="flex items-center justify-end gap-2 pt-1">
           <button
             type="button"
-            onClick={onClose}
+            onClick={dismiss}
             disabled={busy}
             className="flex items-center gap-1.5 rounded-md border border-border px-3 py-2 text-sm hover:bg-surface-dark transition-colors disabled:opacity-50"
           >
@@ -278,6 +302,6 @@ export default function ConfirmDialog({
           </button>
         </div>
       </div>
-    </div>
+    </dialog>
   );
 }

@@ -1,7 +1,7 @@
 use crate::safe_fs::{self, AncestorGuard};
 use flate2::read::GzDecoder;
 use std::fs::{self, File, FileTimes, OpenOptions};
-use std::io::{self, BufReader, Read, Write};
+use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::sync::{Arc, Mutex};
@@ -24,8 +24,8 @@ enum ArchiveFormat {
 
 // Limits cover declared sizes and actual streamed bytes, including tar headers.
 #[derive(Clone, Copy)]
-struct Limits { entries: usize, file_bytes: u64, total_bytes: u64, archive_bytes: u64, duration: Duration }
-const LIMITS: Limits = Limits { entries: 20_000, file_bytes: 256 * 1024 * 1024, total_bytes: 2 * 1024 * 1024 * 1024, archive_bytes: 1024 * 1024 * 1024, duration: Duration::from_secs(120) };
+struct Limits { entries: usize, file_bytes: u64, total_bytes: u64, archive_bytes: u64, zip_metadata_bytes: u64, duration: Duration }
+const LIMITS: Limits = Limits { entries: 20_000, file_bytes: 256 * 1024 * 1024, total_bytes: 2 * 1024 * 1024 * 1024, archive_bytes: 1024 * 1024 * 1024, zip_metadata_bytes: 32 * 1024 * 1024, duration: Duration::from_secs(120) };
 static IMPORT: Mutex<Option<Arc<AtomicBool>>> = Mutex::new(None);
 
 pub struct ImportJob { pub cancelled: Arc<AtomicBool> }
@@ -89,14 +89,31 @@ impl Budget<'_> {
     }
 }
 
-pub fn extract_archive(path: &Path, cancelled: &AtomicBool, mut progress: impl FnMut(u64, usize)) -> Result<ArchiveExtraction, String> {
+pub fn extract_archive(
+    path: &Path,
+    cancelled: &AtomicBool,
+    observe_staging: impl FnOnce(&Path) -> Result<(), String>,
+    progress: impl FnMut(u64, usize),
+) -> Result<ArchiveExtraction, String> {
+    let base_dir = crate::application_data_dir().map_err(|e| e.to_string())?.join("archive-imports");
+    extract_archive_in(path, &base_dir, cancelled, observe_staging, progress)
+}
+
+fn extract_archive_in(
+    path: &Path,
+    base_dir: &Path,
+    cancelled: &AtomicBool,
+    observe_staging: impl FnOnce(&Path) -> Result<(), String>,
+    mut progress: impl FnMut(u64, usize),
+) -> Result<ArchiveExtraction, String> {
     let (source, _source_guard, format) = open_archive(path, LIMITS)?;
-    let (staging_dir, staging_guard) = create_staging_dir()?;
-    let manifest_error = |error| format!("Import data retained at {}. {error}", staging_dir.display());
-    save_manifest(&staging_dir, Some(path), "extracting", &[], None).map_err(manifest_error)?;
+    let (staging_dir, staging_guard) = create_staging_dir_in(base_dir)?;
+    let retained_error = |error| format!("Import staging retained at {}. {error}", staging_dir.display());
+    observe_staging(&staging_dir).map_err(retained_error)?;
+    save_manifest(&staging_dir, Some(path), "extracting", &[], None).map_err(retained_error)?;
     match extract_archive_from(source, format, &staging_dir, LIMITS, cancelled, &mut progress) {
         Ok(extracted_files) => {
-            save_manifest(&staging_dir, Some(path), "extracted", &[], None).map_err(manifest_error)?;
+            save_manifest(&staging_dir, Some(path), "extracted", &[], None).map_err(retained_error)?;
             Ok(ArchiveExtraction {
                 staging_dir,
                 extracted_files,
@@ -110,11 +127,6 @@ pub fn extract_archive(path: &Path, cancelled: &AtomicBool, mut progress: impl F
             Err(format!("{err}. Import data retained at {}{}", staging_dir.display(), manifest.err().map(|e| format!("; {e}")).unwrap_or_default()))
         }
     }
-}
-
-fn create_staging_dir() -> Result<(PathBuf, AncestorGuard), String> {
-    let base_dir = crate::application_data_dir().map_err(|e| e.to_string())?.join("archive-imports");
-    create_staging_dir_in(&base_dir)
 }
 
 fn create_staging_dir_in(base_dir: &Path) -> Result<(PathBuf, AncestorGuard), String> {
@@ -204,11 +216,194 @@ fn archive_format(path: &Path) -> Result<ArchiveFormat, String> {
     }
 }
 
-fn extract_zip_to(file: File, staging_dir: &Path, budget: &mut Budget<'_>) -> Result<usize, String> {
-    let mut archive =
-        ZipArchive::new(file).map_err(|e| format!("Failed to read zip archive: {}", e))?;
+// zip 0.6.6 probes for footer signatures one byte at a time. Cache aligned
+// windows so those probes do not turn into a seek and disk read per byte.
+const ZIP_READ_WINDOW: usize = 16 * 1024;
+struct ZipReader<'a> {
+    file: File,
+    len: u64,
+    position: u64,
+    window: [u8; ZIP_READ_WINDOW],
+    window_start: u64,
+    window_len: usize,
+    cancelled: &'a AtomicBool,
+    started: Instant,
+    duration: Duration,
+}
 
-    if archive.len() > budget.limits.entries { return Err("Archive entry count limit exceeded".into()); }
+impl<'a> ZipReader<'a> {
+    fn new(file: File, budget: &Budget<'a>) -> io::Result<Self> {
+        let len = file.metadata()?.len();
+        if len > budget.limits.archive_bytes {
+            return Err(io::Error::other("Archive input size limit exceeded"));
+        }
+        Ok(Self {
+            file,
+            len,
+            position: 0,
+            window: [0; ZIP_READ_WINDOW],
+            window_start: 0,
+            window_len: 0,
+            cancelled: budget.cancelled,
+            started: budget.started,
+            duration: budget.limits.duration,
+        })
+    }
+
+    fn read_at(&mut self, position: u64, buffer: &mut [u8]) -> io::Result<()> {
+        self.seek(SeekFrom::Start(position))?;
+        self.read_exact(buffer)
+    }
+}
+
+impl Read for ZipReader<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if self.cancelled.load(Ordering::Relaxed) {
+            return Err(io::Error::other("Archive import cancelled"));
+        }
+        if self.started.elapsed() >= self.duration {
+            return Err(io::Error::other("Archive import time limit exceeded"));
+        }
+        if buffer.is_empty() || self.position >= self.len {
+            return Ok(0);
+        }
+        if self.position < self.window_start || self.position >= self.window_start + self.window_len as u64 {
+            let start = self.position / ZIP_READ_WINDOW as u64 * ZIP_READ_WINDOW as u64;
+            let len = (self.len - start).min(ZIP_READ_WINDOW as u64) as usize;
+            self.file.seek(SeekFrom::Start(start))?;
+            self.file.read_exact(&mut self.window[..len])?;
+            self.window_start = start;
+            self.window_len = len;
+        }
+        let start = (self.position - self.window_start) as usize;
+        let len = buffer.len().min(self.window_len - start);
+        buffer[..len].copy_from_slice(&self.window[start..start + len]);
+        self.position += len as u64;
+        Ok(len)
+    }
+}
+
+impl Seek for ZipReader<'_> {
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        self.position = match position {
+            SeekFrom::Start(offset) => Some(offset),
+            SeekFrom::End(offset) => self.len.checked_add_signed(offset),
+            SeekFrom::Current(offset) => self.position.checked_add_signed(offset),
+        }
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid ZIP seek"))?;
+        Ok(self.position)
+    }
+}
+
+fn zip_field<const N: usize>(bytes: &[u8], offset: usize) -> [u8; N] {
+    bytes[offset..offset + N].try_into().expect("fixed ZIP header field")
+}
+
+fn find_zip64_end(reader: &mut ZipReader<'_>, mut position: u64, last: u64) -> io::Result<u64> {
+    let mut bytes = [0; ZIP_READ_WINDOW];
+    while position <= last {
+        // Keep three bytes of overlap so signatures across windows are visible.
+        let candidates = (last - position + 1).min((bytes.len() - 3) as u64) as usize;
+        reader.read_at(position, &mut bytes[..candidates + 3])?;
+        if let Some(index) = bytes[..candidates + 3].windows(4).position(|magic| magic == b"PK\x06\x06") {
+            return Ok(position + index as u64);
+        }
+        position += candidates as u64;
+    }
+    Err(io::Error::other("Missing ZIP64 central directory end"))
+}
+
+fn preflight_zip(reader: &mut ZipReader<'_>, limits: Limits) -> io::Result<usize> {
+    const END_LEN: usize = 22;
+    const LOCATOR_LEN: usize = 20;
+    const ENTRY_LEN: usize = 46;
+    // Mirror the footer selection in pinned zip 0.6.6 spec.rs and read.rs.
+    let tail_len = reader.len.min((END_LEN + usize::from(u16::MAX)) as u64) as usize;
+    if tail_len < END_LEN {
+        return Err(io::Error::other("Missing ZIP central directory end"));
+    }
+    let mut tail = vec![0; tail_len];
+    let tail_start = reader.len - tail_len as u64;
+    reader.read_at(tail_start, &mut tail)?;
+    let end_index = tail[..tail_len - END_LEN + 4].windows(4)
+        .rposition(|magic| magic == b"PK\x05\x06")
+        .ok_or_else(|| io::Error::other("Missing ZIP central directory end"))?;
+    let end_position = tail_start + end_index as u64;
+    let end = &tail[end_index..end_index + END_LEN];
+    let comment_len = usize::from(u16::from_le_bytes(zip_field(end, 20)));
+    if comment_len > tail_len - end_index - END_LEN {
+        return Err(io::Error::other("Truncated ZIP comment"));
+    }
+
+    // The parser looks relative to EOF, even if the classic fields fit.
+    let mut locator = [0; LOCATOR_LEN];
+    if let Some(position) = reader.len.checked_sub((END_LEN + LOCATOR_LEN + comment_len) as u64) {
+        reader.read_at(position, &mut locator)?;
+    }
+    let invalid_offset = || io::Error::other("Invalid ZIP central directory offset");
+    let (count, start, end) = if &locator[..4] == b"PK\x06\x07" {
+        let nominal = u64::from_le_bytes(zip_field(&locator, 8));
+        let last = end_position.checked_sub(60).ok_or_else(invalid_offset)?;
+        let position = find_zip64_end(reader, nominal, last)?;
+        let mut end = [0; 56];
+        reader.read_at(position, &mut end)?;
+        let count = u64::from_le_bytes(zip_field(&end, 32));
+        let offset = u64::from_le_bytes(zip_field(&end, 48));
+        let start = offset.checked_add(position - nominal).ok_or_else(invalid_offset)?;
+        (count, start, position)
+    } else {
+        let count = u64::from(u16::from_le_bytes(zip_field(end, 8)));
+        let size = u64::from(u32::from_le_bytes(zip_field(end, 12)));
+        let offset = u64::from(u32::from_le_bytes(zip_field(end, 16)));
+        let start = end_position.checked_sub(size)
+            .filter(|start| *start >= offset)
+            .ok_or_else(invalid_offset)?;
+        (count, start, end_position)
+    };
+    if count > limits.entries as u64 {
+        return Err(io::Error::other("Archive entry count limit exceeded"));
+    }
+    if start > end {
+        return Err(invalid_offset());
+    }
+
+    // The parser allocates the variable fields in each record. Walk only their
+    // fixed headers first so forged lengths cannot drive those allocations.
+    let mut position = start;
+    let mut entry = [0; ENTRY_LEN];
+    for _ in 0..count {
+        if end - position < ENTRY_LEN as u64 {
+            return Err(io::Error::other("Truncated ZIP central directory entry"));
+        }
+        reader.read_at(position, &mut entry)?;
+        if &entry[..4] != b"PK\x01\x02" {
+            return Err(io::Error::other("Invalid ZIP central directory entry"));
+        }
+        let variable_len: u64 = [28, 30, 32].into_iter()
+            .map(|offset| u64::from(u16::from_le_bytes(zip_field(&entry, offset))))
+            .sum();
+        position += ENTRY_LEN as u64 + variable_len;
+        if position > end {
+            return Err(io::Error::other("Invalid ZIP central directory entry length"));
+        }
+        if position - start > limits.zip_metadata_bytes {
+            return Err(io::Error::other("Archive ZIP metadata size limit exceeded"));
+        }
+    }
+    Ok(count as usize)
+}
+
+fn extract_zip_to(file: File, staging_dir: &Path, budget: &mut Budget<'_>) -> Result<usize, String> {
+    let mut reader = ZipReader::new(file, budget).map_err(|e| e.to_string())?;
+    let count = preflight_zip(&mut reader, budget.limits)
+        .map_err(|e| format!("Failed to read zip archive: {e}"))?;
+    budget.check()?;
+    let mut archive = ZipArchive::new(reader).map_err(|e| format!("Failed to read zip archive: {e}"))?;
+    if archive.len() != count {
+        return Err("ZIP central directory changed during validation".into());
+    }
+    budget.check()?;
+
     let mut extracted = 0;
     for i in 0..archive.len() {
         budget.check()?;
@@ -368,7 +563,7 @@ pub fn save_manifest(staging: &Path, source: Option<&Path>, status: &str, result
             serde_json::from_reader::<_, serde_json::Value>(BufReader::new(file)).map_err(|e| e.to_string())?
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound =>
-            serde_json::json!({"version":1,"createdAt":chrono::Utc::now().to_rfc3339(),"source":source.map(|p|p.to_string_lossy().into_owned()),"staging":staging.to_string_lossy(),"limits":{"entries":LIMITS.entries,"fileBytes":LIMITS.file_bytes,"totalBytes":LIMITS.total_bytes,"seconds":LIMITS.duration.as_secs()}}),
+            serde_json::json!({"version":1,"createdAt":chrono::Utc::now().to_rfc3339(),"source":source.map(|p|p.to_string_lossy().into_owned()),"staging":staging.to_string_lossy(),"limits":{"entries":LIMITS.entries,"fileBytes":LIMITS.file_bytes,"totalBytes":LIMITS.total_bytes,"zipMetadataBytes":LIMITS.zip_metadata_bytes,"seconds":LIMITS.duration.as_secs()}}),
         Err(error) => return Err(error.to_string()),
     };
     let mut remaining = Vec::new();
@@ -451,6 +646,36 @@ mod tests {
         writer.finish().unwrap();
     }
 
+    fn write_zip64(path: &Path, prefix_len: usize, count: u64, poison_central: bool) {
+        write_zip(path, &[("nested/entry.txt", b"data")]);
+        let mut zip = fs::read(path).unwrap();
+        let end = zip.split_off(zip.len() - 22);
+        let central_size = u32::from_le_bytes(zip_field(&end, 12));
+        let central_offset = u32::from_le_bytes(zip_field(&end, 16));
+        if poison_central {
+            zip[central_offset as usize] = 0;
+        }
+        let zip64_offset = zip.len() as u64;
+        let mut output = vec![b'x'; prefix_len];
+        output.extend(zip);
+        output.extend(b"PK\x06\x06");
+        output.extend(44u64.to_le_bytes());
+        output.extend(45u16.to_le_bytes());
+        output.extend(45u16.to_le_bytes());
+        output.extend([0; 8]);
+        output.extend(count.to_le_bytes());
+        output.extend(count.to_le_bytes());
+        output.extend(u64::from(central_size).to_le_bytes());
+        output.extend(u64::from(central_offset).to_le_bytes());
+        output.extend(b"PK\x06\x07");
+        output.extend(0u32.to_le_bytes());
+        output.extend(zip64_offset.to_le_bytes());
+        output.extend(1u32.to_le_bytes());
+        // The classic footer retains the original ordinary one-entry fields.
+        output.extend(end);
+        fs::write(path, output).unwrap();
+    }
+
     fn write_tgz(path: &Path, files: &[(&str, &[u8])]) {
         let file = File::create(path).unwrap();
         let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::default());
@@ -485,6 +710,116 @@ mod tests {
         assert_eq!(file_names(&staging), vec!["doc.pdf", "img.jpg"]);
         assert_eq!(fs::read(staging.join("img.jpg")).unwrap(), b"image");
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn zip_preflight_preserves_long_comments_and_prefixed_zip64() {
+        let root = test_dir("zip-preflight-compatible");
+        let source = root.join("comment.zip");
+        let mut writer = zip::ZipWriter::new(File::create(&source).unwrap());
+        writer.start_file("entry.txt", FileOptions::default()).unwrap();
+        writer.write_all(b"commented").unwrap();
+        writer.set_raw_comment(vec![b'c'; usize::from(u16::MAX)]);
+        drop(writer.finish().unwrap());
+        drop(writer);
+
+        let staging = root.join("comment");
+        assert_eq!(extract_archive_to(&source, &staging).unwrap(), 1);
+        assert_eq!(fs::read(staging.join("entry.txt")).unwrap(), b"commented");
+
+        let source = root.join("prefixed.zip");
+        write_zip64(&source, ZIP_READ_WINDOW + 7, 1, false);
+        let staging = root.join("prefixed");
+        assert_eq!(extract_archive_to(&source, &staging).unwrap(), 1);
+        assert_eq!(fs::read(staging.join("entry.txt")).unwrap(), b"data");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn zip_preflight_rejects_forged_count_before_central_parse() {
+        let root = test_dir("zip-preflight-count");
+        let source = root.join("forged.zip");
+        // zip 0.6.6 preallocates when the claimed count fits below the EOCD offset.
+        let count = LIMITS.entries + 1;
+        write_zip64(&source, count, count as u64, true);
+        let staging = root.join("staging");
+        let error = extract_archive_to(&source, &staging).unwrap_err();
+        assert!(error.contains("entry count limit"), "{error}");
+        assert!(file_names(&staging).is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn staging_observation_failure_stops_before_manifest_and_payload() {
+        let root = test_dir("archive-staging-observation");
+        let source = root.join("fixture.zip");
+        write_zip(&source, &[("entry.txt", b"data")]);
+        let mut observed = None;
+        let error = extract_archive_in(
+            &source,
+            &root.join("archive-imports"),
+            &AtomicBool::new(false),
+            |staging| {
+                observed = Some(staging.to_path_buf());
+                Err("forced journal error".into())
+            },
+            |_, _| panic!("extraction started without a staging receipt"),
+        ).unwrap_err();
+        let staging = observed.expect("staging receipt attempted");
+        assert!(error.contains("forced journal error"), "{error}");
+        assert!(error.contains(staging.to_string_lossy().as_ref()), "{error}");
+        assert!(file_names(&staging).is_empty());
+        assert!(!staging.with_extension("manifest.json").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn zip_preflight_bounds_actual_central_entry_lengths() {
+        let root = test_dir("zip-preflight-length");
+        let source = root.join("fixture.zip");
+        write_zip(&source, &[("entry.txt", b"data")]);
+        let mut bytes = fs::read(&source).unwrap();
+        let end = &bytes[bytes.len() - 22..];
+        let size = u32::from_le_bytes(zip_field(end, 12)) as u64;
+        let offset = u32::from_le_bytes(zip_field(end, 16)) as usize;
+
+        let limits = Limits { zip_metadata_bytes: size, ..LIMITS };
+        let cancelled = AtomicBool::new(false);
+        assert_eq!(extract_archive_to_with(&source, &root.join("exact"), limits, &cancelled).unwrap(), 1);
+        let smaller = Limits { zip_metadata_bytes: size - 1, ..limits };
+        let error = extract_archive_to_with(&source, &root.join("over"), smaller, &cancelled).unwrap_err();
+        assert!(error.contains("metadata size limit"), "{error}");
+
+        bytes[offset + 28..offset + 30].copy_from_slice(&u16::MAX.to_le_bytes());
+        fs::write(&source, bytes).unwrap();
+        let error = extract_archive_to(&source, &root.join("forged")).unwrap_err();
+        assert!(error.contains("entry length"), "{error}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn zip_parser_reads_observe_cancellation_after_preflight() {
+        let root = test_dir("zip-parser-cancel");
+        let source = root.join("fixture.zip");
+        write_zip(&source, &[("entry.txt", b"data")]);
+        let cancelled = AtomicBool::new(false);
+        let budget = Budget {
+            limits: LIMITS,
+            started: Instant::now(),
+            cancelled: &cancelled,
+            bytes: 0,
+            files: 0,
+            last_progress: Instant::now(),
+            progress: &mut |_, _| {},
+        };
+        let (file, guard, _) = open_archive(&source, LIMITS).unwrap();
+        let mut reader = ZipReader::new(file, &budget).unwrap();
+        assert_eq!(preflight_zip(&mut reader, LIMITS).unwrap(), 1);
+        cancelled.store(true, Ordering::Relaxed);
+        let error = ZipArchive::new(reader).err().expect("cancelled ZIP constructor");
+        assert!(error.to_string().contains("cancelled"), "{error}");
+        drop(guard);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

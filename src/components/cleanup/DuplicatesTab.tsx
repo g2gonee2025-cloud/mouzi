@@ -1,4 +1,4 @@
-import { useState, useMemo } from "react";
+import { useState, useMemo, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import { useCleanupStore } from "../../store/useCleanupStore";
 import {
@@ -24,6 +24,7 @@ export default function DuplicatesTab() {
   const [showResults, setShowResults] = useState(false);
   const [pending, setPending] = useState<ConfirmDialogProps | null>(null);
   const beginPreview = usePreviewOwner();
+  const resultsHeading = useRef<HTMLHeadingElement>(null);
 
   const groups = useMemo(
     () => (store.duplicates ? sortGroups(store.duplicates) : []),
@@ -46,7 +47,7 @@ export default function DuplicatesTab() {
     setSelected((prev) => ({ ...prev, [hash]: path }));
   };
 
-  const handleConfirm = async () => {
+  const handleConfirm = async (opener: HTMLButtonElement) => {
     if (actions.length === 0) return;
     const owner = beginPreview();
     if (!owner) return;
@@ -59,6 +60,8 @@ export default function DuplicatesTab() {
         bytes: plan.totalBytes,
         notice: "trash",
         preview: plan.actions.map((a) => a.path),
+        opener,
+        focusFallback: () => resultsHeading.current,
         onConfirm: async () => { await store.executeCleanup(plan.planId); setShowResults(true); },
         onClose: () => { owner.abort(); setPending(null); },
       });
@@ -77,6 +80,7 @@ export default function DuplicatesTab() {
   if (showResults && store.results) {
     return (
       <ResultsPanel
+        headingRef={resultsHeading}
         results={store.results}
         onDone={handleResultsDone}
         error={store.error}
@@ -120,7 +124,7 @@ export default function DuplicatesTab() {
               {t("cleanup.reclaimable", { size: formatBytes(reclaimable) })}
             </span>
             <button
-              onClick={handleConfirm}
+              onClick={(event) => void handleConfirm(event.currentTarget)}
               disabled={store.busy || actions.length === 0}
               className="flex items-center gap-1.5 rounded-md bg-red-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-red-700 disabled:opacity-50 transition-colors"
             >

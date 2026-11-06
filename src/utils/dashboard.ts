@@ -24,17 +24,30 @@ export function categoryLabel(name: string, translate: (key: string) => string):
   return Object.prototype.hasOwnProperty.call(CATEGORY_CLASSES, name) ? translate(`categories.${name}`) : name;
 }
 
-interface InventoryQuery {
+export interface DashboardViewOptions {
   sort: "size" | "mtime";
+  query: string;
+  category: string | null;
+  root: string | null;
+}
+
+export const DEFAULT_DASHBOARD_VIEW: DashboardViewOptions = {
+  sort: "size", query: "", category: null, root: null,
+};
+
+export function clearMissingDashboardRoot(view: DashboardViewOptions, missingRoot: string): DashboardViewOptions {
+  return view.root === missingRoot ? { ...view, root: null } : view;
+}
+
+interface InventoryQuery {
+  sort: DashboardViewOptions["sort"];
   category: string;
   root: string;
   query: string;
   limit: number;
 }
 
-interface BrowserScope extends Omit<InventoryQuery, "category" | "root" | "limit"> {
-  category: string | null;
-  root: string | null;
+interface BrowserScope extends DashboardViewOptions {
   rootScope: string;
 }
 

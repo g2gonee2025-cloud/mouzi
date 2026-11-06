@@ -1,4 +1,5 @@
 use chrono::{DateTime, TimeZone, Utc};
+use rusqlite::functions::FunctionFlags;
 use rusqlite::{params, Connection, OptionalExtension, Result as SqliteResult};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -151,10 +152,12 @@ fn open_database(db_path: &Path) -> SqliteResult<Connection> {
     let mut conn = Connection::open(db_path)?;
     initialize_schema(&conn)?;
     recover_interrupted_inventory_on(&mut conn, "Inventory scan was interrupted when the app closed")?;
+    recover_interrupted_schedule_runs_on(&mut conn)?;
     Ok(conn)
 }
 
 fn initialize_schema(conn: &Connection) -> SqliteResult<()> {
+    register_inventory_search(conn)?;
 
     conn.execute(
         "CREATE TABLE IF NOT EXISTS watched_folders (
@@ -368,6 +371,12 @@ fn initialize_schema(conn: &Connection) -> SqliteResult<()> {
         );
         CREATE TABLE IF NOT EXISTS scheduler_state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS schedule_occurrences (key TEXT PRIMARY KEY, claimed_at TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS schedule_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, status TEXT NOT NULL, claimed_at TEXT NOT NULL,
+            started_at TEXT, finished_at TEXT, occurrences INTEGER NOT NULL,
+            organized INTEGER NOT NULL DEFAULT 0, errors INTEGER NOT NULL DEFAULT 0,
+            deferred INTEGER NOT NULL DEFAULT 0, uncertain INTEGER NOT NULL DEFAULT 0, message TEXT
+        );
     ")?;
     let intent_columns: Vec<String> = conn.prepare("PRAGMA table_info(operation_intents)")?
         .query_map([], |row| row.get(1))?.collect::<SqliteResult<_>>()?;
@@ -375,6 +384,8 @@ fn initialize_schema(conn: &Connection) -> SqliteResult<()> {
         ("undo_action_log_id", "INTEGER"),
         ("undo_expected_identity", "TEXT"),
         ("undo_observed_identity", "TEXT"),
+        ("undo_observation", "TEXT"),
+        ("schedule_run_id", "INTEGER"),
     ] {
         if !intent_columns.iter().any(|column| column == name) {
             conn.execute(&format!("ALTER TABLE operation_intents ADD COLUMN {name} {column_type}"), [])?;
@@ -382,6 +393,11 @@ fn initialize_schema(conn: &Connection) -> SqliteResult<()> {
     }
     conn.execute_batch("CREATE UNIQUE INDEX IF NOT EXISTS pending_undo_action_idx
         ON operation_intents(undo_action_log_id) WHERE action='undo' AND status='pending'")?;
+    conn.execute_batch("CREATE INDEX IF NOT EXISTS schedule_run_intents_idx
+        ON operation_intents(schedule_run_id, status) WHERE schedule_run_id IS NOT NULL")?;
+    conn.execute_batch("CREATE INDEX IF NOT EXISTS schedule_occurrences_legacy_slot_idx
+        ON schedule_occurrences(substr(substr(key,4),instr(substr(key,4),'|')+1))
+        WHERE substr(key,1,3)='v1|'")?;
     let inventory_state_cols:Vec<String>=conn.prepare("PRAGMA table_info(inventory_state)")?.query_map([],|r|r.get(1))?.collect::<SqliteResult<_>>()?;
     if !inventory_state_cols.iter().any(|name|name=="mutation_revision") {
         conn.execute("ALTER TABLE inventory_state ADD COLUMN mutation_revision INTEGER NOT NULL DEFAULT 0",[])?;
@@ -796,42 +812,145 @@ pub fn get_schedule_last_check() -> SqliteResult<Option<String>> {
     sqlite_lock()?.query_row("SELECT value FROM scheduler_state WHERE key='last_check'", [], |row| row.get(0)).optional()
 }
 
-pub(crate) fn claim_schedule_occurrences(keys: &[&str], checkpoint: &str) -> SqliteResult<usize> {
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ScheduleRunClaim {
+    pub id: i64,
+    pub occurrences: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ScheduleRun {
+    pub id: i64,
+    pub status: String,
+    pub claimed_at: String,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+    pub occurrences: usize,
+    pub organized: usize,
+    pub errors: usize,
+    pub deferred: usize,
+    pub uncertain: usize,
+    pub message: Option<String>,
+}
+
+#[derive(Default)]
+pub(crate) struct ScheduleRunProgress {
+    pub organized: usize,
+    pub errors: usize,
+    pub deferred: usize,
+    pub revoked: bool,
+    pub message: Option<String>,
+}
+
+impl ScheduleRunProgress {
+    pub(crate) fn record_error(&mut self, message: String) {
+        self.errors += 1;
+        if self.message.is_none() {
+            self.message = Some(message.chars().take(512).collect());
+        }
+    }
+}
+
+pub(crate) fn claim_schedule_occurrences(keys: &[&str], checkpoint: &str) -> SqliteResult<Option<ScheduleRunClaim>> {
     claim_schedule_occurrences_on(&mut *sqlite_lock()?, keys, checkpoint)
 }
 
-fn claim_schedule_occurrences_on(conn: &mut Connection, keys: &[&str], checkpoint: &str) -> SqliteResult<usize> {
+// The legacy format puts a configuration segment before the local date and
+// time. Match everything after that segment using the legacy slot index.
+const CLAIM_SCHEDULE_OCCURRENCE_SQL: &str =
+    "INSERT OR IGNORE INTO schedule_occurrences(key,claimed_at)
+     SELECT ?1,?2 WHERE NOT EXISTS (
+       SELECT 1 FROM schedule_occurrences WHERE substr(key,1,3)='v1|'
+       AND substr(substr(key,4),instr(substr(key,4),'|')+1)=substr(?1,4)
+     )";
+
+fn claim_schedule_occurrences_on(conn: &mut Connection, keys: &[&str], checkpoint: &str) -> SqliteResult<Option<ScheduleRunClaim>> {
     let tx = conn.transaction()?;
     let claimed_at = Utc::now().to_rfc3339();
     let mut count = 0;
     {
-        // A legacy key includes a configuration segment before date and time.
-        // Honor any old claim for the slot, regardless of that configuration.
-        let mut insert = tx.prepare(
-            "INSERT OR IGNORE INTO schedule_occurrences(key,claimed_at)
-             SELECT ?1,?2 WHERE NOT EXISTS (
-               SELECT 1 FROM schedule_occurrences WHERE key GLOB ('v1|*' || substr(?1,3))
-             )"
-        )?;
+        let mut insert = tx.prepare(CLAIM_SCHEDULE_OCCURRENCE_SQL)?;
         for key in keys { count += insert.execute(params![key, &claimed_at])?; }
     }
     tx.execute("INSERT INTO scheduler_state(key,value) VALUES('last_check',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [checkpoint])?;
+    let run = if count == 0 {
+        None
+    } else {
+        tx.execute("INSERT INTO schedule_runs(status,claimed_at,occurrences) VALUES('claimed',?1,?2)", params![claimed_at, count])?;
+        Some(ScheduleRunClaim { id: tx.last_insert_rowid(), occurrences: count })
+    };
     tx.commit()?;
-    Ok(count)
+    Ok(run)
+}
+
+pub(crate) fn start_schedule_run(id: i64) -> SqliteResult<()> {
+    let changed = sqlite_lock()?.execute(
+        "UPDATE schedule_runs SET status='running',started_at=?2 WHERE id=?1 AND status='claimed'",
+        params![id, Utc::now().to_rfc3339()],
+    )?;
+    if changed == 1 { Ok(()) } else { Err(rusqlite::Error::QueryReturnedNoRows) }
+}
+
+pub(crate) fn finish_schedule_run(id: i64, progress: &ScheduleRunProgress) -> SqliteResult<()> {
+    finish_schedule_run_on(&*sqlite_lock()?, id, progress)
+}
+
+fn finish_schedule_run_on(conn: &Connection, id: i64, progress: &ScheduleRunProgress) -> SqliteResult<()> {
+    let (status, message) = if progress.revoked {
+        ("interrupted", Some("Schedule settings changed during the run"))
+    } else if progress.errors > 0 {
+        ("failed", progress.message.as_deref())
+    } else {
+        ("completed", None)
+    };
+    let changed = conn.execute(
+        "UPDATE schedule_runs SET status=?2,finished_at=?3,organized=?4,errors=?5,deferred=?6,message=?7,
+         uncertain=(SELECT COUNT(*) FROM operation_intents WHERE schedule_run_id=?1 AND status='pending')
+         WHERE id=?1 AND status='running'",
+        params![id, status, Utc::now().to_rfc3339(), progress.organized, progress.errors, progress.deferred, message],
+    )?;
+    if changed == 1 { Ok(()) } else { Err(rusqlite::Error::QueryReturnedNoRows) }
+}
+
+fn recover_interrupted_schedule_runs_on(conn: &mut Connection) -> SqliteResult<()> {
+    let tx = conn.transaction()?;
+    tx.execute(
+        "UPDATE schedule_runs AS r SET status='interrupted',finished_at=?1,
+         organized=(SELECT COUNT(*) FROM operation_intents WHERE schedule_run_id=r.id AND status='completed'),
+         errors=(SELECT COUNT(*) FROM operation_intents WHERE schedule_run_id=r.id AND status='failed'),
+         uncertain=(SELECT COUNT(*) FROM operation_intents WHERE schedule_run_id=r.id AND status='pending'),
+         message='The app closed before this run finished'
+         WHERE r.status IN ('claimed','running')",
+        [Utc::now().to_rfc3339()],
+    )?;
+    tx.commit()
+}
+
+pub fn recent_schedule_runs() -> SqliteResult<Vec<ScheduleRun>> {
+    let conn = sqlite_lock()?;
+    let mut stmt = conn.prepare(
+        "SELECT id,status,claimed_at,started_at,finished_at,occurrences,organized,errors,deferred,uncertain,message
+         FROM schedule_runs ORDER BY id DESC LIMIT 10",
+    )?;
+    let rows = stmt.query_map([], |row| Ok(ScheduleRun {
+        id: row.get(0)?, status: row.get(1)?, claimed_at: row.get(2)?, started_at: row.get(3)?,
+        finished_at: row.get(4)?, occurrences: row.get(5)?, organized: row.get(6)?, errors: row.get(7)?,
+        deferred: row.get(8)?, uncertain: row.get(9)?, message: row.get(10)?,
+    }))?;
+    rows.collect()
 }
 
 #[cfg(test)]
 #[test]
 fn scheduler_claims_legacy_slots_once_and_rolls_back_the_whole_checkpoint() {
     let mut conn = Connection::open_in_memory().unwrap();
+    initialize_schema(&conn).unwrap();
     conn.execute_batch(
-        "CREATE TABLE schedule_occurrences (key TEXT PRIMARY KEY, claimed_at TEXT NOT NULL);
-         CREATE TABLE scheduler_state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-         INSERT INTO schedule_occurrences VALUES('v1|08:00:00,14:00:00|2026-11-06|14:00:00','legacy');"
+        "INSERT INTO schedule_occurrences VALUES('v1|08:00:00,14:00:00|2026-11-06|14:00:00','legacy');"
     ).unwrap();
     let today = ["v2|2026-11-06|10:00:00", "v2|2026-11-06|14:00:00"];
-    assert_eq!(claim_schedule_occurrences_on(&mut conn, &today, "first").unwrap(), 1);
-    assert_eq!(claim_schedule_occurrences_on(&mut conn, &today, "second").unwrap(), 0);
+    assert_eq!(claim_schedule_occurrences_on(&mut conn, &today, "first").unwrap().unwrap().occurrences, 1);
+    assert!(claim_schedule_occurrences_on(&mut conn, &today, "second").unwrap().is_none());
     conn.execute_batch(
         "CREATE TRIGGER fail_second_claim BEFORE INSERT ON schedule_occurrences
          WHEN NEW.key='v2|2026-11-07|14:00:00' BEGIN SELECT RAISE(ABORT,'fixture failure'); END;"
@@ -839,8 +958,62 @@ fn scheduler_claims_legacy_slots_once_and_rolls_back_the_whole_checkpoint() {
     let tomorrow = ["v2|2026-11-07|10:00:00", "v2|2026-11-07|14:00:00"];
     assert!(claim_schedule_occurrences_on(&mut conn, &tomorrow, "third").is_err());
     let count: i64 = conn.query_row("SELECT COUNT(*) FROM schedule_occurrences", [], |row| row.get(0)).unwrap();
+    let runs: i64 = conn.query_row("SELECT COUNT(*) FROM schedule_runs", [], |row| row.get(0)).unwrap();
     let checkpoint: String = conn.query_row("SELECT value FROM scheduler_state WHERE key='last_check'", [], |row| row.get(0)).unwrap();
-    assert_eq!((count, checkpoint.as_str()), (2, "second"));
+    assert_eq!((count, runs, checkpoint.as_str()), (2, 1, "second"));
+}
+
+#[cfg(test)]
+#[test]
+fn scheduler_legacy_claim_probe_uses_an_index_and_matches_the_entire_date() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    initialize_schema(&conn).unwrap();
+    conn.execute_batch(
+        "INSERT INTO schedule_occurrences VALUES('v1|14:00:00|+12026-11-06|14:00:00','legacy');"
+    ).unwrap();
+    let ordinary = "v2|2026-11-06|14:00:00";
+    let extended = "v2|+12026-11-06|14:00:00";
+    let run = claim_schedule_occurrences_on(&mut conn, &[ordinary, extended], "checkpoint").unwrap().unwrap();
+    assert_eq!(run.occurrences, 1);
+    let saved: String = conn.query_row(
+        "SELECT key FROM schedule_occurrences WHERE key LIKE 'v2|%'", [], |row| row.get(0),
+    ).unwrap();
+    assert_eq!(saved, ordinary);
+
+    let mut plan = conn.prepare(&format!("EXPLAIN QUERY PLAN {CLAIM_SCHEDULE_OCCURRENCE_SQL}")).unwrap();
+    let details = plan.query_map(params![extended, "fixture"], |row| row.get::<_, String>(3))
+        .unwrap().collect::<SqliteResult<Vec<_>>>().unwrap();
+    assert!(details.iter().any(|detail| {
+        detail.starts_with("SEARCH") && detail.contains("schedule_occurrences_legacy_slot_idx")
+    }), "Legacy slot lookup should search its index: {details:?}");
+}
+
+#[cfg(test)]
+#[test]
+fn scheduler_recovery_preserves_claims_and_distinguishes_confirmed_from_uncertain_moves() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    initialize_schema(&conn).unwrap();
+    let slots = ["v2|2026-11-06|08:00:00"];
+    let running = claim_schedule_occurrences_on(&mut conn, &slots, "running").unwrap().unwrap();
+    let queued = claim_schedule_occurrences_on(&mut conn, &["v2|2026-11-06|09:00:00"], "queued").unwrap().unwrap();
+    let finishing = claim_schedule_occurrences_on(&mut conn, &["v2|2026-11-06|10:00:00"], "finishing").unwrap().unwrap();
+    conn.execute("UPDATE schedule_runs SET status='running' WHERE id IN (?1,?2)", params![running.id, finishing.id]).unwrap();
+    for (source, status) in [("a", "completed"), ("b", "failed"), ("c", "pending")] {
+        conn.execute("INSERT INTO operation_intents(created_at,action,source_path,status,schedule_run_id) VALUES('fixture','move',?1,?2,?3)", params![source, status, running.id]).unwrap();
+    }
+    conn.execute("INSERT INTO operation_intents(created_at,action,source_path,schedule_run_id) VALUES('fixture','move','d',?1)", [finishing.id]).unwrap();
+    let mut progress = ScheduleRunProgress { organized: 1, ..Default::default() };
+    progress.record_error("Move observed but the history write failed".into());
+    finish_schedule_run_on(&conn, finishing.id, &progress).unwrap();
+    recover_interrupted_schedule_runs_on(&mut conn).unwrap();
+    recover_interrupted_schedule_runs_on(&mut conn).unwrap();
+    let read = |id| conn.query_row("SELECT status,organized,errors,uncertain FROM schedule_runs WHERE id=?1", [id], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?, row.get::<_, i64>(3)?))
+    }).unwrap();
+    assert_eq!(read(running.id), ("interrupted".into(), 1, 1, 1));
+    assert_eq!(read(queued.id), ("interrupted".into(), 0, 0, 0));
+    assert_eq!(read(finishing.id), ("failed".into(), 1, 1, 1));
+    assert!(claim_schedule_occurrences_on(&mut conn, &slots, "replay").unwrap().is_none());
 }
 
 pub fn clear_logs() -> SqliteResult<()> {
@@ -905,11 +1078,55 @@ pub fn begin_operation_intent(action:&str,source:&str,requested_destination:Opti
     Ok(conn.last_insert_rowid())
 }
 
+pub(crate) fn begin_scheduled_move_intent(run_id: i64, source: &str, requested: &str) -> SqliteResult<i64> {
+    let conn = sqlite_lock()?;
+    let changed = conn.execute(
+        "INSERT INTO operation_intents(created_at,action,source_path,requested_destination,schedule_run_id)
+         SELECT ?1,'move',?2,?3,?4 WHERE EXISTS (SELECT 1 FROM schedule_runs WHERE id=?4 AND status='running')",
+        params![Utc::now().to_rfc3339(), source, requested, run_id],
+    )?;
+    if changed == 1 { Ok(conn.last_insert_rowid()) } else { Err(rusqlite::Error::QueryReturnedNoRows) }
+}
+
+pub(crate) fn observe_pending_archive_staging(intent: i64, staging: &str) -> Result<(), String> {
+    let changed = lock_db()?.execute(
+        "UPDATE operation_intents SET actual_destination=?2 WHERE id=?1 AND action='archive_import' AND status='pending'",
+        params![intent, staging],
+    ).map_err(|error| error.to_string())?;
+    if changed == 1 { Ok(()) } else { Err("Archive import intent is unavailable".into()) }
+}
+
 pub fn finalize_operation_intent(id:i64,status:&str,actual_destination:Option<&str>,message:Option<&str>)->SqliteResult<()> {
     let conn=sqlite_lock()?;
     let changed=conn.execute("UPDATE operation_intents SET completed_at=?2,status=?3,actual_destination=?4,message=?5 WHERE id=?1 AND status='pending'",params![id,Utc::now().to_rfc3339(),status,actual_destination,message])?;
     if changed!=1 {return Err(rusqlite::Error::QueryReturnedNoRows);}
     Ok(())
+}
+
+pub(crate) fn observe_retained_move_output(id: i64, action: &str, path: &str, message: &str) -> SqliteResult<()> {
+    let conn = sqlite_lock()?;
+    let changed = conn.execute(
+        "UPDATE operation_intents SET actual_destination=?3,message=?4
+         WHERE id=?1 AND action=?2 AND action IN ('move','suggestion')
+         AND status='pending' AND actual_destination IS NULL",
+        params![id, action, path, message],
+    )?;
+    if changed != 1 { return Err(rusqlite::Error::QueryReturnedNoRows); }
+    Ok(())
+}
+
+pub(crate) fn mark_retained_move_inventory_stale(source: &Path, output: &Path) -> SqliteResult<()> {
+    let folders = get_watched_folders()?;
+    let mut roots = configured_inventory_ancestors(&source.to_string_lossy(), &folders);
+    roots.extend(configured_inventory_ancestors(&output.to_string_lossy(), &folders));
+    roots.sort_unstable();
+    roots.dedup();
+    if roots.is_empty() { return Ok(()); }
+    let mut conn = sqlite_lock()?;
+    let tx = conn.transaction()?;
+    mark_inventory_ancestors_stale(&tx, &roots)?;
+    tx.execute("UPDATE inventory_state SET revision=revision+1,mutation_revision=mutation_revision+1 WHERE id=1", [])?;
+    tx.commit()
 }
 
 pub fn begin_cleanup_intent(action:&str,path:&str)->SqliteResult<i64> {
@@ -1050,13 +1267,15 @@ pub(crate) struct PendingUndo {
     pub observed: Option<String>,
     pub expected_identity: Option<String>,
     pub observed_identity: Option<String>,
+    pub retained_message: Option<String>,
 }
 
 pub(crate) fn pending_undos() -> Result<Vec<PendingUndo>, String> {
     let conn = lock_db()?;
     let mut stmt = conn.prepare(
         "SELECT id, undo_action_log_id, source_path, requested_destination, actual_destination,
-                undo_expected_identity, undo_observed_identity
+                undo_expected_identity, undo_observed_identity,
+                CASE WHEN undo_observation='retained' THEN message END
          FROM operation_intents WHERE action='undo' AND status='pending' ORDER BY id",
     ).map_err(|error| error.to_string())?;
     let rows = stmt.query_map([], |row| Ok(PendingUndo {
@@ -1067,6 +1286,7 @@ pub(crate) fn pending_undos() -> Result<Vec<PendingUndo>, String> {
         observed: row.get(4)?,
         expected_identity: row.get(5)?,
         observed_identity: row.get(6)?,
+        retained_message: row.get(7)?,
     })).map_err(|error| error.to_string())?;
     rows.collect::<SqliteResult<_>>().map_err(|error| error.to_string())
 }
@@ -1084,10 +1304,18 @@ pub fn begin_undo_intent(action_log_id: i64, source: &str, destination: &str, ex
 }
 
 pub fn observe_undo_restore(id: i64, actual: &str, identity: &str) -> Result<(), String> {
+    observe_undo_output(id, actual, Some(identity), "restored", None)
+}
+
+pub fn observe_undo_retained_output(id: i64, actual: &str, identity: Option<&str>, message: &str) -> Result<(), String> {
+    observe_undo_output(id, actual, identity, "retained", Some(message))
+}
+
+fn observe_undo_output(id: i64, actual: &str, identity: Option<&str>, observation: &str, message: Option<&str>) -> Result<(), String> {
     let changed = lock_db()?.execute(
-        "UPDATE operation_intents SET actual_destination=?2,undo_observed_identity=?3
+        "UPDATE operation_intents SET actual_destination=?2,undo_observed_identity=?3,undo_observation=?4,message=?5
          WHERE id=?1 AND action='undo' AND status='pending' AND actual_destination IS NULL",
-        params![id, actual, identity],
+        params![id, actual, identity, observation, message],
     ).map_err(|error| error.to_string())?;
     if changed != 1 { return Err("Undo recovery record is unavailable".into()); }
     Ok(())
@@ -1116,7 +1344,7 @@ pub fn finalize_undo_intent(id: i64, action_log_id: i64, old: &str, new: &str, e
     let changed = tx.execute(
         "UPDATE operation_intents SET completed_at=?2,status='completed'
          WHERE id=?1 AND status='pending' AND undo_action_log_id=?3 AND source_path=?4
-         AND actual_destination=?5 AND undo_observed_identity=?6",
+         AND actual_destination=?5 AND undo_observed_identity=?6 AND undo_observation='restored'",
         params![id, Utc::now().to_rfc3339(), action_log_id, old, new, expected],
     ).map_err(|error| error.to_string())?;
     if changed != 1 { return Err("Undo recovery record is unavailable".into()); }
@@ -1449,6 +1677,45 @@ fn get_age_buckets_on(conn: &Connection, now: i64) -> SqliteResult<Vec<AgeBucket
         .collect())
 }
 
+fn register_inventory_search(conn: &Connection) -> SqliteResult<()> {
+    let mut last_matcher: Option<(String, regex::Regex)> = None;
+    conn.create_scalar_function(
+        "mouzi_path_contains",
+        2,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC | FunctionFlags::SQLITE_DIRECTONLY,
+        move |context| {
+            let path = context.get_raw(0).as_str()?;
+            let query = context.get_raw(1).as_str()?;
+            // The bound query is shared by every row of the statement.
+            if last_matcher.as_ref().is_none_or(|(previous, _)| previous.as_str() != query) {
+                let matcher = regex::RegexBuilder::new(&regex::escape(query))
+                    .case_insensitive(true)
+                    .build()
+                    .map_err(|error| rusqlite::Error::UserFunctionError(Box::new(error)))?;
+                last_matcher = Some((query.to_owned(), matcher));
+            }
+            Ok(last_matcher.as_ref().is_some_and(|(_, matcher)| matcher.is_match(path)))
+        },
+    )
+}
+
+fn inventory_files_sql(sort: &str) -> String {
+    let order = if sort == "mtime" {
+        "mtime DESC, path ASC"
+    } else {
+        "size DESC, path ASC"
+    };
+    format!(
+        "SELECT path, size, mtime, category, root_path FROM file_inventory
+         WHERE root_path IN (SELECT path FROM watched_folders)
+           AND (?1 = '' OR category = ?1)
+           AND (?2 = '' OR root_path = ?2)
+           AND (?3 = '' OR mouzi_path_contains(path,?3))
+         ORDER BY {order}
+         LIMIT ?4"
+    )
+}
+
 fn get_inventory_files_on(
     conn: &Connection,
     sort: &str,
@@ -1457,26 +1724,16 @@ fn get_inventory_files_on(
     query: Option<&str>,
     limit: i64,
 ) -> SqliteResult<Vec<InventoryFile>> {
-    let order = if sort == "mtime" {
-        "mtime DESC, path ASC"
-    } else {
-        "size DESC, path ASC"
-    };
     let cat = category.unwrap_or("");
     let root_path = root.unwrap_or("");
     let q = query.unwrap_or("").trim();
-    let sql = format!(
-        "SELECT path, size, mtime, category, root_path FROM file_inventory
-         WHERE root_path IN (SELECT path FROM watched_folders)
-           AND (?1 = '' OR category = ?1)
-           AND (?2 = '' OR root_path = ?2)
-           AND (?3 = '' OR INSTR(LOWER(path),LOWER(?3)) > 0)
-         ORDER BY {order}
-         LIMIT ?4"
-    );
-    let mut stmt = conn.prepare(&sql)?;
+    query_inventory_files(conn, &inventory_files_sql(sort), params![cat, root_path, q, limit.max(0)])
+}
+
+fn query_inventory_files(conn: &Connection, sql: &str, bindings: impl rusqlite::Params) -> SqliteResult<Vec<InventoryFile>> {
+    let mut stmt = conn.prepare(sql)?;
     let rows = stmt
-        .query_map(params![cat, root_path, q, limit.max(0)], |row| {
+        .query_map(bindings, |row| {
             Ok(InventoryFile {
                 path: row.get(0)?,
                 size: row.get(1)?,
@@ -2170,6 +2427,210 @@ mod tests {
         assert_eq!(result[0].path, paths[0]);
         assert!(get_inventory_files_on(&conn, "size", None, Some("removed-root"), None, 10).unwrap().is_empty());
         assert_eq!(get_inventory_stats_on(&conn).unwrap().total_files, 4);
+    }
+
+    #[test]
+    fn unicode_path_search_is_caseless_and_literal_before_limit() {
+        let mut conn = mem_conn_with_inventory();
+        conn.execute("INSERT INTO watched_folders(path,mode) VALUES('root','paused')", []).unwrap();
+        let found = r"C:\Docs\ÄRGER-Σ-Փ-[A].txt";
+        let kelvin = r"C:\Docs\Kelvin.txt";
+        let paths = [
+            (found, 1), (kelvin, 2), (r"C:\Docs\ÄRGER-Σ-Փ-A.txt", 90),
+            (r"C:\Other\ÄRGER-Σ-Փ-[A].txt", 91), (r"C:\Docs\other.txt", 92),
+        ];
+        let rows: Vec<_> = paths.into_iter().map(|(path, size)| InventoryRow {
+            path: path.into(), size, mtime: 1, category: "Other".into(),
+        }).collect();
+        replace_inventory_on(&mut conn, "root", &rows).unwrap();
+        let search = |query| get_inventory_files_on(&conn, "size", Some("Other"), Some("root"), Some(query), 1).unwrap();
+        assert_eq!(search(r"\docs\ärger-ς-փ-[a].txt")[0].path, found);
+        assert_eq!(search("kelvin.txt")[0].path, kelvin);
+        assert!(search("/docs/ärger-ς-փ-[a].txt").is_empty());
+        assert_eq!(search(r"\DOCS\ÄRGER-σ-Փ-[A].TXT")[0].path, found);
+        assert!(get_inventory_files_on(&conn, "size", Some("other"), Some("root"), Some("kelvin"), 1).unwrap().is_empty());
+        assert!(get_inventory_files_on(&conn, "size", Some("Other"), Some("ROOT"), Some("kelvin"), 1).unwrap().is_empty());
+    }
+
+    #[test]
+    #[ignore = "opt-in file-backed inventory benchmark; run with --release and --nocapture"]
+    fn representative_inventory_search_benchmark() {
+        use std::time::{Duration, Instant};
+
+        const ACTIVE: &str = r"C:\Active";
+        const PAUSED: &str = r"D:\Paused";
+        const ORPHAN: &str = r"E:\Removed";
+        const UNICODE: &str = r"reports\ÄRGER-Σ-Փ.txt";
+        const LITERAL_A: &str = r"reports\A\100%_Status[1].txt";
+        const LITERAL_B: &str = r"reports\B\100%_Status[1].txt";
+        const ROW_COUNT: i64 = 120_000;
+        const LIMIT: i64 = 80;
+
+        struct TemporaryDatabase(PathBuf);
+        impl Drop for TemporaryDatabase {
+            fn drop(&mut self) { let _ = std::fs::remove_file(&self.0); }
+        }
+        struct Search<'a> {
+            name: &'a str,
+            sort: &'a str,
+            query: &'a str,
+            category: Option<&'a str>,
+            root: Option<&'a str>,
+            expected: Vec<String>,
+        }
+        fn fixture_root(index: i64) -> &'static str {
+            match index {
+                0..60_000 => ACTIVE,
+                60_000..100_000 => PAUSED,
+                _ => ORPHAN,
+            }
+        }
+        fn ordinary_path(index: i64) -> String {
+            format!(r"{}\records\group{:02}\file-{index:06}.txt", fixture_root(index), index % 60)
+        }
+        fn baseline_sql(sort: &str) -> String {
+            let order = if sort == "mtime" { "mtime DESC, path ASC" } else { "size DESC, path ASC" };
+            format!(
+                "SELECT path, size, mtime, category, root_path FROM file_inventory
+                 WHERE root_path IN (SELECT path FROM watched_folders)
+                   AND (?1 = '' OR category = ?1)
+                   AND (?2 = '' OR root_path = ?2)
+                   AND (?3 = '' OR INSTR(LOWER(path),LOWER(?3)) > 0)
+                 ORDER BY {order}
+                 LIMIT ?4"
+            )
+        }
+        fn percentiles(mut times: Vec<Duration>) -> (Duration, Duration) {
+            times.sort_unstable();
+            (times[times.len().div_ceil(2) - 1], times[(times.len() * 95).div_ceil(100) - 1])
+        }
+        fn pair_order(index: usize) -> [usize; 2] {
+            if index % 2 == 0 { [0, 1] } else { [1, 0] }
+        }
+        fn paired_microseconds(pairs: &[[Duration; 2]]) -> String {
+            pairs.iter().map(|pair| format!("{}/{}", pair[0].as_micros(), pair[1].as_micros()))
+                .collect::<Vec<_>>().join(" ")
+        }
+
+        let path = TemporaryDatabase(std::env::temp_dir().join(format!(
+            "mouzi-inventory-benchmark-{}-{}.db", std::process::id(), Utc::now().timestamp_nanos_opt().unwrap(),
+        )));
+        let mut corpus_checksum = blake3::Hasher::new();
+        {
+            let mut conn = open_database(&path.0).unwrap();
+            let tx = conn.transaction().unwrap();
+            tx.execute("INSERT INTO watched_folders(path,mode) VALUES(?1,'manual'),(?2,'paused')", [ACTIVE, PAUSED]).unwrap();
+            let mut insert = tx.prepare("INSERT INTO file_inventory(root_path,path,size,mtime,category) VALUES(?1,?2,?3,?4,?5)").unwrap();
+            for index in 0..ROW_COUNT {
+                let root = fixture_root(index);
+                let special = match index {
+                    1 | 60_001 | 100_001 => Some(UNICODE),
+                    4 | 60_004 | 100_004 => Some(LITERAL_A),
+                    6 => Some(LITERAL_B),
+                    7 => Some(r"reports\WrongCategory\100%_Status[1].txt"),
+                    8 => Some(r"reports\NearMiss\100X_Status[1].txt"),
+                    _ => None,
+                };
+                let name = special.map_or_else(|| ordinary_path(index), |relative| format!(r"{root}\{relative}"));
+                let mtime = if special.is_some() { ROW_COUNT + 1 } else { index };
+                let category = if index % 2 == 0 { "Documents" } else { "Code" };
+                insert.execute(params![root, name, index, mtime, category]).unwrap();
+                corpus_checksum.update(name.as_bytes()).update(&[0]);
+                corpus_checksum.update(&index.to_le_bytes()).update(&mtime.to_le_bytes()).update(category.as_bytes());
+            }
+            drop(insert);
+            tx.commit().unwrap();
+        }
+        println!("rows={ROW_COUNT} bytes={} sqlite={} release={} corpus={}",
+            std::fs::metadata(&path.0).unwrap().len(), rusqlite::version(), !cfg!(debug_assertions), corpus_checksum.finalize());
+
+        let top: Vec<_> = (0..100_000).rev().take(LIMIT as usize).map(ordinary_path).collect();
+        let searches = [
+            Search { name: "browse", sort: "size", query: "", category: None, root: None, expected: top.clone() },
+            Search { name: "dense-ascii", sort: "size", query: "FILE-", category: None, root: None, expected: top },
+            Search { name: "sparse-unicode", sort: "size", query: "ärger-ς-փ.txt", category: None, root: None,
+                expected: vec![format!(r"{PAUSED}\{UNICODE}"), format!(r"{ACTIVE}\{UNICODE}")] },
+            Search { name: "missing", sort: "size", query: "never-present", category: None, root: None, expected: vec![] },
+            Search { name: "scoped-literal", sort: "mtime", query: r"\100%_status[1].txt", category: Some("Documents"), root: Some(ACTIVE),
+                expected: vec![format!(r"{ACTIVE}\{LITERAL_A}"), format!(r"{ACTIVE}\{LITERAL_B}")] },
+            Search { name: "paused", sort: "size", query: "file-", category: Some("Code"), root: Some(PAUSED),
+                expected: (60_000..100_000).rev().filter(|index| index % 2 != 0).take(LIMIT as usize).map(ordinary_path).collect() },
+            Search { name: "orphan", sort: "size", query: "file-", category: None, root: Some(ORPHAN), expected: vec![] },
+        ];
+        let mut failures = Vec::new();
+        for search in searches {
+            let distinguishes_baseline = search.name == "sparse-unicode";
+            let implementations = ["baseline", "candidate"];
+            let bindings = (search.category.unwrap_or(""), search.root.unwrap_or(""), search.query, LIMIT);
+            let expected = [&[][..], search.expected.as_slice()];
+            let expected = if distinguishes_baseline { expected } else { [expected[1]; 2] };
+            let run = |conn: &Connection, arm: usize| {
+                let start = Instant::now();
+                let rows = if arm == 0 {
+                    query_inventory_files(conn, &baseline_sql(search.sort), bindings)
+                } else {
+                    get_inventory_files_on(conn, search.sort, search.category, search.root, Some(search.query), LIMIT)
+                }.unwrap();
+                let elapsed = start.elapsed();
+                assert!(rows.iter().map(|row| &row.path).eq(expected[arm]), "{} {}: wrong ordered paths", search.name, implementations[arm]);
+                (elapsed, rows)
+            };
+            let connections = [open_database(&path.0).unwrap(), open_database(&path.0).unwrap()];
+            let mut checksums = [blake3::Hasher::new(), blake3::Hasher::new()];
+            for pair in 0..2 {
+                for arm in pair_order(pair) {
+                    let (_, rows) = run(&connections[arm], arm);
+                    if pair == 0 {
+                        for row in rows {
+                            checksums[arm].update(row.path.as_bytes()).update(&[0]);
+                        }
+                    }
+                }
+            }
+            let sample_pairs = |count, reopen| {
+                (0..count).map(|pair| {
+                    let mut elapsed = [Duration::ZERO; 2];
+                    for arm in pair_order(pair) {
+                        elapsed[arm] = if reopen {
+                            // Reopen outside the timing window. This clears
+                            // SQLite's connection cache while keeping the OS cache.
+                            let connection = open_database(&path.0).unwrap();
+                            run(&connection, arm).0
+                        } else {
+                            run(&connections[arm], arm).0
+                        };
+                    }
+                    elapsed
+                }).collect::<Vec<_>>()
+            };
+            let warm_pairs = sample_pairs(30, false);
+            let reopen_pairs = sample_pairs(10, true);
+            println!("{} paired_us baseline/candidate, alternating AB/BA: warm=[{}] reopen=[{}]",
+                search.name, paired_microseconds(&warm_pairs), paired_microseconds(&reopen_pairs));
+
+            let mut metrics = Vec::new();
+            for arm in 0..2 {
+                let sql = if arm == 0 { baseline_sql(search.sort) } else { inventory_files_sql(search.sort) };
+                let implementation = implementations[arm];
+                let plan = connections[arm].prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap()
+                    .query_map(bindings, |row| row.get::<_, String>(3)).unwrap()
+                    .collect::<SqliteResult<Vec<_>>>().unwrap();
+                let warm = percentiles(warm_pairs.iter().map(|pair| pair[arm]).collect());
+                let reopen = percentiles(reopen_pairs.iter().map(|pair| pair[arm]).collect());
+                println!("{} {implementation} rows={} checksum={} warm_p50_ms={:.3} warm_p95_ms={:.3} reopen_p50_ms={:.3} reopen_p95_ms={:.3} plan={plan:?}",
+                    search.name, expected[arm].len(), checksums[arm].finalize(), warm.0.as_secs_f64() * 1_000.0, warm.1.as_secs_f64() * 1_000.0,
+                    reopen.0.as_secs_f64() * 1_000.0, reopen.1.as_secs_f64() * 1_000.0);
+                metrics.push((warm.1, reopen.1));
+            }
+            let (baseline, candidate) = (metrics[0], metrics[1]);
+            let relative_bound = |prior: Duration| prior.mul_f64(1.5).max(prior + Duration::from_millis(30));
+            if candidate.0 > Duration::from_millis(250) || candidate.1 > Duration::from_millis(500)
+                || (!distinguishes_baseline && (candidate.0 > relative_bound(baseline.0) || candidate.1 > relative_bound(baseline.1)))
+            {
+                failures.push(search.name);
+            }
+        }
+        assert!(failures.is_empty(), "inventory benchmark exceeded latency bounds: {failures:?}");
     }
 
     #[test]

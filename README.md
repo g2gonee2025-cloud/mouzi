@@ -80,7 +80,7 @@ Pop-Location
 npm run tauri build -- --no-bundle --ci -- --locked --jobs 2
 ```
 
-The final command produces an unsigned executable at `src-tauri/target/release/mouzi.exe`. Tauri builds the frontend as part of this command. CI runs both test suites on `main`, `wip/**`, pull requests and manual dispatch. Its log records the checked-out commit, runner and toolchain versions, and the executable's size and SHA-256 digest.
+The final command produces an unsigned executable at `src-tauri/target/release/mouzi.exe`. Tauri builds the frontend as part of this command. Standard builds produce the executable only. Explicit installer requests fail because installer identity and upgrade behavior still need verification. CI runs both test suites on `main`, `wip/**`, pull requests and manual dispatch. Its log records the checked-out commit, runner and toolchain versions, and the executable's size and SHA-256 digest.
 
 The real Recycle Bin integration test is ignored by default. Run it only on disposable fixtures through the explicit manual CI input or an explicitly chosen local test. Passing ordinary tests does not establish Shell recycling, real cross-volume movement, desktop event timing or installer upgrade behavior.
 

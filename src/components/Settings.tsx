@@ -4,7 +4,7 @@ import { useAppStore, Rule, ScheduleSettings, WatchedFolder, type PreferencesPat
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { formatBytes } from "../utils/format";
-import { save, open } from "@tauri-apps/plugin-dialog";
+import { open } from "@tauri-apps/plugin-dialog";
 import About from "./About";
 import ActionRefreshWarnings from "./ActionRefreshWarnings";
 import ConfirmDialog, { type ConfirmRequest } from "./cleanup/ConfirmDialog";
@@ -106,6 +106,77 @@ function defaultSchedule(): ScheduleSettings {
   };
 }
 
+type SchedulerRun = {
+  id: number;
+  status: "claimed" | "running" | "completed" | "failed" | "interrupted";
+  claimed_at: string;
+  organized: number;
+  errors: number;
+  deferred: number;
+  uncertain: number;
+  message: string | null;
+};
+
+function SchedulerRunStatus() {
+  const { t } = useTranslation();
+  const [runs, setRuns] = useState<SchedulerRun[]>([]);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let disposed = false;
+    let request = 0;
+    let unlisten: (() => void) | undefined;
+    const refresh = async (resultSaved = true) => {
+      const current = ++request;
+      try {
+        const runs = await invoke<SchedulerRun[]>("get_recent_scheduler_runs_cmd");
+        if (!disposed && current === request) {
+          setRuns(runs);
+          setError(resultSaved ? null : "The latest result could not be saved.");
+        }
+      } catch (cause) {
+        if (!disposed && current === request) setError(String(cause));
+      }
+    };
+    listen<{ result_saved: boolean }>("scheduled-clean-done", ({ payload }) => {
+      if (!disposed) void refresh(payload.result_saved);
+    }).then((stop) => {
+      if (disposed) stop();
+      else {
+        unlisten = stop;
+        if (!request) void refresh();
+      }
+    }).catch(() => { if (!disposed) void refresh(); });
+    return () => { disposed = true; unlisten?.(); };
+  }, []);
+
+  if (!runs.length && !error) return null;
+  const title = t("settings.scheduler.recentRuns", { defaultValue: "Recent scheduled runs" });
+  return (
+    <div className="text-xs text-text-muted space-y-1">
+      <p className="font-medium">{title}</p>
+      {runs.length > 0 && (
+        <ul aria-label={title} tabIndex={0} className="max-h-64 overflow-y-auto space-y-2">
+          {runs.map((run) => (
+            <li key={run.id}>
+              <p>{new Date(run.claimed_at).toLocaleString()} · {t(`settings.scheduler.status.${run.status}`, { defaultValue: run.status })}</p>
+              <p>{t("settings.scheduler.runCounts", {
+                defaultValue: "Organized {{organized}} · Errors {{errors}} · Deferred {{deferred}}",
+                organized: run.organized, errors: run.errors, deferred: run.deferred,
+              })}</p>
+              {run.uncertain > 0 && <p>{t("settings.scheduler.pendingRecovery", {
+                defaultValue: "Move records needing review: {{count}}", count: run.uncertain,
+              })}</p>}
+              {run.message && <p className="break-words">{run.message}</p>}
+            </li>
+          ))}
+        </ul>
+      )}
+      {error && <p role="status" className="break-words">{error}</p>}
+    </div>
+  );
+}
+
 export default function Settings() {
   const { t } = useTranslation();
   const {
@@ -170,6 +241,7 @@ export default function Settings() {
     return () => { disposed = true; stop?.(); };
   }, [isImportingArchive]);
   const [pending, setPending] = useState<ConfirmRequest | null>(null);
+  const sectionHeading = useRef<HTMLHeadingElement>(null);
   const [undoToast, setUndoToast] = useState<UndoNotice[] | null>(null);
 
   // 8s, not the 3s the export/import toasts use: a `collision` line ends in a
@@ -237,24 +309,28 @@ export default function Settings() {
     if (await runWrite(() => rule.id ? updateRule(rule) : addRule(rule))) setEditingRule(null);
   };
 
-  const askRemoveFolder = (folder: WatchedFolder) => {
+  const askRemoveFolder = (folder: WatchedFolder, opener: HTMLButtonElement) => {
     if (folder.id === undefined) return;
     setPending({
       title: t("confirm.op.removeFolder"),
       count: 1,
       notice: "permanent",
       note: t("confirm.note.removeFolder"),
+      opener,
+      focusFallback: () => sectionHeading.current,
       onConfirm: () => removeFolder(folder.id!),
     });
   };
 
-  const askDeleteRule = (rule: Rule) => {
+  const askDeleteRule = (rule: Rule, opener: HTMLButtonElement) => {
     if (rule.id === undefined) return;
     setPending({
       title: t("confirm.op.deleteRule"),
       count: 1,
       notice: "permanent",
       note: t("confirm.note.deleteRule"),
+      opener,
+      focusFallback: () => sectionHeading.current,
       onConfirm: () => deleteRule(rule.id!),
     });
   };
@@ -281,7 +357,7 @@ export default function Settings() {
     }
   };
 
-  const askUndoAll = async () => {
+  const askUndoAll = async (opener: HTMLButtonElement) => {
     let restorable: number;
     try {
       restorable = (await loadHistoryCounts()).undoable;
@@ -295,6 +371,8 @@ export default function Settings() {
       count: restorable,
       notice: "move",
       note: t("confirm.note.undoAll"),
+      opener,
+      focusFallback: () => sectionHeading.current,
       // `undoAllNotices` rebuilds the restored count from `results` rather than
       // reading `UndoAllResult.count`, which the backend fills with every
       // non-`failed` row and therefore counts `missing` ones too.
@@ -307,7 +385,7 @@ export default function Settings() {
   // `clear_logs_cmd` is an unconditional DELETE FROM action_logs, so this takes
   // the undo trail with it - every Undo button in the app reads from the same
   // table. Undoing history and deleting it are not the same verb.
-  const askClearLogs = async () => {
+  const askClearLogs = async (opener: HTMLButtonElement) => {
     let total: number;
     try {
       total = (await loadHistoryCounts()).total;
@@ -321,6 +399,8 @@ export default function Settings() {
       count: total,
       notice: "permanent",
       note: t("confirm.note.clearHistory", { count: total }),
+      opener,
+      focusFallback: () => sectionHeading.current,
       onConfirm: () => clearLogs(),
     });
   };
@@ -385,38 +465,26 @@ export default function Settings() {
 
   const handleExportRules = async () => {
     try {
-      const path = await save({
-        filters: [{ name: "JSON", extensions: ["json"] }],
-        defaultPath: "mouzi-rules.json",
-      });
-      if (path) {
-        await exportRules(path);
-        setRuleToast({ message: t("settings.rules.exportSuccess"), type: "success" });
-      }
+      if (!(await exportRules())) return;
+      setRuleToast({ message: t("settings.rules.exportSuccess"), type: "success" });
     } catch (e) {
       console.error("Export rules failed:", e);
-      setRuleToast({ message: t("settings.rules.exportError"), type: "error" });
+      setRuleToast({ message: `${t("settings.rules.exportError")}. ${String(e)}`, type: "error" });
     }
     setTimeout(() => setRuleToast(null), 3000);
   };
 
   const handleImportRules = async () => {
     try {
-      const selected = await open({
-        filters: [{ name: "JSON", extensions: ["json"] }],
-        multiple: false,
+      const count = await importRules(replaceOnImport);
+      if (count === null) return;
+      setRuleToast({
+        message: t("settings.rules.importSuccess", { count }),
+        type: "success",
       });
-      const path = Array.isArray(selected) ? selected[0] : selected;
-      if (path) {
-        const count = await importRules(path, replaceOnImport);
-        setRuleToast({
-          message: t("settings.rules.importSuccess", { count }),
-          type: "success",
-        });
-      }
     } catch (e) {
       console.error("Import rules failed:", e);
-      setRuleToast({ message: t("settings.rules.importError"), type: "error" });
+      setRuleToast({ message: `${t("settings.rules.importError")}. ${String(e)}`, type: "error" });
     }
     setTimeout(() => setRuleToast(null), 3000);
   };
@@ -529,7 +597,7 @@ export default function Settings() {
         <fieldset disabled={isSaving} className="min-w-0">
         {tab === "folders" && (
           <div className="space-y-4">
-            <h2 className="text-lg font-semibold">{t("settings.folders.title")}</h2>
+            <h2 ref={sectionHeading} tabIndex={-1} className="text-lg font-semibold">{t("settings.folders.title")}</h2>
             <div className="flex gap-2">
               <input
                 type="text"
@@ -627,7 +695,7 @@ export default function Settings() {
                     </div>
                   </div>
                   <button
-                    onClick={() => askRemoveFolder(f)}
+                    onClick={(event) => askRemoveFolder(f, event.currentTarget)}
                     className="p-1.5 rounded-md text-red-500 hover:bg-red-50 shrink-0"
                     title={t("confirm.op.removeFolder")}
                     aria-label={`${t("confirm.op.removeFolder")}: ${f.path}`}
@@ -643,7 +711,7 @@ export default function Settings() {
         {tab === "rules" && (
           <div className="space-y-4">
             <div className="flex items-center justify-between">
-              <h2 className="text-lg font-semibold">{t("settings.rules.title")}</h2>
+              <h2 ref={sectionHeading} tabIndex={-1} className="text-lg font-semibold">{t("settings.rules.title")}</h2>
               <button
                 onClick={() =>
                   setEditingRule({
@@ -837,7 +905,7 @@ export default function Settings() {
                       <Save size={14} />
                     </button>
                     <button
-                      onClick={() => askDeleteRule(r)}
+                      onClick={(event) => askDeleteRule(r, event.currentTarget)}
                       className="p-1.5 rounded-md text-red-500 hover:bg-red-50"
                       title={t("confirm.op.deleteRule")}
                       aria-label={`${t("confirm.op.deleteRule")}: ${r.name}`}
@@ -854,10 +922,10 @@ export default function Settings() {
         {tab === "history" && (
           <div className="space-y-4">
             <div className="flex items-center justify-between">
-              <h2 className="text-lg font-semibold">{t("settings.history.title")}</h2>
+              <h2 ref={sectionHeading} tabIndex={-1} className="text-lg font-semibold">{t("settings.history.title")}</h2>
               <div className="flex items-center gap-2">
                 <button
-                  onClick={askUndoAll}
+                  onClick={(event) => void askUndoAll(event.currentTarget)}
                   disabled={!historyCounts || historyCounts.undoable === 0}
                   title={!historyCounts || historyCounts.undoable === 0 ? t("settings.history.revertAllDisabled") : undefined}
                   className="flex items-center gap-1.5 rounded-md border border-amber-300 px-3 py-2 text-sm text-amber-700 hover:bg-amber-50 disabled:opacity-50 disabled:cursor-not-allowed"
@@ -866,7 +934,7 @@ export default function Settings() {
                   {t("settings.history.revertAll")}
                 </button>
                 <button
-                  onClick={askClearLogs}
+                  onClick={(event) => void askClearLogs(event.currentTarget)}
                   disabled={!historyCounts || historyCounts.total === 0}
                   className="flex items-center gap-1.5 rounded-md border border-red-200 px-3 py-2 text-sm text-red-600 hover:bg-red-50"
                 >
@@ -1120,6 +1188,7 @@ export default function Settings() {
                 <h3 className="text-base font-semibold">{t("settings.scheduler.title")}</h3>
                 <p className="text-xs text-text-muted">{t("settings.scheduler.desc")}</p>
               </div>
+              <SchedulerRunStatus />
 
               <div className="flex items-center justify-between">
                 <label className="text-sm font-medium text-text-muted">

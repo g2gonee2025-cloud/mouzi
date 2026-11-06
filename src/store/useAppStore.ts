@@ -123,8 +123,8 @@ interface AppState {
   getPendingFiles: () => Promise<void>;
   getSchedule: () => Promise<void>;
   updateSchedule: (schedule: ScheduleSettings) => Promise<void>;
-  exportRules: (path: string) => Promise<void>;
-  importRules: (path: string, replace: boolean) => Promise<number>;
+  exportRules: () => Promise<boolean>;
+  importRules: (replace: boolean) => Promise<number | null>;
 }
 
 function scheduleFrom(settings: AppSettings): ScheduleSettings {
@@ -364,13 +364,11 @@ export const useAppStore = create<AppState>((set, get) => ({
     get().applySettings(committed);
   },
 
-  exportRules: async (path) => {
-    await invoke('export_rules_cmd', { path });
-  },
+  exportRules: () => invoke<boolean>('export_rules_cmd'),
 
-  importRules: async (path, replace) => {
-    const count = await invoke<number>('import_rules_cmd', { path, replace });
-    await get().loadRules();
+  importRules: async (replace) => {
+    const count = await invoke<number | null>('import_rules_cmd', { replace });
+    if (count !== null) await get().loadRules();
     return count;
   },
 }));

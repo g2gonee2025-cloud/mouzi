@@ -6,38 +6,38 @@ import { formatBytes, formatTimestamp } from "../../utils/format";
 import { fileName, parentDir } from "../../utils/paths";
 import {
   categoryClass, categoryLabel, createInventoryBrowserLoader, inventoryBrowserScope,
-  type InventoryBrowserView,
+  type DashboardViewOptions, type InventoryBrowserView,
 } from "../../utils/dashboard";
 import type { InventoryFile } from "../../store/useDashboardStore";
 
-interface FileBrowserProps {
+interface FileBrowserProps extends DashboardViewOptions {
   initialLargest: InventoryFile[];
   initialRecent: InventoryFile[];
-  category: string | null;
-  root: string | null;
   rootScope: string;
   totalFiles: number;
   revision: number;
+  onSort: (sort: DashboardViewOptions["sort"]) => void;
+  onQuery: (query: string) => void;
   onClearCategory: () => void;
   onClearRoot: () => void;
 }
 
-type Mode = "size" | "mtime";
-
 export default function FileBrowser({
   initialLargest,
   initialRecent,
+  sort,
+  query,
   category,
   root,
   rootScope,
   totalFiles,
   revision,
+  onSort,
+  onQuery,
   onClearCategory,
   onClearRoot,
 }: FileBrowserProps) {
   const { t } = useTranslation();
-  const [mode, setMode] = useState<Mode>("size");
-  const [query, setQuery] = useState("");
   const [view, setView] = useState<InventoryBrowserView>();
   const [copied, setCopied] = useState<string | null>(null);
   const searchId = useId();
@@ -50,16 +50,16 @@ export default function FileBrowser({
   ));
   const search = query.trim();
   const filtered = Boolean(search || category || root);
-  const scope = inventoryBrowserScope({ sort: mode, query: search, category, root, rootScope });
+  const scope = inventoryBrowserScope({ sort, query: search, category, root, rootScope });
   const activeView = view?.scope === scope ? view : undefined;
-  const files = filtered ? activeView?.rows ?? [] : mode === "size" ? initialLargest : initialRecent;
+  const files = filtered ? activeView?.rows ?? [] : sort === "size" ? initialLargest : initialRecent;
   const loading = filtered && (activeView?.loading ?? true);
   const error = filtered ? activeView?.error : null;
 
   useEffect(() => {
-    void loader.load({ sort: mode, query: search, category, root, rootScope, initialLargest, initialRecent }, 200);
+    void loader.load({ sort, query: search, category, root, rootScope, initialLargest, initialRecent }, 200);
     return loader.cancel;
-  }, [mode, search, category, root, rootScope, initialLargest, initialRecent, revision, loader]);
+  }, [sort, search, category, root, rootScope, initialLargest, initialRecent, revision, loader]);
 
   useEffect(() => {
     mounted.current = true;
@@ -124,7 +124,7 @@ export default function FileBrowser({
             id={searchId}
             type="search"
             value={query}
-            onChange={(e) => setQuery(e.target.value)}
+            onChange={(e) => onQuery(e.target.value)}
             aria-keyshortcuts="/"
             className="w-full rounded-md border border-border bg-surface pl-8 pr-3 py-1.5 text-sm text-text focus:outline-none focus:border-primary"
           />
@@ -133,22 +133,22 @@ export default function FileBrowser({
 
       <div className="flex flex-wrap items-center gap-2 mb-3">
         <h3 className="text-sm font-semibold text-text mr-auto">
-          {mode === "size" ? t("dashboard.largestFiles") : t("dashboard.recentFiles")}
+          {sort === "size" ? t("dashboard.largestFiles") : t("dashboard.recentFiles")}
         </h3>
         <div className="flex rounded-md border border-border overflow-hidden text-xs">
           <button
             type="button"
-            onClick={() => setMode("size")}
-            aria-pressed={mode === "size"}
-            className={`px-2.5 py-1 ${mode === "size" ? "bg-primary text-on-primary" : "text-text-muted hover:text-text"}`}
+            onClick={() => onSort("size")}
+            aria-pressed={sort === "size"}
+            className={`px-2.5 py-1 ${sort === "size" ? "bg-primary text-on-primary" : "text-text-muted hover:text-text"}`}
           >
             {t("dashboard.largestFiles")}
           </button>
           <button
             type="button"
-            onClick={() => setMode("mtime")}
-            aria-pressed={mode === "mtime"}
-            className={`px-2.5 py-1 ${mode === "mtime" ? "bg-primary text-on-primary" : "text-text-muted hover:text-text"}`}
+            onClick={() => onSort("mtime")}
+            aria-pressed={sort === "mtime"}
+            className={`px-2.5 py-1 ${sort === "mtime" ? "bg-primary text-on-primary" : "text-text-muted hover:text-text"}`}
           >
             {t("dashboard.recentFiles")}
           </button>

@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "archive-picker",
+  "description": "Allow the workspace to pick archives for import",
+  "windows": ["app"],
+  "permissions": ["dialog:allow-open"]
+}

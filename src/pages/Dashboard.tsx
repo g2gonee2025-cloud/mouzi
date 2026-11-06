@@ -1,4 +1,4 @@
-import { useEffect, useCallback, useState } from "react";
+import { useEffect, useCallback, useState, type Dispatch, type SetStateAction } from "react";
 import { useTranslation } from "react-i18next";
 import { invoke } from "@tauri-apps/api/core";
 import {
@@ -14,6 +14,7 @@ import ActivityTimeline from "../components/dashboard/ActivityTimeline";
 import AgeHistogram from "../components/dashboard/AgeHistogram";
 import InsightCards from "../components/dashboard/InsightCards";
 import FileBrowser from "../components/dashboard/FileBrowser";
+import { clearMissingDashboardRoot, type DashboardViewOptions } from "../utils/dashboard";
 import { navigateHash, fileName } from "../utils/paths";
 import {
   ChevronLeft,
@@ -24,7 +25,12 @@ import {
   Settings,
 } from "lucide-react";
 
-export default function Dashboard() {
+interface DashboardProps {
+  view: DashboardViewOptions;
+  setView: Dispatch<SetStateAction<DashboardViewOptions>>;
+}
+
+export default function Dashboard({ view, setView }: DashboardProps) {
   const { t } = useTranslation();
   const {
     stats,
@@ -42,8 +48,7 @@ export default function Dashboard() {
     syncScanState,
   } = useDashboardStore();
 
-  const [category, setCategory] = useState<string | null>(null);
-  const [root, setRoot] = useState<string | null>(null);
+  const { category, root } = view;
   const [scanListenersReady, setScanListenersReady] = useState(false);
   const [scanListenerError, setScanListenerError] = useState<string | null>(null);
   const [scanListenerAttempt, setScanListenerAttempt] = useState(0);
@@ -67,8 +72,8 @@ export default function Dashboard() {
 
   const activeRoot = stats?.watchedRoots.some((item) => item.path === root) ? root : null;
   useEffect(() => {
-    if (root && stats && !activeRoot) setRoot(null);
-  }, [root, stats, activeRoot]);
+    if (root && stats && !activeRoot) setView((current) => clearMissingDashboardRoot(current, root));
+  }, [root, stats, activeRoot, setView]);
 
   const handleFocus = useCallback(() => {
     void refresh();
@@ -98,11 +103,11 @@ export default function Dashboard() {
   };
 
   const toggleCategory = (value: string | null) => {
-    setCategory((prev) => (value && prev === value ? null : value));
+    setView((current) => ({ ...current, category: current.category === value ? null : value }));
   };
 
   const toggleRoot = (value: string | null) => {
-    setRoot((prev) => (value && prev === value ? null : value));
+    setView((current) => ({ ...current, root: current.root === value ? null : value }));
   };
 
   const reasonMessage =
@@ -237,13 +242,17 @@ export default function Dashboard() {
             <FileBrowser
               initialLargest={stats!.largestFiles ?? []}
               initialRecent={stats!.recentFiles ?? []}
+              sort={view.sort}
+              query={view.query}
               category={category}
               root={activeRoot}
               rootScope={JSON.stringify(stats!.watchedRoots.map((item) => item.path).sort())}
               totalFiles={stats!.totalFiles}
               revision={stats!.revision}
-              onClearCategory={() => setCategory(null)}
-              onClearRoot={() => setRoot(null)}
+              onSort={(sort) => setView((current) => ({ ...current, sort }))}
+              onQuery={(query) => setView((current) => ({ ...current, query }))}
+              onClearCategory={() => toggleCategory(null)}
+              onClearRoot={() => toggleRoot(null)}
             />
 
             <StorageRibbon

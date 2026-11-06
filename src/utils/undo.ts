@@ -158,6 +158,12 @@ export function undoAllNotices(result: UndoAllResult): UndoNotice[] {
       key: "undo.allFailed",
       values: { count: breakdown.failed },
     });
+    const reasons = new Set(result.results.flatMap((row) =>
+      row.status === "failed" && row.message ? [row.message] : [],
+    ));
+    if (reasons.size > 0) {
+      notices.push({ tone: "error", key: "undo.reason", values: { message: [...reasons].join("\n") } });
+    }
   }
   return notices;
 }

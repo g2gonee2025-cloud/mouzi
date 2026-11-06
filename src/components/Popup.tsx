@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useAppStore } from "../store/useAppStore";
 import ActionRefreshWarnings from "./ActionRefreshWarnings";
@@ -66,6 +66,7 @@ export default function Popup() {
     destination_folder: string;
   } | null>(null);
   const [pending, setPending] = useState<ConfirmRequest | null>(null);
+  const cleanResult = useRef<HTMLDivElement>(null);
   const [undoToast, setUndoToast] = useState<UndoNotice[] | null>(null);
 
   useEffect(() => {
@@ -136,13 +137,15 @@ export default function Popup() {
   // `scan_folder_cmd` walks the whole folder rather than just draining the
   // queue, so a 0 count is not a no-op and must not disable the button; the
   // queue is only a floor on what the scan will find.
-  const handleCleanClick = () => {
+  const handleCleanClick = (opener: HTMLButtonElement) => {
     setPending({
       title: t("confirm.op.cleanNow"),
       count: pendingFiles.length,
       countIsExact: false,
       notice: "move",
       note: t("confirm.note.cleanNow"),
+      opener,
+      focusFallback: () => cleanResult.current,
       onConfirm: handleClean,
     });
   };
@@ -210,7 +213,7 @@ export default function Popup() {
       {/* Actions */}
       <div className="p-3 space-y-2">
         <button
-          onClick={handleCleanClick}
+          onClick={(event) => handleCleanClick(event.currentTarget)}
           disabled={isLoading}
           className="w-full flex items-center justify-center gap-2 rounded-lg bg-primary px-3 py-2.5 text-sm font-medium text-on-primary hover:bg-primary-hover transition-colors disabled:opacity-60"
         >
@@ -364,7 +367,7 @@ export default function Popup() {
       {/* Scan results toast */}
       {cleanCompleted && (
         <div className="px-3 pb-3">
-          <div className="rounded-lg bg-green-50 border border-green-200 px-3 py-2 text-xs text-green-700">
+          <div ref={cleanResult} tabIndex={-1} className="rounded-lg bg-green-50 border border-green-200 px-3 py-2 text-xs text-green-700">
             {t("notifications.cleaned", { count: scanResults.length })}
           </div>
         </div>

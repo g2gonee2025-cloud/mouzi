@@ -172,6 +172,15 @@ describe("undoAllNotices", () => {
     expect(notices.find((n) => n.key === "undo.allFailed")!.values).toEqual({ count: 1 });
   });
 
+  it("shows the retained output path and recovery record in bulk Undo", () => {
+    const message = "Verified copy retained at C:\\files\\report_0.txt. Undo recovery record 41 remains pending.";
+    const failed = result("failed", { message });
+    expect(undoAllNotices(all([failed, failed]))).toEqual([
+      { tone: "error", key: "undo.allFailed", values: { count: 2 } },
+      { tone: "error", key: "undo.reason", values: { message } },
+    ]);
+  });
+
   it("mentions renamed files without lowering the restored headline", () => {
     const notices = undoAllNotices(all([result("collision"), result("ok")]));
     expect(notices[0].values).toEqual({ count: 2 });

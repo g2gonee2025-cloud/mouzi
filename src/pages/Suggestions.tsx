@@ -1,4 +1,4 @@
-import { useEffect, useCallback, useState } from "react";
+import { useEffect, useCallback, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { navigateHash } from "../utils/paths";
 import { useSuggestionsStore, distinctSuggestionRules, type Suggestion } from "../store/useSuggestionsStore";
@@ -72,6 +72,8 @@ export default function Suggestions() {
   const [createRule, setCreateRule] = useState(createRuleDefault);
   const [pending, setPending] = useState<ConfirmDialogProps | null>(null);
   const beginPreview = usePreviewOwner();
+  const pageHeading = useRef<HTMLHeadingElement>(null);
+  const resultsHeading = useRef<HTMLHeadingElement>(null);
 
   useEffect(() => {
     loadSuggestions();
@@ -94,7 +96,7 @@ export default function Suggestions() {
   // `createRule` is pre-checked, so one click used to move every file AND leave
   // behind a permanent enabled rule per file. The dialog states both outcomes
   // and lets the rule half be called out even when the box is unticked.
-  const reviewSuggestions = async (captured: readonly Suggestion[]) => {
+  const reviewSuggestions = async (captured: readonly Suggestion[], opener: HTMLButtonElement) => {
     if (!captured.length || busy || loading || pending) return;
     const owner = beginPreview();
     if (!owner) return;
@@ -112,6 +114,8 @@ export default function Suggestions() {
         notice: "move",
         note: ruleNotes.length ? [t("suggestions.ruleCount", { count: rules.filter((r) => r.disposition === "create").length }), ...ruleNotes].join("\n") : undefined,
         preview: plans.map((plan) => `${plan.path} → ${plan.destination}`),
+        opener,
+        focusFallback: () => resultsHeading.current ?? pageHeading.current,
         onConfirm: () => acceptAll(plans),
         onClose: () => { owner.abort(); setPending(null); },
       });
@@ -119,8 +123,6 @@ export default function Suggestions() {
       owner.abort();
     }
   };
-  const handleAcceptAllClick = () => reviewSuggestions(suggestions.map((s) => ({ ...s })));
-
   return (
     <div className="h-full flex flex-col bg-surface text-text">
       {/* Header */}
@@ -134,7 +136,7 @@ export default function Suggestions() {
             <ChevronLeft size={18} />
           </button>
           <Sparkles size={18} className="text-primary" />
-          <h1 className="text-base font-semibold">{t("suggestions.title")}</h1>
+          <h1 ref={pageHeading} tabIndex={-1} className="text-base font-semibold">{t("suggestions.title")}</h1>
         </div>
         <div className="flex items-center gap-2">
           <button
@@ -166,9 +168,9 @@ export default function Suggestions() {
         {results && results.length > 0 && (
           <div className="rounded-lg border border-border bg-surface-dark p-4 space-y-2">
             <div className="flex items-center justify-between">
-              <span className="text-sm font-semibold">
+              <h2 ref={resultsHeading} tabIndex={-1} className="text-sm font-semibold">
                 {t("suggestions.resultsTitle")}
-              </span>
+              </h2>
               <button
                 onClick={clearResults}
                 className="text-xs text-text-muted hover:text-text underline"
@@ -258,7 +260,7 @@ export default function Suggestions() {
               </div>
               <div className="flex items-center gap-2">
                 <button
-                  onClick={handleAcceptAllClick}
+                  onClick={(event) => void reviewSuggestions(suggestions, event.currentTarget)}
                   disabled={busy || loading || !!preparedPlans}
                   className="flex items-center gap-1 rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-on-primary hover:bg-primary-hover transition-colors disabled:opacity-50"
                 >
@@ -320,7 +322,7 @@ export default function Suggestions() {
                   {/* Actions */}
                   <div className="flex items-center gap-1 shrink-0">
                     <button
-                      onClick={() => reviewSuggestions([{ ...s }])}
+                      onClick={(event) => void reviewSuggestions([s], event.currentTarget)}
                       disabled={busy || loading || !!preparedPlans}
                       aria-label={t("suggestions.accept")}
                       className="p-1.5 rounded-md bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-400 hover:bg-green-200 dark:hover:bg-green-900/50 transition-colors disabled:opacity-50"

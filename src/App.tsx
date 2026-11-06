@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { parseHash } from "./utils/paths";
+import { DEFAULT_DASHBOARD_VIEW } from "./utils/dashboard";
 import { useTranslation } from "react-i18next";
 import { initI18n, SupportedLang } from "./i18n";
 import { useAppStore, type AppSettings } from "./store/useAppStore";
@@ -38,6 +39,7 @@ function App() {
   const { loadSettings, settings } = useAppStore();
 
   const [hash, setHash] = useState(() => parseHash().route);
+  const [dashboardView, setDashboardView] = useState(DEFAULT_DASHBOARD_VIEW);
 
   useEffect(() => {
     const onHash = () => setHash(parseHash().route);
@@ -163,7 +165,7 @@ function App() {
       {hash === "settings" ? (
           <Settings />
         ) : hash === "dashboard" ? (
-          <Dashboard />
+          <Dashboard view={dashboardView} setView={setDashboardView} />
         ) : hash === "cleanup" ? (
           <Cleanup />
         ) : hash === "suggestions" ? (

@@ -1,6 +1,6 @@
-use crate::db::{get_rules, get_settings, get_watched_folders, ActionLog, Rule, WatchedFolder};
+use crate::db::{get_rules, get_settings, get_watched_folders, ActionLog, Rule, ScheduleRunProgress, WatchedFolder};
 use crate::ignore::{is_ignored, load_mouziignore};
-use crate::safe_fs::{AncestorGuard, FileIdentity};
+use crate::safe_fs::{AncestorGuard, FileIdentity, MoveFailure};
 use crate::suppress::{CancellationTicket, SuppressionSet, SUPPRESSION_TTL};
 use chrono::Utc;
 use regex::Regex;
@@ -263,17 +263,20 @@ fn execute_rule(file_info: &FileInfo, rule: &Rule, root: &Path) -> Result<String
 #[derive(Debug)]
 pub enum ProcessOutcome {
     Organized { rule: Rule, destination: String, warning: Option<String> },
+    Retained { message: String },
     Skipped,
     Retry { reason: String },
 }
 
-pub(crate) struct WatchedManualRoot {
+pub(crate) struct WatchedRoot {
     id: i64,
-    path: PathBuf,
+    pub(crate) path: PathBuf,
     identity: FileIdentity,
 }
 
-impl WatchedManualRoot {
+pub(crate) type WatchedManualRoot = WatchedRoot;
+
+impl WatchedRoot {
     pub(crate) fn capture(folder: &WatchedFolder) -> Result<Self, String> {
         let id = folder.id.ok_or("Watched folder has no identifier")?;
         if !folder.enabled || crate::db::is_folder_paused_mode(&folder.mode) {
@@ -286,25 +289,32 @@ impl WatchedManualRoot {
         Ok(Self { id, path, identity })
     }
 
-    fn guard_current(&self, folders: &[WatchedFolder]) -> Result<AncestorGuard, String> {
-        if !folders.iter().any(|folder| {
-            folder.id == Some(self.id) && Path::new(&folder.path) == self.path.as_path()
-                && folder.enabled && !crate::db::is_folder_paused_mode(&folder.mode)
-        }) {
-            return Err(format!("Watched folder is no longer eligible: {}", self.path.display()));
-        }
+    pub(crate) fn matches_registration(&self, folder: &WatchedFolder) -> bool {
+        folder.id == Some(self.id) && Path::new(&folder.path) == self.path.as_path()
+    }
+
+    pub(crate) fn guard_physical(&self) -> Result<AncestorGuard, String> {
         let guard = crate::safe_fs::guard_directory(&self.path)?;
         if crate::safe_fs::file_identity(&self.path)? != self.identity {
             return Err(format!("Watched folder changed identity: {}", self.path.display()));
         }
         Ok(guard)
     }
+
+    fn guard_current(&self, folders: &[WatchedFolder]) -> Result<AncestorGuard, String> {
+        if !folders.iter().any(|folder| self.matches_registration(folder)
+            && folder.enabled && !crate::db::is_folder_paused_mode(&folder.mode)) {
+            return Err(format!("Watched folder is no longer eligible: {}", self.path.display()));
+        }
+        self.guard_physical()
+    }
 }
 
 #[derive(Clone, Copy)]
 enum FolderAuthority<'a> {
     Automatic,
-    Scheduled(&'a dyn Fn() -> bool),
+    RegisteredWatch(&'a WatchedRoot),
+    Scheduled { run_id: i64, is_current: &'a dyn Fn() -> bool, revoked: &'a std::cell::Cell<bool> },
     WatchedManual(&'a WatchedManualRoot),
     ArchiveStaging,
 }
@@ -322,6 +332,16 @@ pub fn process_file_with_suppression(
     process_file(path, bypass_grace, root, suppression, ticket, expected_identity, authority)
 }
 
+pub(crate) fn process_watched_file(
+    path: &Path,
+    root: &WatchedRoot,
+    suppression: &SuppressionSet,
+    ticket: &CancellationTicket,
+    expected_identity: Option<&FileIdentity>,
+) -> Result<ProcessOutcome, String> {
+    process_file(path, false, &root.path, suppression, ticket, expected_identity, FolderAuthority::RegisteredWatch(root))
+}
+
 fn process_file(
     path: &Path,
     bypass_grace: bool,
@@ -332,25 +352,36 @@ fn process_file(
     authority: FolderAuthority<'_>,
 ) -> Result<ProcessOutcome, String> {
     let _operation = suppression.with_operation();
-    if matches!(authority, FolderAuthority::Scheduled(is_current) if !is_current()) {
-        return Ok(ProcessOutcome::Skipped);
+    if let FolderAuthority::Scheduled { is_current, revoked, .. } = authority {
+        if !is_current() {
+            revoked.set(true);
+            return Ok(ProcessOutcome::Skipped);
+        }
     }
     if !ticket.is_current() || suppression.is_suppressed(path, Instant::now()) {
         return Ok(ProcessOutcome::Skipped);
     }
     let settings = get_settings().map_err(|e| format!("Cannot read organizer settings: {e}"))?;
     let folders = get_watched_folders().map_err(|e| format!("Cannot read watched folders: {e}"))?;
-    if matches!(authority, FolderAuthority::Automatic | FolderAuthority::Scheduled(_)) && !folders.iter().any(|folder| {
+    if matches!(authority, FolderAuthority::Automatic | FolderAuthority::Scheduled { .. }) && !folders.iter().any(|folder| {
         folder.enabled && crate::db::is_folder_auto_mode(&folder.mode)
             && same_path(Path::new(&folder.path), root)
     }) {
         return Ok(ProcessOutcome::Skipped);
     }
-    let _root_guard = if let FolderAuthority::WatchedManual(watched) = authority {
-        Some(watched.guard_current(&folders)?)
-    } else {
-        crate::safe_fs::validate_root(root)?;
-        None
+    let _root_guard = match authority {
+        FolderAuthority::RegisteredWatch(watched) => {
+            if !folders.iter().any(|folder| watched.matches_registration(folder)
+                && folder.enabled && crate::db::is_folder_auto_mode(&folder.mode)) {
+                return Ok(ProcessOutcome::Skipped);
+            }
+            Some(watched.guard_physical()?)
+        }
+        FolderAuthority::WatchedManual(watched) => Some(watched.guard_current(&folders)?),
+        _ => {
+            crate::safe_fs::validate_root(root)?;
+            None
+        }
     };
     if !path.parent().is_some_and(|parent| crate::safe_fs::directory_contains(parent, root).unwrap_or(false)) {
         return Err(format!("File is outside organizer root: {}", path.display()));
@@ -398,23 +429,31 @@ fn process_file(
     let source = path.to_string_lossy().to_string();
     let requested_string = requested.to_string_lossy().to_string();
     // If intent cannot be recorded, no filesystem mutation takes place.
-    let intent = crate::db::begin_operation_intent("move", &source, Some(&requested_string))
-        .map_err(|e| format!("Cannot record move intent for {source}: {e}"))?;
-    suppression.arm(&[path.to_path_buf(), requested.clone()], Instant::now(), SUPPRESSION_TTL);
-    let moved = match crate::safe_fs::move_file_checked_expected(path, &requested, &identity) {
+    let intent = match authority {
+        FolderAuthority::Scheduled { run_id, .. } => crate::db::begin_scheduled_move_intent(run_id, &source, &requested_string),
+        _ => crate::db::begin_operation_intent("move", &source, Some(&requested_string)),
+    }.map_err(|e| format!("Cannot record move intent for {source}: {e}"))?;
+    suppression.arm(std::slice::from_ref(&requested), Instant::now(), SUPPRESSION_TTL);
+    let moved = match crate::safe_fs::move_file_checked_expected_detailed(path, &requested, &identity) {
         Ok(moved) => moved,
         Err(error) => {
-            let recorded = crate::db::finalize_operation_intent(intent, "failed", None, Some(&error));
-            return Err(match recorded {
-                Ok(()) => error,
-                Err(record_error) => format!("{error}; recording the failed move also failed: {record_error}"),
-            });
+            if let Some(message) = record_retained_move(intent, "move", path, &error, suppression) {
+                return Ok(ProcessOutcome::Retained { message });
+            }
+            let retry_source = matches!(authority, FolderAuthority::RegisteredWatch(_))
+                && matches!(&error, MoveFailure::SourceSharingViolation(_));
+            let error = error.to_string();
+            return match crate::db::finalize_operation_intent(intent, "failed", None, Some(&error)) {
+                Ok(()) if retry_source => Ok(ProcessOutcome::Retry { reason: error }),
+                Ok(()) => Err(error),
+                Err(record_error) => Err(format!("{error}; recording the failed move also failed: {record_error}")),
+            };
         }
     };
     let destination = moved.destination.to_string_lossy().to_string();
     // Renew for the actual collision-selected destination, measured after the
     // operation so a slow copy does not consume the delivery lease.
-    suppression.arm(&[path.to_path_buf(), requested, moved.destination], Instant::now(), SUPPRESSION_TTL);
+    suppression.arm(&[requested, moved.destination], Instant::now(), SUPPRESSION_TTL);
     let log = ActionLog {
         id: None, timestamp: Utc::now(), source_path: source,
         destination_path: Some(destination.clone()), action: rule.action.clone(),
@@ -425,6 +464,23 @@ fn process_file(
     )
         .err().map(|error| format!("Moved to {destination}, but history/inventory recording failed: {error}"));
     Ok(ProcessOutcome::Organized { rule, destination, warning })
+}
+
+pub(crate) fn record_retained_move(
+    intent: i64, action: &str, source: &Path, error: &MoveFailure, suppression: &SuppressionSet,
+) -> Option<String> {
+    let MoveFailure::RetainedOutput { path, source_preserved, .. } = error else { return None; };
+    suppression.arm(&[source.to_path_buf(), path.clone()], Instant::now(), SUPPRESSION_TTL);
+    let source_state = if *source_preserved { "The source was preserved." }
+        else { "The source state could not be confirmed." };
+    let mut message = format!("{error}. {source_state} Recovery record {intent} remains pending.");
+    if let Err(error) = crate::db::observe_retained_move_output(intent, action, &path.to_string_lossy(), &message) {
+        message.push_str(&format!(" Could not save the retained path: {error}."));
+    }
+    if let Err(error) = crate::db::mark_retained_move_inventory_stale(source, path) {
+        message.push_str(&format!(" Could not mark inventory stale: {error}."));
+    }
+    Some(message)
 }
 
 pub fn same_path(left: &Path, right: &Path) -> bool {
@@ -445,51 +501,130 @@ pub(crate) fn scan_watched_manual_folder(root: &WatchedManualRoot, suppression: 
     -> Result<Vec<(String, String, String)>, String>
 {
     scan_folder(&root.path, suppression, FolderAuthority::WatchedManual(root), None)
+        .map_err(|error| error.message)
 }
 
-pub fn manual_scan_folder_cancelable(folder: &str, suppression: &SuppressionSet, cancelled: &std::sync::atomic::AtomicBool)
-    -> Result<Vec<(String, String, String)>, String>
+pub(crate) type SortedFiles = Vec<(String, String, String)>;
+
+#[derive(Debug)]
+pub(crate) struct FolderScanError {
+    pub results: SortedFiles,
+    pub message: String,
+}
+
+pub(crate) fn manual_scan_folder_cancelable(root: &Path, suppression: &SuppressionSet, cancelled: &std::sync::atomic::AtomicBool)
+    -> Result<SortedFiles, FolderScanError>
 {
-    scan_folder(Path::new(folder), suppression, FolderAuthority::ArchiveStaging, Some(cancelled))
+    scan_folder(root, suppression, FolderAuthority::ArchiveStaging, Some(cancelled))
 }
 
 pub fn scheduled_scan_folder(folder: &str, suppression: &SuppressionSet)
     -> Result<Vec<(String, String, String)>, String>
 {
     scan_folder(Path::new(folder), suppression, FolderAuthority::Automatic, None)
+        .map_err(|error| error.message)
 }
 
-pub(crate) fn scheduled_scan_folder_if_current(folder: &str, suppression: &SuppressionSet, is_current: &dyn Fn() -> bool)
-    -> Result<Vec<(String, String, String)>, String>
-{
-    scan_folder(Path::new(folder), suppression, FolderAuthority::Scheduled(is_current), None)
+pub(crate) fn scheduled_scan_folder_if_current(
+    folder: &str, suppression: &SuppressionSet, run_id: i64, is_current: &dyn Fn() -> bool,
+    progress: &mut ScheduleRunProgress,
+) {
+    if let Err(error) = scan_scheduled_folder(Path::new(folder), suppression, run_id, is_current, progress, |_| {}) {
+        progress.record_error(format!("{folder}: {error}"));
+    }
+}
+
+fn scan_scheduled_folder(
+    root: &Path, suppression: &SuppressionSet, run_id: i64, is_current: &dyn Fn() -> bool,
+    progress: &mut ScheduleRunProgress, mut before_file: impl FnMut(&Path),
+) -> Result<(), String> {
+    crate::safe_fs::validate_root(root)?;
+    load_mouziignore(&root.to_string_lossy())?;
+    let revoked = std::cell::Cell::new(false);
+    let authority = FolderAuthority::Scheduled { run_id, is_current, revoked: &revoked };
+    for entry in fs::read_dir(root).map_err(|error| error.to_string())? {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => { progress.record_error(format!("{}: {error}", root.display())); continue; }
+        };
+        let path = entry.path();
+        if !path.is_file() { continue; }
+        let ticket = suppression.ticket(&path);
+        before_file(&path);
+        match process_file(&path, false, root, suppression, &ticket, None, authority) {
+            Ok(ProcessOutcome::Organized { warning, .. }) => {
+                progress.organized += 1;
+                if let Some(warning) = warning { progress.record_error(warning); }
+            }
+            Ok(ProcessOutcome::Retry { .. }) => progress.deferred += 1,
+            Ok(ProcessOutcome::Skipped) => {}
+            Ok(ProcessOutcome::Retained { message }) | Err(message) => {
+                progress.record_error(format!("{}: {message}", path.display()));
+            }
+        }
+        if revoked.get() {
+            progress.revoked = true;
+            break;
+        }
+    }
+    Ok(())
 }
 
 fn scan_folder(root: &Path, suppression: &SuppressionSet, authority: FolderAuthority<'_>, cancelled: Option<&std::sync::atomic::AtomicBool>)
-    -> Result<Vec<(String, String, String)>, String>
+    -> Result<SortedFiles, FolderScanError>
 {
-    crate::safe_fs::validate_root(root)?;
-    load_mouziignore(&root.to_string_lossy())?;
+    let entries = (|| {
+        crate::safe_fs::validate_root(root)?;
+        load_mouziignore(&root.to_string_lossy())?;
+        fs::read_dir(root).map_err(|error| error.to_string())
+    })().map_err(|message| FolderScanError { results: Vec::new(), message })?;
     let bypass_grace = matches!(authority, FolderAuthority::WatchedManual(_) | FolderAuthority::ArchiveStaging);
+    scan_folder_entries(
+        entries.map(|entry| entry.map(|entry| entry.path()).map_err(|error| error.to_string())),
+        cancelled,
+        |path| process_file(path, bypass_grace, root, suppression, &suppression.ticket(path), None, authority),
+    )
+}
+
+fn scan_folder_entries(
+    entries: impl IntoIterator<Item = Result<PathBuf, String>>,
+    cancelled: Option<&std::sync::atomic::AtomicBool>,
+    mut process: impl FnMut(&Path) -> Result<ProcessOutcome, String>,
+) -> Result<SortedFiles, FolderScanError> {
     let mut results = Vec::new();
     let mut errors = Vec::new();
-    for entry in fs::read_dir(root).map_err(|e| e.to_string())? {
-        if cancelled.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)) { return Err(format!("Import cancelled after organizing {} files", results.len())); }
-        let path = entry.map_err(|e| e.to_string())?.path();
+    for entry in entries {
+        let entry = if cancelled.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)) {
+            Err(format!("Import cancelled after organizing {} files", results.len()))
+        } else {
+            entry
+        };
+        let path = match entry {
+            Ok(path) => path,
+            Err(mut message) => {
+                if !errors.is_empty() {
+                    message.push_str("; ");
+                    message.push_str(&errors.join("; "));
+                }
+                return Err(FolderScanError { results, message });
+            }
+        };
         if !path.is_file() { continue; }
         let file_name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
-        let ticket = suppression.ticket(&path);
-        match process_file(&path, bypass_grace, root, suppression, &ticket, None, authority) {
+        match process(&path) {
             Ok(ProcessOutcome::Organized { rule, destination, warning }) => {
                 results.push((file_name, rule.name, destination));
                 if let Some(warning) = warning { errors.push(warning); }
             }
             Ok(ProcessOutcome::Skipped | ProcessOutcome::Retry { .. }) => {}
-            Err(error) => errors.push(format!("{file_name}: {error}")),
+            Ok(ProcessOutcome::Retained { message }) | Err(message) => errors.push(format!("{file_name}: {message}")),
         }
     }
     if errors.is_empty() { Ok(results) }
-    else { Err(format!("Organized {} files; {}", results.len(), errors.join("; "))) }
+    else {
+        let message = format!("Organized {} files; {}", results.len(), errors.join("; "));
+        Err(FolderScanError { results, message })
+    }
 }
 
 #[cfg(test)]
@@ -601,7 +736,7 @@ mod tests {
         fs::create_dir(&staging).unwrap();
         fs::write(staging.join("archive.authorityx"), b"archive").unwrap();
         let cancelled = std::sync::atomic::AtomicBool::new(false);
-        assert_eq!(manual_scan_folder_cancelable(&staging.to_string_lossy(), &suppression, &cancelled).unwrap().len(), 1);
+        assert_eq!(manual_scan_folder_cancelable(&staging, &suppression, &cancelled).unwrap().len(), 1);
         assert_eq!(fs::read(staging.join("Filed/archive.authorityx")).unwrap(), b"archive");
 
         crate::db::update_folder_mode(folder_id, crate::db::FOLDER_MODE_MANUAL).unwrap();
@@ -615,13 +750,129 @@ mod tests {
         fs::OpenOptions::new().write(true).open(&second).unwrap()
             .set_modified(SystemTime::now() - Duration::from_secs(86_401)).unwrap();
         let checks = std::cell::Cell::new(0);
-        let scheduled = scheduled_scan_folder_if_current(&root.to_string_lossy(), &suppression, &|| {
+        let mut scheduled = ScheduleRunProgress::default();
+        scheduled_scan_folder_if_current(&root.to_string_lossy(), &suppression, 0, &|| {
             checks.set(checks.get() + 1);
             false
-        }).unwrap();
+        }, &mut scheduled);
         assert_eq!(checks.get(), 1);
-        assert!(scheduled.is_empty());
+        assert!(scheduled.revoked);
+        assert_eq!(scheduled.organized, 0);
         assert_eq!(fs::read(&second).unwrap(), b"replacement");
+    }
+
+    #[test]
+    fn partial_archive_receipts_keep_the_actual_destination() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct Fixture {
+            root: PathBuf,
+            first: PathBuf,
+            rule: i64,
+            intent: i64,
+        }
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                if let Ok(conn) = crate::db::lock_db() {
+                    let source = self.first.to_string_lossy();
+                    let _ = conn.execute("DELETE FROM action_logs WHERE source_path=?1", [source.as_ref()]);
+                    let _ = conn.execute("DELETE FROM operation_intents WHERE source_path=?1", [source.as_ref()]);
+                    let _ = conn.execute("DELETE FROM operation_intents WHERE id=?1", [self.intent]);
+                }
+                let _ = crate::db::delete_rule(self.rule);
+                let _ = fs::remove_dir_all(&self.root);
+            }
+        }
+
+        let _serial = crate::db::serialise_test_db();
+        crate::db::init_test_db();
+        for stop in ["entry", "cancel", "warning"] {
+            let root = std::env::temp_dir().join(format!(
+                "mouzi-partial-archive-{stop}-{}-{}", std::process::id(), Utc::now().timestamp_nanos_opt().unwrap()
+            ));
+            fs::create_dir(&root).unwrap();
+            let root = fs::canonicalize(root).unwrap();
+            let staging = root.join("staging");
+            let filed = root.join("filed");
+            fs::create_dir(&staging).unwrap();
+            fs::create_dir(&filed).unwrap();
+            let first = staging.join("first.archivepartialx");
+            let second = staging.join("second.archivepartialx");
+            let occupied = filed.join("first.archivepartialx");
+            let destination = filed.join("first_0.archivepartialx");
+            fs::write(&first, b"first").unwrap();
+            fs::write(&second, b"second").unwrap();
+            fs::write(&occupied, b"occupied").unwrap();
+
+            let mut custom = rule(&filed.to_string_lossy());
+            custom.name = "Archive fixture".into();
+            custom.priority = i32::MIN;
+            custom.extensions = vec!["archivepartialx".into()];
+            let rule_id = crate::db::add_rule(&custom).unwrap();
+            let source = root.join("input.zip");
+            let intent = crate::db::begin_operation_intent("archive_import", &source.to_string_lossy(), None).unwrap();
+            let _fixture = Fixture { root, first: first.clone(), rule: rule_id, intent };
+            crate::archive::save_manifest(&staging, Some(&source), "extracted", &[], None).unwrap();
+            crate::db::observe_pending_archive_staging(intent, &staging.to_string_lossy()).unwrap();
+
+            let intent_state = || {
+                crate::db::lock_db().unwrap().query_row(
+                    "SELECT status, actual_destination FROM operation_intents WHERE id=?1",
+                    [intent],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                ).unwrap()
+            };
+            let expected_staging = staging.to_string_lossy().into_owned();
+            assert_eq!(intent_state(), ("pending".to_owned(), expected_staging.clone()));
+
+            let cancelled = AtomicBool::new(false);
+            let suppression = SuppressionSet::new();
+            let entries = [
+                Ok(first.clone()),
+                if stop == "entry" { Err("forced directory entry failure".into()) } else { Ok(second.clone()) },
+            ];
+            let sorting = scan_folder_entries(entries, Some(&cancelled), |path| {
+                if path == second.as_path() {
+                    return Err("forced second-file error".into());
+                }
+                let mut outcome = process_file(
+                    path, true, &staging, &suppression, &suppression.ticket(path), None, FolderAuthority::ArchiveStaging,
+                )?;
+                let warning = match &mut outcome {
+                    ProcessOutcome::Organized { warning, .. } => warning,
+                    other => panic!("first file did not organize: {other:?}"),
+                };
+                assert!(warning.is_none(), "{warning:?}");
+                if stop == "warning" {
+                    *warning = Some("forced history warning".into());
+                } else if stop == "cancel" {
+                    cancelled.store(true, Ordering::Relaxed);
+                }
+                Ok(outcome)
+            });
+            let error = crate::commands::finish_archive_sort(intent, &staging, 2, sorting).unwrap_err();
+            assert!(error.contains(match stop {
+                "entry" => "forced directory entry failure",
+                "cancel" => "Import cancelled",
+                _ => "forced history warning",
+            }), "{error}");
+            assert_eq!(intent_state(), ("partial".to_owned(), expected_staging));
+
+            let receipt: serde_json::Value = serde_json::from_slice(
+                &fs::read(staging.with_extension("manifest.json")).unwrap(),
+            ).unwrap();
+            assert_eq!(receipt["status"], "partial");
+            assert_eq!(receipt["sortedResults"], serde_json::json!([
+                ["first.archivepartialx", "Archive fixture", destination.to_string_lossy().as_ref()]
+            ]));
+            let remaining = receipt["remainingEntries"].as_array().unwrap();
+            assert_eq!(remaining.len(), 1);
+            assert_eq!(remaining[0]["name"], "second.archivepartialx");
+            assert!(!first.exists());
+            assert_eq!(fs::read(destination).unwrap(), b"first");
+            assert_eq!(fs::read(occupied).unwrap(), b"occupied");
+            assert_eq!(fs::read(second).unwrap(), b"second");
+        }
     }
 
     /// The destination expression exactly as it stood before `root` was
@@ -922,5 +1173,83 @@ mod tests {
         let status: String = conn.query_row("SELECT status FROM operation_intents WHERE source_path=?1", [source.to_string_lossy().as_ref()], |row| row.get(0)).unwrap();
         assert_eq!(status, "completed");
         conn.execute("DELETE FROM action_logs WHERE source_path=?1", [source.to_string_lossy().as_ref()]).unwrap();
+    }
+
+    #[test]
+    fn scheduled_scan_stops_after_a_committed_mid_batch_disable() {
+        use crate::db;
+        let _serial = db::serialise_test_db();
+        db::init_test_db();
+        let original = crate::scheduler::schedule_from_settings(db::get_settings().unwrap());
+        let path = std::env::temp_dir().join(format!(
+            "mouzi-schedule-{}-{}", std::process::id(), Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        fs::create_dir(&path).unwrap();
+        let path = fs::canonicalize(path).unwrap();
+        let folder = db::add_watched_folder(&path.to_string_lossy(), db::FOLDER_MODE_SILENT).unwrap();
+        let mut custom = rule("Filed");
+        custom.extensions = vec!["scheduledrevocation".into()];
+        custom.priority = i32::MIN;
+        let rule_id = db::add_rule(&custom).unwrap();
+        let run = {
+            let conn = db::lock_db().unwrap();
+            conn.execute("INSERT INTO schedule_runs(status,claimed_at,occurrences) VALUES('claimed','fixture',1)", []).unwrap();
+            conn.last_insert_rowid()
+        };
+        struct Fixture { path: PathBuf, folder: i64, rule: i64, run: i64, original: db::ScheduleSettings }
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                if let Ok(conn) = db::lock_db() {
+                    let _ = conn.execute("DELETE FROM action_logs WHERE source_path IN (SELECT source_path FROM operation_intents WHERE schedule_run_id=?1)", [self.run]);
+                    let _ = conn.execute("DELETE FROM operation_intents WHERE schedule_run_id=?1", [self.run]);
+                    let _ = conn.execute("DELETE FROM schedule_runs WHERE id=?1", [self.run]);
+                }
+                let _ = db::update_schedule_settings(&self.original);
+                let _ = db::delete_rule(self.rule);
+                let _ = db::remove_watched_folder(self.folder);
+                let _ = fs::remove_dir_all(&self.path);
+            }
+        }
+        let _fixture = Fixture { path: path.clone(), folder, rule: rule_id, run, original };
+        for name in ["first.scheduledrevocation", "second.scheduledrevocation"] {
+            let file = path.join(name);
+            fs::write(&file, name.as_bytes()).unwrap();
+            fs::OpenOptions::new().write(true).open(&file).unwrap()
+                .set_modified(SystemTime::now() - Duration::from_secs(86_401)).unwrap();
+        }
+        let scheduler = crate::scheduler::Scheduler::new();
+        let suppression = SuppressionSet::new();
+        let mut schedule = db::ScheduleSettings {
+            schedule_enabled: true, schedule_times_per_day: 1, schedule_time_1: Some("08:00".into()),
+            schedule_time_2: None, schedule_time_3: None, schedule_time_4: None,
+        };
+        scheduler.save_schedule(&suppression, &schedule).unwrap();
+        let revision = scheduler.revision();
+        db::start_schedule_run(run).unwrap();
+        let mut selected = Vec::new();
+        let mut progress = ScheduleRunProgress::default();
+        scan_scheduled_folder(&path, &suppression, run, &|| scheduler.revision() == revision, &mut progress, |file| {
+            selected.push(file.to_path_buf());
+            if selected.len() == 2 {
+                assert!(!selected[0].exists(), "first move must finish before disable");
+                schedule.schedule_enabled = false;
+                assert!(!scheduler.save_schedule(&suppression, &schedule).unwrap().schedule_enabled);
+            }
+        }).unwrap();
+        assert_eq!(selected.len(), 2);
+        assert_eq!((progress.organized, progress.errors, progress.revoked), (1, 0, true));
+        let first = selected[0].file_name().unwrap().to_str().unwrap();
+        let second = selected[1].file_name().unwrap().to_str().unwrap();
+        assert_eq!(fs::read(path.join("Filed").join(first)).unwrap(), first.as_bytes());
+        assert_eq!(fs::read(&selected[1]).unwrap(), second.as_bytes());
+        assert!(!path.join("Filed").join(second).exists());
+        db::finish_schedule_run(run, &progress).unwrap();
+        let receipt = db::recent_schedule_runs().unwrap().into_iter().find(|row| row.id == run).unwrap();
+        assert_eq!((receipt.status.as_str(), receipt.organized), ("interrupted", 1));
+        let conn = db::lock_db().unwrap();
+        let linked: i64 = conn.query_row("SELECT COUNT(*) FROM operation_intents WHERE schedule_run_id=?1 AND status='completed'", [run], |row| row.get(0)).unwrap();
+        let history: i64 = conn.query_row("SELECT COUNT(*) FROM action_logs WHERE source_path=?1", [selected[0].to_string_lossy().as_ref()], |row| row.get(0)).unwrap();
+        let denied: i64 = conn.query_row("SELECT COUNT(*) FROM operation_intents WHERE source_path=?1", [selected[1].to_string_lossy().as_ref()], |row| row.get(0)).unwrap();
+        assert_eq!((linked, history, denied), (1, 1, 0));
     }
 }
