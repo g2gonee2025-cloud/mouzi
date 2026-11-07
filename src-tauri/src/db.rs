@@ -1801,6 +1801,13 @@ pub fn get_inventory_files(
     query: Option<&str>,
     limit: i64,
 ) -> SqliteResult<Vec<InventoryFile>> {
+    // An extended Windows path fits within 32,767 UTF-16 code units.
+    // A longer literal cannot match, so skip regex compilation and the DB lock.
+    const MAX_QUERY_CHARS: usize = 32_767;
+    let query = query.map(str::trim);
+    if query.is_some_and(|text| text.chars().nth(MAX_QUERY_CHARS).is_some()) {
+        return Ok(Vec::new());
+    }
     let conn = sqlite_lock()?;
     get_inventory_files_on(&conn, sort, category, root, query, limit)
 }
@@ -2450,6 +2457,32 @@ mod tests {
         assert_eq!(search(r"\DOCS\ÄRGER-σ-Փ-[A].TXT")[0].path, found);
         assert!(get_inventory_files_on(&conn, "size", Some("other"), Some("root"), Some("kelvin"), 1).unwrap().is_empty());
         assert!(get_inventory_files_on(&conn, "size", Some("Other"), Some("ROOT"), Some("kelvin"), 1).unwrap().is_empty());
+    }
+
+    #[test]
+    fn inventory_search_returns_no_matches_for_an_oversized_literal() {
+        let _guard = serialise_test_db();
+        init_test_db();
+
+        struct WatchedRoot(i64);
+        impl Drop for WatchedRoot {
+            fn drop(&mut self) {
+                let _ = remove_watched_folder(self.0);
+            }
+        }
+
+        let root = r"C:\mouzi-oversized-search-fixture";
+        let _root = WatchedRoot(add_watched_folder(root, FOLDER_MODE_MANUAL).unwrap());
+        replace_inventory_for_root(root, &[InventoryRow {
+            path: format!(r"{root}\report.txt"),
+            size: 1,
+            mtime: 1,
+            category: "Documents".into(),
+        }]).unwrap();
+
+        let query = "a".repeat(300_000);
+        assert!(get_inventory_files("size", None, Some(root), Some(&query), 1).unwrap().is_empty());
+        assert_eq!(get_inventory_files("size", None, Some(root), Some("  REPORT  "), 1).unwrap().len(), 1);
     }
 
     #[test]
