@@ -1,22 +1,21 @@
-use crate::db::{self, ActionLog, Rule};
+use crate::db::{self, ActionLog, OrganizationHistory, OrganizationLog, Rule, WatchedFolder};
 use crate::rules::{self, FileInfo};
+use crate::safe_fs::{self, AncestorGuard, FileIdentity, RootScope, ValidatedFile};
+use crate::suppress::{SuppressionSet, SUPPRESSION_TTL};
 use chrono::Utc;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::Read;
-#[cfg(not(target_os = "windows"))]
-use std::io::Write;
+use std::io::{Read, Seek};
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Mutex,
 };
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
-pub static OPERATION_LOCK: Mutex<()> = Mutex::new(());
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 static PLANS: Lazy<Mutex<HashMap<String, CachedPlan>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 
@@ -27,27 +26,6 @@ pub fn new_run_id() -> String {
         std::process::id(),
         NEXT_ID.fetch_add(1, Ordering::Relaxed)
     )
-}
-
-pub fn fingerprint(path: &Path) -> Result<String, String> {
-    if !fs::symlink_metadata(path)
-        .map_err(|e| e.to_string())?
-        .file_type()
-        .is_file()
-    {
-        return Err("Only regular files are supported".into());
-    }
-    let mut file = fs::File::open(path).map_err(|e| e.to_string())?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0u8; 65536];
-    loop {
-        let count = file.read(&mut buffer).map_err(|e| e.to_string())?;
-        if count == 0 {
-            break;
-        }
-        hasher.update(&buffer[..count]);
-    }
-    Ok(format!("{:x}", hasher.finalize()))
 }
 
 pub fn suspicious_name(path: &Path) -> bool {
@@ -69,38 +47,6 @@ pub fn suspicious_name(path: &Path) -> bool {
         })
 }
 
-pub fn validate_template(template: &str) -> Result<(), String> {
-    let mut sample = template.to_string();
-    for token in [
-        "{stem}",
-        "{filename}",
-        "{extension}",
-        "{year}",
-        "{month}",
-        "{day}",
-    ] {
-        sample = sample.replace(token, "sample");
-    }
-    if sample.contains(['{', '}']) || !safe_filename(&sample) {
-        return Err("validation.template".into());
-    }
-    Ok(())
-}
-
-fn safe_filename(name: &str) -> bool {
-    let stem = name.split('.').next().unwrap_or_default().to_uppercase();
-    !name.is_empty()
-        && name.len() <= 240
-        && !name.ends_with(['.', ' '])
-        && !name
-            .chars()
-            .any(|c| c.is_control() || "<>:\"/\\|?*".contains(c))
-        && ![
-            "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7",
-            "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
-        ]
-        .contains(&stem.as_str())
-}
 
 fn path_key(path: &Path) -> String {
     let text = path.to_string_lossy().to_string();
@@ -111,220 +57,25 @@ fn path_key(path: &Path) -> String {
     }
 }
 
-pub fn destination_for(
-    file: &FileInfo,
-    rule: &Rule,
-    reserved: &mut HashSet<String>,
-) -> Result<Option<PathBuf>, String> {
-    rules::validate_rule(rule)?;
-    if ["delete", "ignore"].contains(&rule.action.as_str()) {
-        return Ok(None);
-    }
-    let output = rules::output_file_info(file, rule);
-    let parent = file.path.parent().ok_or("Missing parent folder")?;
-    let (folder, name) = if rule.action == "rename" {
-        let stem = file.path.file_stem().unwrap_or_default().to_string_lossy();
-        let extension = file.path.extension().unwrap_or_default().to_string_lossy();
-        let now = Utc::now();
-        let name = rule
-            .options
-            .rename_template
-            .replace("{stem}", &stem)
-            .replace("{filename}", &file.name)
-            .replace("{extension}", &extension)
-            .replace("{year}", &now.format("%Y").to_string())
-            .replace("{month}", &now.format("%m").to_string())
-            .replace("{day}", &now.format("%d").to_string());
-        let name = if extension.is_empty() {
-            name.trim_end_matches('.').to_string()
-        } else {
-            name
-        };
-        if !safe_filename(&name) {
-            return Err("validation.template".into());
-        }
-        (parent.to_path_buf(), name)
-    } else {
-        let folder = rules::resolve_destination(&rule.destination, &output);
-        (
-            if folder.is_absolute() {
-                folder
-            } else {
-                parent.join(folder)
-            },
-            output.name,
-        )
-    };
-    let proposed = folder.join(&name);
-    if path_key(&proposed) == path_key(&file.path)
-        || (proposed.exists()
-            && fs::canonicalize(&proposed).ok() == fs::canonicalize(&file.path).ok())
-    {
-        return Err("preview.unchanged".into());
-    }
-    let stem = Path::new(&name)
-        .file_stem()
-        .unwrap_or_default()
-        .to_string_lossy();
-    let ext = Path::new(&name)
-        .extension()
-        .map(|s| format!(".{}", s.to_string_lossy()))
-        .unwrap_or_default();
-    for index in 0..10000 {
-        let candidate = if index == 0 {
-            proposed.clone()
-        } else {
-            folder.join(format!("{stem} ({index}){ext}"))
-        };
-        let key = path_key(&candidate);
-        if !candidate.try_exists().map_err(|e| e.to_string())? && !reserved.contains(&key) {
-            reserved.insert(key);
-            return Ok(Some(candidate));
-        }
-    }
-    Err("Too many destination conflicts".into())
-}
-
-// create_new reserves the destination atomically, including on another drive.
-// A failing copy leaves the source in place; a failing removal keeps both copies.
-pub fn move_without_overwrite(source: &Path, destination: &Path) -> Result<(), String> {
-    if !fs::symlink_metadata(source)
-        .map_err(|e| e.to_string())?
-        .file_type()
-        .is_file()
-    {
-        return Err("Only regular files are supported".into());
-    }
-    let parent = destination.parent().ok_or("Missing destination folder")?;
-    fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    // Hard links reserve the name without overwriting and preserve NTFS streams.
-    match fs::hard_link(source, destination) {
-        Ok(()) => {
-            return fs::remove_file(source).map_err(|e| {
-                format!(
-                    "File retained at both {} and {}: {e}",
-                    source.display(),
-                    destination.display()
-                )
-            })
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Err(e.to_string()),
-        Err(_) => {}
-    }
-    #[cfg(target_os = "windows")]
-    {
-        return copy_between_windows_volumes(source, destination);
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        let mut input = fs::File::open(source).map_err(|e| e.to_string())?;
-        let metadata = input.metadata().map_err(|e| e.to_string())?;
-        let original_hash = fingerprint(source)?;
-        let mut output = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(destination)
-            .map_err(|e| e.to_string())?;
-        let result = (|| -> std::io::Result<()> {
-            std::io::copy(&mut input, &mut output)?;
-            output.flush()?;
-            output.set_times(fs::FileTimes::new().set_modified(metadata.modified()?))?;
-            output.set_permissions(metadata.permissions())?;
-            output.sync_all()?;
-            Ok(())
-        })();
-        drop(output);
-        drop(input);
-        if let Err(error) = result {
-            let _ = fs::remove_file(destination);
-            return Err(error.to_string());
-        }
-        if fingerprint(source)? != original_hash || fingerprint(destination)? != original_hash {
-            return Err(format!(
-                "File changed during copy. Both copies were retained: {}",
-                destination.display()
-            ));
-        }
-        fs::remove_file(source).map_err(|e| {
-            format!(
-                "Copy created at {}; source could not be removed: {e}",
-                destination.display()
-            )
-        })
-    }
-}
-
-#[cfg(target_os = "windows")]
-fn copy_between_windows_volumes(source: &Path, destination: &Path) -> Result<(), String> {
-    use std::os::windows::ffi::OsStrExt;
-    #[link(name = "kernel32")]
-    extern "system" {
-        fn CopyFileW(existing: *const u16, new: *const u16, fail_if_exists: i32) -> i32;
-    }
-    let original = fingerprint(source)?;
-    let from: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
-    let to: Vec<u16> = destination
-        .as_os_str()
-        .encode_wide()
-        .chain(Some(0))
-        .collect();
-    // CopyFileW preserves alternate streams, including Mark of the Web.
-    // Both NUL-terminated buffers remain alive for the entire call.
-    if unsafe { CopyFileW(from.as_ptr(), to.as_ptr(), 1) } == 0 {
-        return Err(std::io::Error::last_os_error().to_string());
-    }
-    if fingerprint(source)? != original || fingerprint(destination)? != original {
-        return Err(format!(
-            "File changed during copy. Both copies were retained: {}",
-            destination.display()
-        ));
-    }
-    fs::remove_file(source).map_err(|e| {
-        format!(
-            "Copy created at {}; source could not be removed: {e}",
-            destination.display()
-        )
-    })
-}
-
-pub fn execute_destination(
-    source: &Path,
-    rule: &Rule,
-    destination: Option<&Path>,
-) -> Result<(), String> {
-    match rule.action.as_str() {
-        "move" | "rename" => {
-            move_without_overwrite(source, destination.ok_or("Missing destination")?)
-        }
-        "delete" => trash::delete(source).map_err(|e| e.to_string()),
-        "ignore" => Ok(()),
-        _ => Err("validation.action".into()),
-    }
+#[cfg(test)]
+pub(crate) fn move_without_overwrite(source: &Path, destination: &Path) -> Result<(), String> {
+    let (mut file, _ancestors) = safe_fs::open_guarded_regular_file(source)?;
+    let identity = safe_fs::identity_from_handle(&file)?;
+    let digest = safe_fs::hash_handle(&mut file)?.to_hex();
+    drop(file);
+    safe_fs::move_reviewed_file(source, destination, &identity, digest.as_str()).map(|_| ())
 }
 
 pub fn already_processed(path: &Path) -> Result<bool, String> {
-    processed(path, true)
-}
-
-fn processed(path: &Path, include_restored: bool) -> Result<bool, String> {
-    let db = db::get_db();
-    let hashes = db
-        .lock()
-        .unwrap()
-        .prepare("SELECT fingerprint FROM processed_files WHERE path=?1 AND (restored=0 OR ?2=1)")
-        .map_err(|e| e.to_string())?
-        .query_map(
-            rusqlite::params![path.to_string_lossy().as_ref(), include_restored],
-            |r| r.get::<_, String>(0),
-        )
-        .map_err(|e| e.to_string())?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| e.to_string())?;
-    Ok(if let Some(hash) = hashes.first() {
-        &fingerprint(path)? == hash
-    } else {
-        false
-    })
+    let canonical = fs::canonicalize(path).map_err(|error| error.to_string())?;
+    let fingerprints = db::organization_fingerprints(&path.to_string_lossy(), &canonical.to_string_lossy(), true)
+        .map_err(|error| error.to_string())?;
+    if fingerprints.is_empty() {
+        return Ok(false);
+    }
+    let (mut file, _ancestors) = safe_fs::open_guarded_regular_file(path)?;
+    let digest = safe_fs::hash_handle(&mut file)?.to_hex();
+    fingerprints_match(&mut file, &fingerprints, digest.as_str())
 }
 
 #[derive(Clone, Serialize)]
@@ -346,8 +97,13 @@ pub struct Preview {
 struct Planned {
     entry: PreviewEntry,
     rule: Rule,
-    fingerprint: String,
-    modified: std::time::SystemTime,
+    source_identity: FileIdentity,
+    root_identity: FileIdentity,
+    digest: String,
+    modified: SystemTime,
+    requested_destination: PathBuf,
+    destination_ancestor: PathBuf,
+    destination_identity: FileIdentity,
 }
 struct CachedPlan {
     created: Instant,
@@ -361,181 +117,211 @@ pub struct OperationResult {
     pub error: Option<String>,
 }
 
-fn watched_file(path: &Path) -> bool {
-    db::get_watched_folders()
-        .map(|folders| {
-            folders.into_iter().any(|f| {
-                f.enabled
-                    && f.mode != "paused"
-                    && path
-                        .parent()
-                        .is_some_and(|p| fs::canonicalize(p).ok() == fs::canonicalize(&f.path).ok())
-            })
-        })
-        .unwrap_or(false)
+const PLAN_LIFETIME: Duration = Duration::from_secs(1800);
+
+fn preview_paths(paths: Option<Vec<String>>, scope: &RootScope) -> Result<Vec<PathBuf>, String> {
+    if let Some(paths) = paths {
+        return Ok(paths.into_iter().map(PathBuf::from).collect());
+    }
+    let mut paths = Vec::new();
+    for root in scope.active_roots() {
+        let entries = fs::read_dir(&root).map_err(|error| format!("{}: {error}", root.display()))?;
+        for entry in entries {
+            let entry = entry.map_err(|error| error.to_string())?;
+            if entry.file_type().map_err(|error| error.to_string())?.is_file() {
+                paths.push(entry.path());
+            }
+        }
+    }
+    Ok(paths)
 }
 
-pub fn preview(paths: Option<Vec<String>>) -> Result<Preview, String> {
-    let _guard = OPERATION_LOCK.lock().unwrap();
-    let paths = match paths {
-        Some(paths) => paths.into_iter().map(PathBuf::from).collect::<Vec<_>>(),
-        None => {
-            let mut paths = Vec::new();
-            for folder in db::get_watched_folders()
-                .map_err(|e| e.to_string())?
-                .into_iter()
-                .filter(|f| f.enabled && f.mode != "paused")
-            {
-                let entries =
-                    fs::read_dir(&folder.path).map_err(|e| format!("{}: {e}", folder.path))?;
-                paths.extend(
-                    entries
-                        .filter_map(Result::ok)
-                        .map(|e| e.path())
-                        .filter(|p| p.is_file()),
-                );
-            }
-            paths
-        }
+fn eligible_file(scope: &RootScope, path: &Path) -> Result<Option<ValidatedFile>, String> {
+    let file = match scope.validate_file(path) {
+        Ok(file) => file,
+        Err(_) => return Ok(None),
     };
+    if rules::organization_path_is_protected(path, &file.owning_root)?
+        || db::is_organization_baseline(&path.to_string_lossy(), &file.canonical_path.to_string_lossy())
+            .map_err(|error| error.to_string())?
+    {
+        return Ok(None);
+    }
+    Ok(Some(file))
+}
+
+fn sha256_handle(file: &mut fs::File) -> Result<String, String> {
+    file.rewind().map_err(|error| error.to_string())?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0; 65536];
+    loop {
+        let count = file.read(&mut buffer).map_err(|error| error.to_string())?;
+        if count == 0 {
+            return Ok(format!("{:x}", hasher.finalize()));
+        }
+        hasher.update(&buffer[..count]);
+    }
+}
+
+fn recorded_as_processed(path: &Path, file: &mut ValidatedFile, digest: &str) -> Result<bool, String> {
+    let fingerprints = db::organization_fingerprints(
+        &path.to_string_lossy(), &file.canonical_path.to_string_lossy(), false,
+    ).map_err(|error| error.to_string())?;
+    fingerprints_match(&mut file.file, &fingerprints, digest)
+}
+
+pub(crate) fn fingerprints_match(file: &mut fs::File, fingerprints: &[String], digest: &str) -> Result<bool, String> {
+    if fingerprints.iter().any(|value| value.strip_prefix("blake3:") == Some(digest)) {
+        return Ok(true);
+    }
+    if fingerprints.iter().any(|value| !value.contains(':')) {
+        let legacy_digest = sha256_handle(file)?;
+        return Ok(fingerprints.contains(&legacy_digest));
+    }
+    Ok(false)
+}
+
+fn destination_guard(path: &Path) -> Result<(PathBuf, FileIdentity, AncestorGuard), String> {
+    let mut ancestor = path.parent().ok_or("Missing destination parent")?;
+    loop {
+        match fs::symlink_metadata(ancestor) {
+            Ok(_) => {
+                let guard = safe_fs::guard_directory(ancestor)?;
+                let identity = safe_fs::file_identity(ancestor)?;
+                return Ok((ancestor.to_path_buf(), identity, guard));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                ancestor = ancestor.parent().ok_or("No existing destination parent")?;
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+}
+
+fn checked_destination(root: &Path, file: &FileInfo, rule: &Rule) -> Result<PathBuf, String> {
+    let requested = rules::planned_destination(root, file, rule)?;
+    let unchanged = path_key(&requested) == path_key(&file.path);
+    let already_filed = rule.action == "move" && requested.file_name() == file.path.file_name()
+        && rules::is_already_filed(root, &file.path, file, rule);
+    if unchanged || already_filed {
+        return Err("preview.unchanged".into());
+    }
+    Ok(requested)
+}
+
+pub(crate) fn preview(paths: Option<Vec<String>>, suppression: &SuppressionSet) -> Result<Preview, String> {
+    let _operation = suppression.with_operation();
+    let folders = db::get_watched_folders().map_err(|error| error.to_string())?;
+    let scope = safe_fs::eligible_scope(&folders)?;
+    let rules = db::get_rules().map_err(|error| error.to_string())?;
+    let check_locks = db::get_settings().map_err(|error| error.to_string())?.lock_check_enabled;
+    let mut paths = preview_paths(paths, &scope)?;
+    paths.sort();
+    paths.dedup();
+
     let id = new_run_id();
     let mut seen = HashSet::new();
     let mut reserved = HashSet::new();
     let mut items = Vec::new();
     let mut entries = Vec::new();
-    let mut paths = paths;
-    paths.sort();
     for path in paths {
-        if !seen.insert(path_key(&path))
-            || !watched_file(&path)
-            || db::is_baseline_file(&path)
-            || rules::should_ignore_file(&path)
-            || rules::is_file_ignored_by_mouziignore(&path)
-        {
-            continue;
-        }
-        let Some(file) = rules::scan_file(&path) else {
+        // Probe before taking the write-denying file handle.
+        let locked = check_locks && rules::is_file_locked(&path);
+        let Some(mut file) = eligible_file(&scope, &path)? else { continue; };
+        if !seen.insert(file.identity.clone()) { continue; }
+        let info = rules::describe_file(&path, &file.metadata).ok_or("Invalid organization file name")?;
+        let Some(rule) = rules::matching_rule_in_root(&info, Some(&file.owning_root), &folders, &rules) else {
             continue;
         };
-        if processed(&path, false)? {
-            continue;
-        }
-        let Some(rule) = rules::find_matching_rule(&file) else {
-            continue;
-        };
-        if rule.action == "ignore" {
-            continue;
-        }
+        if rule.action == "ignore" { continue; }
         let mut entry = PreviewEntry {
             id: new_run_id(),
-            source: path.to_string_lossy().into(),
+            source: path.to_string_lossy().into_owned(),
             destination: None,
             rule: rule.name.clone(),
             action: rule.action.clone(),
-            size: file.size,
+            size: info.size,
             warning: suspicious_name(&path),
             error: None,
         };
-        let result = (|| -> Result<(String, std::time::SystemTime), String> {
-            if rules::is_file_locked(&path) {
+        let planned = (|| -> Result<Option<Planned>, String> {
+            if rule.action == "delete" {
+                return Err("preview.recoveryUnavailable".into());
+            }
+            if locked {
                 return Err("preview.locked".into());
             }
-            let dest = destination_for(&file, &rule, &mut reserved)?;
-            entry.destination = dest.map(|d| d.to_string_lossy().into());
-            let modified = fs::metadata(&path)
-                .and_then(|m| m.modified())
-                .map_err(|e| e.to_string())?;
-            Ok((fingerprint(&path)?, modified))
-        })();
-        match result {
-            Ok((hash, modified)) => items.push(Planned {
+            let digest = safe_fs::hash_handle(&mut file.file)?.to_hex().to_string();
+            if recorded_as_processed(&path, &mut file, &digest)? {
+                return Ok(None);
+            }
+            let modified = file.metadata.modified().map_err(|error| error.to_string())?;
+            let requested = checked_destination(&file.owning_root, &info, rule)?;
+            let parent = requested.parent().ok_or("Missing destination parent")?;
+            let name = requested.file_name().and_then(|name| name.to_str()).ok_or("Invalid destination filename")?;
+            let destination = safe_fs::try_unique_destination_with(parent, name, |candidate| {
+                reserved.contains(&path_key(candidate))
+            })?;
+            let (ancestor, ancestor_identity, _destination_guard) = destination_guard(&destination)?;
+            reserved.insert(path_key(&destination));
+            entry.destination = Some(destination.to_string_lossy().into_owned());
+            Ok(Some(Planned {
                 entry: entry.clone(),
-                rule,
-                fingerprint: hash,
+                rule: rule.clone(),
+                source_identity: file.identity.clone(),
+                root_identity: safe_fs::file_identity(&file.owning_root)?,
+                digest,
                 modified,
-            }),
+                requested_destination: requested,
+                destination_ancestor: ancestor,
+                destination_identity: ancestor_identity,
+            }))
+        })();
+        match planned {
+            Ok(Some(item)) => items.push(item),
+            Ok(None) => continue,
             Err(error) => entry.error = Some(error),
         }
         entries.push(entry);
     }
-    let mut plans = PLANS.lock().unwrap();
-    plans.retain(|_, plan| plan.created.elapsed() < Duration::from_secs(1800));
+
+    let mut plans = PLANS.lock().map_err(|_| "Organization preview cache is unavailable")?;
+    plans.retain(|_, plan| plan.created.elapsed() < PLAN_LIFETIME);
     if plans.len() >= 32 {
         return Err("Too many open previews. Close an older preview.".into());
     }
-    plans.insert(
-        id.clone(),
-        CachedPlan {
-            created: Instant::now(),
-            items,
-        },
-    );
+    plans.insert(id.clone(), CachedPlan { created: Instant::now(), items });
     Ok(Preview { id, entries })
 }
 
 pub fn discard(id: &str) {
-    PLANS.lock().unwrap().remove(id);
+    if let Ok(mut plans) = PLANS.lock() {
+        plans.remove(id);
+    }
 }
 
-pub fn apply(id: &str, selected: &[String]) -> Result<Vec<OperationResult>, String> {
-    let _guard = OPERATION_LOCK.lock().unwrap();
-    let plan = PLANS.lock().unwrap().remove(id).ok_or("preview.expired")?;
-    if plan.created.elapsed() > Duration::from_secs(1800) {
+pub(crate) fn apply(
+    id: &str, selected: &[String], suppression: &SuppressionSet,
+) -> Result<Vec<OperationResult>, String> {
+    let _operation = suppression.with_operation();
+    let plan = PLANS.lock().map_err(|_| "Organization preview cache is unavailable")?
+        .remove(id).ok_or("preview.expired")?;
+    if plan.created.elapsed() >= PLAN_LIFETIME {
         return Err("preview.expired".into());
     }
+    let selected: HashSet<_> = selected.iter().map(String::as_str).collect();
+    let available: HashSet<_> = plan.items.iter().map(|item| item.entry.id.as_str()).collect();
+    if !selected.is_subset(&available) {
+        return Err("Selection contains an item outside the reviewed plan".into());
+    }
+
+    let folders = db::get_watched_folders().map_err(|error| error.to_string())?;
+    let scope = safe_fs::eligible_scope(&folders)?;
+    let rules = db::get_rules().map_err(|error| error.to_string())?;
     let run_id = new_run_id();
     let mut results = Vec::new();
-    for item in plan
-        .items
-        .into_iter()
-        .filter(|i| selected.contains(&i.entry.id))
-    {
-        let result = (|| -> Result<(), String> {
-            let path = Path::new(&item.entry.source);
-            if !watched_file(path)
-                || db::is_baseline_file(path)
-                || rules::should_ignore_file(path)
-                || rules::is_file_ignored_by_mouziignore(path)
-            {
-                return Err("preview.changed".into());
-            }
-            if rules::is_file_locked(path) {
-                return Err("preview.locked".into());
-            }
-            let file = rules::scan_file(path).ok_or("preview.changed")?;
-            let rule = rules::find_matching_rule(&file).ok_or("preview.changed")?;
-            if serde_json::to_string(&rule).ok() != serde_json::to_string(&item.rule).ok()
-                || fingerprint(path)? != item.fingerprint
-                || fs::metadata(path)
-                    .and_then(|m| m.modified())
-                    .map_err(|e| e.to_string())?
-                    != item.modified
-            {
-                return Err("preview.changed".into());
-            }
-            execute_destination(
-                path,
-                &rule,
-                item.entry.destination.as_deref().map(Path::new),
-            )?;
-            db::log_action(&ActionLog {
-                id: None,
-                timestamp: Utc::now(),
-                source_path: item.entry.source.clone(),
-                destination_path: item.entry.destination.clone(),
-                action: rule.action,
-                file_name: file.name,
-                file_type: rule.name,
-                undone: false,
-                run_id: Some(run_id.clone()),
-                trigger: "approved".into(),
-                file_extension: file.extension,
-                file_size: file.size,
-                fingerprint: Some(item.fingerprint.clone()),
-            })
-            .map_err(|e| format!("Operation completed but history could not be saved: {e}"))?;
-            Ok(())
-        })();
+    for item in plan.items.into_iter().filter(|item| selected.contains(item.entry.id.as_str())) {
+        let result = apply_item(&item, &scope, &folders, &rules, &run_id, suppression);
         results.push(OperationResult {
             id: item.entry.id,
             source: item.entry.source,
@@ -546,33 +332,67 @@ pub fn apply(id: &str, selected: &[String]) -> Result<Vec<OperationResult>, Stri
     Ok(results)
 }
 
-pub fn undo_one(id: i64) -> Result<bool, String> {
-    let db = db::get_db();
-    let log = db.lock().unwrap().query_row("SELECT source_path,destination_path,fingerprint FROM action_logs WHERE id=?1 AND undone=0 AND action IN ('move','rename')", [id], |r| Ok((r.get::<_,String>(0)?, r.get::<_,String>(1)?, r.get::<_,Option<String>>(2)?))).map_err(|e| e.to_string())?;
-    let (source, destination, expected) = log;
-    let Some(expected) = expected else {
-        return Err("history.unverified".into());
+fn apply_item(
+    item: &Planned, scope: &RootScope, folders: &[WatchedFolder], rules: &[Rule],
+    run_id: &str, suppression: &SuppressionSet,
+) -> Result<(), String> {
+    let path = Path::new(&item.entry.source);
+    let destination = Path::new(item.entry.destination.as_deref().ok_or("Missing reviewed destination")?);
+    let file = eligible_file(scope, path)?.ok_or("preview.changed")?;
+    if file.identity != item.source_identity
+        || safe_fs::file_identity(&file.owning_root)? != item.root_identity
+        || file.metadata.modified().ok() != Some(item.modified)
+    {
+        return Err("preview.changed".into());
+    }
+    let info = rules::describe_file(path, &file.metadata).ok_or("preview.changed")?;
+    let rule = rules::matching_rule_in_root(&info, Some(&file.owning_root), folders, rules).ok_or("preview.changed")?;
+    if *rule != item.rule || checked_destination(&file.owning_root, &info, rule)? != item.requested_destination {
+        return Err("preview.changed".into());
+    }
+    // The reviewed ancestor was the deepest directory that existed at preview.
+    // The mover validates any new descendants without following links. A prior
+    // item in this same batch may already have created those directories.
+    let _destination_guard = safe_fs::guard_directory(&item.destination_ancestor)?;
+    if safe_fs::file_identity(&item.destination_ancestor)? != item.destination_identity {
+        return Err("Reviewed destination folder changed; preview again".into());
+    }
+
+    let _source_guard = file.into_parent_guard();
+    let intent = db::begin_operation_intent("move", &item.entry.source, item.entry.destination.as_deref())
+        .map_err(|error| format!("Cannot record reviewed move intent: {error}"))?;
+    suppression.arm(&[destination.to_path_buf()], Instant::now(), SUPPRESSION_TTL);
+    let moved = match safe_fs::move_organization_file(
+        path, destination, &item.source_identity, &item.digest, item.modified, true,
+    ) {
+        Ok(moved) => moved,
+        Err(error) => {
+            if let Some(message) = rules::record_retained_move(intent, "move", path, &error, suppression) {
+                return Err(message);
+            }
+            let message = error.to_string();
+            db::finalize_operation_intent(intent, "failed", None, Some(&message))
+                .map_err(|error| format!("{message}; could not record failed move: {error}"))?;
+            return Err(message);
+        }
     };
-    if Path::new(&source).try_exists().map_err(|e| e.to_string())? {
-        return Err("history.conflict".into());
-    }
-    if fingerprint(Path::new(&destination))? != expected {
-        return Err("history.changed".into());
-    }
-    move_without_overwrite(Path::new(&destination), Path::new(&source))?;
-    let mut conn = db.lock().unwrap();
-    let tx = conn.transaction().map_err(|e| e.to_string())?;
-    tx.execute("UPDATE action_logs SET undone=1 WHERE id=?1", [id])
-        .map_err(|e| e.to_string())?;
-    tx.execute(
-        "INSERT OR REPLACE INTO processed_files(path,fingerprint,restored) VALUES (?1,?2,1)",
-        rusqlite::params![source, expected],
-    )
-    .map_err(|e| e.to_string())?;
-    tx.execute("DELETE FROM processed_files WHERE path=?1", [destination])
-        .map_err(|e| e.to_string())?;
-    tx.commit().map_err(|e| e.to_string())?;
-    Ok(true)
+    suppression.arm(std::slice::from_ref(&moved.destination), Instant::now(), SUPPRESSION_TTL);
+    let log = ActionLog {
+        id: None,
+        timestamp: Utc::now(),
+        source_path: item.entry.source.clone(),
+        destination_path: Some(moved.destination.to_string_lossy().into_owned()),
+        action: rule.action.clone(),
+        file_name: info.name,
+        file_type: rule.name.clone(),
+        undone: false,
+    };
+    let history = OrganizationHistory {
+        run_id, trigger: "approved", extension: &info.extension, size: info.size, digest: &item.digest,
+    };
+    db::finalize_organization_move(intent, &log, &moved, history).map_err(|error| {
+        format!("Moved to {}, but recovery record {intent} is pending: {error}", moved.destination.display())
+    })
 }
 
 #[derive(Default, Deserialize)]
@@ -585,7 +405,7 @@ pub struct HistoryFilter {
     pub to: String,
     pub run_id: String,
 }
-pub fn history(filter: &HistoryFilter) -> Result<Vec<ActionLog>, String> {
+pub fn history(filter: &HistoryFilter) -> Result<Vec<OrganizationLog>, String> {
     let from = if filter.from.is_empty() {
         None
     } else {
@@ -604,23 +424,23 @@ pub fn history(filter: &HistoryFilter) -> Result<Vec<ActionLog>, String> {
                 .with_timezone(&Utc),
         )
     };
-    Ok(db::get_recent_logs(-1)
+    Ok(db::get_organization_logs()
         .map_err(|e| e.to_string())?
         .into_iter()
         .filter(|log| {
-            log.file_name
+            log.action.file_name
                 .to_lowercase()
                 .contains(&filter.query.to_lowercase())
                 && log
-                    .file_type
+                    .action.file_type
                     .to_lowercase()
                     .contains(&filter.rule.to_lowercase())
                 && (filter.extension.is_empty()
                     || log
                         .file_extension
                         .eq_ignore_ascii_case(filter.extension.trim_start_matches('.')))
-                && from.is_none_or(|date| log.timestamp >= date)
-                && to.is_none_or(|date| log.timestamp <= date)
+                && from.is_none_or(|date| log.action.timestamp >= date)
+                && to.is_none_or(|date| log.action.timestamp <= date)
                 && (filter.run_id.is_empty()
                     || log.run_id.as_deref() == Some(filter.run_id.as_str()))
         })

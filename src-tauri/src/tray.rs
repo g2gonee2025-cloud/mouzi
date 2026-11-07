@@ -1,22 +1,24 @@
-use crate::db::get_settings;
-use crate::i18n::TrayI18n;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager};
+use crate::db::get_settings;
+use crate::i18n::TrayI18n;
 
 pub fn setup_tray(app: &AppHandle, lang: &str) -> Result<(), Box<dyn std::error::Error>> {
     let i18n = TrayI18n::new(lang);
 
     let quit_i = MenuItem::with_id(app, "quit", i18n.get("quit"), true, None::<&str>)?;
-    let settings_i = MenuItem::with_id(app, "settings", i18n.get("settings"), true, None::<&str>)?;
     let clean_i = MenuItem::with_id(app, "clean", i18n.get("clean_now"), true, None::<&str>)?;
+    let suggestions_i = MenuItem::with_id(app, "suggestions", i18n.get("suggestions"), true, None::<&str>)?;
+    let dashboard_i = MenuItem::with_id(app, "dashboard", i18n.get("dashboard"), true, None::<&str>)?;
+    let cleanup_i = MenuItem::with_id(app, "cleanup", i18n.get("cleanup"), true, None::<&str>)?;
+    let settings_i = MenuItem::with_id(app, "settings", i18n.get("settings"), true, None::<&str>)?;
     let separator = PredefinedMenuItem::separator(app)?;
 
-    let menu = Menu::with_items(app, &[&clean_i, &settings_i, &separator, &quit_i])?;
+    let menu = Menu::with_items(app, &[&clean_i, &suggestions_i, &dashboard_i, &cleanup_i, &settings_i, &separator, &quit_i])?;
 
     let mut builder = TrayIconBuilder::with_id("tray")
         .tooltip(i18n.get("tooltip"))
-        .show_menu_on_left_click(false)
         .menu(&menu)
         .on_menu_event(|app, event| match event.id.as_ref() {
             "quit" => {
@@ -25,43 +27,30 @@ pub fn setup_tray(app: &AppHandle, lang: &str) -> Result<(), Box<dyn std::error:
             "settings" => {
                 show_settings_window(app);
             }
+            "dashboard" => {
+                show_dashboard_window(app);
+            }
+            "suggestions" => {
+                show_suggestions_window(app);
+            }
+            "cleanup" => {
+                show_cleanup_window(app);
+            }
             "clean" => {
-                crate::commands::show_review_cmd(app.clone(), Vec::new());
+                if let Err(error) = crate::commands::show_review_cmd(app.clone(), Vec::new()) {
+                    eprintln!("[tray] Could not open organization review: {error}");
+                }
             }
             _ => {}
         })
         .on_tray_icon_event(|tray, event| {
-            if let TrayIconEvent::Click {
-                button,
-                button_state,
-                ..
-            } = event
-            {
-                if button == MouseButton::Left && button_state == tauri::tray::MouseButtonState::Up
-                {
+            if let TrayIconEvent::Click { button, .. } = event {
+                if button == MouseButton::Left {
                     show_popup_window(tray.app_handle());
                 }
             }
         });
 
-    #[cfg(target_os = "macos")]
-    {
-        let mut pixels = vec![0u8; 22 * 22 * 4];
-        for y in 0..22i32 {
-            for x in 0..22i32 {
-                let body = (x - 11) * (x - 11) + (y - 12) * (y - 12) <= 49;
-                let ears = (x - 5) * (x - 5) + (y - 5) * (y - 5) <= 12
-                    || (x - 17) * (x - 17) + (y - 5) * (y - 5) <= 12;
-                if body || ears {
-                    pixels[((y * 22 + x) * 4 + 3) as usize] = 255;
-                }
-            }
-        }
-        builder = builder
-            .icon(tauri::image::Image::new_owned(pixels, 22, 22))
-            .icon_as_template(true);
-    }
-    #[cfg(not(target_os = "macos"))]
     if let Some(icon) = app.default_window_icon() {
         builder = builder.icon(icon.clone());
     }
@@ -80,8 +69,6 @@ fn tray_lang(_app: &AppHandle) -> String {
 pub fn show_popup_window(app: &AppHandle) {
     let i18n = TrayI18n::new(&tray_lang(app));
     if let Some(window) = app.get_webview_window("popup") {
-        #[cfg(target_os = "macos")]
-        position_popup(app, &window);
         let _ = window.show();
         let _ = window.set_focus();
     } else {
@@ -113,47 +100,29 @@ pub fn show_popup_window(app: &AppHandle) {
         .build();
 
         if let Ok(win) = window {
-            #[cfg(target_os = "macos")]
-            {
-                position_popup(app, &win);
-                let popup = win.clone();
-                win.on_window_event(move |event| {
-                    if matches!(event, tauri::WindowEvent::Focused(false)) {
-                        let _ = popup.hide();
-                    }
-                });
-            }
             let _ = win.show();
             let _ = win.set_focus();
         }
     }
 }
 
-#[cfg(target_os = "macos")]
-fn position_popup(app: &AppHandle, window: &tauri::WebviewWindow) {
-    if let Some(tray) = app.tray_by_id("tray") {
-        if let Ok(Some(rect)) = tray.rect() {
-            let scale = window.scale_factor().unwrap_or(1.0);
-            let physical = rect.position.to_physical::<f64>(scale);
-            let monitor = window
-                .monitor_from_point(physical.x, physical.y)
-                .ok()
-                .flatten();
-            let scale = monitor.as_ref().map(|m| m.scale_factor()).unwrap_or(scale);
-            let position = rect.position.to_logical::<f64>(scale);
-            let size = rect.size.to_logical::<f64>(scale);
-            let mut x = position.x + size.width / 2.0 - 150.0;
-            if let Some(monitor) = monitor {
-                let left = monitor.position().to_logical::<f64>(scale).x;
-                let width = monitor.size().to_logical::<f64>(scale).width;
-                x = x.clamp(left + 4.0, (left + width - 304.0).max(left + 4.0));
-            }
-            let _ = window.set_position(tauri::LogicalPosition::new(
-                x,
-                position.y + size.height + 4.0,
-            ));
-        }
+pub fn update_tray_language(app: &AppHandle, lang: &str) {
+    let translated = TrayI18n::new(lang);
+    let result = (|| -> Result<Menu<tauri::Wry>, tauri::Error> {
+        let clean = MenuItem::with_id(app, "clean", translated.get("clean_now"), true, None::<&str>)?;
+        let suggestions = MenuItem::with_id(app, "suggestions", translated.get("suggestions"), true, None::<&str>)?;
+        let dashboard = MenuItem::with_id(app, "dashboard", translated.get("dashboard"), true, None::<&str>)?;
+        let cleanup = MenuItem::with_id(app, "cleanup", translated.get("cleanup"), true, None::<&str>)?;
+        let settings = MenuItem::with_id(app, "settings", translated.get("settings"), true, None::<&str>)?;
+        let separator = PredefinedMenuItem::separator(app)?;
+        let quit = MenuItem::with_id(app, "quit", translated.get("quit"), true, None::<&str>)?;
+        Menu::with_items(app, &[&clean, &suggestions, &dashboard, &cleanup, &settings, &separator, &quit])
+    })();
+    if let (Some(tray), Ok(menu)) = (app.tray_by_id("tray"), result) {
+        let _ = tray.set_menu(Some(menu));
     }
+    let pending = app.try_state::<crate::AppState>().and_then(|state| state.watcher.lock().ok().map(|watcher| watcher.get_pending_files().len())).unwrap_or(0);
+    update_tray_tooltip(app, pending);
 }
 
 pub fn update_tray_tooltip(app: &AppHandle, count: usize) {
@@ -171,25 +140,115 @@ pub fn update_tray_tooltip(app: &AppHandle, count: usize) {
     }
 }
 
-pub fn show_settings_window(app: &AppHandle) {
+/// Convert a Tauri app URL (`/#/dashboard`) to a `location.hash` fragment (`#/dashboard`).
+/// Assigning `location.hash = '/#/dashboard'` becomes `#/#/dashboard`, which parseHash
+/// does not treat as the dashboard route.
+pub fn workspace_fragment(url_or_hash: &str) -> String {
+    let s = url_or_hash.trim();
+    if let Some(rest) = s.strip_prefix("/#") {
+        format!("#{rest}")
+    } else if s.starts_with('#') {
+        s.to_string()
+    } else {
+        format!("#/{s}")
+    }
+}
+
+/// Script that sets `location.hash` in the workspace webview.
+/// Quotes and line breaks are stripped so this is safe to `eval`.
+pub fn location_hash_script(hash: &str) -> String {
+    let fragment = workspace_fragment(hash);
+    let safe: String = fragment
+        .chars()
+        .filter(|c| !matches!(*c, '\'' | '\\' | '\n' | '\r'))
+        .collect();
+    format!("window.location.hash = '{safe}'")
+}
+
+/// One workspace window for dashboard, cleanup, suggestions, and settings.
+/// The tray popup stays a separate compact flyout.
+/// `url` is a Tauri webview path (`/#/dashboard`); eval uses the fragment only.
+fn show_app_window(app: &AppHandle, url: &str, title_key: &str) {
     let i18n = TrayI18n::new(&tray_lang(app));
-    if let Some(window) = app.get_webview_window("settings") {
+    let title = i18n.get(title_key);
+    if let Some(window) = app.get_webview_window("app") {
+        let _ = window.eval(&location_hash_script(url));
+        let _ = window.set_title(title);
         let _ = window.show();
         let _ = window.set_focus();
-    } else {
-        let window = tauri::WebviewWindowBuilder::new(
-            app,
-            "settings",
-            tauri::WebviewUrl::App("/#/settings".into()),
-        )
-        .title(i18n.get("settings_title"))
-        .inner_size(900.0, 650.0)
-        .min_inner_size(700.0, 500.0)
-        .build();
+        return;
+    }
+    let window = tauri::WebviewWindowBuilder::new(
+        app,
+        "app",
+        tauri::WebviewUrl::App(url.into()),
+    )
+    .title(title)
+    .inner_size(1100.0, 820.0)
+    .min_inner_size(800.0, 600.0)
+    .build();
 
-        if let Ok(win) = window {
-            let _ = win.show();
-            let _ = win.set_focus();
-        }
+    if let Ok(win) = window {
+        let _ = win.show();
+        let _ = win.set_focus();
+    }
+}
+
+pub fn hide_app_window(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("app") {
+        let _ = window.hide();
+    }
+}
+
+pub fn show_settings_window(app: &AppHandle) {
+    show_app_window(app, "/#/settings", "settings_title");
+}
+
+pub fn show_dashboard_window(app: &AppHandle) {
+    show_app_window(app, "/#/dashboard", "dashboard_title");
+}
+
+pub fn show_suggestions_window(app: &AppHandle) {
+    show_app_window(app, "/#/suggestions", "suggestions_title");
+}
+
+pub fn show_cleanup_window(app: &AppHandle) {
+    show_app_window(app, "/#/cleanup", "cleanup_title");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{location_hash_script, workspace_fragment};
+
+    fn assigned_fragment(script: &str) -> &str {
+        script
+            .split('\'')
+            .nth(1)
+            .expect("eval script must quote the hash")
+    }
+
+    #[test]
+    fn location_hash_script_sets_route() {
+        assert_eq!(
+            location_hash_script("#/dashboard"),
+            "window.location.hash = '#/dashboard'"
+        );
+    }
+
+    #[test]
+    fn location_hash_script_strips_quotes_and_breaks() {
+        assert_eq!(
+            location_hash_script("#'evil\n"),
+            "window.location.hash = '#evil'"
+        );
+    }
+
+    #[test]
+    fn production_webview_url_eval_is_a_dashboard_fragment() {
+        let url = "/#/dashboard";
+        assert_eq!(workspace_fragment(url), "#/dashboard");
+        let script = location_hash_script(url);
+        assert_eq!(assigned_fragment(script.as_str()), "#/dashboard");
+        assert_ne!(assigned_fragment(script.as_str()), "/#/dashboard");
     }
 }

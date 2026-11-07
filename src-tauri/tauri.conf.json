@@ -8,6 +8,7 @@
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
     "beforeBuildCommand": "npm run build",
+    "beforeBundleCommand": "node scripts/block-bundle.mjs",
     "frontendDist": "../dist"
   },
   "app": {
@@ -28,9 +29,8 @@
     "trayIcon": null
   },
   "bundle": {
-    "active": true,
-    "createUpdaterArtifacts": true,
-    "targets": "all",
+    "active": false,
+    "targets": [],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -38,11 +38,6 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "windows": {
-      "nsis": {
-        "installerHooks": "./installer.nsh"
-      }
-    },
     "macOS": {
       "infoPlist": "Info.plist"
     }

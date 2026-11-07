@@ -1,0 +1,223 @@
+import { useState, useMemo, useRef } from "react";
+import { useTranslation } from "react-i18next";
+import { useCleanupStore } from "../../store/useCleanupStore";
+import {
+  formatBytes,
+  formatTimestamp,
+} from "../../utils/format";
+import {
+  reclaimableBytes,
+  sortGroups,
+  buildDuplicateActions,
+  resolveKeeper,
+  type DuplicateGroup,
+} from "../../utils/cleanup";
+import { Search, Trash2, Check } from "lucide-react";
+import ResultsPanel from "./ResultsPanel";
+import ConfirmDialog, { type ConfirmDialogProps } from "./ConfirmDialog";
+import { usePreviewOwner } from "./usePreviewOwner";
+
+export default function DuplicatesTab() {
+  const { t } = useTranslation();
+  const store = useCleanupStore();
+  const [selected, setSelected] = useState<Record<string, string>>({});
+  const [showResults, setShowResults] = useState(false);
+  const [pending, setPending] = useState<ConfirmDialogProps | null>(null);
+  const beginPreview = usePreviewOwner();
+  const resultsHeading = useRef<HTMLHeadingElement>(null);
+
+  const groups = useMemo(
+    () => (store.duplicates ? sortGroups(store.duplicates) : []),
+    [store.duplicates],
+  );
+  const reclaimable = useMemo(() => reclaimableBytes(groups), [groups]);
+
+  // The button count and the card badges are both derived from this, so what
+  // the user is told they are about to delete is what actually gets sent.
+  const actions = useMemo(
+    () => buildDuplicateActions(groups, selected),
+    [groups, selected],
+  );
+
+  // Summed off `actions`, never off `reclaimableBytes(groups)`: if the two ever
+  // disagreed the dialog would quote one number and the backend act on another.
+  const handleFind = () => store.findDuplicates();
+
+  const handleKeep = (hash: string, path: string) => {
+    setSelected((prev) => ({ ...prev, [hash]: path }));
+  };
+
+  const handleConfirm = async (opener: HTMLButtonElement) => {
+    if (actions.length === 0) return;
+    const owner = beginPreview();
+    if (!owner) return;
+    try {
+      const plan = await store.prepareCleanup(actions, owner.signal);
+      if (owner.signal.aborted) return;
+      setPending({
+        title: t("confirm.op.trashDuplicates"),
+        count: plan.actions.length,
+        bytes: plan.totalBytes,
+        notice: "trash",
+        preview: plan.actions.map((a) => a.path),
+        opener,
+        focusFallback: () => resultsHeading.current,
+        onConfirm: async () => { await store.executeCleanup(plan.planId); setShowResults(true); },
+        onClose: () => { owner.abort(); setPending(null); },
+      });
+    } catch {
+      owner.abort();
+    }
+  };
+
+  // When results come back, refresh the list
+  const handleResultsDone = () => {
+    setShowResults(false);
+    store.clearResults();
+    store.findDuplicates();
+  };
+
+  if (showResults && store.results) {
+    return (
+      <ResultsPanel
+        headingRef={resultsHeading}
+        results={store.results}
+        onDone={handleResultsDone}
+        error={store.error}
+      />
+    );
+  }
+
+  return (
+    <div className="space-y-3">
+      <div className="flex items-center justify-between">
+        <p className="text-xs text-text-muted">{t("cleanup.duplicatesHint")}</p>
+        <button
+          onClick={handleFind}
+          disabled={store.loading || store.busy || !!store.preparedPlan}
+          className="flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-on-primary hover:bg-primary-hover disabled:opacity-50 transition-colors"
+        >
+          <Search size={14} />
+          {store.loading
+            ? t("app.loading")
+            : t("cleanup.findDuplicates")}
+        </button>
+      </div>
+
+      {store.error && (
+        <div className="rounded-lg bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 px-4 py-3 text-xs text-red-700 dark:text-red-400">
+          {store.error}
+        </div>
+      )}
+
+      {store.duplicates && groups.length === 0 && (
+        <div className="rounded-lg border border-border bg-surface-dark p-6 text-center text-xs text-text-muted">
+          {t("cleanup.noDuplicates")}
+        </div>
+      )}
+
+      {groups.length > 0 && (
+        <>
+          <div className="flex items-center justify-between px-1">
+            <span className="text-xs text-text-muted">
+              {groups.length} {t("cleanup.groupCount")} &middot;{" "}
+              {t("cleanup.reclaimable", { size: formatBytes(reclaimable) })}
+            </span>
+            <button
+              onClick={(event) => void handleConfirm(event.currentTarget)}
+              disabled={store.busy || actions.length === 0}
+              className="flex items-center gap-1.5 rounded-md bg-red-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-red-700 disabled:opacity-50 transition-colors"
+            >
+              <Trash2 size={14} />
+              {store.busy
+                ? t("app.loading")
+                : t("cleanup.confirm", {
+                    count: actions.length,
+                  })}
+            </button>
+          </div>
+
+          <div className="space-y-2">
+            {groups.map((g) => (
+              <DuplicateGroupCard
+                key={g.hash}
+                group={g}
+                keepPath={resolveKeeper(g, selected)}
+                onKeep={handleKeep}
+              />
+            ))}
+          </div>
+        </>
+      )}
+
+      {pending && <ConfirmDialog {...pending} />}
+    </div>
+  );
+}
+
+function DuplicateGroupCard({
+  group,
+  keepPath,
+  onKeep,
+}: {
+  group: DuplicateGroup;
+  keepPath: string | undefined;
+  onKeep: (hash: string, path: string) => void;
+}) {
+  const { t } = useTranslation();
+  const hashShort = group.hash.slice(0, 12);
+
+  return (
+    <div className="rounded-lg border border-border bg-surface-dark p-3">
+      <div className="flex items-center gap-2 mb-2">
+        <span className="text-[10px] font-mono text-text-muted bg-surface px-1.5 py-0.5 rounded">
+          {hashShort}…
+        </span>
+        <span className="text-xs text-text-muted">
+          {formatBytes(group.files[0].size)} &times; {group.files.length}
+        </span>
+        <span className="text-xs text-red-500 ml-auto">
+          -{formatBytes(group.files[0].size * (group.files.length - 1))}
+        </span>
+      </div>
+      <div className="space-y-1">
+        {group.files.map((f) => {
+          const isKept = f.path === keepPath;
+          const fname = f.path.split("\\").pop()?.split("/").pop() || f.path;
+          return (
+            <div
+              key={f.path}
+              className={`flex items-center gap-2 rounded-md px-2 py-1.5 text-xs ${
+                isKept
+                  ? "bg-green-50 dark:bg-green-900/20 border border-green-200 dark:border-green-800"
+                  : "hover:bg-surface"
+              }`}
+            >
+              <button
+                onClick={() => onKeep(group.hash, f.path)}
+                className={`shrink-0 w-4 h-4 rounded-full border-2 flex items-center justify-center transition-colors ${
+                  isKept
+                    ? "border-green-500 bg-green-500"
+                    : "border-border hover:border-primary"
+                }`}
+              >
+                {isKept && <Check size={10} className="text-white" />}
+              </button>
+              <span className="flex-1 truncate" title={f.path}>
+                {fname}
+              </span>
+              <span className="text-text-muted shrink-0">
+                {formatTimestamp(f.mtime)}
+              </span>
+              {isKept && (
+                <span className="text-[10px] text-green-600 font-medium shrink-0">
+                  {t("cleanup.kept")}
+                </span>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}

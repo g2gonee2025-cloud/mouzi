@@ -18,23 +18,55 @@ function strings(object, prefix = '') {
 }
 const tokens = value => [...value.matchAll(/\{\{[^{}]+\}\}|\{[^{}]+\}/g)].map(match => match[0]).sort();
 const reference = strings(locales.en);
+const pluralSuffix = /_(zero|one|two|few|many|other)$/;
+const pluralGroups = new Set(Object.keys(reference).filter(key => pluralSuffix.test(key))
+  .map(key => key.replace(pluralSuffix, '')));
+function messageKey(key) {
+  const base = key.replace(pluralSuffix, '');
+  return pluralGroups.has(base) ? base : key;
+}
+const messageKeys = entries => [...new Set(Object.keys(entries).map(messageKey))].sort();
+
+function integerPluralExamples(language) {
+  const rules = new Intl.PluralRules(language);
+  const examples = new Map();
+  // The UI passes integer file, rule, and history counts. A million also
+  // exercises the additional category used by several Romance languages.
+  for (const count of [...Array.from({ length: 200 }, (_, n) => n), 1_000_000]) {
+    const category = rules.select(count);
+    if (!examples.has(category)) examples.set(category, count);
+  }
+  return examples;
+}
 
 for (const [language, locale] of Object.entries(locales)) {
   test(`${language}: all UI keys and placeholders are present without fallback (#67)`, async () => {
     assert.ok(locale.beta, 'Missing organization translations');
     const translated = strings(locale);
-    assert.deepEqual(Object.keys(translated).sort(), Object.keys(reference).sort());
-    for (const [key, source] of Object.entries(reference)) {
-      assert.ok(translated[key].trim(), `${language}: empty ${key}`);
-      assert.deepEqual(tokens(translated[key]), tokens(source), `${language}: placeholders in ${key}`);
+    assert.deepEqual(messageKeys(translated), messageKeys(reference));
+    for (const [key, value] of Object.entries(translated)) {
+      const base = messageKey(key);
+      const source = reference[key] ?? reference[`${base}_other`];
+      assert.ok(value.trim(), `${language}: empty ${key}`);
+      assert.deepEqual(tokens(value), tokens(source), `${language}: placeholders in ${key}`);
     }
     // Disable fallback so a missing runtime lookup cannot silently use English.
     const instance = i18next.createInstance();
     await instance.init({ lng: language, fallbackLng: false, resources: { [language]: { translation: locale } } });
-    for (const key of Object.keys(reference)) {
-      const fullKey = key;
-      assert.equal(instance.exists(fullKey), true, fullKey);
-      assert.equal(instance.t(fullKey, { count: 3 }), translated[key].replaceAll('{{count}}', '3'));
+    const examples = integerPluralExamples(language);
+    for (const key of messageKeys(reference)) {
+      if (!pluralGroups.has(key)) {
+        assert.equal(instance.exists(key), true, key);
+        assert.equal(instance.t(key, { count: 3 }), translated[key].replaceAll('{{count}}', '3'));
+        continue;
+      }
+      for (const [category, count] of examples) {
+        const variant = count === 0 && Object.hasOwn(translated, `${key}_zero`)
+          ? `${key}_zero` : `${key}_${category}`;
+        const expected = translated[variant] ?? (examples.size === 1 ? translated[key] : undefined);
+        assert.ok(expected, `${language}: missing ${variant}`);
+        assert.equal(instance.t(key, { count }), expected.replaceAll('{{count}}', String(count)));
+      }
     }
   });
 }

@@ -10,10 +10,10 @@ pub fn handle_folder_args(app: &tauri::AppHandle, args: &[String]) -> bool {
     else {
         return false;
     };
-    *app.state::<crate::AppState>()
-        .add_folder_request
-        .lock()
-        .unwrap() = Some(path.clone());
+    let Some(state) = app.try_state::<crate::AppState>() else { return false; };
+    let Ok(mut request) = state.add_folder_request.lock() else { return false; };
+    *request = Some(path.clone());
+    drop(request);
     crate::tray::show_settings_window(app);
     let _ = app.emit("add-folder-request", ());
     true

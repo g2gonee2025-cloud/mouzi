@@ -1,287 +1,237 @@
-use crate::{db, operations as op, rules};
-use once_cell::sync::Lazy;
-use std::{
-    fs,
-    path::PathBuf,
-    sync::{Mutex, MutexGuard},
-};
+use super::{undo_action_with, validate_rule_destination};
+use crate::{db, operations as op, rules, suppress::SuppressionSet};
+use std::{fs, path::{Path, PathBuf}, sync::{Arc, MutexGuard}};
 
-static DATABASE: Lazy<Mutex<()>> = Lazy::new(|| {
-    let path = std::env::temp_dir().join(format!("mouzi-beta-tests-db-{}", op::new_run_id()));
-    fs::create_dir_all(&path).unwrap();
-    db::init_db(path).unwrap();
-    Mutex::new(())
-});
 struct Fixture {
     root: PathBuf,
-    _guard: MutexGuard<'static, ()>,
+    folder: i64,
+    rules: Vec<i64>,
+    suppression: Arc<SuppressionSet>,
+    _db: MutexGuard<'static, ()>,
 }
+
 impl Fixture {
     fn new() -> Self {
-        let guard = DATABASE.lock().unwrap_or_else(|p| p.into_inner());
-        db::get_db().lock().unwrap().execute_batch("DELETE FROM rules; DELETE FROM watched_folders; DELETE FROM folder_baseline; DELETE FROM action_logs; DELETE FROM processed_files;").unwrap();
-        let root = std::env::temp_dir().join(format!("mouzi-beta-fixture-{}", op::new_run_id()));
-        fs::create_dir_all(&root).unwrap();
-        db::add_watched_folder(root.to_str().unwrap(), "manual").unwrap();
-        Self {
-            root,
-            _guard: guard,
-        }
+        let guard = db::serialise_test_db();
+        db::init_test_db();
+        let root = std::env::temp_dir().join(format!("mouzi-organization-test-{}", op::new_run_id()));
+        fs::create_dir(&root).unwrap();
+        let folder = db::add_watched_folder(root.to_str().unwrap(), "manual").unwrap();
+        Self { root, folder, rules: Vec::new(), suppression: Arc::new(SuppressionSet::new()), _db: guard }
     }
+
     fn write(&self, name: &str, contents: &str) -> PathBuf {
         let path = self.root.join(name);
         fs::write(&path, contents).unwrap();
         path
     }
+
     fn rule(&self) -> db::Rule {
-        serde_json::from_value(serde_json::json!({"id":null,"name":"Documents","priority":0,"enabled":true,"extensions":["txt"],"pattern":null,"destination":"Sorted","action":"move","folder_id":0})).unwrap()
+        db::Rule {
+            name: "Reviewed documents".into(),
+            priority: i32::MIN,
+            enabled: true,
+            extensions: vec!["txt".into()],
+            destination: "Sorted".into(),
+            action: "move".into(),
+            folder_id: self.folder,
+            ..Default::default()
+        }
     }
-    fn apply_all(&self) -> Vec<op::OperationResult> {
-        let p = op::preview(None).unwrap();
-        op::apply(
-            &p.id,
-            &p.entries
-                .iter()
-                .filter(|e| e.error.is_none())
-                .map(|e| e.id.clone())
-                .collect::<Vec<_>>(),
-        )
-        .unwrap()
+
+    fn add(&mut self, rule: &db::Rule) -> i64 {
+        validate_rule_destination(rule).unwrap();
+        let id = db::add_rule(rule).unwrap();
+        self.rules.push(id);
+        id
+    }
+
+    fn preview(&self, paths: &[&Path]) -> op::Preview {
+        op::preview(Some(paths.iter().map(|path| path.to_string_lossy().into_owned()).collect()), &self.suppression).unwrap()
+    }
+
+    fn apply(&self, plan: &op::Preview, index: usize) -> op::OperationResult {
+        op::apply(&plan.id, &[plan.entries[index].id.clone()], &self.suppression).unwrap().remove(0)
     }
 }
+
 impl Drop for Fixture {
     fn drop(&mut self) {
+        for id in &self.rules {
+            db::delete_rule(*id).unwrap();
+        }
+        db::remove_watched_folder(self.folder).unwrap();
+        assert_eq!(self.root.parent(), Some(std::env::temp_dir().as_path()));
         let _ = fs::remove_dir_all(&self.root);
     }
 }
 
 #[test]
-fn extension_normalization_storage_matching_and_import_atomicity() {
-    let f = Fixture::new();
-    let mut rule = f.rule();
-    rule.extensions = vec![" exe, msi, ,".into()];
-    let id = db::add_rule(&rule).unwrap();
-    let stored: String = db::get_db()
-        .lock()
-        .unwrap()
-        .query_row("SELECT extensions FROM rules WHERE id=?1", [id], |r| {
-            r.get(0)
-        })
-        .unwrap();
-    assert_eq!(stored, "exe,msi");
-    let path = f.write("readme", "a genuinely extensionless text file");
-    assert!(!rules::matches_rule(
-        &rules::scan_file(&path).unwrap(),
-        &rule
-    ));
-    db::get_db()
-        .lock()
-        .unwrap()
-        .execute("UPDATE rules SET extensions='exe, msi,' WHERE id=?1", [id])
-        .unwrap();
-    assert_eq!(db::get_rules().unwrap()[0].extensions, vec!["exe", "msi"]);
-    assert!(rules::find_matching_rule(&rules::scan_file(&path).unwrap()).is_none());
-    rule.extensions = vec!["".into()];
-    assert!(db::add_rule(&rule).is_err());
-    assert!(db::import_rules(&[f.rule(), rule], true).is_err());
-    assert_eq!(db::get_rules().unwrap().len(), 1);
-    let mut wildcard = f.rule();
-    wildcard.extensions = vec!["*".into()];
-    assert!(rules::matches_rule(
-        &rules::scan_file(&path).unwrap(),
-        &wildcard
-    ));
-}
-
-#[test]
-fn combined_conditions_validation_and_folder_scope() {
-    let f = Fixture::new();
+fn scoped_rule_conditions_and_normalized_extensions_survive_storage() {
+    let mut f = Fixture::new();
     let path = f.write("invoice.txt", "12345");
-    let file = rules::scan_file(&path).unwrap();
+    let info = rules::scan_file(&path).unwrap();
+    let date = chrono::DateTime::<chrono::Utc>::from(fs::metadata(&path).unwrap().modified().unwrap())
+        .format("%Y-%m-%d").to_string();
     let mut rule = f.rule();
+    rule.extensions = vec![" TXT, msi, ,".into()];
     rule.pattern = Some("^invoice".into());
-    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
     rule.options.min_size = Some(5);
     rule.options.max_size = Some(5);
-    rule.options.modified_after = Some(today.clone());
-    rule.options.modified_before = Some(today);
-    assert!(rules::matches_rule(&file, &rule));
+    rule.options.modified_after = Some(date.clone());
+    rule.options.modified_before = Some(date);
+    let id = f.add(&rule);
+    let stored = db::get_rules().unwrap().into_iter().find(|rule| rule.id == Some(id)).unwrap();
+    assert_eq!(stored.extensions, ["txt", "msi"]);
+    assert!(rules::matches_rule(&info, &stored));
+    let extensionless = f.write("invoice", "12345");
+    assert!(!rules::matches_rule(&rules::scan_file(&extensionless).unwrap(), &stored));
     rule.options.min_size = Some(6);
-    assert!(!rules::matches_rule(&file, &rule));
-    assert!(rules::validate_rule(&rule).is_err());
-    rule.options.min_size = Some(0);
+    assert!(!rules::matches_rule(&info, &rule));
+    assert!(validate_rule_destination(&rule).is_err());
+    rule.options.min_size = Some(5);
     rule.pattern = Some("[".into());
-    assert!(rules::validate_rule(&rule).is_err());
+    assert!(validate_rule_destination(&rule).is_err());
     rule.pattern = None;
     rule.options.modified_after = Some("invalid".into());
-    assert!(rules::validate_rule(&rule).is_err());
-    rule.options = Default::default();
-    rule.folder_id = 99999;
-    db::add_rule(&rule).unwrap();
-    assert!(rules::find_matching_rule(&file).is_none());
+    assert!(validate_rule_destination(&rule).is_err());
+
+    let other = f.root.join("Other");
+    fs::create_dir(&other).unwrap();
+    let other_id = db::add_watched_folder(other.to_str().unwrap(), "manual").unwrap();
+    let folders = db::get_watched_folders().unwrap();
+    assert!(rules::matching_rule_in_root(&info, Some(&other), &folders, &[stored]).is_none());
+    db::remove_watched_folder(other_id).unwrap();
 }
 
 #[test]
-fn preview_selective_apply_changed_files_rules_and_conflicts() {
-    let f = Fixture::new();
+fn apply_uses_only_the_selected_entries_and_rechecks_the_review() {
+    let mut f = Fixture::new();
     let mut rule = f.rule();
-    rule.id = Some(db::add_rule(&rule).unwrap());
+    rule.id = Some(f.add(&rule));
     let a = f.write("a.txt", "alpha");
     let b = f.write("b.txt", "beta");
-    let p = op::preview(None).unwrap();
-    assert_eq!(p.entries.len(), 2);
+    let plan = f.preview(&[&a, &b]);
+    assert_eq!(plan.entries.len(), 2);
     assert!(a.exists() && b.exists());
     assert!(!f.root.join("Sorted").exists());
-    assert!(op::apply(&p.id, &[p.entries[0].id.clone()]).unwrap()[0].success);
-    assert!(!a.exists());
-    assert!(b.exists());
-    assert!(op::apply(&p.id, &[]).is_err());
-    let p = op::preview(None).unwrap();
-    fs::write(&b, "changed").unwrap();
-    assert!(!op::apply(&p.id, &[p.entries[0].id.clone()]).unwrap()[0].success);
-    assert!(b.exists());
-    let p = op::preview(None).unwrap();
-    let dest = PathBuf::from(p.entries[0].destination.as_ref().unwrap());
-    fs::write(&dest, "existing content").unwrap();
-    assert!(!op::apply(&p.id, &[p.entries[0].id.clone()]).unwrap()[0].success);
-    assert_eq!(fs::read_to_string(&dest).unwrap(), "existing content");
-    assert!(b.exists());
-    let p = op::preview(None).unwrap();
-    assert!(p.entries[0]
-        .destination
-        .as_ref()
-        .unwrap()
-        .ends_with("b (1).txt"));
+    let result = f.apply(&plan, 0);
+    assert!(result.success, "{:?}", result.error);
+    assert!(!a.exists() && b.exists());
+    assert!(op::apply(&plan.id, &[], &f.suppression).is_err());
+
+    let plan = f.preview(&[&b]);
+    fs::write(&b, "edit").unwrap();
+    assert!(!f.apply(&plan, 0).success);
+    let plan = f.preview(&[&b]);
+    let destination = plan.entries[0].destination.as_ref().unwrap();
+    fs::write(destination, "occupied").unwrap();
+    assert!(!f.apply(&plan, 0).success);
+    assert_eq!(fs::read_to_string(destination).unwrap(), "occupied");
+
+    let plan = f.preview(&[&b]);
+    assert!(plan.entries[0].destination.as_ref().unwrap().ends_with("b_0.txt"));
     rule.destination = "Elsewhere".into();
     db::update_rule(&rule).unwrap();
-    assert!(!op::apply(&p.id, &[p.entries[0].id.clone()]).unwrap()[0].success);
+    assert!(!f.apply(&plan, 0).success);
     assert!(b.exists());
 }
 
 #[test]
-fn runs_filters_safe_partial_undo_and_no_automatic_redo() {
-    let f = Fixture::new();
-    db::add_rule(&f.rule()).unwrap();
-    let a = f.write("a.txt", "alpha");
-    let b = f.write("b.txt", "beta");
-    assert!(f.apply_all().iter().all(|r| r.success));
-    let logs = db::get_recent_logs(-1).unwrap();
-    assert_eq!(logs.len(), 2);
-    assert_eq!(logs[0].run_id, logs[1].run_id);
-    let a_log = logs.iter().find(|l| l.file_name == "a.txt").unwrap();
-    let b_log = logs.iter().find(|l| l.file_name == "b.txt").unwrap();
-    fs::write(&a, "new unrelated file").unwrap();
-    assert_eq!(
-        op::undo_one(a_log.id.unwrap()).unwrap_err(),
-        "history.conflict"
-    );
-    assert!(op::undo_one(b_log.id.unwrap()).unwrap());
-    assert!(b.exists());
-    assert!(op::already_processed(&b).unwrap());
-    let mut filter = op::HistoryFilter::default();
-    filter.query = "b.".into();
-    filter.rule = "documents".into();
-    filter.extension = ".TXT".into();
-    assert_eq!(op::history(&filter).unwrap().len(), 1);
-    filter.from = "2099-01-01T00:00:00Z".into();
-    assert!(op::history(&filter).unwrap().is_empty());
-    fs::remove_file(&a).unwrap();
-    fs::write(
-        a_log.destination_path.as_ref().unwrap(),
-        "modified after move",
-    )
-    .unwrap();
-    assert_eq!(
-        op::undo_one(a_log.id.unwrap()).unwrap_err(),
-        "history.changed"
-    );
-    assert!(
-        !db::get_recent_logs(-1)
-            .unwrap()
-            .iter()
-            .find(|l| l.id == a_log.id)
-            .unwrap()
-            .undone
-    );
-    let folder = db::get_watched_folders().unwrap()[0].id.unwrap();
-    db::update_folder_mode(folder, "silent").unwrap();
-    assert!(rules::process_file_in_run(&b, true, "test", "automatic")
-        .unwrap()
-        .is_none());
-    assert!(b.exists());
-    db::clear_logs().unwrap();
-    assert!(op::already_processed(&b).unwrap());
-}
-
-#[test]
-fn rename_templates_collisions_no_loops_and_undo() {
-    let f = Fixture::new();
+fn rename_run_history_and_undo_verify_content_and_preserve_collisions() {
+    let mut f = Fixture::new();
     let mut rule = f.rule();
     rule.action = "rename".into();
     rule.options.rename_template = "renamed-{stem}.{extension}".into();
-    db::add_rule(&rule).unwrap();
-    let source = f.write("note.txt", "original");
-    f.write("renamed-note.txt", "do not overwrite");
-    let p = op::preview(Some(vec![source.to_string_lossy().into()])).unwrap();
-    let dest = PathBuf::from(p.entries[0].destination.as_ref().unwrap());
-    assert!(dest.ends_with("renamed-note (1).txt"));
-    assert!(op::apply(&p.id, &[p.entries[0].id.clone()]).unwrap()[0].success);
-    assert_eq!(dest.parent(), source.parent());
-    assert!(op::already_processed(&dest).unwrap());
-    assert!(op::preview(Some(vec![dest.to_string_lossy().into()]))
-        .unwrap()
-        .entries
-        .is_empty());
-    let log = db::get_recent_logs(-1).unwrap().remove(0);
-    assert!(op::undo_one(log.id.unwrap()).unwrap());
-    assert_eq!(fs::read_to_string(&source).unwrap(), "original");
+    f.add(&rule);
+    let a = f.write("note.txt", "original");
+    let b = f.write("second.txt", "second");
+    let occupied = f.write("renamed-note.txt", "keep");
+    let plan = f.preview(&[&a, &b]);
+    let renamed = PathBuf::from(plan.entries[0].destination.as_ref().unwrap());
+    assert!(renamed.ends_with("renamed-note_0.txt"));
+    let selected = plan.entries.iter().map(|entry| entry.id.clone()).collect::<Vec<_>>();
+    assert!(op::apply(&plan.id, &selected, &f.suppression).unwrap().iter().all(|row| row.success));
+    assert!(op::already_processed(&renamed).unwrap());
+    let repeat = f.preview(&[&renamed]);
+    assert!(repeat.entries.is_empty());
+    op::discard(&repeat.id);
+
+    let filter = op::HistoryFilter {
+        rule: rule.name.clone(),
+        extension: ".TXT".into(),
+        ..Default::default()
+    };
+    let logs: Vec<_> = op::history(&filter).unwrap().into_iter().filter(|row| {
+        row.action.source_path == a.to_string_lossy() || row.action.source_path == b.to_string_lossy()
+    }).collect();
+    assert_eq!(logs.len(), 2);
+    assert!(logs[0].run_id.is_some());
+    assert_eq!(logs[0].run_id, logs[1].run_id);
+    let id = logs.iter().find(|row| row.action.source_path == a.to_string_lossy()).unwrap().action.id.unwrap();
+
+    fs::write(&renamed, "replaced").unwrap();
+    assert_eq!(undo_action_with(id, &f.suppression).unwrap().status, "failed");
+    assert_eq!(fs::read_to_string(&renamed).unwrap(), "replaced");
+    assert!(!a.exists());
+    fs::write(&renamed, "original").unwrap();
+    fs::write(&a, "new file").unwrap();
+    let result = undo_action_with(id, &f.suppression).unwrap();
+    assert_eq!(result.status, "collision", "{result:?}");
+    let restored = PathBuf::from(result.restored_to.unwrap());
+    assert_eq!(fs::read_to_string(&restored).unwrap(), "original");
+    assert!(op::already_processed(&restored).unwrap());
+    assert_eq!(fs::read_to_string(&a).unwrap(), "new file");
+    assert_eq!(fs::read_to_string(occupied).unwrap(), "keep");
     for template in ["../{stem}", "CON.txt", "{unknown}", "a:b", "foo."] {
-        assert!(op::validate_template(template).is_err(), "{template}");
+        rule.options.rename_template = template.into();
+        assert!(validate_rule_destination(&rule).is_err(), "{template}");
     }
 }
 
 #[test]
-fn only_new_baseline_modes_suggest_and_suspicious_queue() {
-    let f = Fixture::new();
+fn only_new_and_suggest_respect_baseline_and_keep_suspicious_files_reviewable() {
+    let mut f = Fixture::new();
     let mut rule = f.rule();
     rule.extensions = vec!["*".into()];
-    db::add_rule(&rule).unwrap();
+    f.add(&rule);
     let old = f.write("old.txt", "old");
-    let id = db::get_watched_folders().unwrap()[0].id.unwrap();
-    db::set_only_new(id, true).unwrap();
+    db::set_only_new(f.folder, true).unwrap();
     let new = f.write("new.txt", "new");
-    assert!(db::is_baseline_file(&old));
-    assert!(!db::is_baseline_file(&new));
-    db::update_folder_mode(id, "suggest").unwrap();
-    assert!(db::get_watched_folders().unwrap()[0].only_new);
-    assert!(rules::process_file_in_run(&new, true, "test", "scheduled")
-        .unwrap()
-        .is_none());
-    let p = op::preview(None).unwrap();
-    assert_eq!(p.entries.len(), 1);
-    assert!(p.entries[0].source.ends_with("new.txt"));
-    let suspicious = f.write("invoice.pdf.exe", "not an actual executable");
-    assert!(op::suspicious_name(&suspicious));
-    let p = op::preview(None).unwrap();
-    assert!(
-        p.entries
-            .iter()
-            .find(|e| e.source.ends_with("invoice.pdf.exe"))
-            .unwrap()
-            .warning
-    );
-    db::update_folder_mode(id, "silent").unwrap();
-    assert!(
-        rules::process_file_in_run(&suspicious, true, "test", "automatic")
-            .unwrap()
-            .is_none()
-    );
-    assert!(suspicious.exists());
-    db::set_only_new(id, false).unwrap();
-    assert!(!db::is_baseline_file(&old));
-    db::set_only_new(id, true).unwrap();
-    assert!(db::is_baseline_file(&new));
-    assert!(db::add_watched_folder(f.root.to_str().unwrap(), "manual").is_err());
+    let suspicious = f.write("invoice.pdf.exe", "unexpected extension");
+    db::update_folder_mode(f.folder, "suggest").unwrap();
+
+    let plan = f.preview(&[&old, &new, &suspicious]);
+    assert_eq!(plan.entries.len(), 2);
+    assert!(plan.entries.iter().any(|entry| entry.source.ends_with("new.txt") && !entry.warning));
+    assert!(plan.entries.iter().any(|entry| entry.source.ends_with("invoice.pdf.exe") && entry.warning));
+    op::discard(&plan.id);
+
+    db::update_folder_mode(f.folder, "paused").unwrap();
+    let plan = f.preview(&[&old, &new, &suspicious]);
+    assert!(plan.entries.is_empty());
+    op::discard(&plan.id);
+
+    db::update_folder_mode(f.folder, "manual").unwrap();
+    fs::remove_file(&old).unwrap();
+    db::forget_removed_baseline(f.folder, &old, &f.root).unwrap();
+    f.write("old.txt", "new file at old path");
+    let plan = f.preview(&[&old]);
+    assert_eq!(plan.entries.len(), 1);
+    op::discard(&plan.id);
+}
+
+#[test]
+fn delete_rule_cannot_be_applied_without_a_verified_recovery_method() {
+    let mut f = Fixture::new();
+    let mut rule = f.rule();
+    rule.action = "delete".into();
+    f.add(&rule);
+    let source = f.write("retain.txt", "keep");
+    let plan = f.preview(&[&source]);
+    assert_eq!(plan.entries[0].error.as_deref(), Some("preview.recoveryUnavailable"));
+    assert!(op::apply(&plan.id, &[plan.entries[0].id.clone()], &f.suppression).is_err());
+    assert_eq!(fs::read_to_string(source).unwrap(), "keep");
 }
 
 #[cfg(windows)]
@@ -293,10 +243,7 @@ fn moving_preserves_mark_of_the_web_and_never_overwrites() {
     let mark = "[ZoneTransfer]\r\nZoneId=3\r\n";
     fs::write(format!("{}:Zone.Identifier", source.display()), mark).unwrap();
     op::move_without_overwrite(&source, &destination).unwrap();
-    assert_eq!(
-        fs::read_to_string(format!("{}:Zone.Identifier", destination.display())).unwrap(),
-        mark
-    );
+    assert_eq!(fs::read_to_string(format!("{}:Zone.Identifier", destination.display())).unwrap(), mark);
     let source = f.write("download.txt", "another");
     assert!(op::move_without_overwrite(&source, &destination).is_err());
     assert!(source.exists());

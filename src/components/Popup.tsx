@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useAppStore } from "../store/useAppStore";
+import ActionRefreshWarnings from "./ActionRefreshWarnings";
 import {
   FolderOpen,
   Sparkles,
@@ -18,9 +19,7 @@ import {
 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { check, type Update } from "@tauri-apps/plugin-updater";
-import { relaunch } from "@tauri-apps/plugin-process";
-import { PRIVATE_BETA } from "../build";
+import { UNDO_TONE_CLASS, undoNotice, type UndoNotice } from "../utils/undo";
 
 function getIconForType(typeName: string) {
   const lower = typeName.toLowerCase();
@@ -53,33 +52,35 @@ export default function Popup() {
     folders,
     pendingFiles,
     getPendingFiles,
-    settings,
-    loadSettings,
   } = useAppStore();
-  const [scanResults] = useState<
-    { file: string; rule: string; destination: string }[]
-  >([]);
+  const [reviewError, setReviewError] = useState<string | null>(null);
+  const [selectedFiles, setSelectedFiles] = useState<Set<string>>(new Set());
   const [toast, setToast] = useState<{
     file: string;
     rule: string;
     destination: string;
     destination_folder: string;
-    message?: string;
   } | null>(null);
-  const [selectedFiles, setSelectedFiles] = useState<Set<string>>(new Set());
-  const [availableUpdate, setAvailableUpdate] = useState<Update | null>(null);
-  const [updateBusy, setUpdateBusy] = useState(false);
-
-  const pendingPath = (folder: string, file: string) => {
-    const separator = folder.includes("\\") ? "\\" : "/";
-    return `${folder.replace(/[\\/]$/, "")}${separator}${file}`;
-  };
+  const [undoToast, setUndoToast] = useState<UndoNotice[] | null>(null);
 
   useEffect(() => {
-    loadLogs();
-    loadStats();
-    loadFolders();
-    loadSettings();
+    if (!toast) return;
+    const timer = setTimeout(() => setToast(null), 30000);
+    return () => clearTimeout(timer);
+  }, [toast]);
+
+  // 8s, not the 3s the other popups use: a `collision` line ends in a
+  // filesystem path, and 3s cuts it off before it can be read or copied.
+  useEffect(() => {
+    if (!undoToast) return;
+    const timer = setTimeout(() => setUndoToast(null), 8000);
+    return () => clearTimeout(timer);
+  }, [undoToast]);
+
+  useEffect(() => {
+    loadLogs().catch(console.error);
+    loadStats().catch(console.error);
+    loadFolders().catch(console.error);
     getPendingFiles();
 
     // Listen for file-organized events from Rust watcher — show in-app toast
@@ -93,11 +94,9 @@ export default function Popup() {
           rule: payload.rule,
           destination: payload.destination,
           destination_folder: destFolder,
-          message: payload.message || undefined,
         });
-        setTimeout(() => setToast(null), 30000);
-        loadLogs();
-        loadStats();
+        loadLogs().catch(console.error);
+        loadStats().catch(console.error);
         getPendingFiles();
       }
     });
@@ -108,56 +107,32 @@ export default function Popup() {
     }, 3000);
 
     return () => {
-      unlisten.then((f) => f());
+      unlisten.then((f) => f()).catch(console.error);
       clearInterval(interval);
     };
-  }, [loadLogs, loadStats, loadFolders, loadSettings, getPendingFiles]);
-
-  useEffect(() => {
-    if (!settings?.auto_update_enabled || PRIVATE_BETA) return;
-    check()
-      .then((update) => setAvailableUpdate(update))
-      .catch((error) => console.error("[updater] automatic check failed:", error));
-  }, [settings?.auto_update_enabled]);
-
-  useEffect(() => {
-    const available = new Set(
-      pendingFiles.map(([folder, file]) => pendingPath(folder, file))
-    );
-    setSelectedFiles((current) =>
-      new Set([...current].filter((path) => available.has(path)))
-    );
-  }, [pendingFiles]);
+  }, [loadLogs, loadStats, loadFolders, getPendingFiles]);
 
 
 
-  const handleClean = async () => {
-    await invoke("show_review_cmd", { paths: [] });
-    await invoke("close_popup");
+  const openReview = async (paths: string[]) => {
+    setReviewError(null);
+    try {
+      await invoke("show_review_cmd", { paths });
+      setSelectedFiles(new Set());
+    } catch (error) {
+      setReviewError(String(error));
+    }
   };
+
+  const pendingPaths = pendingFiles.map(([folder, name]) => ({
+    name,
+    path: folder.replace(/[\\/]$/, "") + (folder.includes("\\") ? "\\" : "/") + name,
+  }));
+  const selectedPaths = pendingPaths.filter(({ path }) => selectedFiles.has(path)).map(({ path }) => path);
 
   const handleOpenDownloads = async () => {
     const downloads = folders[0]?.path || (await invoke<string>("get_downloads_folder"));
     await invoke("open_folder_cmd", { path: downloads });
-  };
-
-  const handleSelected = async () => {
-    if (selectedFiles.size === 0) return;
-    await invoke("show_review_cmd", { paths: [...selectedFiles] });
-    await invoke("close_popup");
-    setSelectedFiles(new Set());
-  };
-
-  const handleInstallUpdate = async () => {
-    if (!availableUpdate) return;
-    setUpdateBusy(true);
-    try {
-      await availableUpdate.downloadAndInstall();
-      await relaunch();
-    } catch (error) {
-      console.error("[updater] installation failed:", error);
-      setUpdateBusy(false);
-    }
   };
 
   const handleOpenActionFolder = async (filePath: string | null | undefined) => {
@@ -172,6 +147,27 @@ export default function Popup() {
 
   const handleQuit = () => {
     invoke("close_popup");
+  };
+
+  /**
+   * `undo_action_cmd` is a no-op on the row when the source is gone, yet the
+   * backend still flips `undone`, so the row below re-renders as a finished
+   * item. Reading the status here is the only thing that stops a file which is
+   * still sitting in its organised folder being reported as restored.
+   */
+  const handleUndo = async (id: number | undefined) => {
+    if (id === undefined) {
+      setUndoToast([{ tone: "error", key: "undo.noId" }]);
+      return;
+    }
+    try {
+      setUndoToast(undoNotice(await undoAction(id)));
+    } catch (e) {
+      console.error("Undo failed:", e);
+      setUndoToast([
+        { tone: "error", key: "confirm.failed", values: { error: String(e) } },
+      ]);
+    }
   };
 
   const totalStats = stats.reduce((sum, s) => sum + s.count, 0);
@@ -197,62 +193,39 @@ export default function Popup() {
       {/* Actions */}
       <div className="p-3 space-y-2">
         <button
-          onClick={handleClean}
+          onClick={() => void openReview([])}
           disabled={isLoading}
-          className="w-full flex items-center justify-center gap-2 rounded-lg bg-primary px-3 py-2.5 text-sm font-medium text-white hover:bg-primary-hover transition-colors disabled:opacity-60"
+          className="w-full flex items-center justify-center gap-2 rounded-lg bg-primary px-3 py-2.5 text-sm font-medium text-on-primary hover:bg-primary-hover transition-colors disabled:opacity-60"
         >
           <Sparkles size={15} />
-          {isLoading ? "..." : t("popup.organizeNow")}
+          {isLoading ? "..." : t("popup.cleanNow")}
         </button>
         {pendingFiles.length > 0 && (
-          <div className="rounded-lg border border-border bg-surface-dark p-2 space-y-2">
-            <div className="flex items-center justify-between text-xs text-text-muted">
-              <span>{t("popup.pendingFiles", { count: pendingFiles.length })}</span>
-              <button
-                onClick={() => {
-                  const all = pendingFiles.map(([folder, file]) => pendingPath(folder, file));
-                  setSelectedFiles(
-                    selectedFiles.size === all.length ? new Set() : new Set(all)
-                  );
-                }}
-                className="text-primary hover:underline"
-              >
-                {selectedFiles.size === pendingFiles.length
-                  ? t("popup.clearSelection")
-                  : t("popup.selectAll")}
-              </button>
-            </div>
-            <div className="max-h-20 overflow-auto space-y-1">
-              {pendingFiles.map(([folder, file]) => {
-                const path = pendingPath(folder, file);
-                return (
-                  <label key={path} className="flex items-center gap-2 text-xs">
-                    <input
-                      type="checkbox"
-                      checked={selectedFiles.has(path)}
-                      onChange={() =>
-                        setSelectedFiles((current) => {
-                          const next = new Set(current);
-                          if (next.has(path)) next.delete(path);
-                          else next.add(path);
-                          return next;
-                        })
-                      }
-                    />
-                    <span className="truncate" title={path}>{file}</span>
-                  </label>
-                );
-              })}
-            </div>
-            <button
-              onClick={handleSelected}
-              disabled={selectedFiles.size === 0 || isLoading}
-              className="w-full rounded-md border border-primary px-2 py-1.5 text-xs font-medium text-primary hover:bg-primary/10 disabled:opacity-50"
-            >
-              {t("popup.organizeSelected", { count: selectedFiles.size })}
-            </button>
+          <div className="text-center text-xs text-text-muted">
+            {t("popup.pendingFiles", { count: pendingFiles.length })}
           </div>
         )}
+        {reviewError && <p role="alert" className="mt-2 break-words text-xs text-red-600">{reviewError}</p>}
+        <ActionRefreshWarnings />
+        {pendingPaths.length > 0 && <div className="mt-2 space-y-2">
+          <div className="max-h-24 space-y-1 overflow-auto text-xs">
+            {pendingPaths.map(({ name, path }) => <label key={path} className="flex items-center gap-2" title={path}>
+              <input type="checkbox" checked={selectedFiles.has(path)} onChange={(event) => {
+                const checked = event.target.checked;
+                setSelectedFiles((previous) => {
+                  const next = new Set(previous);
+                  if (checked) next.add(path);
+                  else next.delete(path);
+                  return next;
+                });
+              }} />
+              <span className="truncate">{name}</span>
+            </label>)}
+          </div>
+          <button type="button" disabled={!selectedPaths.length} className="text-xs text-primary underline disabled:opacity-50"
+            onClick={() => void openReview(selectedPaths)}>{t("beta.review")} ({selectedPaths.length})</button>
+        </div>}
+
         <button
           onClick={handleOpenDownloads}
           className="w-full flex items-center justify-center gap-2 rounded-lg border border-border px-3 py-2 text-sm font-medium hover:bg-surface-dark transition-colors"
@@ -288,18 +261,18 @@ export default function Popup() {
                 <span className="text-text-muted truncate max-w-[80px]">
                   {log.file_type}
                 </span>
-                {!log.undone && log.id && log.action === "move" && log.destination_path && (
+                {!log.undone && log.id && (
                   <>
                     <button
                       onClick={() => handleOpenActionFolder(log.destination_path)}
                       className="p-1 rounded hover:bg-border text-text-muted hover:text-text"
-                      title={t("popup.openActionFolder")}
-                      aria-label={t("popup.openActionFolder")}
+                      title={t("cleanup.openFolder")}
+                      aria-label={t("cleanup.openFolder")}
                     >
                       <FolderOpen size={12} />
                     </button>
                     <button
-                      onClick={() => undoAction(log.id!)}
+                      onClick={() => void handleUndo(log.id)}
                       className="p-1 rounded hover:bg-border text-text-muted hover:text-text"
                       title={t("popup.undo")}
                       aria-label={t("popup.undo")}
@@ -343,33 +316,24 @@ export default function Popup() {
       {/* Clickable toast for auto-organized files */}
       {toast && (
         <div className="px-3 pb-2">
-          <div
-            onPointerDown={async () => {
-              try {
-                await invoke("open_folder_cmd", { path: toast.destination_folder });
-              } catch {
-                console.error("Failed to open folder");
-              }
-              setToast(null);
-            }}
-            className="w-full text-left rounded-lg bg-primary/10 border border-primary/20 px-3 py-2 text-xs hover:bg-primary/20 transition-colors cursor-pointer"
-            role="button"
-          >
+          <div className="w-full rounded-lg bg-primary/10 border border-primary/20 px-3 py-2 text-xs">
             <div className="flex items-center justify-between">
-              <div className="flex items-center gap-1.5 text-primary">
-                <ExternalLink size={12} />
-                <span className="font-medium">
-                  {toast.message || t("popup.organized", { file: toast.file })}
-                </span>
-              </div>
-              <button
-                onClick={(e) => {
-                  e.stopPropagation();
+              <button type="button" className="flex items-center gap-1.5 text-primary text-left hover:underline" onClick={async () => {
+                try {
+                  await invoke("open_folder_cmd", { path: toast.destination_folder });
                   setToast(null);
-                }}
+                } catch (e) {
+                  setUndoToast([{ tone: "error", key: "confirm.failed", values: { error: String(e) } }]);
+                }
+              }}>
+                <ExternalLink size={12} />
+                <span className="font-medium">{t("popup.organized", { file: toast.file })}</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setToast(null)}
+                aria-label={t("common.dismiss")}
                 className="p-0.5 rounded hover:bg-primary/20 text-primary"
-                title={t("common.close")}
-                aria-label={t("common.close")}
               >
                 <X size={10} />
               </button>
@@ -381,31 +345,28 @@ export default function Popup() {
         </div>
       )}
 
-      {/* Scan results toast */}
-      {scanResults.length > 0 && (
-        <div className="px-3 pb-3">
-          <div className="rounded-lg bg-green-50 border border-green-200 px-3 py-2 text-xs text-green-700">
-            {t("notifications.cleaned", { count: scanResults.length })}
-          </div>
+      {/* Pinned near the bottom of the tray, where the rows themselves offer no
+          correction: a `missing` undo just makes the row's Undo button vanish,
+          which looks exactly like a file that went home. */}
+      {undoToast && (
+        <div
+          role="status"
+          aria-live="polite"
+          className="space-y-1 px-3 pb-2"
+        >
+          {undoToast.map((notice) => (
+            <div
+              key={notice.key}
+              className={`rounded-lg px-3 py-2 text-xs ${UNDO_TONE_CLASS[notice.tone]}`}
+            >
+              {t(notice.key, notice.values)}
+            </div>
+          ))}
         </div>
       )}
 
-      {availableUpdate && (
-        <div className="px-3 pb-3">
-          <div className="rounded-lg border border-primary/30 bg-primary/10 p-2.5 text-xs">
-            <div className="font-medium">
-              {t("updater.available", { version: availableUpdate.version })}
-            </div>
-            <button
-              onClick={handleInstallUpdate}
-              disabled={updateBusy}
-              className="mt-2 w-full rounded-md bg-primary px-2 py-1.5 font-medium text-white disabled:opacity-60"
-            >
-              {updateBusy ? t("updater.installing") : t("updater.installRestart")}
-            </button>
-          </div>
-        </div>
-      )}
+      {/* Scan results toast */}
+
     </div>
   );
 }
