@@ -53,7 +53,9 @@ Suggestions prepare an immutable per-file backend plan before confirmation. It c
 
 Creating a future extension rule is off by default. The review states its global scope, priority, existing coverage/conflicts and deduplicated count. Such rules apply to eligible watched folders added later as well. Conflicting automation must be edited explicitly.
 
-Local AI is disabled until enabled in Settings. Choose an installed Ollama model there. When needed, the backend contacts only `http://127.0.0.1:11434`, with redirects and environment proxies disabled, bounded responses and request budgets. It verifies the selected model against the model list. Filenames are sent to that local service; file contents are not. Missing models or optional provider failures fall back to offline results without changing their provenance. Switching off Local AI disables future model requests; a request already in flight can finish within its timeout.
+Local AI is disabled until enabled in Settings. Choose an installed Ollama model there. When needed, the backend contacts only `http://127.0.0.1:11434`, with redirects and environment proxies disabled, bounded responses and request budgets. It verifies the selected model against the model list and sends only filenames for classification.
+
+If Suggestions needs local AI and cannot connect to Ollama, it prompts you to start Ollama. If Ollama does not list the selected model, install it or choose an installed model in Settings → General. You can still review and accept offline suggestions. Mouzi briefly remembers unsuccessful lookups, so if the message persists after fixing the problem, refresh again in a minute. Turning off local AI disables future requests. A request already in flight can finish within its timeout.
 
 ## Archives and recovery records
 
