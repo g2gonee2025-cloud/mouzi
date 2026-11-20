@@ -106,13 +106,9 @@ pub fn set_only_new_cmd(window: tauri::WebviewWindow, id: i64, enabled: bool) ->
     Ok(())
 }
 
-#[tauri::command(async)]
-pub fn show_review_cmd(app: AppHandle, paths: Vec<String>) -> Result<(), String> {
-    let state = app.try_state::<AppState>().ok_or("Application coordinator is unavailable")?;
-    *state.review_request.lock().map_err(|_| "Organization review request is unavailable")? = Some(paths);
-    crate::tray::show_settings_window(&app);
-    let _ = app.emit("open-review", ());
-    Ok(())
+#[tauri::command]
+pub async fn show_review_cmd(app: AppHandle, paths: Vec<String>) -> Result<(), String> {
+    crate::tray::open_window(&app, crate::tray::WindowAction::Review(paths)).await
 }
 
 #[tauri::command]
@@ -982,9 +978,9 @@ pub fn save_mouziignore_cmd(app: AppHandle, folder_path: String, patterns: Vec<S
     })
 }
 
-#[tauri::command(async)]
-pub fn show_popup_cmd(app: AppHandle) {
-    crate::tray::show_popup_window(&app);
+#[tauri::command]
+pub async fn show_popup_cmd(app: AppHandle) -> Result<(), String> {
+    crate::tray::open_window(&app, crate::tray::WindowAction::Popup).await
 }
 
 /// Return files detected in manual-mode folders that are waiting for Clean Now.

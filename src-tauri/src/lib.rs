@@ -156,14 +156,14 @@ pub fn run() {
 
             // On first launch, show the popup so the user knows the app is running
             if is_first_run {
-                tray::show_popup_window(&app_handle);
+                let _ = tray::show_popup_window(&app_handle);
             }
 
             // Dev: open the dashboard so `tauri dev` lands on the main surface.
             #[cfg(debug_assertions)]
             {
                 if std::env::var("MOUZI_OPEN").unwrap_or_else(|_| "dashboard".into()) != "none" {
-                    tray::show_dashboard_window(&app_handle);
+                    let _ = tray::show_dashboard_window(&app_handle);
                 }
             }
 

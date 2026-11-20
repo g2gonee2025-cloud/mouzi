@@ -1,8 +1,72 @@
+use std::sync::mpsc::{self, Sender};
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 use crate::db::get_settings;
 use crate::i18n::TrayI18n;
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum WindowAction {
+    Popup,
+    Settings,
+    Dashboard,
+    Suggestions,
+    Cleanup,
+    Review(Vec<String>),
+}
+
+impl WindowAction {
+    fn show(self, app: &AppHandle) -> Result<(), String> {
+        match self {
+            Self::Popup => show_popup_window(app),
+            Self::Settings => show_settings_window(app),
+            Self::Dashboard => show_dashboard_window(app),
+            Self::Suggestions => show_app_window(app, "/#/suggestions", "suggestions_title"),
+            Self::Cleanup => show_app_window(app, "/#/cleanup", "cleanup_title"),
+            Self::Review(paths) => return show_review_window(app, paths),
+        }.map_err(|error| error.to_string())
+    }
+}
+
+type WindowCompletion = tauri::async_runtime::Sender<Result<(), String>>;
+
+struct WindowRequest {
+    app: AppHandle,
+    action: WindowAction,
+    completion: Option<WindowCompletion>,
+}
+
+struct WindowDispatch(Sender<WindowRequest>);
+
+fn dispatch_in_order<Request: Send + 'static>(
+    mut handle: impl FnMut(Request) + Send + 'static,
+) -> std::io::Result<Sender<Request>> {
+    let (sender, requests) = mpsc::channel();
+    // Building a WebView2 window can wait on the Windows event loop. Queue
+    // from GUI callbacks and let this worker complete one request at a time.
+    std::thread::Builder::new().name("mouzi-window-dispatch".into()).spawn(move || {
+        for request in requests { handle(request); }
+    })?;
+    Ok(sender)
+}
+
+fn queue_window(app: &AppHandle, action: WindowAction, completion: Option<WindowCompletion>) -> Result<(), String> {
+    let dispatch = app.try_state::<WindowDispatch>().ok_or("Window dispatch is unavailable")?;
+    dispatch.inner().0.send(WindowRequest { app: app.clone(), action, completion })
+        .map_err(|_| "Window dispatch has stopped".into())
+}
+
+fn queue_tray_window(app: &AppHandle, action: WindowAction) {
+    if let Err(error) = queue_window(app, action, None) {
+        eprintln!("[tray] Could not queue window request: {error}");
+    }
+}
+
+pub(crate) async fn open_window(app: &AppHandle, action: WindowAction) -> Result<(), String> {
+    let (complete, mut result) = tauri::async_runtime::channel(1);
+    queue_window(app, action, Some(complete))?;
+    result.recv().await.ok_or_else(|| "Window dispatch ended before reporting a result".to_string())?
+}
 
 pub fn setup_tray(app: &AppHandle, lang: &str) -> Result<(), Box<dyn std::error::Error>> {
     let i18n = TrayI18n::new(lang);
@@ -17,33 +81,33 @@ pub fn setup_tray(app: &AppHandle, lang: &str) -> Result<(), Box<dyn std::error:
 
     let menu = Menu::with_items(app, &[&clean_i, &suggestions_i, &dashboard_i, &cleanup_i, &settings_i, &separator, &quit_i])?;
 
+    app.manage(WindowDispatch(dispatch_in_order(|request: WindowRequest| {
+        let result = request.action.show(&request.app);
+        if let Some(complete) = request.completion {
+            let _ = complete.try_send(result);
+        } else if let Err(error) = result {
+            eprintln!("[tray] Could not open window: {error}");
+        }
+    })?));
+
     let mut builder = TrayIconBuilder::with_id("tray")
         .tooltip(i18n.get("tooltip"))
         .menu(&menu)
         .on_menu_event(|app, event| {
-            if event.id.as_ref() == "quit" {
-                app.exit(0);
-                return;
-            }
-            let app = app.clone();
-            // WebView2 needs the Windows event loop to keep pumping while a window is built.
-            tauri::async_runtime::spawn_blocking(move || match event.id.as_ref() {
-                "settings" => show_settings_window(&app),
-                "dashboard" => show_dashboard_window(&app),
-                "suggestions" => show_suggestions_window(&app),
-                "cleanup" => show_cleanup_window(&app),
-                "clean" => {
-                    if let Err(error) = crate::commands::show_review_cmd(app, Vec::new()) {
-                        eprintln!("[tray] Could not open organization review: {error}");
-                    }
-                }
-                _ => {}
-            });
+            let action = match event.id.as_ref() {
+                "quit" => { app.exit(0); return; }
+                "settings" => WindowAction::Settings,
+                "dashboard" => WindowAction::Dashboard,
+                "suggestions" => WindowAction::Suggestions,
+                "cleanup" => WindowAction::Cleanup,
+                "clean" => WindowAction::Review(Vec::new()),
+                _ => return,
+            };
+            queue_tray_window(app, action);
         })
         .on_tray_icon_event(|tray, event| {
             if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = event {
-                let app = tray.app_handle().clone();
-                tauri::async_runtime::spawn_blocking(move || show_popup_window(&app));
+                queue_tray_window(tray.app_handle(), WindowAction::Popup);
             }
         });
 
@@ -62,44 +126,23 @@ fn tray_lang(_app: &AppHandle) -> String {
         .unwrap_or_else(|_| "en".to_string())
 }
 
-pub fn show_popup_window(app: &AppHandle) {
+pub fn show_popup_window(app: &AppHandle) -> tauri::Result<()> {
     let i18n = TrayI18n::new(&tray_lang(app));
     if let Some(window) = app.get_webview_window("popup") {
-        let _ = window.show();
-        let _ = window.set_focus();
-    } else {
-        #[cfg(target_os = "macos")]
-        let window = tauri::WebviewWindowBuilder::new(
-            app,
-            "popup",
-            tauri::WebviewUrl::App("/#/popup".into()),
-        )
-        .title(i18n.get("popup_title"))
-        .inner_size(300.0, 420.0)
-        .decorations(false)
-        .always_on_top(true)
-        .shadow(false)
-        .build();
-
-        #[cfg(not(target_os = "macos"))]
-        let window = tauri::WebviewWindowBuilder::new(
-            app,
-            "popup",
-            tauri::WebviewUrl::App("/#/popup".into()),
-        )
-        .title(i18n.get("popup_title"))
-        .inner_size(300.0, 420.0)
-        .decorations(false)
-        .always_on_top(true)
-        .skip_taskbar(true)
-        .shadow(false)
-        .build();
-
-        if let Ok(win) = window {
-            let _ = win.show();
-            let _ = win.set_focus();
-        }
+        window.show()?;
+        return window.set_focus();
     }
+    let builder = tauri::WebviewWindowBuilder::new(app, "popup", tauri::WebviewUrl::App("/#/popup".into()))
+        .title(i18n.get("popup_title"))
+        .inner_size(300.0, 420.0)
+        .decorations(false)
+        .always_on_top(true)
+        .shadow(false);
+    #[cfg(not(target_os = "macos"))]
+    let builder = builder.skip_taskbar(true);
+    let window = builder.build()?;
+    window.show()?;
+    window.set_focus()
 }
 
 pub fn update_tray_language(app: &AppHandle, lang: &str) {
@@ -164,15 +207,14 @@ pub fn location_hash_script(hash: &str) -> String {
 /// One workspace window for dashboard, cleanup, suggestions, and settings.
 /// The tray popup stays a separate compact flyout.
 /// `url` is a Tauri webview path (`/#/dashboard`); eval uses the fragment only.
-fn show_app_window(app: &AppHandle, url: &str, title_key: &str) {
+fn show_app_window(app: &AppHandle, url: &str, title_key: &str) -> tauri::Result<()> {
     let i18n = TrayI18n::new(&tray_lang(app));
     let title = i18n.get(title_key);
     if let Some(window) = app.get_webview_window("app") {
-        let _ = window.eval(&location_hash_script(url));
-        let _ = window.set_title(title);
-        let _ = window.show();
-        let _ = window.set_focus();
-        return;
+        window.eval(&location_hash_script(url))?;
+        window.set_title(title)?;
+        window.show()?;
+        return window.set_focus();
     }
     let window = tauri::WebviewWindowBuilder::new(
         app,
@@ -182,12 +224,9 @@ fn show_app_window(app: &AppHandle, url: &str, title_key: &str) {
     .title(title)
     .inner_size(1100.0, 820.0)
     .min_inner_size(800.0, 600.0)
-    .build();
-
-    if let Ok(win) = window {
-        let _ = win.show();
-        let _ = win.set_focus();
-    }
+    .build()?;
+    window.show()?;
+    window.set_focus()
 }
 
 pub fn hide_app_window(app: &AppHandle) {
@@ -196,25 +235,52 @@ pub fn hide_app_window(app: &AppHandle) {
     }
 }
 
-pub fn show_settings_window(app: &AppHandle) {
-    show_app_window(app, "/#/settings", "settings_title");
+pub fn show_settings_window(app: &AppHandle) -> tauri::Result<()> {
+    show_app_window(app, "/#/settings", "settings_title")
 }
 
-pub fn show_dashboard_window(app: &AppHandle) {
-    show_app_window(app, "/#/dashboard", "dashboard_title");
+pub fn show_dashboard_window(app: &AppHandle) -> tauri::Result<()> {
+    show_app_window(app, "/#/dashboard", "dashboard_title")
 }
 
-pub fn show_suggestions_window(app: &AppHandle) {
-    show_app_window(app, "/#/suggestions", "suggestions_title");
-}
-
-pub fn show_cleanup_window(app: &AppHandle) {
-    show_app_window(app, "/#/cleanup", "cleanup_title");
+fn show_review_window(app: &AppHandle, paths: Vec<String>) -> Result<(), String> {
+    let state = app.try_state::<crate::AppState>().ok_or("Application coordinator is unavailable")?;
+    *state.review_request.lock().map_err(|_| "Organization review request is unavailable")? = Some(paths);
+    if let Err(error) = show_settings_window(app) {
+        // The serial dispatcher is the only writer. The renderer may have
+        // already consumed the payload if showing the window partly succeeded.
+        if let Ok(mut pending) = state.review_request.lock() { *pending = None; }
+        return Err(error.to_string());
+    }
+    app.emit("open-review", ()).map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{location_hash_script, workspace_fragment};
+    use super::{dispatch_in_order, location_hash_script, workspace_fragment, WindowAction};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    #[test]
+    fn queued_window_actions_wait_for_the_first_and_keep_their_order() {
+        let (observed, events) = mpsc::channel();
+        let (release, blocked) = mpsc::channel();
+        let queue = dispatch_in_order(move |action| {
+            let first = action == WindowAction::Popup;
+            observed.send(action).unwrap();
+            if first { blocked.recv().unwrap(); }
+        }).unwrap();
+
+        queue.send(WindowAction::Popup).unwrap();
+        let timeout = Duration::from_secs(2);
+        assert_eq!(events.recv_timeout(timeout).unwrap(), WindowAction::Popup);
+        queue.send(WindowAction::Settings).unwrap();
+        queue.send(WindowAction::Dashboard).unwrap();
+        assert_eq!(events.try_recv(), Err(mpsc::TryRecvError::Empty));
+        release.send(()).unwrap();
+        assert_eq!(events.recv_timeout(timeout).unwrap(), WindowAction::Settings);
+        assert_eq!(events.recv_timeout(timeout).unwrap(), WindowAction::Dashboard);
+    }
 
     fn assigned_fragment(script: &str) -> &str {
         script
