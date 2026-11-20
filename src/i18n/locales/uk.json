@@ -357,6 +357,7 @@
     "staleDays": "Днів",
     "selectAll": "Вибрати все",
     "kept": "Збережено",
+    "keepFile": "Залишити {{path}}",
     "confirm": "Підтвердити ({{count}})",
     "reclaimable": "Звільняється: {{size}}",
     "noDuplicates": "Дублікатів не знайдено",

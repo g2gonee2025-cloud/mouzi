@@ -363,6 +363,7 @@
     "staleDays": "Ngày",
     "selectAll": "Chọn tất cả",
     "kept": "Đã giữ lại",
+    "keepFile": "Giữ lại {{path}}",
     "confirm": "Xác nhận ({{count}})",
     "reclaimable": "Có thể thu hồi: {{size}}",
     "noDuplicates": "Không tìm thấy tệp trùng lặp",

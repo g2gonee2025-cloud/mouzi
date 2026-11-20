@@ -357,6 +357,7 @@
     "staleDays": "日",
     "selectAll": "すべて選択",
     "kept": "保持",
+    "keepFile": "{{path}} を残す",
     "confirm": "確認（{{count}}件）",
     "reclaimable": "解放可能: {{size}}",
     "noDuplicates": "重複ファイルは見つかりませんでした",

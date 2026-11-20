@@ -1,4 +1,4 @@
-import { useState, useCallback, useMemo, useRef } from "react";
+import { useState, useCallback, useId, useMemo, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import { useCleanupStore } from "../../store/useCleanupStore";
 import { formatBytes, formatTimestamp } from "../../utils/format";
@@ -33,6 +33,7 @@ export default function FileListTab({
 }: FileListTabProps) {
   const { t } = useTranslation();
   const store = useCleanupStore();
+  const thresholdId = useId();
   const [threshold, setThreshold] = useState(defaultThreshold);
   const [checked, setChecked] = useState<Set<string>>(new Set());
   const [showResults, setShowResults] = useState(false);
@@ -139,12 +140,13 @@ export default function FileListTab({
           <p className="text-xs text-text-muted">{hint}</p>
         </div>
         <div className="flex items-center gap-2">
-          <label className="text-xs text-text-muted shrink-0">
+          <label htmlFor={thresholdId} className="text-xs text-text-muted shrink-0">
             {isBytes
               ? t("cleanup.minBytes")
               : t("cleanup.staleDays")}
           </label>
           <input
+            id={thresholdId}
             type="number"
             min={1}
             value={threshold}
@@ -212,6 +214,7 @@ export default function FileListTab({
                   >
                     <input
                       type="checkbox"
+                      aria-label={f.path}
                       checked={checked.has(f.path)}
                       onChange={() => toggle(f.path)}
                       className="rounded border-border shrink-0"

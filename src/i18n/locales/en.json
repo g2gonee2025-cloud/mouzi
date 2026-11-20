@@ -357,6 +357,7 @@
     "staleDays": "Days",
     "selectAll": "Select all",
     "kept": "Kept",
+    "keepFile": "Keep {{path}}",
     "confirm": "Confirm ({{count}})",
     "reclaimable": "Reclaimable: {{size}}",
     "noDuplicates": "No duplicates found",

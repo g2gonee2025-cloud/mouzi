@@ -357,6 +357,7 @@
     "staleDays": "Дней",
     "selectAll": "Выбрать всё",
     "kept": "Сохранено",
+    "keepFile": "Оставить {{path}}",
     "confirm": "Подтвердить ({{count}})",
     "reclaimable": "Освобождается: {{size}}",
     "noDuplicates": "Дубликаты не найдены",

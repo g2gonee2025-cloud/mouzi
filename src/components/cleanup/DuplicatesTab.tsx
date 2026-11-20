@@ -5,6 +5,7 @@ import {
   formatBytes,
   formatTimestamp,
 } from "../../utils/format";
+import { fileName, parentDir } from "../../utils/paths";
 import {
   reclaimableBytes,
   sortGroups,
@@ -183,7 +184,6 @@ function DuplicateGroupCard({
       <div className="space-y-1">
         {group.files.map((f) => {
           const isKept = f.path === keepPath;
-          const fname = f.path.split("\\").pop()?.split("/").pop() || f.path;
           return (
             <div
               key={f.path}
@@ -194,6 +194,9 @@ function DuplicateGroupCard({
               }`}
             >
               <button
+                type="button"
+                aria-label={t("cleanup.keepFile", { path: f.path })}
+                aria-pressed={isKept}
                 onClick={() => onKeep(group.hash, f.path)}
                 className={`shrink-0 w-4 h-4 rounded-full border-2 flex items-center justify-center transition-colors ${
                   isKept
@@ -203,9 +206,10 @@ function DuplicateGroupCard({
               >
                 {isKept && <Check size={10} className="text-white" />}
               </button>
-              <span className="flex-1 truncate" title={f.path}>
-                {fname}
-              </span>
+              <div className="min-w-0 flex-1">
+                <span className="block break-all">{fileName(f.path)}</span>
+                <span className="block break-all text-text-muted">{parentDir(f.path)}</span>
+              </div>
               <span className="text-text-muted shrink-0">
                 {formatTimestamp(f.mtime)}
               </span>

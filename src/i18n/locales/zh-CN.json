@@ -357,6 +357,7 @@
     "staleDays": "天数",
     "selectAll": "全选",
     "kept": "保留",
+    "keepFile": "保留 {{path}}",
     "confirm": "确认（{{count}}）",
     "reclaimable": "可释放空间：{{size}}",
     "noDuplicates": "未找到重复文件",

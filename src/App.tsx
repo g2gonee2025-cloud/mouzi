@@ -55,8 +55,10 @@ function App() {
     if (!settings) return;
     const lang = (settings.language || "en") as SupportedLang;
     let disposed = false;
-    initI18n(lang).then(() => {
-      if (!disposed) setReady(true);
+    initI18n(lang).then((resolvedLanguage) => {
+      if (disposed) return;
+      document.documentElement.lang = resolvedLanguage;
+      setReady(true);
     }).catch((e) => {
       if (!disposed) setBootError(String(e));
     });

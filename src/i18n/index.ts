@@ -37,6 +37,7 @@ export async function initI18n(lang: SupportedLang) {
       escapeValue: false,
     },
   });
+  return i18n.resolvedLanguage ?? 'en';
 }
 
 export default i18n;

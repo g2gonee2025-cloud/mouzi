@@ -147,6 +147,7 @@ export default function EmptyDirsTab() {
                 >
                   <input
                     type="checkbox"
+                    aria-label={path}
                     checked={checked.has(path)}
                     onChange={() => toggle(path)}
                     className="rounded border-border shrink-0"
