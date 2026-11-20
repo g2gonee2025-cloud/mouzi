@@ -7,6 +7,7 @@ use regex::Regex;
 use std::fs;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 /// Probe whether another process denies write sharing on this file.
@@ -443,6 +444,7 @@ pub(crate) struct WatchedRoot {
     pub(crate) id: i64,
     pub(crate) path: PathBuf,
     identity: FileIdentity,
+    watch_active: AtomicBool,
 }
 
 pub(crate) type WatchedManualRoot = WatchedRoot;
@@ -457,7 +459,14 @@ impl WatchedRoot {
         crate::safe_fs::validate_root(&path)?;
         let _guard = crate::safe_fs::guard_directory(&path)?;
         let identity = crate::safe_fs::file_identity(&path)?;
-        Ok(Self { id, path, identity })
+        Ok(Self { id, path, identity, watch_active: AtomicBool::new(true) })
+    }
+
+    pub(crate) fn capture_unattended(folder: &WatchedFolder, allow_legacy: bool) -> Result<Self, String> {
+        let root = Self::capture(folder)?;
+        let _guard = root.guard_physical()?;
+        crate::db::verify_watch_identity(root.id, &folder.path, &root.identity.key(), allow_legacy)?;
+        Ok(root)
     }
 
     pub(crate) fn matches_registration(&self, folder: &WatchedFolder) -> bool {
@@ -469,7 +478,22 @@ impl WatchedRoot {
         if crate::safe_fs::file_identity(&self.path)? != self.identity {
             return Err(format!("Watched folder changed identity: {}", self.path.display()));
         }
+        if !self.watch_is_active() {
+            return Err("Folder watcher registration was retired".into());
+        }
         Ok(guard)
+    }
+
+    pub(crate) fn watch_is_active(&self) -> bool {
+        self.watch_active.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn same_physical_root(&self, other: &Self) -> bool {
+        self.identity == other.identity
+    }
+
+    pub(crate) fn retire_watch(&self) {
+        self.watch_active.store(false, Ordering::Release);
     }
 
     fn guard_current(&self, folders: &[WatchedFolder]) -> Result<AncestorGuard, String> {

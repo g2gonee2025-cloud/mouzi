@@ -564,7 +564,10 @@ fn migrate_organization_schema(conn: &Connection) -> SqliteResult<()> {
             ("extension_mappings", "TEXT NOT NULL DEFAULT 'jpeg:jpg'"),
             ("options", "TEXT NOT NULL DEFAULT '{}'"),
         ]),
-        ("watched_folders", &[("only_new", "INTEGER NOT NULL DEFAULT 0")]),
+        ("watched_folders", &[
+            ("only_new", "INTEGER NOT NULL DEFAULT 0"),
+            ("watch_identity", "TEXT"),
+        ]),
         ("action_logs", &[
             ("file_identity", "TEXT"),
             ("run_id", "TEXT"),
@@ -871,26 +874,29 @@ pub(crate) fn register_watched_folder(path: &str, mode: &str, only_new: bool) ->
         if existing.path == path
             || crate::safe_fs::file_identity(Path::new(&existing.path)).ok().as_ref() == Some(&identity)
         {
-            return existing.id.ok_or_else(|| "Existing folder has no identifier".into());
+            let id = existing.id.ok_or("Existing folder has no identifier")?;
+            verify_watch_identity(id, &existing.path, &identity.key(), true)?;
+            return Ok(id);
         }
     }
 
     let baseline = only_new.then(|| capture_folder_baseline(&canonical)).transpose()?;
-    insert_watched_folder(path, mode, baseline.as_deref()).map_err(|error| error.to_string())
+    insert_watched_folder(path, mode, baseline.as_deref(), Some(&identity.key()))
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
 pub fn add_watched_folder(path: &str, mode: &str) -> SqliteResult<i64> {
-    insert_watched_folder(path, mode, None)
+    insert_watched_folder(path, mode, None, None)
 }
 
-fn insert_watched_folder(path: &str, mode: &str, baseline: Option<&[PathBuf]>) -> SqliteResult<i64> {
+fn insert_watched_folder(path: &str, mode: &str, baseline: Option<&[PathBuf]>, identity: Option<&str>) -> SqliteResult<i64> {
     let ancestors = configured_inventory_ancestors(path, &get_watched_folders()?);
     let mut conn = sqlite_lock()?;
     let tx = conn.transaction()?;
     let changed = tx.execute(
-        "INSERT OR IGNORE INTO watched_folders (path, enabled, mode, only_new) VALUES (?1, 1, ?2, ?3)",
-        params![path, mode, baseline.is_some()],
+        "INSERT OR IGNORE INTO watched_folders (path, enabled, mode, only_new, watch_identity) VALUES (?1, 1, ?2, ?3, ?4)",
+        params![path, mode, baseline.is_some(), identity],
     )?;
     // INSERT OR IGNORE leaves last_insert_rowid unchanged on an existing row.
     let id = tx.query_row("SELECT id FROM watched_folders WHERE path=?1", [path], |row| row.get(0))?;
@@ -904,6 +910,28 @@ fn insert_watched_folder(path: &str, mode: &str, baseline: Option<&[PathBuf]>) -
     tx.execute("INSERT OR IGNORE INTO inventory_roots(root_path) VALUES(?1)", [path])?;
     tx.commit()?;
     Ok(id)
+}
+
+/// A watcher may learn a legacy registration at startup or when its path is
+/// explicitly added again. Background recovery must already have a binding.
+pub(crate) fn verify_watch_identity(id: i64, path: &str, identity: &str, allow_legacy: bool) -> Result<(), String> {
+    let conn = lock_db()?;
+    if allow_legacy {
+        conn.execute(
+            "UPDATE watched_folders SET watch_identity=?3 WHERE id=?1 AND path=?2 AND watch_identity IS NULL",
+            params![id, path, identity],
+        ).map_err(|error| error.to_string())?;
+    }
+    let expected: Option<String> = conn.query_row(
+        "SELECT watch_identity FROM watched_folders WHERE id=?1 AND path=?2",
+        params![id, path],
+        |row| row.get(0),
+    ).map_err(|error| error.to_string())?;
+    match expected {
+        Some(expected) if expected == identity => Ok(()),
+        Some(_) => Err("A different physical folder is at this location. Reconnect the original, or remove this registration and add the new folder.".into()),
+        None => Err("This older registration has no saved folder identity. Reconnect the original folder and restart Mouzi, or add the original folder again.".into()),
+    }
 }
 
 pub fn remove_watched_folder(id: i64) -> SqliteResult<()> {

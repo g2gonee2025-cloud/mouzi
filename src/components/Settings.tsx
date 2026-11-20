@@ -217,6 +217,7 @@ export default function Settings() {
   const [editingRule, setEditingRule] = useState<Rule | null>(null);
   const [newFolderPath, setNewFolderPath] = useState("");
   const [newOnlyNew, setNewOnlyNew] = useState(false);
+  const [watchIssues, setWatchIssues] = useState<Record<string, string>>({});
   const [explorer, setExplorer] = useState<[boolean, boolean]>([false, false]);
   const [writeError, setWriteError] = useState<string | null>(null);
   const [isSaving, setIsSaving] = useState(false);
@@ -264,6 +265,29 @@ export default function Settings() {
     Promise.all([loadRules(), loadFolders(), loadLogs(), getSchedule()])
       .catch((e) => setWriteError(String(e)));
   }, [loadRules, loadFolders, loadLogs, getSchedule]);
+
+  useEffect(() => {
+    let disposed = false;
+    let generation = 0;
+    let stop: (() => void) | undefined;
+    const refresh = async () => {
+      const request = ++generation;
+      try {
+        const issues = await invoke<Record<string, string>>("get_watcher_issues_cmd");
+        if (!disposed && request === generation) setWatchIssues(issues);
+      } catch (error) {
+        if (!disposed) console.error(error);
+      }
+    };
+    listen("watcher-health", () => { if (!disposed) void refresh(); }).then((unlisten) => {
+      if (disposed) unlisten();
+      else {
+        stop = unlisten;
+        if (!generation) void refresh();
+      }
+    }).catch(() => { if (!disposed) void refresh(); });
+    return () => { disposed = true; stop?.(); };
+  }, []);
 
   useEffect(() => {
     let disposed = false;
@@ -649,6 +673,9 @@ export default function Settings() {
                 >
                   <div className="min-w-0 flex-1">
                     <div className="text-sm font-medium truncate">{f.path}</div>
+                    {f.mode !== "paused" && watchIssues[f.path] && (
+                      <p role="status" className="mt-1 break-words text-xs text-text-muted">{watchIssues[f.path]}</p>
+                    )}
                     <div className="mt-1.5">
                       <label className="text-[10px] uppercase tracking-wide text-text-muted block mb-1">
                         {t("settings.folders.mode")}

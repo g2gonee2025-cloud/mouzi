@@ -240,6 +240,7 @@ pub fn run() {
             save_mouziignore_cmd,
             show_popup_cmd,
             get_pending_files_cmd,
+            get_watcher_issues_cmd,
             refresh_watcher_cmd,
             get_schedule_cmd,
             update_schedule_cmd,

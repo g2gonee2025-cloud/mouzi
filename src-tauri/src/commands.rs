@@ -954,6 +954,11 @@ pub fn get_pending_files_cmd(
     Ok(watcher.get_pending_files())
 }
 
+#[tauri::command(async)]
+pub fn get_watcher_issues_cmd(state: tauri::State<AppState>) -> Result<HashMap<String, String>, String> {
+    Ok(state.watcher.lock().map_err(|_| "Watcher state unavailable")?.issues())
+}
+
 /// Refresh all folder watchers. Useful after changing folder modes.
 #[tauri::command(async)]
 pub fn refresh_watcher_cmd(app: AppHandle) -> Result<(), String> {
