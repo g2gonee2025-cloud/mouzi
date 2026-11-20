@@ -43,6 +43,7 @@ export interface ActionLog {
   file_name: string;
   file_type: string;
   undone: boolean;
+  undo_verified?: boolean;
 }
 
 export interface OrganizationLog extends ActionLog {

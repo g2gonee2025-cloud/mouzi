@@ -4,7 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import { useTranslation } from "react-i18next";
 import { type OrganizationLog, type UndoResult, useAppStore } from "../store/useAppStore";
 import { parentDir } from "../utils/paths";
-import { UNDO_TONE_CLASS, undoNotice } from "../utils/undo";
+import { canRestoreLog as canRestore, UNDO_TONE_CLASS, undoNotice } from "../utils/undo";
 import { buttonClass, fieldClass, primaryClass, errorText } from "./BetaControls";
 import ConfirmDialog, { type ConfirmRequest } from "./cleanup/ConfirmDialog";
 
@@ -16,10 +16,6 @@ type HistoryRead =
 
 interface SelectedUndoResult extends UndoResult {
   id: number;
-}
-
-function canRestore(log: OrganizationLog) {
-  return log.id !== undefined && !log.undone && log.undo_verified && ["move", "rename", "accept"].includes(log.action);
 }
 
 export default function HistoryView() {

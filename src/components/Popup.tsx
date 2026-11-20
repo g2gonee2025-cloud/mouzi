@@ -21,7 +21,7 @@ import {
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { parentDir } from "../utils/paths";
-import { UNDO_TONE_CLASS, undoNotice, type UndoNotice } from "../utils/undo";
+import { canRestoreLog, UNDO_TONE_CLASS, undoNotice, type UndoNotice } from "../utils/undo";
 
 function getIconForType(typeName: string) {
   const lower = typeName.toLowerCase();
@@ -286,27 +286,25 @@ export default function Popup() {
                 <span className="text-text-muted truncate max-w-[80px]">
                   {log.file_type}
                 </span>
-                {!log.undone && log.id && (
-                  <>
-                    {log.destination_path && (
-                      <button
-                        onClick={() => handleOpenActionFolder(log.destination_path)}
-                        className="p-1 rounded hover:bg-border text-text-muted hover:text-text"
-                        title={t("cleanup.openFolder")}
-                        aria-label={t("cleanup.openFolder")}
-                      >
-                        <FolderOpen size={12} />
-                      </button>
-                    )}
-                    <button
-                      onClick={() => void handleUndo(log.id)}
-                      className="p-1 rounded hover:bg-border text-text-muted hover:text-text"
-                      title={t("popup.undo")}
-                      aria-label={t("popup.undo")}
-                    >
-                      <RotateCcw size={12} />
-                    </button>
-                  </>
+                {!log.undone && log.id && log.destination_path && (
+                  <button
+                    onClick={() => handleOpenActionFolder(log.destination_path)}
+                    className="p-1 rounded hover:bg-border text-text-muted hover:text-text"
+                    title={t("cleanup.openFolder")}
+                    aria-label={t("cleanup.openFolder")}
+                  >
+                    <FolderOpen size={12} />
+                  </button>
+                )}
+                {canRestoreLog(log) && (
+                  <button
+                    onClick={() => void handleUndo(log.id)}
+                    className="p-1 rounded hover:bg-border text-text-muted hover:text-text"
+                    title={t("popup.undo")}
+                    aria-label={t("popup.undo")}
+                  >
+                    <RotateCcw size={12} />
+                  </button>
                 )}
               </div>
             ))}
