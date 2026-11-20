@@ -2385,7 +2385,6 @@ pub fn get_dashboard_snapshot() -> SqliteResult<DashboardSnapshot> {
     let largest_files=get_snapshot_files_on(&tx,"size")?;
     let recent_files=get_snapshot_files_on(&tx,"mtime")?;
     let now=now_epoch();
-    let mut insights = get_insights_on(&tx,now)?;
     // Use the current-root relation for all snapshot aggregates.
     let (large_files,large_bytes,stale_files,stale_bytes,other_files):(i64,i64,i64,i64,i64)=tx.query_row(
         "SELECT COALESCE(SUM(size>=?1),0),COALESCE(SUM(CASE WHEN size>=?1 THEN size ELSE 0 END),0),
@@ -2393,9 +2392,24 @@ pub fn get_dashboard_snapshot() -> SqliteResult<DashboardSnapshot> {
          FROM file_inventory WHERE root_path IN (SELECT path FROM watched_folders)",
         params![LARGE_FILE_BYTES,now-STALE_FILE_DAYS*86_400],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)),
     )?;
-    insights.large_files=large_files; insights.large_bytes=large_bytes; insights.stale_files=stale_files; insights.stale_bytes=stale_bytes; insights.other_files=other_files;
-    let (groups,extras):(i64,i64)=tx.query_row("SELECT COUNT(*),COALESCE(SUM((cnt-1)*size),0) FROM (SELECT size,COUNT(*) AS cnt FROM file_inventory WHERE size>?1 AND root_path IN (SELECT path FROM watched_folders) GROUP BY size HAVING COUNT(*)>1)",[SAME_SIZE_MIN_BYTES],|r|Ok((r.get(0)?,r.get(1)?)))?;
-    insights.same_size_groups=groups; insights.same_size_extra_bytes=extras;
+    let (same_size_groups, same_size_extra_bytes) = tx.query_row(
+        "SELECT COUNT(*),COALESCE(SUM((cnt-1)*size),0) FROM (
+            SELECT size,COUNT(*) AS cnt FROM file_inventory
+            WHERE size>?1 AND root_path IN (SELECT path FROM watched_folders)
+            GROUP BY size HAVING COUNT(*)>1
+        )",
+        [SAME_SIZE_MIN_BYTES],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let insights = DashboardInsights {
+        large_files,
+        large_bytes,
+        stale_files,
+        stale_bytes,
+        other_files,
+        same_size_groups,
+        same_size_extra_bytes,
+    };
     let mut age_buckets:Vec<AgeBucket>=["7d","30d","90d","365d","older"].iter().map(|b|AgeBucket{bucket:b.to_string(),files:0,bytes:0}).collect();
     let mut age_stmt=tx.prepare("SELECT CASE WHEN mtime>=?1 THEN 0 WHEN mtime>=?2 THEN 1 WHEN mtime>=?3 THEN 2 WHEN mtime>=?4 THEN 3 ELSE 4 END,COUNT(*),COALESCE(SUM(size),0) FROM file_inventory WHERE root_path IN (SELECT path FROM watched_folders) GROUP BY 1")?;
     for row in age_stmt.query_map(params![now-7*86_400,now-30*86_400,now-90*86_400,now-365*86_400],|r|Ok((r.get::<_,usize>(0)?,r.get::<_,i64>(1)?,r.get::<_,i64>(2)?)))? {
