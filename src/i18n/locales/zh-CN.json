@@ -483,11 +483,13 @@
     "collision": "已恢复为其他文件名",
     "missing": "找不到文件，未能恢复",
     "failed": "无法撤销此操作",
+    "restoredPending": "文件已恢复，操作历史记录尚未完成。",
     "restoredTo": "已恢复到 {{path}}",
     "reason": "原因：{{message}}",
     "noId": "这条历史记录没有 ID，无法撤销",
     "allRestored": "已恢复 {{count}} 个文件",
     "allCollision": "已用其他文件名恢复 {{count}} 个文件",
+    "allRestoredPending": "{{count}} 个已恢复文件的操作历史记录尚未完成",
     "allMissing": "找不到 {{count}} 个文件，未能恢复",
     "allFailed": "无法恢复 {{count}} 个文件"
   },

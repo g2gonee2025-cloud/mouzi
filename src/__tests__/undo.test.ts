@@ -10,7 +10,7 @@ import {
 import type { UndoAllResult, UndoResult, UndoStatus } from "../store/useAppStore";
 
 /** Every status the Rust side can return. Kept in sync with `UndoStatus`. */
-const ALL_STATUSES: UndoStatus[] = ["ok", "collision", "missing", "failed"];
+const ALL_STATUSES: UndoStatus[] = ["ok", "collision", "restored_pending", "missing", "failed"];
 
 const result = (
   status: UndoStatus,
@@ -47,6 +47,7 @@ describe("undoNotice", () => {
   it("maps each status to its own key", () => {
     expect(undoNotice(result("ok"))[0].key).toBe("undo.ok");
     expect(undoNotice(result("collision"))[0].key).toBe("undo.collision");
+    expect(undoNotice(result("restored_pending"))[0].key).toBe("undo.restoredPending");
     expect(undoNotice(result("missing"))[0].key).toBe("undo.missing");
     expect(undoNotice(result("failed"))[0].key).toBe("undo.failed");
   });
@@ -78,6 +79,17 @@ describe("undoNotice", () => {
     });
   });
 
+  it("warns that a completed restore still has an incomplete History record", () => {
+    expect(undoNotice(result("restored_pending", {
+      restoredTo: "C:/Downloads/report_0.pdf",
+      message: "Undo recovery record 41 remains pending.",
+    }))).toEqual([
+      { tone: "warning", key: "undo.restoredPending" },
+      { tone: "warning", key: "undo.restoredTo", values: { path: "C:/Downloads/report_0.pdf" } },
+      { tone: "warning", key: "undo.reason", values: { message: "Undo recovery record 41 remains pending." } },
+    ]);
+  });
+
   // A `restoredTo` on a non-move status would be the exact claim the file came
   // back, and the file did not move.
   it("hides restoredTo for statuses where nothing moved back", () => {
@@ -87,7 +99,7 @@ describe("undoNotice", () => {
     }
   });
 
-  it("surfaces the backend's reason only for failed", () => {
+  it("surfaces the backend's reason for an ordinary failure", () => {
     const failed = undoNotice(result("failed", { message: "ACCESS_DENIED" }));
     expect(failed[1]).toEqual({
       tone: "error",
@@ -106,6 +118,23 @@ describe("undoNotice", () => {
 });
 
 describe("undoAllBreakdown", () => {
+  it("counts a completed restore with a pending record once and keeps failure separate", () => {
+    expect(undoAllBreakdown([
+      result("ok"),
+      result("collision"),
+      result("restored_pending"),
+      result("missing"),
+      result("failed"),
+    ])).toEqual({
+      total: 5,
+      restored: 3,
+      collision: 1,
+      restoredPending: 1,
+      missing: 1,
+      failed: 1,
+    });
+  });
+
   it("counts collisions as restored, missing as neither", () => {
     const breakdown = undoAllBreakdown([
       result("ok"),
@@ -117,6 +146,7 @@ describe("undoAllBreakdown", () => {
       total: 4,
       restored: 2,
       collision: 1,
+      restoredPending: 0,
       missing: 1,
       failed: 1,
     });
@@ -127,6 +157,7 @@ describe("undoAllBreakdown", () => {
       total: 0,
       restored: 0,
       collision: 0,
+      restoredPending: 0,
       missing: 0,
       failed: 0,
     });
@@ -134,6 +165,40 @@ describe("undoAllBreakdown", () => {
 });
 
 describe("undoAllNotices", () => {
+  it("keeps each pending restore's actual path and recovery reason in the bulk receipt", () => {
+    const restoredPath = "C:/Downloads/report_0.pdf";
+    const secondPath = "C:/Downloads/invoice.pdf";
+    const firstReason = "Undo recovery record 41 remains pending.";
+    const secondReason = "Undo recovery record 42 remains pending.";
+    expect(undoAllNotices(all([
+      result("ok"),
+      result("collision"),
+      result("restored_pending", { restoredTo: restoredPath, message: firstReason }),
+      result("restored_pending", { restoredTo: secondPath, message: secondReason }),
+      result("missing"),
+      result("failed", { restoredTo: "C:/Organised/unmoved.pdf", message: "ACCESS_DENIED" }),
+    ]))).toEqual([
+      { tone: "warning", key: "undo.allRestored", values: { count: 4 } },
+      { tone: "warning", key: "undo.allCollision", values: { count: 1 } },
+      { tone: "warning", key: "undo.allRestoredPending", values: { count: 2 } },
+      { tone: "warning", key: "undo.restoredTo", values: { path: restoredPath } },
+      { tone: "warning", key: "undo.reason", values: { message: firstReason } },
+      { tone: "warning", key: "undo.restoredTo", values: { path: secondPath } },
+      { tone: "warning", key: "undo.reason", values: { message: secondReason } },
+      { tone: "error", key: "undo.allMissing", values: { count: 1 } },
+      { tone: "error", key: "undo.allFailed", values: { count: 1 } },
+      { tone: "error", key: "undo.reason", values: { message: "ACCESS_DENIED" } },
+    ]);
+  });
+
+  it("warns on the restored total when only History recording remains incomplete", () => {
+    const notices = undoAllNotices(all([result("restored_pending")]));
+    expect(notices).toEqual([
+      { tone: "warning", key: "undo.allRestored", values: { count: 1 } },
+      { tone: "warning", key: "undo.allRestoredPending", values: { count: 1 } },
+    ]);
+  });
+
   it("reports a clean run as a single success line", () => {
     const notices = undoAllNotices(all([result("ok"), result("ok")]));
     expect(notices).toEqual([
@@ -205,6 +270,7 @@ describe("undoAllNotices", () => {
       all([]),
       all([result("ok")]),
       all([result("collision"), result("missing"), result("failed")]),
+      all([result("restored_pending", { restoredTo: "C:/Downloads/report.pdf", message: "Pending" })]),
     ];
     for (const run of runs) {
       for (const notice of undoAllNotices(run)) {

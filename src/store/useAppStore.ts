@@ -97,7 +97,7 @@ export interface ScheduleSettings {
  * caller that ignores it reports a green "Undone" badge for a file that is
  * still in its organised location.
  */
-export type UndoStatus = "ok" | "collision" | "missing" | "failed";
+export type UndoStatus = "ok" | "collision" | "restored_pending" | "missing" | "failed";
 
 export interface UndoResult {
   status: UndoStatus;

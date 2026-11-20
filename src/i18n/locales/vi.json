@@ -489,11 +489,13 @@
     "collision": "Đã khôi phục với tên khác",
     "missing": "Không tìm thấy tệp - chưa được khôi phục",
     "failed": "Không thể hoàn tác thao tác này",
+    "restoredPending": "Đã khôi phục tệp. Mục tương ứng trong lịch sử chưa hoàn tất.",
     "restoredTo": "Hiện ở {{path}}",
     "reason": "Lý do: {{message}}",
     "noId": "Mục lịch sử này không có id nên không thể hoàn tác",
     "allRestored": "Đã khôi phục {{count}} tệp",
     "allCollision": "{{count}} tệp đã được khôi phục với tên khác",
+    "allRestoredPending": "Lịch sử của {{count}} tệp đã khôi phục chưa được ghi đầy đủ",
     "allMissing": "{{count}} tệp không tìm thấy và không được khôi phục",
     "allFailed": "Không khôi phục được {{count}} tệp"
   },

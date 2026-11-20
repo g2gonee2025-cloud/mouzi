@@ -483,11 +483,13 @@
     "collision": "別の名前で復元しました",
     "missing": "ファイルが見つかりませんでした。復元されていません",
     "failed": "この操作を取り消せませんでした",
+    "restoredPending": "ファイルを復元しました。履歴への記録は未完了です。",
     "restoredTo": "現在地: {{path}}",
     "reason": "理由: {{message}}",
     "noId": "この履歴には ID がないため、取り消せません",
     "allRestored": "{{count}} 件を復元しました",
     "allCollision": "{{count}} 件を別の名前で復元しました",
+    "allRestoredPending": "復元した {{count}} 件の履歴への記録が未完了です",
     "allMissing": "{{count}} 件が見つからず、復元されませんでした",
     "allFailed": "{{count}} 件を復元できませんでした"
   },

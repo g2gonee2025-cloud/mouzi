@@ -935,9 +935,9 @@ export default function Settings() {
             <ActionRefreshWarnings />
             {undoToast && (
               <div role="status" aria-live="polite" className="space-y-1">
-                {undoToast.map((notice) => (
+                {undoToast.map((notice, index) => (
                   <div
-                    key={notice.key}
+                    key={`${notice.key}-${index}`}
                     className={`rounded-md px-3 py-2 text-xs ${UNDO_TONE_CLASS[notice.tone]}`}
                   >
                     {t(notice.key, notice.values)}

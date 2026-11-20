@@ -12,25 +12,22 @@ export interface UndoNotice {
 
 export interface UndoAllBreakdown {
   total: number;
-  /** `ok` + `collision`: the file is back in the source folder. */
+  /** The file physically moved back, even when History recording is incomplete. */
   restored: number;
   /** `collision`: restored, but under a different name than the user expects. */
   collision: number;
+  /** Restored files whose History entries still need recovery. */
+  restoredPending: number;
   /** `missing`: the recorded organized file could not be found for restoration. */
   missing: number;
   failed: number;
 }
 
-/**
- * Every map here is a `Record` keyed by `UndoStatus` rather than a `switch`, so
- * a fifth status added on the Rust side fails to compile in this file instead
- * of silently falling through to the "restored" wording. That fall-through is
- * the whole bug: it produced a green "Undone" badge for files that were never
- * moved back.
- */
+/** Each wire status has explicit wording, tone and physical outcome. */
 const NOTICE_KEY: Record<UndoStatus, string> = {
   ok: "undo.ok",
   collision: "undo.collision",
+  restored_pending: "undo.restoredPending",
   missing: "undo.missing",
   failed: "undo.failed",
 };
@@ -38,19 +35,16 @@ const NOTICE_KEY: Record<UndoStatus, string> = {
 const NOTICE_TONE: Record<UndoStatus, UndoTone> = {
   ok: "success",
   collision: "warning",
+  restored_pending: "warning",
   missing: "error",
   failed: "error",
 };
 
-/**
- * Whether the file physically moved back. Only these two statuses may render a
- * `restoredTo` path - on `missing` and `failed` the file is still sitting in
- * the folder Mouzi moved it to, so showing a destination would be the exact
- * lie this fix exists to stop.
- */
+/** Only a confirmed physical restore can display a restored path. */
 const MOVED_BACK: Record<UndoStatus, boolean> = {
   ok: true,
   collision: true,
+  restored_pending: true,
   missing: false,
   failed: false,
 };
@@ -68,20 +62,28 @@ export const UNDO_TONE_CLASS: Record<UndoTone, string> = {
  * these in order so the outcome is never buried under a detail.
  */
 export function undoNotice(result: UndoResult): UndoNotice[] {
-  const notices: UndoNotice[] = [
+  return [
     { tone: NOTICE_TONE[result.status], key: NOTICE_KEY[result.status] },
+    ...undoDetails(result),
   ];
+}
+
+function undoDetails(result: UndoResult): UndoNotice[] {
+  const notices: UndoNotice[] = [];
+  const historyPending = result.status === "restored_pending";
   if (MOVED_BACK[result.status] && result.restoredTo) {
     notices.push({
-      tone: "success",
+      tone: historyPending ? "warning" : "success",
       key: "undo.restoredTo",
       values: { path: result.restoredTo },
     });
   }
-  // `failed` is the only status where `message` carries the reason rather than
-  // a location, so it is the only one that should surface it.
-  if (result.status === "failed" && result.message) {
-    notices.push({ tone: "error", key: "undo.reason", values: { message: result.message } });
+  if ((historyPending || result.status === "failed") && result.message) {
+    notices.push({
+      tone: NOTICE_TONE[result.status],
+      key: "undo.reason",
+      values: { message: result.message },
+    });
   }
   return notices;
 }
@@ -91,12 +93,14 @@ export function undoAllBreakdown(results: readonly UndoResult[]): UndoAllBreakdo
     total: results.length,
     restored: 0,
     collision: 0,
+    restoredPending: 0,
     missing: 0,
     failed: 0,
   };
   for (const result of results) {
     if (MOVED_BACK[result.status]) breakdown.restored += 1;
     if (result.status === "collision") breakdown.collision += 1;
+    if (result.status === "restored_pending") breakdown.restoredPending += 1;
     if (result.status === "missing") breakdown.missing += 1;
     if (result.status === "failed") breakdown.failed += 1;
   }
@@ -106,7 +110,7 @@ export function undoAllBreakdown(results: readonly UndoResult[]): UndoAllBreakdo
 /** Aggregate the per-file outcomes from Restore all. */
 export function undoAllNotices(result: UndoAllResult): UndoNotice[] {
   const breakdown = undoAllBreakdown(result.results);
-  const untruthful = breakdown.missing + breakdown.failed;
+  const incomplete = breakdown.restoredPending + breakdown.missing + breakdown.failed;
   const notices: UndoNotice[] = [];
 
   if (breakdown.total === 0) {
@@ -117,7 +121,7 @@ export function undoAllNotices(result: UndoAllResult): UndoNotice[] {
 
   if (breakdown.restored > 0) {
     notices.push({
-      tone: untruthful > 0 ? "warning" : "success",
+      tone: incomplete > 0 ? "warning" : "success",
       key: "undo.allRestored",
       values: { count: breakdown.restored },
     });
@@ -132,6 +136,16 @@ export function undoAllNotices(result: UndoAllResult): UndoNotice[] {
       key: "undo.allCollision",
       values: { count: breakdown.collision },
     });
+  }
+  if (breakdown.restoredPending > 0) {
+    notices.push({
+      tone: "warning",
+      key: "undo.allRestoredPending",
+      values: { count: breakdown.restoredPending },
+    });
+    for (const row of result.results) {
+      if (row.status === "restored_pending") notices.push(...undoDetails(row));
+    }
   }
   if (breakdown.missing > 0) {
     notices.push({
