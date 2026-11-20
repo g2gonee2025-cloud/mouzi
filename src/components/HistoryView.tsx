@@ -9,6 +9,10 @@ import { buttonClass, fieldClass, primaryClass, errorText } from "./BetaControls
 import ConfirmDialog, { type ConfirmRequest } from "./cleanup/ConfirmDialog";
 
 const emptyFilters = { query: "", rule: "", extension: "", from: "", to: "", run_id: "" };
+type HistoryRead =
+  | { status: "loading" }
+  | { status: "failed"; error: string }
+  | { status: "ready"; request: number; rows: OrganizationLog[] };
 
 interface SelectedUndoResult extends UndoResult {
   id: number;
@@ -21,22 +25,27 @@ function canRestore(log: OrganizationLog) {
 export default function HistoryView() {
   const { t } = useTranslation();
   const [filters, setFilters] = useState(emptyFilters);
-  const [logs, setLogs] = useState<OrganizationLog[]>([]);
+  const [read, setRead] = useState<HistoryRead>({ status: "loading" });
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [error, setError] = useState("");
-  const [busy, setBusy] = useState(true);
   const [confirm, setConfirm] = useState<ConfirmRequest | null>(null);
   const [limit, setLimit] = useState(100);
   const [results, setResults] = useState<Array<SelectedUndoResult & { source: string }>>([]);
   const appliedFilters = useRef(emptyFilters);
   const generation = useRef(0);
+  const restoring = useRef(false);
   const heading = useRef<HTMLHeadingElement>(null);
+  const busy = read.status === "loading";
+  const ready = read.status === "ready";
+  const logs = ready ? read.rows : [];
+  const ownsRows = () => ready && read.request === generation.current;
 
   const load = useCallback(async (resetSelection = false) => {
     const request = ++generation.current;
     const value = appliedFilters.current;
-    setBusy(true);
-    setError("");
+    setRead({ status: "loading" });
+    // A new read invalidates consent from the old rows unless its restore was already sent.
+    if (!restoring.current) setConfirm(null);
     if (resetSelection) {
       setSelected(new Set());
       setLimit(100);
@@ -48,13 +57,11 @@ export default function HistoryView() {
         to: value.to ? new Date(value.to).toISOString() : "",
       } });
       if (request === generation.current) {
-        setLogs(rows);
+        setRead({ status: "ready", request, rows });
         setSelected((previous) => new Set(rows.filter((row) => canRestore(row) && previous.has(row.id!)).map((row) => row.id!)));
       }
     } catch (cause) {
-      if (request === generation.current) setError(errorText(cause));
-    } finally {
-      if (request === generation.current) setBusy(false);
+      if (request === generation.current) setRead({ status: "failed", error: errorText(cause) });
     }
   }, []);
   useEffect(() => {
@@ -77,10 +84,12 @@ export default function HistoryView() {
       return;
     }
     appliedFilters.current = value;
+    setError("");
     void load(true);
   }
 
   function toggle(id: number) {
+    if (!ownsRows()) return;
     setSelected((previous) => {
       const next = new Set(previous);
       if (next.has(id)) next.delete(id);
@@ -90,8 +99,9 @@ export default function HistoryView() {
   }
 
   function askRestore(opener: HTMLButtonElement) {
-    const rows = logs.filter((log) => canRestore(log) && selected.has(log.id!));
-    if (!rows.length) return;
+    if (!ownsRows() || !selectedLogs.length) return;
+    const rows = selectedLogs;
+    const reviewedRequest = generation.current;
     setConfirm({
       title: t("beta.confirmUndo", { count: rows.length }),
       count: rows.length,
@@ -101,15 +111,22 @@ export default function HistoryView() {
       opener,
       focusFallback: () => heading.current,
       onConfirm: async () => {
-        const sources = new Map(rows.map((log) => [log.id!, log.source_path]));
-        const outcomes = await invoke<SelectedUndoResult[]>("undo_selected_cmd", { ids: [...sources.keys()] });
-        setResults(outcomes.map((outcome) => ({ ...outcome, source: sources.get(outcome.id) ?? "" })));
-        await Promise.all([load(), useAppStore.getState().refreshActionViews()]);
+        if (restoring.current || reviewedRequest !== generation.current) return;
+        restoring.current = true;
+        try {
+          const sources = new Map(rows.map((log) => [log.id!, log.source_path]));
+          const outcomes = await invoke<SelectedUndoResult[]>("undo_selected_cmd", { ids: [...sources.keys()] });
+          setResults(outcomes.map((outcome) => ({ ...outcome, source: sources.get(outcome.id) ?? "" })));
+          await Promise.all([load(), useAppStore.getState().refreshActionViews()]);
+        } finally {
+          restoring.current = false;
+        }
       },
     });
   }
 
   const eligibleLogs = logs.filter(canRestore);
+  const selectedLogs = eligibleLogs.filter((log) => selected.has(log.id!));
   const groups = new Map<string, OrganizationLog[]>();
   for (const log of logs.slice(0, limit)) {
     const key = log.run_id || "legacy";
@@ -133,6 +150,11 @@ export default function HistoryView() {
       </div>
     </form>
     {error && <p role="alert" className="text-red-700 dark:text-red-300">{error}</p>}
+    {busy && <p role="status" className="text-text-muted">{t("common.loading")}</p>}
+    {read.status === "failed" && <div className="space-y-2">
+      <p role="alert" className="text-red-700 dark:text-red-300">{read.error}</p>
+      <button type="button" className={buttonClass} onClick={() => void load()}>{t("common.retry")}</button>
+    </div>}
     {results.length > 0 && <div role="status" className="space-y-2 rounded-lg border border-border p-3">
       <h3 className="font-medium">{t("beta.results")}</h3>
       {results.map((result) => {
@@ -146,29 +168,31 @@ export default function HistoryView() {
       })}
     </div>}
     <div className="flex flex-wrap items-center gap-2">
-      <button className={buttonClass} disabled={busy || !eligibleLogs.length}
-        onClick={() => setSelected(new Set(eligibleLogs.map((log) => log.id!)))}>{t("beta.selectAll")}</button>
-      <button className={buttonClass} disabled={busy} onClick={() => setSelected(new Set())}>{t("beta.clearSelection")}</button>
-      <span>{t("beta.selected", { count: selected.size })}</span>
-      <button className={primaryClass} disabled={busy || !selected.size}
+      <button className={buttonClass} disabled={!eligibleLogs.length}
+        onClick={() => { if (ownsRows()) setSelected(new Set(eligibleLogs.map((log) => log.id!))); }}>{t("beta.selectAll")}</button>
+      <button className={buttonClass} disabled={!ready} onClick={() => setSelected(new Set())}>{t("beta.clearSelection")}</button>
+      <span>{t("beta.selected", { count: selectedLogs.length })}</span>
+      <button className={primaryClass} disabled={!selectedLogs.length}
         onClick={(event) => askRestore(event.currentTarget)}>{t("beta.undoSelection")}</button>
     </div>
-    {!busy && !logs.length && <p>{t("beta.noHistory")}</p>}
+    {ready && !logs.length && <p>{t("beta.noHistory")}</p>}
     {[...groups].map(([key, entries]) => <section key={key} className="space-y-3 rounded-lg border border-border p-3">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <h4 className="text-sm font-medium">
           {key === "legacy" ? t("beta.legacy") : t("beta.run") + " · " + t("beta." + entries[0].trigger, { defaultValue: entries[0].trigger })}
           <span className="block text-xs text-text-muted">{new Date(entries[0].timestamp).toLocaleString()}</span>
         </h4>
-        <button className={buttonClass} disabled={busy} onClick={() => setSelected((previous) => new Set([
-          ...previous,
-          ...logs.filter((log) => (log.run_id || "legacy") === key && canRestore(log)).map((log) => log.id!),
-        ]))}>{t("beta.selectRun")}</button>
+        <button className={buttonClass} onClick={() => {
+          if (ownsRows()) setSelected((previous) => new Set([
+            ...previous,
+            ...eligibleLogs.filter((log) => (log.run_id || "legacy") === key).map((log) => log.id!),
+          ]));
+        }}>{t("beta.selectRun")}</button>
       </div>
       {entries.map((log) => <div key={log.id} className="flex flex-wrap justify-between gap-2 border-t border-border pt-2 text-sm">
         <label className="flex min-w-0 gap-3">
           <input type="checkbox" className="mt-1 shrink-0" checked={selected.has(log.id!)}
-            disabled={busy || !canRestore(log)} onChange={() => toggle(log.id!)} />
+            disabled={!canRestore(log)} onChange={() => toggle(log.id!)} />
           <span className="min-w-0 break-all">
             <strong>{log.file_name}</strong> · {log.file_type} · {t("beta." + log.action, { defaultValue: log.action })}
             <span className="block">{log.source_path}</span>
@@ -187,6 +211,6 @@ export default function HistoryView() {
       </div>)}
     </section>)}
     {logs.length > limit && <button className={buttonClass} onClick={() => setLimit(limit + 100)}>{t("beta.more")}</button>}
-    {confirm && <ConfirmDialog {...confirm} onClose={() => setConfirm(null)} />}
+    {confirm && <ConfirmDialog {...confirm} onClose={() => setConfirm((current) => current === confirm ? null : current)} />}
   </section>;
 }
