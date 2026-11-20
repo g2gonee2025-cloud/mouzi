@@ -114,9 +114,13 @@ fn root_configuration() -> Result<Vec<RootConfig>, String> {
 }
 
 fn current_scope() -> Result<safe_fs::RootScope, String> {
-    safe_fs::eligible_scope(
+    let scope = safe_fs::eligible_scope(
         &db::get_watched_folders().map_err(|error| format!("Cannot read watched folders: {error}"))?,
-    )
+    )?;
+    if scope.active_roots().is_empty() && !scope.unavailable_active_roots().is_empty() {
+        return Err("The enabled watched folders are unavailable. Reconnect a folder to find cleanup candidates.".into());
+    }
+    Ok(scope)
 }
 
 fn modified_epoch(modified: SystemTime) -> i64 {
@@ -735,6 +739,32 @@ mod tests {
             let destination = path.with_file_name(format!("removed-dir-{}", self.directory_calls));
             fs::rename(path, destination).map_err(|error| error.to_string())
         }
+    }
+
+    #[test]
+    fn empty_folder_finder_reports_an_entirely_unavailable_scope() {
+        let _guard = db::serialise_test_db();
+        init();
+        let tree = TestTree::new();
+        let offline = tree.0.join("offline");
+        fs::create_dir(&offline).unwrap();
+        let offline_id = db::add_watched_folder(&offline.to_string_lossy(), db::FOLDER_MODE_MANUAL).unwrap();
+        fs::rename(&offline, tree.0.join("retained")).unwrap();
+        let unavailable = find_empty_dirs();
+
+        db::update_folder_mode(offline_id, db::FOLDER_MODE_PAUSED).unwrap();
+        let paused = find_empty_dirs();
+        db::update_folder_mode(offline_id, db::FOLDER_MODE_MANUAL).unwrap();
+        let online = tree.0.join("online");
+        fs::create_dir_all(online.join("empty")).unwrap();
+        let online_id = db::add_watched_folder(&online.to_string_lossy(), db::FOLDER_MODE_MANUAL).unwrap();
+        let mixed = find_empty_dirs();
+        db::remove_watched_folder(online_id).unwrap();
+        db::remove_watched_folder(offline_id).unwrap();
+
+        assert!(unavailable.unwrap_err().contains("watched folders are unavailable"));
+        assert!(paused.unwrap().is_empty());
+        assert_eq!(mixed.unwrap().len(), 1);
     }
 
     #[test]
