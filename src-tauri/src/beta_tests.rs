@@ -118,6 +118,58 @@ fn scoped_rule_conditions_and_normalized_extensions_survive_storage() {
     db::remove_watched_folder(other_id).unwrap();
 }
 
+#[cfg(windows)]
+#[test]
+fn review_distinguishes_read_only_files_from_sharing_locks() {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let mut fixture = Fixture::new();
+    fixture.add(&fixture.rule());
+    assert!(db::get_settings().unwrap().lock_check_enabled);
+    let read_only = fixture.write("read-only.txt", "read-only payload");
+    let locked = fixture.write("locked.txt", "open payload");
+    let expected = fixture.root.join("Sorted").join("read-only.txt");
+    let mut permissions = fs::metadata(&read_only).unwrap().permissions();
+    permissions.set_readonly(true);
+    fs::set_permissions(&read_only, permissions).unwrap();
+    let held = fs::OpenOptions::new().read(true).share_mode(1 | 4).open(&locked).unwrap();
+
+    let preview = op::preview(
+        Some([&read_only, &locked].into_iter().map(|path| path.to_string_lossy().into_owned()).collect()),
+        &fixture.suppression,
+    );
+    drop(held);
+    let result = match &preview {
+        Ok(plan) => match plan.entries.iter().find(|entry| Path::new(&entry.source).ends_with("read-only.txt")) {
+            Some(entry) if entry.error.is_none() => Some(op::apply(&plan.id, &[entry.id.clone()], &fixture.suppression)),
+            _ => { op::discard(&plan.id); None }
+        },
+        Err(_) => None,
+    };
+
+    let mut preserved = false;
+    for path in [&read_only, &expected] {
+        if let Ok(metadata) = fs::metadata(path) {
+            let mut permissions = metadata.permissions();
+            if path == &expected { preserved = permissions.readonly(); }
+            permissions.set_readonly(false);
+            fs::set_permissions(path, permissions).unwrap();
+        }
+    }
+
+    let entries = preview.unwrap().entries;
+    let retained = entries.iter().find(|entry| Path::new(&entry.source).ends_with("locked.txt")).unwrap();
+    assert_eq!(retained.error.as_deref(), Some("preview.locked"));
+    assert_eq!(fs::read_to_string(&locked).unwrap(), "open payload");
+    let entry = entries.iter().find(|entry| Path::new(&entry.source).ends_with("read-only.txt")).unwrap();
+    assert_eq!(entry.error, None);
+    let result = result.unwrap().unwrap();
+    assert!(result[0].success, "{:?}", result[0].error);
+    assert!(preserved);
+    assert_eq!(fs::read_to_string(&expected).unwrap(), "read-only payload");
+    assert!(!read_only.exists());
+}
+
 #[test]
 fn apply_uses_only_the_selected_entries_and_rechecks_the_review() {
     let mut f = Fixture::new();

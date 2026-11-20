@@ -9,11 +9,23 @@ use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
-/// Check if a file is currently locked by another process.
-/// On Windows this tries to open with write access; if another process holds
-/// the file without FILE_SHARE_WRITE the open will fail.
+/// Probe whether another process denies write sharing on this file.
+/// The guarded reader and mover still check access, identity and contents.
 pub(crate) fn is_file_locked(path: &Path) -> bool {
-    fs::OpenOptions::new().write(true).open(path).is_err()
+    let failure = fs::OpenOptions::new().write(true).open(path).err();
+    #[cfg(windows)]
+    {
+        const ERROR_SHARING_VIOLATION: i32 = 32;
+        const ERROR_LOCK_VIOLATION: i32 = 33;
+        failure.is_some_and(|error| matches!(
+            error.raw_os_error(),
+            Some(ERROR_SHARING_VIOLATION | ERROR_LOCK_VIOLATION)
+        ))
+    }
+    #[cfg(not(windows))]
+    {
+        failure.is_some()
+    }
 }
 
 /// Check whether a file has passed its grace period since last modification.
