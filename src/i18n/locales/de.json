@@ -435,7 +435,9 @@
     "preparing": "Plan zur Bestätigung wird vorbereitet…",
     "ruleCount": "Neue Regeln: {{count}}",
     "planChanged": "Datei oder Einstellungen haben sich geändert. Prüfe einen neuen Plan.",
-    "alreadyFiled": "Bereits abgelegt; Kategorie gespeichert"
+    "alreadyFiled": "Bereits abgelegt; Kategorie gespeichert",
+    "localAiModelMissing": "Das ausgewählte Modell fehlt in Ollama. Installieren Sie es oder wählen Sie unter Einstellungen → Allgemein ein installiertes Modell aus. Aktualisieren Sie anschließend die Vorschläge.",
+    "localAiUnreachable": "Ollama ist nicht erreichbar. Starten Sie Ollama und aktualisieren Sie anschließend die Vorschläge."
   },
   "confirm": {
     "impactItems": "{{count}} Element",

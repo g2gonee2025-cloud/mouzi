@@ -435,7 +435,9 @@
     "preparing": "Preparing the reviewed plan…",
     "ruleCount": "New rules: {{count}}",
     "planChanged": "The file or settings changed. Review a new plan.",
-    "alreadyFiled": "Already filed; category saved"
+    "alreadyFiled": "Already filed; category saved",
+    "localAiModelMissing": "Ollama is missing the selected model. Install it or choose an installed model under Settings → General, then refresh.",
+    "localAiUnreachable": "Ollama is unreachable. Start Ollama, then refresh."
   },
   "confirm": {
     "impactItems": "{{count}} item",

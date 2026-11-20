@@ -10,6 +10,13 @@ export interface Suggestion {
   source: "heuristic" | "ollama" | "learned";
   currentCategory: string;
 }
+
+type LocalAiStatus = "modelMissing" | "unreachable" | null;
+export interface SuggestionsResponse {
+  suggestions: Suggestion[];
+  localAiStatus: LocalAiStatus;
+}
+
 export interface AcceptOutcome {
   path: string;
   status: "ok" | "missing" | "failed" | "partial";
@@ -41,6 +48,7 @@ export function distinctSuggestionRules(plans: readonly SuggestionPlan[]): Sugge
 
 interface SuggestionsState {
   suggestions: Suggestion[];
+  localAiStatus: LocalAiStatus;
   loading: boolean;
   busy: boolean;
   error: string | null;
@@ -60,15 +68,15 @@ interface SuggestionsState {
 let loadGeneration = 0;
 const preview = createPreviewSlot();
 export const useSuggestionsStore = create<SuggestionsState>((set, get) => ({
-  suggestions: [], loading: false, busy: false, error: null,
+  suggestions: [], localAiStatus: null, loading: false, busy: false, error: null,
   createRuleDefault: false, preparedPlans: null, results: null,
   loadSuggestions: async () => {
     if (get().busy || get().preparedPlans) return;
     const generation = ++loadGeneration;
-    set({ loading: true, error: null });
+    set({ loading: true, error: null, localAiStatus: null });
     try {
-      const suggestions = await invoke<Suggestion[]>("get_suggestions_cmd", { limit: 100 });
-      if (generation === loadGeneration) set({ suggestions, loading: false });
+      const { suggestions, localAiStatus } = await invoke<SuggestionsResponse>("get_suggestions_with_status_cmd", { limit: 100 });
+      if (generation === loadGeneration) set({ suggestions, localAiStatus, loading: false });
     } catch (error) {
       if (generation === loadGeneration) set({ error: String(error), loading: false });
     }

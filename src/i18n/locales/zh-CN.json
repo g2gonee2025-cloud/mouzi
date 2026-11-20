@@ -435,7 +435,9 @@
     "preparing": "正在准备待确认的操作计划…",
     "ruleCount": "新规则：{{count}} 条",
     "planChanged": "文件或设置已更改，请重新确认操作计划。",
-    "alreadyFiled": "文件已在目标位置，分类已保存"
+    "alreadyFiled": "文件已在目标位置，分类已保存",
+    "localAiModelMissing": "Ollama 缺少所选模型。请安装该模型，或在设置 → 常规中选择已安装的模型，然后刷新建议。",
+    "localAiUnreachable": "无法连接到 Ollama。请启动 Ollama，然后刷新建议。"
   },
   "confirm": {
     "impactItems": "{{count}} 项",

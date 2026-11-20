@@ -6,6 +6,7 @@ const keys = [
   "common.retry", "common.save", "common.saving", "common.loading", "common.dismiss", "common.close", "common.back",
   "settings.general.localAi", "settings.general.localAiModel", "settings.general.localAiPrivacy", "settings.general.gracePeriodUnit",
   "common.cancel", "settings.archive.progress", "suggestions.alreadyFiled",
+  "suggestions.localAiModelMissing", "suggestions.localAiUnreachable",
   "settings.history.showing", "dashboard.loadingFiles", "dashboard.rootPending", "dashboard.rootStale",
   "dashboard.rootFailed", "dashboard.rootLastScan", "dashboard.scanFailed",
   "settings.ignore.extensionTip", "settings.ignore.folderTip", "settings.ignore.officeTip", "settings.ignore.exactTip",

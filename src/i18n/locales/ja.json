@@ -435,7 +435,9 @@
     "preparing": "確認用の計画を準備中…",
     "ruleCount": "新しいルール: {{count}}",
     "planChanged": "ファイルまたは設定が変更されました。新しい計画を確認してください。",
-    "alreadyFiled": "分類済み・カテゴリーを保存しました"
+    "alreadyFiled": "分類済み・カテゴリーを保存しました",
+    "localAiModelMissing": "選択したモデルが Ollama にありません。モデルをインストールするか、設定 → 一般でインストール済みのモデルを選んでから、提案を更新してください。",
+    "localAiUnreachable": "Ollama に接続できません。Ollama を起動してから、提案を更新してください。"
   },
   "confirm": {
     "impactItems": "{{count}} 件",

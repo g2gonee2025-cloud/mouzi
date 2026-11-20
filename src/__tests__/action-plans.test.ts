@@ -210,7 +210,8 @@ it("preserves failed cards for retry and reports a moved file with partial final
   await useSuggestionsStore.getState().acceptAll(reviewed);
   expect(useSuggestionsStore.getState().suggestions.map((s) => s.path)).toEqual(["a"]);
   expect(useSuggestionsStore.getState().results?.[1]).toMatchObject({ status: "partial", dest: "actual/b" });
-  ipc.invoke.mockResolvedValueOnce([suggestion("a")]); await useSuggestionsStore.getState().loadSuggestions();
+  ipc.invoke.mockResolvedValueOnce({ suggestions: [suggestion("a")], localAiStatus: null });
+  await useSuggestionsStore.getState().loadSuggestions();
   expect(useSuggestionsStore.getState().results).toHaveLength(2);
 });
 
