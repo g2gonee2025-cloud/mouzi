@@ -182,12 +182,13 @@ impl Budget<'_> {
         let journal = &mut self.journal;
         let (cancelled, started, duration) = (self.cancelled, self.started, self.limits.duration);
         let name = publish_entry(
-            staging, &stage, &output, entry_path, file_name, &mut self.receipt.published_names,
+            staging, &stage, &output, file_name, &mut self.receipt.published_names,
+            || check_extraction_active(cancelled, started, duration),
             |destination| {
                 if let Some(journal) = journal {
                     journal.append(&EntryEvent::Ready { name: stage_name.clone(), destination: destination.into() })?;
                 }
-                check_extraction_active(cancelled, started, duration)
+                Ok(())
             },
         )?;
         self.receipt.incomplete = None;
@@ -641,25 +642,34 @@ fn create_entry_stage(staging: &Path, entry_index: usize, target_name: &str) -> 
 }
 
 fn publish_entry(
-    staging: &Path, stage: &Path, output: &File, entry_path: &Path, file_name: &str,
+    staging: &Path, stage: &Path, output: &File, file_name: &str,
     published_names: &mut PublishedArchiveNames,
+    mut check_active: impl FnMut() -> Result<(), String>,
     mut record_destination: impl FnMut(&str) -> Result<(), String>,
 ) -> Result<String, String> {
-    let stem = entry_path.file_stem().and_then(|s| s.to_str()).unwrap_or(file_name);
-    let extension = entry_path.extension().and_then(|s| s.to_str());
+    let leaf = Path::new(file_name);
+    let stem = leaf.file_stem().and_then(|s| s.to_str()).unwrap_or(file_name);
+    let extension = leaf.extension().and_then(|s| s.to_str());
     // Remember only the contiguous prefix of names this import already
     // published. A foreign file can disappear, so its slot remains eligible
     // and receives a fresh filesystem check on the next entry.
     let mut next_owned = published_names.next_owned_suffix.get(file_name).copied().unwrap_or(0);
-    for index in next_owned..10_000 {
+    // The import can publish up to LIMITS.entries files with the same basename.
+    // Bound filesystem probes separately when other occupants block publication.
+    let mut probes_remaining = 10_000;
+    for index in next_owned.. {
+        check_active()?;
         let name = if index == 0 { file_name.to_string() } else { match extension { Some(ext) => format!("{stem} ({index}).{ext}"), None => format!("{stem} ({index})") } };
         if published_names.names.contains(&name) {
             if next_owned == index { next_owned += 1; }
             continue;
         }
+        if probes_remaining == 0 { break; }
+        probes_remaining -= 1;
         let target = staging.join(&name);
         if safe_fs::path_occupied(&target)? { continue; }
         record_destination(&name)?;
+        check_active()?;
         match safe_fs::publish_staged_file(output, stage, &target) {
             Ok(true) => {
                 published_names.names.insert(name.clone());
@@ -1517,17 +1527,70 @@ mod tests {
     }
 
     #[test]
+    fn published_archive_names_can_reach_the_entry_limit() {
+        // Resume the normal per-import cursor just before the last allowed entry.
+        let last_index = LIMITS.entries - 1;
+        let mut published = PublishedArchiveNames::default();
+        published.names.insert("index.txt".into());
+        for index in 1..last_index {
+            published.names.insert(format!("index ({index}).txt"));
+        }
+        published.next_owned_suffix.insert("index.txt".into(), last_index);
+
+        let root = test_dir("archive-last-owned-suffix");
+        let staging = fs::canonicalize(&root).unwrap();
+        let (_, stage, mut output) = create_entry_stage(&staging, last_index, "index.txt").unwrap();
+        output.write_all(b"last entry").unwrap();
+        let mut ready = Vec::new();
+        let result = publish_entry(&staging, &stage, &output, "index.txt", &mut published,
+            || Ok(()), |name| { ready.push(name.to_owned()); Ok(()) });
+        drop(output);
+        let name = format!("index ({last_index}).txt");
+        let contents = fs::read(staging.join(&name)).ok();
+        fs::remove_dir_all(root).unwrap();
+        assert_eq!(result.unwrap(), name);
+        assert_eq!(ready, [name]);
+        assert_eq!(contents.as_deref(), Some(b"last entry".as_slice()));
+    }
+
+    #[test]
+    fn cancel_during_filename_search_preserves_existing_and_staged_files() {
+        let root = test_dir("archive-cancel-filename-search");
+        let staging = fs::canonicalize(&root).unwrap();
+        fs::write(staging.join("report.txt"), b"existing").unwrap();
+        let (_, stage, mut output) = create_entry_stage(&staging, 0, "report.txt").unwrap();
+        output.write_all(b"staged").unwrap();
+        let mut checks = 0;
+        let mut ready = Vec::new();
+        let result = publish_entry(
+            &staging, &stage, &output, "report.txt",
+            &mut PublishedArchiveNames::default(),
+            || {
+                checks += 1;
+                if checks == 1 { Ok(()) } else { Err("cancelled".into()) }
+            },
+            |name| { ready.push(name.to_owned()); Ok(()) },
+        );
+        drop(output);
+        assert_eq!(result, Err("cancelled".to_string()));
+        assert!(ready.is_empty());
+        assert_eq!(fs::read(staging.join("report.txt")).unwrap(), b"existing");
+        assert_eq!(fs::read(stage).unwrap(), b"staged");
+        assert!(!staging.join("report (1).txt").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn publication_rechecks_foreign_names_and_never_reuses_its_own_names() {
         let root = test_dir("archive-name-ownership");
         let staging = fs::canonicalize(&root).unwrap();
         let external_directory = staging.join("report (1).txt");
         fs::create_dir(&external_directory).unwrap();
         let mut publications = PublishedArchiveNames::default();
-        let source = Path::new("report.txt");
         let mut publish = |index, bytes: &[u8], record: &mut dyn FnMut(&str) -> Result<(), String>| {
             let (_, stage, mut output) = create_entry_stage(&staging, index, "report.txt").unwrap();
             output.write_all(bytes).unwrap();
-            publish_entry(&staging, &stage, &output, source, "report.txt", &mut publications, record).unwrap()
+            publish_entry(&staging, &stage, &output, "report.txt", &mut publications, || Ok(()), record).unwrap()
         };
         assert_eq!(publish(0, b"first", &mut |_| Ok(())), "report.txt");
         let mut proposed = Vec::new();
