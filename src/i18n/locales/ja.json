@@ -48,6 +48,11 @@
       "importSuccess": "{{extracted}} 個のファイルを展開し、{{count}} 個のファイルを整理しました。",
       "importError": "アーカイブのインポートに失敗しました: {{error}}",
       "openImportFolder": "インポートフォルダーを開く",
+      "sorting": "抽出したファイルを整理中…",
+      "organizedCount": "{{count}} 個のファイルを整理しました。",
+      "cancelling": "キャンセル中…",
+      "statusUnavailable": "インポート状態を取得できません: {{error}}",
+      "importIncomplete": "インポートは未完了です: {{error}}",
       "progress": "{{files}} 個のファイルを抽出 · {{bytes}}"
     },
     "rules": {

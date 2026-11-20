@@ -158,6 +158,11 @@
       "importSuccess": "Se extrajeron {{extracted}} archivo(s) y se organizaron {{count}} archivo(s).",
       "importError": "No se pudo importar el archivo: {{error}}",
       "openImportFolder": "Abrir la carpeta de importación",
+      "sorting": "Organizando los archivos extraídos…",
+      "organizedCount": "Se organizaron {{count}} archivo(s).",
+      "cancelling": "Cancelando…",
+      "statusUnavailable": "Estado de importación no disponible: {{error}}",
+      "importIncomplete": "Importación incompleta: {{error}}",
       "progress": "{{files}} archivos extraídos · {{bytes}}"
     }
   },

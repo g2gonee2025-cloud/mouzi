@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 
 export interface Rule {
   id?: number;
@@ -108,12 +109,27 @@ export interface UndoAllResult {
   results: UndoResult[];
 }
 
-interface ArchiveImportResult {
+interface ArchiveImportReceipt {
   extractedCount: number | null;
   sortedCount: number;
   stagingPath: string;
-  results: [file: string, rule: string, destination: string][];
   issue: string | null;
+}
+
+interface ArchiveImportResult extends ArchiveImportReceipt {
+  results: [file: string, rule: string, destination: string][];
+}
+
+export interface ArchiveImportState {
+  revision: number;
+  jobId: number | null;
+  status: 'idle' | 'running' | 'completed' | 'failed';
+  phase: 'extracting' | 'sorting' | null;
+  bytes: number;
+  files: number;
+  cancelRequested: boolean;
+  result: ArchiveImportReceipt | null;
+  error: string | null;
 }
 
 type ActionRefreshErrors = Record<'history' | 'historyCounts' | 'stats', string | null>;
@@ -129,6 +145,13 @@ interface AppState {
   pendingFiles: [string, string][];
   isLoading: boolean;
   actionRefreshErrors: ActionRefreshErrors;
+  archiveImportState: ArchiveImportState | null;
+  archiveStatusError: string | null;
+  archiveImportError: string | null;
+  archiveCancelError: string | null;
+  archivePickerOpen: boolean;
+  archiveImportPending: boolean;
+  archiveCancelingJob: number | null;
 
   loadSettings: () => Promise<void>;
   applySettings: (settings: AppSettings) => void;
@@ -155,7 +178,11 @@ interface AppState {
   updateSchedule: (schedule: ScheduleSettings) => Promise<void>;
   exportRules: () => Promise<boolean>;
   importRules: (replace: boolean) => Promise<number | null>;
+  loadArchiveImportState: () => Promise<void>;
+  applyArchiveImportState: (snapshot: ArchiveImportState) => void;
+  pickArchiveImport: (pick: () => Promise<string | string[] | null>) => Promise<void>;
   importArchive: (path: string) => Promise<ArchiveImportResult>;
+  cancelArchiveImport: () => Promise<void>;
 }
 
 function scheduleFrom(settings: AppSettings): ScheduleSettings {
@@ -174,6 +201,7 @@ let logsRequest = 0;
 let countsRequest = 0;
 let statsRequest = 0;
 let pendingRequest = 0;
+let archiveStateRequest = 0;
 const noActionRefreshErrors: ActionRefreshErrors = { history: null, historyCounts: null, stats: null };
 
 function withActionRefreshError(state: AppState, key: keyof ActionRefreshErrors, value: string | null) {
@@ -193,6 +221,13 @@ export const useAppStore = create<AppState>((set, get) => ({
   pendingFiles: [],
   isLoading: false,
   actionRefreshErrors: noActionRefreshErrors,
+  archiveImportState: null,
+  archiveStatusError: null,
+  archiveImportError: null,
+  archiveCancelError: null,
+  archivePickerOpen: false,
+  archiveImportPending: false,
+  archiveCancelingJob: null,
 
   loadSettings: async () => {
     const settings = await invoke<AppSettings>('get_settings_cmd');
@@ -401,9 +436,87 @@ export const useAppStore = create<AppState>((set, get) => ({
     return count;
   },
 
+  loadArchiveImportState: async () => {
+    const request = ++archiveStateRequest;
+    const revision = get().archiveImportState?.revision;
+    try {
+      const snapshot = await invoke<ArchiveImportState>('get_archive_import_state_cmd');
+      get().applyArchiveImportState(snapshot);
+      if (request === archiveStateRequest && get().archiveStatusError !== null) set({ archiveStatusError: null });
+    } catch (error) {
+      if (request === archiveStateRequest && get().archiveImportState?.revision === revision) {
+        set({ archiveStatusError: String(error) });
+      }
+    }
+  },
+
+  applyArchiveImportState: (snapshot) => set((state) => {
+    if (state.archiveImportState && snapshot.revision <= state.archiveImportState.revision) return state;
+    return {
+      archiveImportState: snapshot,
+      archiveStatusError: null,
+      archiveCancelError: snapshot.jobId === state.archiveImportState?.jobId ? state.archiveCancelError : null,
+    };
+  }),
+
+  pickArchiveImport: async (pick) => {
+    const state = get();
+    if (!state.archiveImportState || state.archiveImportState.status === 'running'
+        || state.archivePickerOpen || state.archiveImportPending || state.archiveStatusError) return;
+    set({ archivePickerOpen: true, archiveImportError: null });
+    try {
+      const selected = await pick();
+      const path = Array.isArray(selected) ? selected[0] : selected;
+      if (path && get().archiveImportState?.status !== 'running') await get().importArchive(path);
+    } catch (error) {
+      set({ archiveImportError: String(error) });
+    } finally {
+      set({ archivePickerOpen: false });
+    }
+  },
+
   importArchive: async (path) => {
-    const result = await invoke<ArchiveImportResult>('import_archive_cmd', { path });
-    if (result.extractedCount !== null) void get().refreshActionViews();
-    return result;
+    if (get().archiveImportPending || get().archiveImportState?.status === 'running') {
+      throw new Error('An archive import is already running');
+    }
+    set({ archiveImportPending: true, archiveImportError: null });
+    try {
+      const result = await invoke<ArchiveImportResult>('import_archive_cmd', { path });
+      if (result.sortedCount > 0) void get().refreshActionViews();
+      return result;
+    } finally {
+      // The caller's Settings page may have been replaced while the command ran.
+      // Pull the authoritative receipt even if this WebView missed its event.
+      void get().loadArchiveImportState().finally(() => set({ archiveImportPending: false }));
+    }
+  },
+
+  cancelArchiveImport: async () => {
+    const { archiveImportState, archiveCancelingJob } = get();
+    if (archiveImportState?.status !== 'running' || archiveImportState.jobId === null
+        || archiveImportState.cancelRequested || archiveCancelingJob === archiveImportState.jobId) return;
+    const { jobId } = archiveImportState;
+    set({ archiveCancelingJob: jobId, archiveCancelError: null });
+    try {
+      await invoke('cancel_archive_import_cmd', { jobId });
+    } catch (error) {
+      if (get().archiveImportState?.jobId === jobId) set({ archiveCancelError: String(error) });
+    } finally {
+      await get().loadArchiveImportState();
+      if (get().archiveCancelingJob === jobId) set({ archiveCancelingJob: null });
+    }
   },
 }));
+
+export async function observeArchiveImportState(signal: AbortSignal): Promise<void> {
+  const unlisten = await listen<ArchiveImportState>('archive-import-state-changed', ({ payload }) => {
+    if (!signal.aborted) useAppStore.getState().applyArchiveImportState(payload);
+  });
+  if (signal.aborted) {
+    unlisten();
+    return;
+  }
+  signal.addEventListener('abort', unlisten, { once: true });
+  // Listen first so no change between the read and registration is lost.
+  await useAppStore.getState().loadArchiveImportState();
+}

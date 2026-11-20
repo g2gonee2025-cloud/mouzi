@@ -48,6 +48,11 @@
       "importSuccess": "已解压 {{extracted}} 个文件，并整理 {{count}} 个文件。",
       "importError": "导入归档文件失败：{{error}}",
       "openImportFolder": "打开导入文件夹",
+      "sorting": "正在整理已解压的文件…",
+      "organizedCount": "已整理 {{count}} 个文件。",
+      "cancelling": "正在取消…",
+      "statusUnavailable": "无法获取导入状态：{{error}}",
+      "importIncomplete": "导入未完成：{{error}}",
       "progress": "已解压 {{files}} 个文件 · {{bytes}}"
     },
     "rules": {

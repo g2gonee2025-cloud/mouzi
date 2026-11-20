@@ -54,6 +54,11 @@
       "importSuccess": "Đã giải nén {{extracted}} tệp và sắp xếp {{count}} tệp.",
       "importError": "Không thể nhập kho lưu trữ: {{error}}",
       "openImportFolder": "Mở thư mục nhập",
+      "sorting": "Đang sắp xếp các tệp đã giải nén…",
+      "organizedCount": "Đã sắp xếp {{count}} tệp.",
+      "cancelling": "Đang hủy…",
+      "statusUnavailable": "Không xem được trạng thái nhập: {{error}}",
+      "importIncomplete": "Chưa hoàn tất nhập: {{error}}",
       "progress": "Đã giải nén {{files}} tệp · {{bytes}}"
     },
     "rules": {

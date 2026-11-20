@@ -48,6 +48,11 @@
       "importSuccess": "Extracted {{extracted}} file(s) and organized {{count}} file(s).",
       "importError": "Failed to import archive: {{error}}",
       "openImportFolder": "Open import folder",
+      "sorting": "Organizing extracted files…",
+      "organizedCount": "Organized {{count}} file(s).",
+      "cancelling": "Cancelling…",
+      "statusUnavailable": "Archive status unavailable: {{error}}",
+      "importIncomplete": "Import incomplete: {{error}}",
       "progress": "Extracted {{files}} files · {{bytes}}"
     },
     "rules": {

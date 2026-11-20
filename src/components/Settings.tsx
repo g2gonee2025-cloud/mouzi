@@ -3,9 +3,9 @@ import { useTranslation } from "react-i18next";
 import { useAppStore, Rule, ScheduleSettings, WatchedFolder, type PreferencesPatch } from "../store/useAppStore";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { formatBytes } from "../utils/format";
 import { open } from "@tauri-apps/plugin-dialog";
 import About from "./About";
+import ArchiveImportPanel from "./ArchiveImportPanel";
 import ActionRefreshWarnings from "./ActionRefreshWarnings";
 import HistoryView from "./HistoryView";
 import ReviewQueue from "./ReviewQueue";
@@ -33,7 +33,6 @@ import {
   Download,
   Upload,
   Info,
-  ExternalLink,
 } from "lucide-react";
 
 
@@ -208,7 +207,6 @@ export default function Settings() {
     updateSchedule,
     exportRules,
     importRules,
-    importArchive,
   } = useAppStore();
 
   const [tab, setTab] = useState<Tab>("folders");
@@ -231,23 +229,6 @@ export default function Settings() {
   const scheduleDirty = !!schedule && !!scheduleDraft && !schedulesMatch(schedule, localSchedule);
   const [ruleToast, setRuleToast] = useState<{ message: string; type: "success" | "error" } | null>(null);
   const [replaceOnImport, setReplaceOnImport] = useState(false);
-  const [archiveToast, setArchiveToast] = useState<{
-    message: string;
-    type: "success" | "error" | "info";
-    stagingPath?: string;
-  } | null>(null);
-  const [isImportingArchive, setIsImportingArchive] = useState(false);
-  const [archiveProgress, setArchiveProgress] = useState<{ bytes: number; files: number } | null>(null);
-  useEffect(() => {
-    if (!isImportingArchive) return;
-    let disposed = false;
-    let stop: (() => void) | undefined;
-    listen<{ bytes: number; files: number }>("archive-import-progress", (event) => {
-      if (!disposed) setArchiveProgress(event.payload);
-    }).then((unlisten) => { if (disposed) unlisten(); else stop = unlisten; })
-      .catch((error) => setArchiveToast({ type: "error", message: String(error) }));
-    return () => { disposed = true; stop?.(); };
-  }, [isImportingArchive]);
   const [pending, setPending] = useState<ConfirmRequest | null>(null);
   const sectionHeading = useRef<HTMLHeadingElement>(null);
   const [undoToast, setUndoToast] = useState<UndoNotice[] | null>(null);
@@ -463,38 +444,6 @@ export default function Settings() {
     setTimeout(() => setRuleToast(null), 3000);
   };
 
-  const handleImportArchive = async () => {
-    try {
-      const selected = await open({
-        filters: [{ name: "Archives", extensions: ["zip", "tgz", "gz"] }],
-        multiple: false,
-      });
-      const path = Array.isArray(selected) ? selected[0] : selected;
-      if (!path) return;
-
-      setIsImportingArchive(true);
-      setArchiveProgress(null);
-      setArchiveToast({ message: t("settings.archive.importing"), type: "info" });
-
-      const { sortedCount, extractedCount, stagingPath, issue } = await importArchive(path);
-      setArchiveToast({
-        message: issue === null
-          ? t("settings.archive.importSuccess", { count: sortedCount, extracted: extractedCount })
-          : t("settings.archive.importError", { error: issue }),
-        type: issue === null ? "success" : "error",
-        stagingPath,
-      });
-    } catch (e) {
-      console.error("Import archive failed:", e);
-      setArchiveToast({
-        message: t("settings.archive.importError", { error: String(e) }),
-        type: "error",
-      });
-    } finally {
-      setIsImportingArchive(false);
-    }
-  };
-
   const committedGraceSeconds = settings?.grace_period_seconds ?? 300;
   const committedGrace = secondsToUnit(committedGraceSeconds);
   const graceValue = graceDraft?.value ?? String(committedGrace.value);
@@ -607,58 +556,7 @@ export default function Settings() {
               <input type="checkbox" checked={newOnlyNew} onChange={(event) => setNewOnlyNew(event.target.checked)} />
               {t("beta.onlyNew")}
             </label>
-            <div className="rounded-lg border border-border bg-surface-dark p-4 space-y-3">
-              <div className="flex items-start justify-between gap-3">
-                <div>
-                  <h3 className="text-sm font-semibold">{t("settings.archive.title")}</h3>
-                  <p className="mt-1 text-xs text-text-muted">
-                    {t("settings.archive.description")}
-                  </p>
-                </div>
-                <button
-                  onClick={handleImportArchive}
-                  disabled={isImportingArchive}
-                  className="flex shrink-0 items-center gap-1.5 rounded-md border border-border px-3 py-2 text-sm hover:bg-surface transition-colors disabled:cursor-not-allowed disabled:opacity-60"
-                >
-                  <Upload size={14} />
-                  {isImportingArchive
-                    ? t("settings.archive.importingShort")
-                    : t("settings.archive.import")}
-                </button>
-              </div>
-              {isImportingArchive && (
-                <div className="flex items-center gap-3">
-                <button className="rounded-md border border-border px-3 py-2 text-sm hover:bg-surface" onClick={() => {
-                  void invoke("cancel_archive_import_cmd").catch((error) => setArchiveToast({ type: "error", message: String(error) }));
-                }}>{t("common.cancel")}</button>
-                {archiveProgress && <p role="status" className="text-xs text-text-muted">{t("settings.archive.progress", { files: archiveProgress.files, bytes: formatBytes(archiveProgress.bytes) })}</p>}
-                </div>
-              )}
-              {archiveToast && (
-                <div
-                  className={`text-xs px-3 py-2 rounded-md ${
-                    archiveToast.type === "success"
-                      ? "bg-green-50 text-green-700 border border-green-200"
-                      : archiveToast.type === "error"
-                      ? "bg-red-50 text-red-700 border border-red-200"
-                      : "bg-blue-50 text-blue-700 border border-blue-200"
-                  }`}
-                >
-                  <div>{archiveToast.message}</div>
-                  {archiveToast.stagingPath && (
-                    <button
-                      onClick={() =>
-                        invoke("open_folder_cmd", { path: archiveToast.stagingPath }).catch((error) => setArchiveToast({ ...archiveToast, type: "error", message: String(error) }))
-                      }
-                      className="mt-2 inline-flex items-center gap-1 text-xs font-medium underline"
-                    >
-                      <ExternalLink size={12} />
-                      {t("settings.archive.openImportFolder")}
-                    </button>
-                  )}
-                </div>
-              )}
-            </div>
+            <ArchiveImportPanel />
             <div className="space-y-2">
               {folders.map((f) => (
                 <div

@@ -48,6 +48,11 @@
       "importSuccess": "Распаковано файлов: {{extracted}}, организовано файлов: {{count}}.",
       "importError": "Не удалось импортировать архив: {{error}}",
       "openImportFolder": "Открыть папку импорта",
+      "sorting": "Сортировка извлечённых файлов…",
+      "organizedCount": "Организовано файлов: {{count}}.",
+      "cancelling": "Отмена…",
+      "statusUnavailable": "Статус импорта недоступен: {{error}}",
+      "importIncomplete": "Импорт не завершён: {{error}}",
       "progress": "Извлечено файлов: {{files}} · {{bytes}}"
     },
     "rules": {

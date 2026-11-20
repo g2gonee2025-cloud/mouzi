@@ -1,9 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const ipc = vi.hoisted(() => ({ invoke: vi.fn() }));
+const ipc = vi.hoisted(() => ({ invoke: vi.fn(), listen: vi.fn() }));
 vi.mock("@tauri-apps/api/core", () => ipc);
+vi.mock("@tauri-apps/api/event", () => ({ listen: ipc.listen }));
 
-import { useAppStore, type AppSettings } from "../store/useAppStore";
+import { observeArchiveImportState, useAppStore, type AppSettings, type ArchiveImportState } from "../store/useAppStore";
 
 function settings(patch: Partial<AppSettings> = {}): AppSettings {
   return {
@@ -25,9 +26,8 @@ function deferred<T>() {
 
 beforeEach(() => {
   ipc.invoke.mockReset();
-  useAppStore.setState({ settings: null, schedule: null, folders: [], logs: [],
-    historyCounts: null, stats: [], pendingFiles: [], isLoading: false,
-    actionRefreshErrors: { history: null, historyCounts: null, stats: null } });
+  ipc.listen.mockReset();
+  useAppStore.setState(useAppStore.getInitialState(), true);
 });
 
 describe("committed preference and schedule settings", () => {
@@ -104,6 +104,106 @@ describe("committed preference and schedule settings", () => {
       ["enable_autostart_cmd"],
       ["update_settings_cmd", { settings: { autostart: true } }],
     ]);
+  });
+});
+
+describe("archive import in Settings", () => {
+  const running: ArchiveImportState = {
+    revision: 4, jobId: 1, status: "running", phase: "extracting", bytes: 10, files: 1,
+    cancelRequested: false, result: null, error: null,
+  };
+  const partialReceipt = {
+    extractedCount: 1, sortedCount: 0, stagingPath: "C:/archive-imports/cancelled", issue: "Archive import cancelled",
+  };
+  const completed: ArchiveImportState = {
+    ...running, revision: 6, status: "completed", phase: null, cancelRequested: true,
+    result: partialReceipt,
+  };
+
+  it("hydrates a new Settings WebView without a preceding progress event", async () => {
+    const unlisten = vi.fn();
+    ipc.listen.mockResolvedValue(unlisten);
+    ipc.invoke.mockResolvedValueOnce(running);
+    const controller = new AbortController();
+
+    await observeArchiveImportState(controller.signal);
+
+    expect(ipc.listen).toHaveBeenCalledWith("archive-import-state-changed", expect.any(Function));
+    expect(ipc.invoke).toHaveBeenCalledWith("get_archive_import_state_cmd");
+    expect(useAppStore.getState().archiveImportState).toEqual(running);
+    controller.abort();
+    expect(unlisten).toHaveBeenCalledOnce();
+  });
+
+  it("keeps the receipt when its initial read or an event arrives out of order", async () => {
+    const read = deferred<ArchiveImportState>();
+    ipc.listen.mockResolvedValue(vi.fn());
+    ipc.invoke.mockReturnValueOnce(read.promise);
+    const controller = new AbortController();
+    const observing = observeArchiveImportState(controller.signal);
+    await vi.waitFor(() => expect(ipc.invoke).toHaveBeenCalledWith("get_archive_import_state_cmd"));
+    const emit = ipc.listen.mock.calls[0][1];
+
+    emit({ payload: completed });
+    emit({ payload: { ...running, revision: 5 } });
+    read.resolve(running);
+    await observing;
+
+    expect(useAppStore.getState().archiveImportState).toEqual(completed);
+    controller.abort();
+    emit({ payload: { ...running, revision: 7, jobId: 2 } });
+    expect(useAppStore.getState().archiveImportState).toEqual(completed);
+  });
+
+  it("retains the previous receipt when a new import fails before it can start", async () => {
+    useAppStore.getState().applyArchiveImportState(completed);
+    ipc.invoke.mockRejectedValueOnce(new Error("Archive selection was rejected")).mockResolvedValueOnce(completed);
+
+    await useAppStore.getState().pickArchiveImport(async () => "C:/fixture.zip");
+
+    expect(ipc.invoke.mock.calls).toEqual([
+      ["import_archive_cmd", { path: "C:/fixture.zip" }],
+      ["get_archive_import_state_cmd"],
+    ]);
+    expect(useAppStore.getState().archiveImportError).toBe("Error: Archive selection was rejected");
+    expect(useAppStore.getState().archiveImportState).toEqual(completed);
+  });
+
+  it("cancels the observed job and leaves a newer job alone", async () => {
+    const pendingCancel = deferred<void>();
+    const nextJob = { ...running, revision: 7, jobId: 2 };
+    useAppStore.getState().applyArchiveImportState(running);
+    ipc.invoke.mockReturnValueOnce(pendingCancel.promise).mockResolvedValueOnce(nextJob);
+
+    const cancelling = useAppStore.getState().cancelArchiveImport();
+    await useAppStore.getState().cancelArchiveImport();
+    expect(ipc.invoke.mock.calls).toEqual([["cancel_archive_import_cmd", { jobId: 1 }]]);
+    useAppStore.getState().applyArchiveImportState(nextJob);
+    pendingCancel.reject(new Error("Previous job ended"));
+    await cancelling;
+
+    expect(useAppStore.getState().archiveImportState).toEqual(nextJob);
+    expect(useAppStore.getState().archiveCancelError).toBeNull();
+    expect(useAppStore.getState().archiveCancelingJob).toBeNull();
+  });
+
+  it("retains the pending archive invocation in the workspace store", async () => {
+    const result = { ...partialReceipt, results: [] };
+    const flight = deferred<typeof result>();
+    ipc.invoke.mockImplementation(async (command: string) => {
+      if (command === "import_archive_cmd") return flight.promise;
+      if (command === "get_archive_import_state_cmd") return completed;
+      return [];
+    });
+
+    const importing = useAppStore.getState().importArchive("C:/fixture.zip");
+    const busyDuringRequest = useAppStore.getState().archiveImportPending;
+    flight.resolve(result);
+    await expect(importing).resolves.toEqual(result);
+    expect(busyDuringRequest).toBe(true);
+    expect(ipc.invoke.mock.calls.map(([command]) => command)).not.toContain("get_logs_cmd");
+    await vi.waitFor(() => expect(useAppStore.getState().archiveImportPending).toBe(false));
+    expect(useAppStore.getState().archiveImportState?.result).toEqual(completed.result);
   });
 });
 
@@ -215,6 +315,11 @@ describe("authoritative clean scope and history", () => {
       };
       ipc.invoke.mockImplementation(async (command: string) => {
         if (command === "import_archive_cmd") return result;
+        if (command === "get_archive_import_state_cmd") return {
+          revision: 7, jobId: 1, status: "completed", phase: null, bytes: 10, files: 2, cancelRequested: issue !== null,
+          result: { extractedCount: result.extractedCount, sortedCount: result.sortedCount, stagingPath: result.stagingPath, issue },
+          error: null,
+        };
         if (command === "get_logs_cmd") return history.promise;
         if (command === "get_stats_cmd") return [];
         throw new Error(`Unexpected IPC command ${command}`);

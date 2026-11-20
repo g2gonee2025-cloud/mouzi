@@ -48,6 +48,11 @@
       "importSuccess": "Розпаковано файлів: {{extracted}}, впорядковано: {{count}}.",
       "importError": "Не вдалося імпортувати архів: {{error}}",
       "openImportFolder": "Відкрити теку імпорту",
+      "sorting": "Упорядкування розпакованих файлів…",
+      "organizedCount": "Упорядковано файлів: {{count}}.",
+      "cancelling": "Скасування…",
+      "statusUnavailable": "Стан імпорту недоступний: {{error}}",
+      "importIncomplete": "Імпорт не завершено: {{error}}",
       "progress": "Розпаковано файлів: {{files}} · {{bytes}}"
     },
     "rules": {

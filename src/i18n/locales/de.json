@@ -48,6 +48,11 @@
       "importSuccess": "{{extracted}} Datei(en) extrahiert und {{count}} Datei(en) organisiert.",
       "importError": "Archiv konnte nicht importiert werden: {{error}}",
       "openImportFolder": "Importordner öffnen",
+      "sorting": "Entpackte Dateien werden organisiert…",
+      "organizedCount": "{{count}} Datei(en) organisiert.",
+      "cancelling": "Wird abgebrochen…",
+      "statusUnavailable": "Importstatus nicht verfügbar: {{error}}",
+      "importIncomplete": "Import unvollständig: {{error}}",
       "progress": "{{files}} Dateien entpackt · {{bytes}}"
     },
     "rules": {
