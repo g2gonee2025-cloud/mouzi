@@ -309,7 +309,7 @@ pub fn update_folder_mode_cmd(app: tauri::AppHandle, id: i64, mode: String) -> R
 }
 
 #[tauri::command]
-pub fn get_logs_cmd(limit: i64) -> Result<Vec<ActionLog>, String> {
+pub fn get_logs_cmd(limit: i64) -> Result<Vec<RecentActionLog>, String> {
     get_recent_logs(limit.clamp(1, 500)).map_err(|e| e.to_string())
 }
 
@@ -377,6 +377,16 @@ struct UndoTarget {
     dest: Option<String>,
     file_identity: Option<String>,
     fingerprint: Option<String>,
+}
+
+impl UndoTarget {
+    fn destination(&self) -> Option<&str> {
+        self.dest.as_deref().filter(|path| !path.is_empty())
+    }
+
+    fn saved_identity(&self) -> Option<&str> {
+        self.file_identity.as_deref().filter(|identity| !identity.is_empty())
+    }
 }
 
 /// Open the watcher's self-suppression window for `paths`.
@@ -451,7 +461,7 @@ fn finish_undo(target: &UndoTarget, ignored_files: &IgnoredFiles) -> Result<Undo
         return Err(format!("Undo was interrupted (recovery record {}). Inspect {} and {requested} before restoring manually.{location}", receipt.id, receipt.source));
     }
 
-    let Some(dest) = target.dest.as_deref().filter(|path| !path.is_empty()) else {
+    let Some(dest) = target.destination() else {
         return Ok(missing_undo());
     };
     let dest_path = Path::new(dest);
@@ -460,7 +470,7 @@ fn finish_undo(target: &UndoTarget, ignored_files: &IgnoredFiles) -> Result<Undo
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(missing_undo()),
         Err(error) => return Err(format!("Cannot inspect the recorded destination {dest}: {error}")),
     }
-    let expected = target.file_identity.as_deref().ok_or_else(|| format!(
+    let expected = target.saved_identity().ok_or_else(|| format!(
         "This older history entry has no saved file identity. Verify the file at {dest} and restore it manually to {}.",
         target.source,
     ))?;
@@ -531,6 +541,15 @@ fn undo_action_with(id: i64, ignored_files: &IgnoredFiles) -> Result<UndoResult,
     let _operation = ignored_files.with_operation();
     let target = read_undo_target(id)?;
     Ok(finish_undo(&target, ignored_files).unwrap_or_else(failed_undo))
+}
+
+fn cancel_undo_paths(
+    target: &UndoTarget, cancel_paths: impl FnOnce(&[PathBuf]) -> Result<(), String>,
+) -> Result<(), String> {
+    if let Some(dest) = target.destination().filter(|_| target.saved_identity().is_some()) {
+        cancel_paths(&[PathBuf::from(&target.source), PathBuf::from(dest)])?;
+    }
+    Ok(())
 }
 
 fn undo_all_with(
@@ -607,9 +626,10 @@ fn notify_move_observer() {}
 #[tauri::command(async)]
 pub fn undo_action_cmd(app: AppHandle, id: i64, state: tauri::State<AppState>) -> Result<UndoResult, String> {
     let target = read_undo_target(id)?;
-    let mut paths = vec![PathBuf::from(&target.source)];
-    if let Some(dest) = target.dest { paths.push(PathBuf::from(dest)); }
-    state.watcher.lock().map_err(|_| "Watcher state unavailable")?.cancel_paths(&paths);
+    cancel_undo_paths(&target, |paths| {
+        state.watcher.lock().map_err(|_| "Watcher state unavailable")?.cancel_paths(paths);
+        Ok(())
+    })?;
     let result = undo_action_with(id, &state.ignored_files);
     let _ = app.emit("mutation-completed", ());
     result
@@ -2428,12 +2448,27 @@ mod undo_tests {
         let fixture = UndoFixture::new("legacy_identity");
         let (source, dest) = stage(fixture.root(), "legacy.undocheck");
         let id = insert_log_with_identity("2026-01-01T00:00:00Z", &source, Some(&dest), None);
-        let result = undo_action_with(id, &ignored_files()).unwrap();
+        let ignored = ignored_files();
+        let paths = [Path::new(&source), Path::new(&dest)];
+        let tickets = paths.map(|path| ignored.ticket(path));
+        let target = read_undo_target(id).unwrap();
+        cancel_undo_paths(&target, |_| panic!("Legacy Undo must not cancel pending arrivals")).unwrap();
+        let result = undo_action_with(id, &ignored).unwrap();
 
         assert_eq!(result.status, "failed");
         assert!(result.message.unwrap().contains("restore it manually"));
         assert_eq!(std::fs::read(&dest).unwrap(), b"payload");
         assert!(!Path::new(&source).exists());
+        assert_eq!(undone_of(&source), 0);
+        assert!(tickets.iter().all(|ticket| ticket.is_current()));
+        assert!(paths.iter().all(|path| !ignored.is_suppressed(path, Instant::now())));
+
+        let held = fixture.root().join("held-legacy.undocheck");
+        std::fs::rename(&dest, &held).unwrap();
+        cancel_undo_paths(&target, |_| panic!("A missing legacy file must not cancel pending arrivals")).unwrap();
+        assert_eq!(undo_action_with(id, &ignored).unwrap().status, "missing");
+        assert!(tickets.iter().all(|ticket| ticket.is_current()));
+        assert_eq!(std::fs::read(held).unwrap(), b"payload");
         assert_eq!(undone_of(&source), 0);
     }
 
@@ -2504,6 +2539,16 @@ mod undo_tests {
         assert_eq!(reviewed, [missing_verified, verified]);
         assert_eq!(counts.undoable, 2);
         assert!(undo_all_with(&ignored_files(), &[legacy], |_| panic!("legacy row must not cancel queued work")).is_err());
+
+        let recent = serde_json::to_value(get_logs_cmd(50).unwrap()).unwrap();
+        let recent = recent.as_array().unwrap();
+        assert_eq!(recent.len(), 7);
+        let legacy_row = recent.iter().find(|row| row["id"] == legacy).unwrap();
+        assert_eq!(legacy_row["action"], "move");
+        assert_eq!(legacy_row["destination_path"], destination.as_str());
+        assert_eq!(legacy_row["undo_verified"], false);
+        let verified_row = recent.iter().find(|row| row["id"] == verified).unwrap();
+        assert_eq!(verified_row["undo_verified"], true);
 
         let conn = lock_db().unwrap();
         conn.execute("UPDATE action_logs SET undone=1 WHERE id IN (?1,?2)", [missing_verified, verified]).unwrap();
@@ -3010,14 +3055,12 @@ mod undo_tests {
         std::fs::write(&source1, b"in the way").unwrap();
         log_at(1, &source1, Some(&dest1));
 
-        // 2: a destination was recorded but the file is no longer there.
-        let source2 = root.join("in").join("e2.undocheck");
-        let source2 = source2.to_string_lossy().into_owned();
-        let dest2 = root.join("out").join("e2.undocheck");
-        let dest2 = dest2.to_string_lossy().into_owned();
+        // 2: a verified destination was recorded but the file is no longer there.
+        let (source2, dest2) = stage(root, "e2.undocheck");
         log_at(2, &source2, Some(&dest2));
+        std::fs::rename(&dest2, root.join("held-e2.undocheck")).unwrap();
 
-        // 3: no destination was ever recorded.
+        // 3: no destination was ever recorded, so the row is not part of the batch.
         let source3 = root.join("in").join("e3.undocheck");
         let source3 = source3.to_string_lossy().into_owned();
         log_at(3, &source3, None);
@@ -3036,7 +3079,7 @@ mod undo_tests {
 
         // The batch query is ORDER BY timestamp DESC, so rank 4 comes first.
         let statuses: Vec<&str> = outcome.results.iter().map(|r| r.status.as_str()).collect();
-        assert_eq!(statuses, vec!["failed", "missing", "missing", "collision", "ok"]);
+        assert_eq!(statuses, vec!["failed", "missing", "collision", "ok"]);
         assert_eq!(outcome.count, 2, "only actual restores count");
 
         let restored: Vec<Option<&str>> = outcome
@@ -3044,8 +3087,8 @@ mod undo_tests {
             .iter()
             .map(|r| r.restored_to.as_deref())
             .collect();
-        assert_eq!(restored[4], Some(source0.as_str()));
-        assert!(restored[3].unwrap().ends_with("e1_0.undocheck"), "{restored:?}");
+        assert_eq!(restored[3], Some(source0.as_str()));
+        assert!(restored[2].unwrap().ends_with("e1_0.undocheck"), "{restored:?}");
         assert!(Path::new(&source1).exists(), "the file that was in the way must survive");
         assert!(!Path::new(&dest1).exists(), "the restored file must leave its organised location");
         assert!(dest4.exists(), "a failed move must leave the file alone");
@@ -3060,7 +3103,7 @@ mod undo_tests {
         // then — the path the watcher will actually report.
         {
             assert!(
-                ignored.is_guarded(restored[3].unwrap()),
+                ignored.is_guarded(restored[2].unwrap()),
                 "the collision's new name was never guarded"
             );
         }

@@ -113,6 +113,13 @@ pub struct ActionLog {
 }
 
 #[derive(Debug, Serialize)]
+pub struct RecentActionLog {
+    #[serde(flatten)]
+    pub action: ActionLog,
+    pub undo_verified: bool,
+}
+
+#[derive(Debug, Serialize)]
 pub struct OrganizationLog {
     #[serde(flatten)]
     pub action: ActionLog,
@@ -1065,14 +1072,17 @@ pub fn log_action(log: &ActionLog) -> SqliteResult<i64> {
     Ok(conn.last_insert_rowid())
 }
 
-pub fn get_recent_logs(limit: i64) -> SqliteResult<Vec<ActionLog>> {
+pub fn get_recent_logs(limit: i64) -> SqliteResult<Vec<RecentActionLog>> {
     let conn = sqlite_lock()?;
     let mut stmt = conn.prepare(
-        "SELECT id, timestamp, source_path, destination_path, action, file_name, file_type, undone FROM action_logs ORDER BY timestamp DESC LIMIT ?1"
+        "SELECT id, timestamp, source_path, destination_path, action, file_name, file_type, undone,
+         NULLIF(file_identity, '') IS NOT NULL FROM action_logs ORDER BY timestamp DESC LIMIT ?1"
     )?;
-    let logs = stmt.query_map(params![limit], action_log_from_row)?
-    .collect::<SqliteResult<Vec<_>>>()?;
-    Ok(logs)
+    let logs = stmt.query_map(params![limit], |row| Ok(RecentActionLog {
+        action: action_log_from_row(row)?,
+        undo_verified: row.get(8)?,
+    }))?;
+    logs.collect()
 }
 
 fn action_log_from_row(row: &rusqlite::Row<'_>) -> SqliteResult<ActionLog> {
@@ -1094,7 +1104,7 @@ pub(crate) fn get_organization_logs() -> SqliteResult<Vec<OrganizationLog>> {
     let conn = sqlite_lock()?;
     let mut stmt = conn.prepare(
         "SELECT id,timestamp,source_path,destination_path,action,file_name,file_type,undone,
-         run_id,trigger,file_extension,file_size,fingerprint,file_identity IS NOT NULL
+         run_id,trigger,file_extension,file_size,fingerprint,NULLIF(file_identity, '') IS NOT NULL
          FROM action_logs ORDER BY timestamp DESC,id DESC",
     )?;
     let logs = stmt.query_map([], |row| Ok(OrganizationLog {
@@ -1109,11 +1119,15 @@ pub(crate) fn get_organization_logs() -> SqliteResult<Vec<OrganizationLog>> {
     logs.collect()
 }
 
+const UNDO_ELIGIBILITY: &str = "undone=0 AND action IN ('move','rename','accept')
+    AND NULLIF(destination_path, '') IS NOT NULL AND NULLIF(file_identity, '') IS NOT NULL";
+
 pub fn get_undoable_logs() -> SqliteResult<Vec<(i64, String, Option<String>, Option<String>, Option<String>)>> {
     let conn = sqlite_lock()?;
-    let mut stmt = conn.prepare(
-        "SELECT id, source_path, destination_path, file_identity, fingerprint FROM action_logs WHERE undone = 0 AND action IN ('move','rename','accept') ORDER BY timestamp DESC, id DESC"
-    )?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT id, source_path, destination_path, file_identity, fingerprint
+         FROM action_logs WHERE {UNDO_ELIGIBILITY} ORDER BY timestamp DESC, id DESC"
+    ))?;
     let logs = stmt.query_map([], |row| {
         Ok((
             row.get::<_, i64>(0)?,
@@ -1218,7 +1232,7 @@ pub struct HistoryCounts { pub total: i64, pub undoable: i64 }
 
 pub fn history_counts() -> SqliteResult<HistoryCounts> {
     sqlite_lock()?.query_row(
-        "SELECT COUNT(*),COALESCE(SUM(CASE WHEN undone=0 AND action IN ('move','rename','accept') THEN 1 ELSE 0 END),0) FROM action_logs",
+        &format!("SELECT COUNT(*), COUNT(CASE WHEN {UNDO_ELIGIBILITY} THEN 1 END) FROM action_logs"),
         [], |row| Ok(HistoryCounts{total:row.get(0)?,undoable:row.get(1)?}),
     )
 }
@@ -2984,9 +2998,9 @@ mod tests {
         };
         let _row = LogRow { id, table: "action_logs", remove: remove_action_log };
         let logs = get_recent_logs(100).unwrap();
-        let corrupt = logs.iter().find(|l| l.source_path == "/corrupt-test");
+        let corrupt = logs.iter().find(|l| l.action.source_path == "/corrupt-test");
         assert!(corrupt.is_some(), "corrupt row should be returned with epoch fallback");
-        assert_eq!(corrupt.unwrap().timestamp, Utc.timestamp_opt(0, 0).unwrap());
+        assert_eq!(corrupt.unwrap().action.timestamp, Utc.timestamp_opt(0, 0).unwrap());
     }
 
     #[test]
@@ -3521,7 +3535,7 @@ mod tests {
         let recent=log_action(&log(chrono::Duration::days(6)+chrono::Duration::hours(23))).unwrap();let old=log_action(&log(chrono::Duration::days(7)+chrono::Duration::hours(1))).unwrap();
         let _recent=LogRow{id:recent,table:"action_logs",remove:remove_action_log};let _old=LogRow{id:old,table:"action_logs",remove:remove_action_log};
         let stats=get_weekly_stats().unwrap();assert_eq!(stats.iter().find(|(category,_)|category=="week-test-category").unwrap().1,1);
-        let counts=history_counts().unwrap();assert_eq!(counts.total,before.total+2);assert_eq!(counts.undoable,before.undoable+2);
+        let counts=history_counts().unwrap();assert_eq!(counts.total,before.total+2);assert_eq!(counts.undoable,before.undoable);
     }
 
     #[test]
