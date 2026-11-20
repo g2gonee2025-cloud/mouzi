@@ -1,4 +1,4 @@
-import { useEffect, useCallback, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { navigateHash } from "../utils/paths";
 import { useSuggestionsStore, distinctSuggestionRules, type Suggestion } from "../store/useSuggestionsStore";
@@ -80,15 +80,13 @@ export default function Suggestions() {
     loadSuggestions();
   }, [loadSuggestions]);
 
-  // Refresh on window focus
-  const handleFocus = useCallback(() => {
-    loadSuggestions();
-  }, [loadSuggestions]);
-
   useEffect(() => {
+    const handleFocus = () => {
+      if (!useSuggestionsStore.getState().loading) void loadSuggestions();
+    };
     window.addEventListener("focus", handleFocus);
     return () => window.removeEventListener("focus", handleFocus);
-  }, [handleFocus]);
+  }, [loadSuggestions]);
 
   const handleClose = () => {
     navigateHash("dashboard");
