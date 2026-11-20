@@ -9,6 +9,14 @@ import { buttonClass, fieldClass, primaryClass, errorText } from "./BetaControls
 import ConfirmDialog, { type ConfirmRequest } from "./cleanup/ConfirmDialog";
 
 const emptyFilters = { query: "", rule: "", extension: "", from: "", to: "", run_id: "" };
+
+function endOfLocalMinute(value: string): string {
+  const start = new Date(value);
+  const lastSecond = new Date(start.getTime() + 59_000);
+  // History's inclusive bound can retain nanoseconds beyond Date's precision.
+  return lastSecond.toISOString().replace(".000Z", ".999999999Z");
+}
+
 type HistoryRead =
   | { status: "loading" }
   | { status: "failed"; error: string }
@@ -50,7 +58,7 @@ export default function HistoryView() {
       const rows = await invoke<OrganizationLog[]>("history_cmd", { filter: {
         ...value,
         from: value.from ? new Date(value.from).toISOString() : "",
-        to: value.to ? new Date(value.to).toISOString() : "",
+        to: value.to ? endOfLocalMinute(value.to) : "",
       } });
       if (request === generation.current) {
         setRead({ status: "ready", request, rows });

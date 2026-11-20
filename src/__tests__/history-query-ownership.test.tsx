@@ -80,9 +80,15 @@ const confirmation: Match = (node) => node.type === ConfirmDialog;
 const click = (element: Element) => element.props.onClick!({ currentTarget: {} as HTMLButtonElement });
 const settle = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
 const changeDraft = (value: string) => requireElement(search).props.onChange!({ target: { value } });
+const submitFilters = () => requireElement((node) => node.type === "form").props.onSubmit!({ preventDefault: () => {} });
 function apply(query: string) {
   changeDraft(query);
-  requireElement((node) => node.type === "form").props.onSubmit!({ preventDefault: () => {} });
+  submitFilters();
+}
+function changeDate(field: "from" | "to", value: string) {
+  const label = requireElement((node) => node.type === "label" && text(node.props.children) === "beta." + field);
+  requireElement((node) => node.type === "input" && node.props.type === "datetime-local", label)
+    .props.onChange!({ target: { value } });
 }
 function chooseAll() {
   click(requireElement(button("beta.selectAll")));
@@ -130,6 +136,42 @@ async function mount() {
   cleanup = mock.effects.splice(0).map((effect) => effect());
   await settle();
 }
+
+it.each([
+  { name: "one local minute", from: "2026-11-21T10:15", to: "2026-11-21T10:15" },
+  { name: "an end-only range at local midnight", from: "", to: "2026-11-21T23:59" },
+  { name: "a start-only range", from: "2026-11-22T00:00", to: "" },
+])("sends precise History bounds for $name", async ({ from, to }) => {
+  mock.invoke.mockResolvedValue([]);
+  await mount();
+  changeDate("from", from);
+  changeDate("to", to);
+  submitFilters();
+  await settle();
+  expect(mock.invoke).toHaveBeenLastCalledWith("history_cmd", {
+    filter: {
+      query: "", rule: "", extension: "", run_id: "",
+      from: from ? new Date(from).toISOString() : "",
+      to: to ? new Date(to + ":59").toISOString().slice(0, -5) + ".999999999Z" : "",
+    },
+  });
+
+  click(requireElement(button("beta.reset")));
+  await settle();
+  expect(mock.invoke).toHaveBeenLastCalledWith("history_cmd", {
+    filter: { query: "", rule: "", extension: "", from: "", to: "", run_id: "" },
+  });
+});
+
+it("rejects a reversed local minute range before querying History", async () => {
+  mock.invoke.mockResolvedValue([]);
+  await mount();
+  changeDate("from", "2026-11-22T00:00");
+  changeDate("to", "2026-11-21T23:59");
+  submitFilters();
+  expect(text(history())).toContain("beta.validation.date");
+  expect(mock.invoke).toHaveBeenCalledTimes(1);
+});
 
 it("removes previous rows after a filter failure and retries the last applied filter without losing draft text", async () => {
   const pending = deferredRows();
