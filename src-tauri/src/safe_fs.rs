@@ -51,10 +51,14 @@ mod windows_fs {
         fn GetDriveTypeW(root: *const u16) -> u32;
     }
 
+    pub(super) fn drive_type(drive: u8) -> u32 {
+        let root: [u16; 4] = [drive.into(), b':'.into(), b'\\'.into(), 0];
+        unsafe { GetDriveTypeW(root.as_ptr()) }
+    }
+
     pub(super) fn drive_has_no_root(drive: u8) -> bool {
         const DRIVE_NO_ROOT_DIR: u32 = 1;
-        let root: [u16; 4] = [drive.into(), b':'.into(), b'\\'.into(), 0];
-        unsafe { GetDriveTypeW(root.as_ptr()) == DRIVE_NO_ROOT_DIR }
+        drive_type(drive) == DRIVE_NO_ROOT_DIR
     }
 
     pub(super) fn open(path: &Path, directory: bool, moving: bool) -> io::Result<File> {
@@ -465,6 +469,30 @@ pub fn directory_contains(directory: &Path, ancestor: &Path) -> Result<bool, Str
 
 pub(crate) fn guard_directory(path: &Path) -> Result<AncestorGuard, String> {
     Ok(AncestorGuard { _files: pin_ancestry(path)? })
+}
+
+#[cfg(windows)]
+pub(crate) fn guarded_directory_identities(path: &Path) -> Result<(AncestorGuard, Vec<FileIdentity>), String> {
+    if !path.is_absolute() || has_dot_component(path) || !ordinary_registration(path) {
+        return Err("Cannot establish physical ancestry for this directory spelling".into());
+    }
+    use std::path::Prefix;
+    let drive = match path.components().next() {
+        Some(Component::Prefix(prefix)) => match prefix.kind() {
+            Prefix::Disk(drive) | Prefix::VerbatimDisk(drive) => drive,
+            _ => return Err("Cannot establish complete local-volume ancestry".into()),
+        },
+        _ => return Err("Cannot establish complete local-volume ancestry".into()),
+    };
+    const DRIVE_REMOVABLE: u32 = 2;
+    const DRIVE_FIXED: u32 = 3;
+    const DRIVE_RAMDISK: u32 = 6;
+    if !matches!(windows_fs::drive_type(drive), DRIVE_REMOVABLE | DRIVE_FIXED | DRIVE_RAMDISK) {
+        return Err("Cannot establish complete local-volume ancestry".into());
+    }
+    let files = pin_ancestry(path)?;
+    let identities = files.iter().map(identity_from_handle).collect::<Result<Vec<_>, _>>()?;
+    Ok((AncestorGuard { _files: files }, identities))
 }
 
 pub(crate) fn create_guarded_directory(path: &Path) -> Result<AncestorGuard, String> {

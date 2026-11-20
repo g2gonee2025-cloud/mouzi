@@ -748,6 +748,117 @@ fn mark_inventory_ancestors_stale(conn: &Connection, ancestors: &[String]) -> Sq
     Ok(())
 }
 
+struct InventoryMutationScope {
+    global_revision: i64,
+    scans: Vec<ScanningInventoryRoot>,
+    affected_roots: Vec<String>,
+    _guards: Vec<crate::safe_fs::AncestorGuard>,
+}
+
+#[derive(PartialEq, Eq)]
+struct ScanningInventoryRoot {
+    path: String,
+    generation: i64,
+    folder_id: i64,
+}
+
+fn inventory_mutation_revision(conn: &Connection) -> SqliteResult<i64> {
+    conn.query_row("SELECT mutation_revision FROM inventory_state WHERE id=1", [], |row| row.get(0))
+}
+
+fn scanning_inventory_roots(conn: &Connection) -> SqliteResult<Vec<ScanningInventoryRoot>> {
+    let mut statement = conn.prepare(
+        "SELECT r.root_path, r.generation, w.id FROM inventory_roots r
+         JOIN watched_folders w ON w.path=r.root_path WHERE r.status='scanning'",
+    )?;
+    let roots = statement.query_map([], |row| Ok(ScanningInventoryRoot {
+        path: row.get(0)?,
+        generation: row.get(1)?,
+        folder_id: row.get(2)?,
+    }))?;
+    roots.collect()
+}
+
+#[cfg(not(windows))]
+fn inventory_mutation_scope(_paths: &[&Path]) -> Option<InventoryMutationScope> {
+    // The directory handles used by this app deny rename/deletion on Windows.
+    None
+}
+
+#[cfg(windows)]
+fn inventory_mutation_scope(paths: &[&Path]) -> Option<InventoryMutationScope> {
+    let (global_revision, scans) = {
+        let conn = sqlite_lock().ok()?;
+        (inventory_mutation_revision(&conn).ok()?, scanning_inventory_roots(&conn).ok()?)
+    };
+
+    let mut guards = Vec::new();
+    let mut affected_roots = Vec::new();
+    if scans.is_empty() {
+        return Some(InventoryMutationScope { global_revision, scans, affected_roots, _guards: guards });
+    }
+
+    let mut parents = Vec::new();
+    for path in paths {
+        if !path.is_absolute() || path.file_name().is_none() { return None; }
+        // The leaf may already be gone. Its immediate parent must still be
+        // identifiable. A higher existing ancestor alone cannot prove scope.
+        let (guard, identities) = crate::safe_fs::guarded_directory_identities(path.parent()?).ok()?;
+        guards.push(guard);
+        parents.push(identities);
+    }
+
+    for scan in &scans {
+        let (guard, identities) = crate::safe_fs::guarded_directory_identities(Path::new(&scan.path)).ok()?;
+        let scan_root = identities.first()?;
+        let mut affected = false;
+        for ancestry in &parents {
+            // A DOS alias of a subdirectory can hide earlier ancestors on
+            // the same volume. A different visible anchor is inconclusive.
+            if ancestry.first()?.volume == scan_root.volume && ancestry.last() != identities.last() {
+                return None;
+            }
+            affected |= ancestry.contains(scan_root);
+        }
+        if affected { affected_roots.push(scan.path.clone()); }
+        guards.push(guard);
+    }
+    Some(InventoryMutationScope { global_revision, scans, affected_roots, _guards: guards })
+}
+
+fn retire_inventory_root_scan(conn: &Connection, root: &str) -> SqliteResult<()> {
+    let stopped = conn.execute(
+        "UPDATE inventory_roots SET status='failed', stale=1, error='Inventory changed during scan; previous snapshot retained. Scan again.'
+         WHERE root_path=?1 AND status='scanning'",
+        [root],
+    )?;
+    if stopped > 0 {
+        conn.execute("DELETE FROM inventory_scan_stage WHERE root_path=?1", [root])?;
+    } else {
+        conn.execute("UPDATE inventory_roots SET stale=1 WHERE root_path=?1", [root])?;
+    }
+    Ok(())
+}
+
+fn invalidate_inventory_scans(conn: &Connection, scope: Option<&InventoryMutationScope>) -> SqliteResult<()> {
+    if let Some(scope) = scope {
+        // Watched-root registrations and global invalidations advance the
+        // same revision. Also fall back if any scan started or restarted
+        // while the physical proof was being obtained.
+        if inventory_mutation_revision(conn)? == scope.global_revision
+            && scanning_inventory_roots(conn)?.iter().all(|scan| scope.scans.contains(scan))
+        {
+            for root in &scope.affected_roots {
+                retire_inventory_root_scan(conn, root)?;
+            }
+            conn.execute("UPDATE inventory_state SET revision=revision+1 WHERE id=1", [])?;
+            return Ok(());
+        }
+    }
+    conn.execute("UPDATE inventory_state SET revision=revision+1,mutation_revision=mutation_revision+1 WHERE id=1", [])?;
+    Ok(())
+}
+
 pub(crate) fn register_watched_folder(path: &str, mode: &str, only_new: bool) -> Result<i64, String> {
     let configured = Path::new(path);
     let canonical = crate::safe_fs::validate_root(configured)?;
@@ -1386,16 +1497,16 @@ pub(crate) fn observe_retained_move_output(id: i64, action: &str, path: &str, me
 }
 
 pub(crate) fn mark_retained_move_inventory_stale(source: &Path, output: &Path) -> SqliteResult<()> {
+    let scope = inventory_mutation_scope(&[source, output]);
     let folders = get_watched_folders()?;
     let mut roots = configured_inventory_ancestors(&source.to_string_lossy(), &folders);
     roots.extend(configured_inventory_ancestors(&output.to_string_lossy(), &folders));
     roots.sort_unstable();
     roots.dedup();
-    if roots.is_empty() { return Ok(()); }
     let mut conn = sqlite_lock()?;
     let tx = conn.transaction()?;
     mark_inventory_ancestors_stale(&tx, &roots)?;
-    tx.execute("UPDATE inventory_state SET revision=revision+1,mutation_revision=mutation_revision+1 WHERE id=1", [])?;
+    invalidate_inventory_scans(&tx, scope.as_ref())?;
     tx.commit()
 }
 
@@ -1429,23 +1540,42 @@ fn remove_inventory_path_on(conn:&Connection,path:&str)->SqliteResult<()> {
         conn.execute("DELETE FROM dismissed_suggestions WHERE path=?1",[&path])?;
         conn.execute("DELETE FROM category_overrides WHERE path=?1",[&path])?;
         conn.execute("DELETE FROM inventory_fingerprints WHERE path=?1",[&path])?;
-        conn.execute("UPDATE inventory_roots SET stale=1 WHERE root_path IN (SELECT root_path FROM file_inventory WHERE path=?1)",[&path])?;
+        let previous_root: Option<String> = conn.query_row(
+            "SELECT root_path FROM file_inventory WHERE path=?1", [&path], |row| row.get(0),
+        ).optional()?;
+        if let Some(root) = previous_root {
+            retire_inventory_root_scan(conn, &root)?;
+        }
         conn.execute("DELETE FROM file_inventory WHERE path=?1",[&path])?;
     }
-    conn.execute("UPDATE inventory_state SET revision=revision+1,mutation_revision=mutation_revision+1 WHERE id=1",[])?;
     Ok(())
 }
 
 pub fn remove_inventory_path(path:&str)->SqliteResult<()> {
-    let mut conn=sqlite_lock()?;let tx=conn.transaction()?;remove_inventory_path_on(&tx,path)?;tx.commit()
+    let scope = inventory_mutation_scope(&[Path::new(path)]);
+    let mut conn = sqlite_lock()?;
+    let tx = conn.transaction()?;
+    remove_inventory_path_on(&tx, path)?;
+    invalidate_inventory_scans(&tx, scope.as_ref())?;
+    tx.commit()
 }
 
 pub fn finalize_cleanup_intent(id:i64,status:&str,message:Option<&str>,source_removed:bool)->SqliteResult<()> {
+    let source = if source_removed {
+        Some(sqlite_lock()?.query_row(
+            "SELECT source_path FROM operation_intents WHERE id=?1 AND status='pending'",
+            [id], |row| row.get::<_, String>(0),
+        )?)
+    } else { None };
+    let scope = source.as_deref().and_then(|path| inventory_mutation_scope(&[Path::new(path)]));
     let mut conn=sqlite_lock()?;let tx=conn.transaction()?;
     let (path,cleanup_id):(String,i64)=tx.query_row("SELECT source_path,cleanup_id FROM operation_intents WHERE id=?1 AND status='pending'",[id],|r|Ok((r.get(0)?,r.get(1)?)))?;
     tx.execute("UPDATE operation_intents SET completed_at=?2,status=?3,message=?4 WHERE id=?1",params![id,Utc::now().to_rfc3339(),status,message])?;
     tx.execute("UPDATE cleanup_actions SET status=?2,message=?3,undoable=0 WHERE id=?1",params![cleanup_id,status,message])?;
-    if source_removed {remove_inventory_path_on(&tx,&path)?;}
+    if source_removed {
+        remove_inventory_path_on(&tx, &path)?;
+        invalidate_inventory_scans(&tx, scope.as_ref().filter(|_| source.as_deref() == Some(path.as_str())))?;
+    }
     tx.commit()
 }
 
@@ -1453,9 +1583,12 @@ pub fn metadata_mtime_ns(metadata:&std::fs::Metadata)->String {
     metadata.modified().ok().and_then(|time|time.duration_since(UNIX_EPOCH).ok()).map(|elapsed|elapsed.as_nanos().to_string()).unwrap_or_else(||"0".into())
 }
 
-struct PreparedMove { destination:String, size:i64,mtime:i64,identity:String,mtime_ns:String,owner:Option<(i64,String)> }
+struct PreparedMove {
+    destination:String, size:i64,mtime:i64,identity:String,mtime_ns:String,owner:Option<(i64,String)>,
+    inventory_scope: Option<InventoryMutationScope>,
+}
 
-fn prepare_move(destination:&str)->Result<PreparedMove,String> {
+fn prepare_move(source:&str, destination:&str)->Result<PreparedMove,String> {
     // Every filesystem read happens before acquiring the mutation transaction.
     let path=std::fs::canonicalize(destination).map_err(|e|format!("Moved file metadata unavailable: {e}"))?;
     let metadata=std::fs::metadata(&path).map_err(|e|e.to_string())?;
@@ -1473,7 +1606,8 @@ fn prepare_move(destination:&str)->Result<PreparedMove,String> {
         }
     }
     let mtime=metadata.modified().ok().and_then(|t|t.duration_since(UNIX_EPOCH).ok()).map(|d|d.as_secs() as i64).unwrap_or(0);
-    Ok(PreparedMove{destination:path.to_string_lossy().into_owned(),size:metadata.len() as i64,mtime,identity,mtime_ns:metadata_mtime_ns(&metadata),owner:owner.map(|(_,id,path)|(id,path))})
+    let inventory_scope = inventory_mutation_scope(&[Path::new(source), Path::new(destination), &path]);
+    Ok(PreparedMove{destination:path.to_string_lossy().into_owned(),size:metadata.len() as i64,mtime,identity,mtime_ns:metadata_mtime_ns(&metadata),owner:owner.map(|(_,id,path)|(id,path)),inventory_scope})
 }
 
 fn reconcile_move_on(conn:&Connection,old:&str,prepared:&PreparedMove,category:Option<&str>)->SqliteResult<()> {
@@ -1485,6 +1619,7 @@ fn reconcile_move_on(conn:&Connection,old:&str,prepared:&PreparedMove,category:O
     remove_inventory_path_on(conn,old)?;
     // Also clear a prior destination row/cache (including its different spelling).
     remove_inventory_path_on(conn,&prepared.destination)?;
+    invalidate_inventory_scans(conn, prepared.inventory_scope.as_ref())?;
     if let Some((id,root))=&prepared.owner {
         let still_configured:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM watched_folders WHERE id=?1 AND path=?2)",params![id,root],|r|r.get(0))?;
         if !still_configured {return Ok(());}
@@ -1494,14 +1629,14 @@ fn reconcile_move_on(conn:&Connection,old:&str,prepared:&PreparedMove,category:O
         if category.is_some() || previous_category.is_some() {
             conn.execute("INSERT INTO category_overrides(path,identity,size,mtime_ns,category) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(path) DO UPDATE SET identity=excluded.identity,size=excluded.size,mtime_ns=excluded.mtime_ns,category=excluded.category",params![prepared.destination,prepared.identity,prepared.size,prepared.mtime_ns,selected])?;
         }
-        conn.execute("UPDATE inventory_roots SET stale=1 WHERE root_path=?1",[root])?;
+        retire_inventory_root_scan(conn, root)?;
     }
     Ok(())
 }
 
 pub fn reconcile_move(old:&str,new:&str,category:Option<&str>)->Result<(),String> {
     if category.is_some_and(|category|!crate::categories::is_valid_category(category)) {return Err("Invalid canonical category".into());}
-    let prepared=prepare_move(new)?;let mut conn=lock_db()?;let tx=conn.transaction().map_err(|e|e.to_string())?;
+    let prepared=prepare_move(old,new)?;let mut conn=lock_db()?;let tx=conn.transaction().map_err(|e|e.to_string())?;
     reconcile_move_on(&tx,old,&prepared,category).map_err(|e|e.to_string())?;tx.commit().map_err(|e|e.to_string())
 }
 
@@ -1532,7 +1667,7 @@ pub(crate) fn organization_fingerprints(source: &str, canonical: &str, include_r
 
 fn finalize_moved(id:i64,log:&ActionLog,actual_destination:&str,category:Option<&str>,accepted:bool,expected_identity:&str,inventory_source:&str,organization:Option<OrganizationHistory<'_>>)->Result<(),String> {
     if category.is_some_and(|category|!crate::categories::is_valid_category(category)) {return Err("Invalid canonical category".into());}
-    let prepared=prepare_move(actual_destination)?;
+    let prepared=prepare_move(inventory_source,actual_destination)?;
     if prepared.identity != expected_identity { return Err("Moved file was replaced before history finalization; recovery intent retained".into()); }
     let mut conn=lock_db()?;let tx=conn.transaction().map_err(|e|e.to_string())?;
     let changed=tx.execute("UPDATE operation_intents SET completed_at=?2,status='completed',actual_destination=?3 WHERE id=?1 AND status='pending'",params![id,Utc::now().to_rfc3339(),actual_destination]).map_err(|e|e.to_string())?;
@@ -1653,7 +1788,7 @@ pub fn finalize_undo_intent(id: i64, action_log_id: i64, old: &str, new: &str, e
             return Err("Restored file contents changed before history finalization".into());
         }
     }
-    let prepared = prepare_move(new)?;
+    let prepared = prepare_move(old, new)?;
     if prepared.identity != expected {
         return Err("Restored file was replaced before history finalization".into());
     }
@@ -1826,6 +1961,10 @@ fn append_inventory_batch_on(conn: &mut Connection, root: &str, rows: &[Inventor
         for row in rows {
             stmt.execute(params![root, row.path, row.size, row.mtime, row.category, scanned_at])?;
         }
+    }
+    if !rows.is_empty() {
+        // Legacy callers supply row paths directly, without guarded ancestry.
+        invalidate_inventory_scans(&tx, None)?;
     }
     tx.commit()
 }
@@ -2084,9 +2223,12 @@ pub fn append_inventory_batch(root: &str, rows: &[InventoryRow]) -> SqliteResult
 }
 
 pub fn clear_inventory_for_root(root: &str) -> SqliteResult<()> {
-    let conn = sqlite_lock()?;
-    conn.execute("DELETE FROM file_inventory WHERE root_path = ?1", params![root])
-        .map(|_| ())
+    let mut conn = sqlite_lock()?;
+    let tx = conn.transaction()?;
+    retire_inventory_root_scan(&tx, root)?;
+    tx.execute("DELETE FROM file_inventory WHERE root_path = ?1", [root])?;
+    tx.execute("UPDATE inventory_state SET revision=revision+1 WHERE id=1", [])?;
+    tx.commit()
 }
 
 pub fn get_inventory_stats() -> SqliteResult<InventoryStats> {
@@ -2236,7 +2378,7 @@ pub fn begin_inventory_scan(root:&str)->Result<ScanToken,String> {
     tx.execute("DELETE FROM inventory_scan_stage WHERE root_path=?1",[root]).map_err(|e|e.to_string())?;
     tx.execute("UPDATE inventory_state SET revision=revision+1 WHERE id=1",[]).map_err(|e|e.to_string())?;
     let generation=tx.query_row("SELECT generation FROM inventory_roots WHERE root_path=?1",[root],|r|r.get(0)).map_err(|e|e.to_string())?;
-    let revision=tx.query_row("SELECT mutation_revision FROM inventory_state WHERE id=1",[],|r|r.get(0)).map_err(|e|e.to_string())?;
+    let revision=inventory_mutation_revision(&tx).map_err(|e|e.to_string())?;
     tx.commit().map_err(|e|e.to_string())?;
     Ok(ScanToken{root:root.to_string(),root_id,generation,revision})
 }
@@ -2264,8 +2406,7 @@ pub fn publish_inventory_scan(token:&ScanToken)->Result<(),String> {
     tx.execute("UPDATE inventory_roots SET status='complete',stale=0,last_scan_at=?2,error=NULL WHERE root_path=?1",params![token.root,scanned_at]).map_err(|e|e.to_string())?;
     tx.execute("DELETE FROM inventory_scan_stage WHERE root_path=?1 AND generation=?2",params![token.root,token.generation]).map_err(|e|e.to_string())?;
     tx.execute("UPDATE inventory_state SET revision=revision+1 WHERE id=1",[]).map_err(|e|e.to_string())?;
-    // Publishing another root does not invalidate an in-progress scan; only
-    // user/file mutations advance this revision.
+    // Publishing another root leaves in-progress tokens alone.
     tx.commit().map_err(|e|e.to_string())
 }
 
@@ -2433,7 +2574,7 @@ pub fn get_suggestion_candidates_page(limit:i64,after:Option<&str>)->Result<Vec<
 
 pub fn record_suggestion_feedback(path:&str,category:&str,action_log_id:Option<i64>)->Result<(),String> {
     if !crate::categories::is_valid_category(category) {return Err("Invalid canonical category".into());}
-    let prepared=prepare_move(path)?;
+    let prepared=prepare_move(path,path)?;
     let name=std::path::Path::new(path).file_name().unwrap_or_default().to_string_lossy().into_owned();
     let mut conn=lock_db()?;let tx=conn.transaction().map_err(|e|e.to_string())?;
     reconcile_move_on(&tx,path,&prepared,Some(category)).map_err(|e|e.to_string())?;

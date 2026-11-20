@@ -169,9 +169,12 @@ pub fn scan_roots(paths: &[String], mut progress: impl FnMut(ScanEvent)) -> Vec<
         let result=(|| -> Result<(u64,u64),String> {
             let token=db::begin_inventory_scan(root)?;
             let result=(|| -> Result<(u64,u64),String> {
-            let resolved=crate::safe_fs::validate_root(Path::new(root))?;
+            let registered = Path::new(root);
+            let resolved=crate::safe_fs::validate_root(registered)?;
+            let _root_guard = crate::safe_fs::guard_directory(registered)?;
             let patterns=load_mouziignore(root)?;
             let identity=crate::safe_fs::file_identity(&resolved)?;
+            if crate::safe_fs::file_identity(registered)? != identity { return Err("Root identity changed during inventory scan".into()); }
             let mut child_roots=Vec::new();
             for folder in db::get_watched_folders().map_err(|e|e.to_string())? {
                 if folder.path==*root {continue;}
@@ -198,7 +201,9 @@ pub fn scan_roots(paths: &[String], mut progress: impl FnMut(ScanEvent)) -> Vec<
         }));
             walk.walk_dir(&resolved,0)?;
             walk.flush_batch()?;
-            if crate::safe_fs::file_identity(&resolved)? != identity { return Err("Root identity changed during inventory scan".into()); }
+            if crate::safe_fs::file_identity(registered)? != identity || crate::safe_fs::file_identity(&resolved)? != identity {
+                return Err("Root identity changed during inventory scan".into());
+            }
             db::publish_inventory_scan(&token)?;
             Ok((walk.processed,walk.bytes))
             })();
@@ -517,6 +522,78 @@ mod tests {
         let old=db::get_inventory_files("size",None,Some(&root),None,10).unwrap()[0].path.clone();
         let mut invalidated=false;let summaries=scan_roots(&[root.clone()],|event|if matches!(event,ScanEvent::Progress(_)) && !invalidated {db::remove_inventory_path(&old).unwrap();invalidated=true;});
         assert_eq!(summaries[0].status,"failed");assert!(db::get_inventory_files("size",None,Some(&root),None,10).unwrap().is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn disjoint_file_reconciliation_keeps_the_other_scan_live() {
+        let _db = db::serialise_test_db();
+        let scanned = ScanFixture::new("disjoint-live");
+        let changed = ScanFixture::new("disjoint-changed");
+        let scanned_root = scanned.root.to_string_lossy().into_owned();
+        let changed_root = changed.root.to_string_lossy().into_owned();
+        let original = changed.root.join("original.txt");
+        let moved = changed.root.join("moved.txt");
+        fs::write(&original, "changed folder").unwrap();
+        fs::write(scanned.root.join("untouched.txt"), "scanned folder").unwrap();
+        assert_eq!(scan_roots(std::slice::from_ref(&changed_root), |_| {})[0].status, "complete");
+        let changed_token = db::begin_inventory_scan(&changed_root).unwrap();
+
+        let mut reconciled = false;
+        let summaries = scan_roots(std::slice::from_ref(&scanned_root), |event| {
+            if matches!(event, ScanEvent::Progress(_)) && !reconciled {
+                fs::rename(&original, &moved).unwrap();
+                db::reconcile_move(&original.to_string_lossy(), &moved.to_string_lossy(), None).unwrap();
+                reconciled = true;
+            }
+        });
+        assert!(reconciled);
+        assert_eq!(summaries[0].status, "complete", "{:?}", summaries[0].error);
+        assert_eq!(summaries[0].files, 1);
+        assert!(db::publish_inventory_scan(&changed_token).is_err());
+        let rows = db::get_inventory_files("size", None, Some(&changed_root), None, 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].path.ends_with("moved.txt"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn directory_cleanup_invalidates_overlapping_scans_before_they_stage_rows() {
+        let _db = db::serialise_test_db();
+        let parent = ScanFixture::new("cleanup-parent");
+        let other = ScanFixture::new("cleanup-disjoint");
+        let child_path = parent.root.join("nested");
+        let empty = child_path.join("empty");
+        fs::create_dir_all(&empty).unwrap();
+        let child = child_path.to_string_lossy().into_owned();
+        let child_id = db::add_watched_folder(&child, db::FOLDER_MODE_MANUAL).unwrap();
+        struct Child(i64);
+        impl Drop for Child {
+            fn drop(&mut self) { let _ = db::remove_watched_folder(self.0); }
+        }
+        let _child = Child(child_id);
+        let parent_token = db::begin_inventory_scan(&parent.root.to_string_lossy()).unwrap();
+        let child_token = db::begin_inventory_scan(&child).unwrap();
+        let other_token = db::begin_inventory_scan(&other.root.to_string_lossy()).unwrap();
+
+        let intent = db::begin_cleanup_intent("remove_empty_dir", &empty.to_string_lossy()).unwrap();
+        fs::remove_dir(&empty).unwrap();
+        db::finalize_cleanup_intent(intent, "ok", None, true).unwrap();
+
+        assert!(db::stage_inventory_batch(&parent_token, &[]).is_err());
+        assert!(db::publish_inventory_scan(&child_token).is_err());
+        db::publish_inventory_scan(&other_token).unwrap();
+    }
+
+    #[test]
+    fn unresolved_mutation_parent_conservatively_invalidates_the_scan() {
+        let _db = db::serialise_test_db();
+        let scanned = ScanFixture::new("unknown-parent-scan");
+        let changed = ScanFixture::new("unknown-parent-mutation");
+        let token = db::begin_inventory_scan(&scanned.root.to_string_lossy()).unwrap();
+        let vanished = changed.root.join("already-missing-parent").join("file.txt");
+        db::remove_inventory_path(&vanished.to_string_lossy()).unwrap();
+        assert!(db::publish_inventory_scan(&token).is_err());
     }
 
     #[test]
