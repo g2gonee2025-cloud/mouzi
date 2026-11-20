@@ -143,7 +143,7 @@ interface AppState {
   cleanNow: () => Promise<{ file: string; rule: string; destination: string }[]>;
   undoAction: (id: number) => Promise<UndoResult>;
   undoAll: () => Promise<UndoAllResult>;
-  addFolder: (path: string, mode: string) => Promise<number>;
+  addFolder: (path: string, mode: string, onlyNew?: boolean) => Promise<number>;
   removeFolder: (id: number) => Promise<void>;
   updateFolderMode: (id: number, mode: string) => Promise<void>;
   addRule: (rule: Rule) => Promise<void>;
@@ -323,9 +323,9 @@ export const useAppStore = create<AppState>((set, get) => ({
     return result;
   },
 
-  addFolder: async (path, mode) => {
+  addFolder: async (path, mode, onlyNew = false) => {
     try {
-      const id = await invoke<number>('add_folder_cmd', { path, mode });
+      const id = await invoke<number>('add_folder_cmd', { path, mode, onlyNew });
       await get().loadFolders();
       return id;
     } catch (e) {

@@ -263,15 +263,7 @@ impl FolderWatcher {
             // Registration precedes enumeration. Both paths feed the same
             // deduplicated queue, including files arriving during enumeration.
             self.watchers.insert(folder.path.clone(), watcher);
-            let scan = (|| {
-                let _guard = root.guard_physical()?;
-                let entries = std::fs::read_dir(&root.path).map_err(|error| error.to_string())?;
-                for entry in entries {
-                    let path = entry.map_err(|error| error.to_string())?.path();
-                    enqueue_path(&path, &root, &self.pending, &self.pending_manual, &self.suppression, Some(&app_handle))?;
-                }
-                Ok::<(), String>(())
-            })();
+            let scan = self.enqueue_existing_files(&root, Some(&app_handle));
             match scan {
                 Ok(()) => report_health(&app_handle, &folder.path, "active", None),
                 Err(error) => {
@@ -281,6 +273,30 @@ impl FolderWatcher {
             }
         }
         if errors.is_empty() { Ok(()) } else { Err(errors.join("; ")) }
+    }
+
+    fn enqueue_existing_files(&self, root: &Arc<WatchedRoot>, app: Option<&tauri::AppHandle>) -> Result<(), String> {
+        let _guard = root.guard_physical()?;
+        for entry in std::fs::read_dir(&root.path).map_err(|error| error.to_string())? {
+            let path = entry.map_err(|error| error.to_string())?.path();
+            enqueue_path(&path, root, &self.pending, &self.pending_manual, &self.suppression, app)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn reconcile_baseline(&mut self, id: i64) -> Result<(), String> {
+        let folders = get_watched_folders().map_err(|error| error.to_string())?;
+        self.prune_queues(&folders);
+        let Some(folder) = folders.iter().find(|folder| {
+            folder.id == Some(id) && folder.enabled && !folder.only_new
+                && (is_folder_auto_mode(&folder.mode) || is_folder_manual_mode(&folder.mode))
+        }) else { return Ok(()); };
+        let result = self.remember_root(folder)
+            .and_then(|root| self.enqueue_existing_files(&root, self.app_handle.as_ref()));
+        if let (Some(app), Err(error)) = (&self.app_handle, &result) {
+            report_health(app, &folder.path, "error", Some(error));
+        }
+        result
     }
 
     fn remember_root(&mut self, folder: &WatchedFolder) -> Result<Arc<WatchedRoot>, String> {
@@ -314,18 +330,13 @@ impl FolderWatcher {
         };
         self.suppression.invalidate(&removed);
         self.pending_manual.lock().unwrap_or_else(|error| error.into_inner())
-            .retain(|path, root| {
-                let path = Path::new(path);
-                path.is_file() && (valid(root, true)
-                    || (valid(root, false) && crate::operations::suspicious_name(path)))
-            });
+            .retain(|path, root| pending_review_is_current(Path::new(path), root, folders).unwrap_or(false));
         self.update_tray_tooltip();
     }
 
     fn update_tray_tooltip(&self) {
         if let Some(app) = self.app_handle.as_ref() {
-            let count = self.pending_manual.lock().unwrap_or_else(|error| error.into_inner()).len();
-            crate::tray::update_tray_tooltip(app, count);
+            update_pending_tooltip(app, &self.pending_manual);
         }
     }
 
@@ -384,8 +395,32 @@ fn auto_root_is_current(root: &WatchedRoot) -> bool {
         && root.guard_physical().is_ok()
 }
 
+fn path_is_baselined(path: &Path, folder: &WatchedFolder) -> Result<bool, String> {
+    if !folder.only_new { return Ok(false); }
+    let canonical = std::fs::canonicalize(path).map_err(|error| error.to_string())?;
+    crate::db::is_organization_baseline(&path.to_string_lossy(), &canonical.to_string_lossy())
+        .map_err(|error| error.to_string())
+}
+
+fn pending_review_is_current(path: &Path, root: &WatchedRoot, folders: &[WatchedFolder]) -> Result<bool, String> {
+    let Some(folder) = folders.iter().find(|folder| {
+        folder.enabled && root.matches_registration(folder) && (is_folder_manual_mode(&folder.mode)
+            || (is_folder_auto_mode(&folder.mode) && crate::operations::suspicious_name(path)))
+    }) else { return Ok(false); };
+    Ok(path.is_file() && !path_is_baselined(path, folder)?)
+}
+
+fn update_pending_tooltip(app: &tauri::AppHandle, manual: &Arc<Mutex<HashMap<String, Arc<WatchedRoot>>>>) {
+    let queue = manual.clone();
+    let handle = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        let count = queue.lock().unwrap_or_else(|error| error.into_inner()).len();
+        crate::tray::update_tray_tooltip(&handle, count);
+    });
+}
+
 fn enqueue_path(path: &Path, root: &Arc<WatchedRoot>, pending: &Mutex<Vec<PendingFile>>,
-    manual: &Mutex<HashMap<String, Arc<WatchedRoot>>>, suppression: &SuppressionSet, app: Option<&tauri::AppHandle>) -> Result<(), String> {
+    manual: &Arc<Mutex<HashMap<String, Arc<WatchedRoot>>>>, suppression: &SuppressionSet, app: Option<&tauri::AppHandle>) -> Result<(), String> {
     if path.parent() != Some(root.path.as_path()) || !path.is_file() { return Ok(()); }
     let folders = get_watched_folders().map_err(|error| error.to_string())?;
     let Some(folder) = folders.iter().find(|folder| folder.enabled && root.matches_registration(folder)
@@ -394,23 +429,23 @@ fn enqueue_path(path: &Path, root: &Arc<WatchedRoot>, pending: &Mutex<Vec<Pendin
     let _guard = root.guard_physical()?;
     if !path.is_file() || should_ignore_file(path) || suppression.is_suppressed(path, Instant::now())
         || is_file_ignored_by_mouziignore(path)? { return Ok(()); }
-    if folder.only_new {
-        let canonical = std::fs::canonicalize(path).map_err(|error| error.to_string())?;
-        if crate::db::is_organization_baseline(&path.to_string_lossy(), &canonical.to_string_lossy())
-            .map_err(|error| error.to_string())? { return Ok(()); }
-    }
+    if path_is_baselined(path, folder)? { return Ok(()); }
     if crate::operations::already_processed(path)? { return Ok(()); }
     if is_folder_manual_mode(&folder.mode) || crate::operations::suspicious_name(path) {
-        let count = {
-            let mut manual = manual.lock().unwrap_or_else(|error| error.into_inner());
-            manual.insert(path.to_string_lossy().to_string(), root.clone());
-            manual.len()
-        };
+        {
+            let mut queue = manual.lock().unwrap_or_else(|error| error.into_inner());
+            // A configuration write may have committed while this event was
+            // being checked. Reconcile against its current baseline before
+            // inserting, under the same queue lock as pruning.
+            let folders = get_watched_folders().map_err(|error| error.to_string())?;
+            if !pending_review_is_current(path, root, &folders)? { return Ok(()); }
+            queue.insert(path.to_string_lossy().to_string(), root.clone());
+        }
         if let Some(app) = app {
             let _ = app.emit("file-detected", serde_json::json!({
                 "folder": root.path.to_string_lossy(), "file": path.file_name().unwrap_or_default().to_string_lossy()
             }));
-            crate::tray::update_tray_tooltip(app, count);
+            update_pending_tooltip(app, manual);
         }
     } else if is_folder_auto_mode(&folder.mode) {
         let settings = get_settings().map_err(|error| error.to_string())?;
@@ -481,6 +516,53 @@ mod tests {
         suppression.invalidate(std::slice::from_ref(&path));
         assert!(!drained.is_current());
         assert!(suppression.ticket(&path).is_current());
+    }
+
+    #[test]
+    fn only_new_registration_and_toggles_reconcile_the_review_queue() {
+        use crate::db::{self, FOLDER_MODE_MANUAL, FOLDER_MODE_SUGGEST};
+        use std::fs;
+
+        let _serial = db::serialise_test_db();
+        db::init_test_db();
+        let root_path = std::env::temp_dir().join(format!("mouzi-only-new-{}", crate::operations::new_run_id()));
+        fs::create_dir(&root_path).unwrap();
+        struct Fixture { path: PathBuf, id: Option<i64> }
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                if let Some(id) = self.id { let _ = db::remove_watched_folder(id); }
+                let _ = fs::remove_dir_all(&self.path);
+            }
+        }
+        let mut fixture = Fixture { path: root_path.clone(), id: None };
+        fs::write(root_path.join("old.txt"), "existing file").unwrap();
+        let id = db::register_watched_folder(root_path.to_str().unwrap(), FOLDER_MODE_MANUAL, true).unwrap();
+        fixture.id = Some(id);
+        fs::write(root_path.join("new.txt"), "new arrival").unwrap();
+
+        let alias = fs::canonicalize(&root_path).unwrap();
+        assert_eq!(db::register_watched_folder(alias.to_str().unwrap(), FOLDER_MODE_SUGGEST, false).unwrap(), id);
+        let row = db::get_watched_folders().unwrap().into_iter().find(|folder| folder.id == Some(id)).unwrap();
+        assert_eq!(row.mode, FOLDER_MODE_MANUAL);
+        assert!(row.only_new);
+        let mut watcher = FolderWatcher::new(Arc::new(SuppressionSet::new()));
+        let root = watcher.remember_root(&row).unwrap();
+        watcher.enqueue_existing_files(&root, None).unwrap();
+        let pending = || ["new.txt".to_string(), "old.txt".to_string()];
+        assert_eq!(watcher.get_pending_files().into_iter().map(|(_, name)| name).collect::<Vec<_>>(), ["new.txt"]);
+
+        for mode in [FOLDER_MODE_MANUAL, FOLDER_MODE_SUGGEST] {
+            db::update_folder_mode(id, mode).unwrap();
+            assert!(db::set_only_new(id, false).unwrap());
+            watcher.reconcile_baseline(id).unwrap();
+            let mut names = watcher.get_pending_files().into_iter().map(|(_, name)| name).collect::<Vec<_>>();
+            names.sort();
+            assert_eq!(names, pending());
+
+            assert!(db::set_only_new(id, true).unwrap());
+            watcher.reconcile_baseline(id).unwrap();
+            assert!(watcher.pending_manual.lock().unwrap().is_empty());
+        }
     }
 
     #[cfg(windows)]

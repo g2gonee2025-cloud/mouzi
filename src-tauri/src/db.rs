@@ -736,16 +736,45 @@ fn mark_inventory_ancestors_stale(conn: &Connection, ancestors: &[String]) -> Sq
     Ok(())
 }
 
+pub(crate) fn register_watched_folder(path: &str, mode: &str, only_new: bool) -> Result<i64, String> {
+    let configured = Path::new(path);
+    let canonical = crate::safe_fs::validate_root(configured)?;
+    let _guard = crate::safe_fs::guard_directory(configured)?;
+    let identity = crate::safe_fs::file_identity(configured)?;
+    if crate::safe_fs::file_identity(&canonical)? != identity {
+        return Err("Watched folder changed while preparing registration".into());
+    }
+    for existing in get_watched_folders().map_err(|error| error.to_string())? {
+        if existing.path == path
+            || crate::safe_fs::file_identity(Path::new(&existing.path)).ok().as_ref() == Some(&identity)
+        {
+            return existing.id.ok_or_else(|| "Existing folder has no identifier".into());
+        }
+    }
+
+    let baseline = only_new.then(|| capture_folder_baseline(&canonical)).transpose()?;
+    insert_watched_folder(path, mode, baseline.as_deref()).map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
 pub fn add_watched_folder(path: &str, mode: &str) -> SqliteResult<i64> {
+    insert_watched_folder(path, mode, None)
+}
+
+fn insert_watched_folder(path: &str, mode: &str, baseline: Option<&[PathBuf]>) -> SqliteResult<i64> {
     let ancestors = configured_inventory_ancestors(path, &get_watched_folders()?);
-    let mut conn=sqlite_lock()?;let tx=conn.transaction()?;
-    let changed=tx.execute(
-        "INSERT OR IGNORE INTO watched_folders (path, enabled, mode) VALUES (?1, 1, ?2)",
-        params![path, mode],
+    let mut conn = sqlite_lock()?;
+    let tx = conn.transaction()?;
+    let changed = tx.execute(
+        "INSERT OR IGNORE INTO watched_folders (path, enabled, mode, only_new) VALUES (?1, 1, ?2, ?3)",
+        params![path, mode, baseline.is_some()],
     )?;
     // INSERT OR IGNORE leaves last_insert_rowid unchanged on an existing row.
     let id = tx.query_row("SELECT id FROM watched_folders WHERE path=?1", [path], |row| row.get(0))?;
     if changed > 0 {
+        if let Some(paths) = baseline {
+            insert_folder_baseline(&tx, id, paths)?;
+        }
         mark_inventory_ancestors_stale(&tx, &ancestors)?;
         tx.execute("UPDATE inventory_state SET revision=revision+1,mutation_revision=mutation_revision+1 WHERE id=1", [])?;
     }
@@ -777,26 +806,40 @@ pub fn remove_watched_folder(id: i64) -> SqliteResult<()> {
     tx.commit()
 }
 
-pub(crate) fn set_only_new(id: i64, enabled: bool) -> Result<(), String> {
+fn capture_folder_baseline(root: &Path) -> Result<Vec<PathBuf>, String> {
+    // The organizer and its watcher enumerate direct children.
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(root).map_err(|error| format!("Cannot capture the baseline for {}: {error}", root.display()))? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        if entry.file_type().map_err(|error| error.to_string())?.is_file() {
+            files.push(entry.path());
+        }
+    }
+    Ok(files)
+}
+
+fn insert_folder_baseline(conn: &Connection, id: i64, paths: &[PathBuf]) -> SqliteResult<()> {
+    let mut insert = conn.prepare("INSERT INTO folder_baseline(folder_id,path) VALUES(?1,?2)")?;
+    for path in paths {
+        insert.execute(params![id, path.to_string_lossy()])?;
+    }
+    Ok(())
+}
+
+pub(crate) fn set_only_new(id: i64, enabled: bool) -> Result<bool, String> {
     let folder = get_watched_folders().map_err(|error| error.to_string())?
         .into_iter().find(|folder| folder.id == Some(id)).ok_or("Folder not found")?;
-    if folder.only_new == enabled { return Ok(()); }
+    if folder.only_new == enabled { return Ok(false); }
 
     let mut paths = Vec::new();
     let _root_guard = if enabled {
         let root = crate::safe_fs::validate_root(Path::new(&folder.path))?;
-        let identity = crate::safe_fs::file_identity(&root)?;
-        let guard = crate::safe_fs::guard_directory(&root)?;
-        if crate::safe_fs::file_identity(Path::new(&folder.path))? != identity {
+        let configured = Path::new(&folder.path);
+        let guard = crate::safe_fs::guard_directory(configured)?;
+        if crate::safe_fs::file_identity(configured)? != crate::safe_fs::file_identity(&root)? {
             return Err("Watched folder changed while preparing the new-files setting".into());
         }
-        // The organizer and its watcher enumerate direct children.
-        for entry in std::fs::read_dir(&root).map_err(|error| error.to_string())? {
-            let entry = entry.map_err(|error| error.to_string())?;
-            if entry.file_type().map_err(|error| error.to_string())?.is_file() {
-                paths.push(entry.path());
-            }
-        }
+        paths = capture_folder_baseline(&root)?;
         Some(guard)
     } else {
         None
@@ -808,14 +851,9 @@ pub(crate) fn set_only_new(id: i64, enabled: bool) -> Result<(), String> {
         params![enabled,id,folder.path,folder.only_new]).map_err(|error| error.to_string())?;
     if changed != 1 { return Err("Watched folder settings changed; try again".into()); }
     tx.execute("DELETE FROM folder_baseline WHERE folder_id=?1", [id]).map_err(|error| error.to_string())?;
-    {
-        let mut insert = tx.prepare("INSERT INTO folder_baseline(folder_id,path) VALUES(?1,?2)")
-            .map_err(|error| error.to_string())?;
-        for path in paths {
-            insert.execute(params![id,path.to_string_lossy()]).map_err(|error| error.to_string())?;
-        }
-    }
-    tx.commit().map_err(|error| error.to_string())
+    insert_folder_baseline(&tx, id, &paths).map_err(|error| error.to_string())?;
+    tx.commit().map_err(|error| error.to_string())?;
+    Ok(true)
 }
 
 pub(crate) fn forget_removed_baseline(id: i64, path: &Path, registered_root: &Path) -> SqliteResult<()> {

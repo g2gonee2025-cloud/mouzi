@@ -318,11 +318,7 @@ export default function Settings() {
   const handleAddFolder = async () => {
     if (!newFolderPath.trim()) return;
     if (await runWrite(async () => {
-      const id = await addFolder(newFolderPath.trim(), "manual");
-      if (newOnlyNew) {
-        await invoke("set_only_new_cmd", { id, enabled: true });
-        await loadFolders();
-      }
+      await addFolder(newFolderPath.trim(), "manual", newOnlyNew);
     })) {
       setNewFolderPath("");
       setNewOnlyNew(false);

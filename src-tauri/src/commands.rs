@@ -100,8 +100,9 @@ pub async fn undo_selected_cmd(
 pub fn set_only_new_cmd(window: tauri::WebviewWindow, id: i64, enabled: bool) -> Result<(), String> {
     if window.label() != "app" { return Err("Watched folder settings are available only in the workspace window".into()); }
     let app = window.app_handle();
-    with_configuration(app, || crate::db::set_only_new(id, enabled))?;
-    let _ = app.emit("folders-changed", ());
+    if with_configuration(app, || crate::db::set_only_new(id, enabled))? {
+        reconcile_saved_folders(app, |watcher| watcher.reconcile_baseline(id));
+    }
     Ok(())
 }
 
@@ -222,6 +223,21 @@ fn with_configuration<T>(app: &AppHandle, write: impl FnOnce() -> Result<T, Stri
     write()
 }
 
+fn reconcile_saved_folders(
+    app: &AppHandle,
+    reconcile: impl FnOnce(&mut crate::watcher::FolderWatcher) -> Result<(), String>,
+) {
+    if let Some(state) = app.try_state::<AppState>() {
+        let health = state.watcher.lock().map_err(|_| "Watcher state unavailable".to_string())
+            .and_then(|mut watcher| reconcile(&mut watcher));
+        if let Err(error) = health {
+            // Keep a committed configuration distinct from watcher health.
+            eprintln!("[watcher] Saved folder configuration: {error}");
+        }
+    }
+    let _ = app.emit("folders-changed", ());
+}
+
 #[tauri::command(async)]
 pub fn add_rule_cmd(app: AppHandle, rule: Rule) -> Result<i64, String> {
     validate_rule_destination(&rule)?;
@@ -245,36 +261,19 @@ pub fn get_folders_cmd() -> Result<Vec<WatchedFolder>, String> {
 }
 
 #[tauri::command(async)]
-pub fn add_folder_cmd(app: tauri::AppHandle, path: String, mode: String) -> Result<i64, String> {
+pub fn add_folder_cmd(app: tauri::AppHandle, path: String, mode: String, only_new: Option<bool>) -> Result<i64, String> {
     if !is_valid_folder_mode(&mode) {
         return Err(format!("Invalid folder mode: {}", mode));
     }
-    let folder = crate::safe_fs::validate_root(Path::new(&path))?;
-    let identity = crate::safe_fs::file_identity(&folder)?;
-    let id = with_configuration(&app, || {
-    for existing in get_watched_folders().map_err(|e| e.to_string())? {
-        if crate::safe_fs::file_identity(Path::new(&existing.path)).ok().as_ref() == Some(&identity) {
-            return existing.id.ok_or_else(|| "Existing folder has no identifier".into());
-        }
-    }
-    add_watched_folder(&path, &mode).map_err(|e| e.to_string())
-    })?;
-    if let Some(state) = app.try_state::<crate::AppState>() {
-        let mut watcher = state.watcher.lock().unwrap();
-        watcher.refresh(app.clone()).map_err(|e| format!("Folder saved; watcher refresh failed: {e}"))?;
-    }
-    let _ = app.emit("folders-changed", ());
+    let id = with_configuration(&app, || register_watched_folder(&path, &mode, only_new.unwrap_or(false)))?;
+    reconcile_saved_folders(&app, |watcher| watcher.refresh(app.clone()));
     Ok(id)
 }
 
 #[tauri::command(async)]
 pub fn remove_folder_cmd(app: tauri::AppHandle, id: i64) -> Result<(), String> {
     with_configuration(&app, || remove_watched_folder(id).map_err(|e| e.to_string()))?;
-    if let Some(state) = app.try_state::<crate::AppState>() {
-        let mut watcher = state.watcher.lock().unwrap();
-        watcher.refresh(app.clone()).map_err(|e| format!("Folder removed; watcher refresh failed: {e}"))?;
-    }
-    let _ = app.emit("folders-changed", ());
+    reconcile_saved_folders(&app, |watcher| watcher.refresh(app.clone()));
     let _ = app.emit("mutation-completed", ());
     Ok(())
 }
@@ -285,33 +284,21 @@ pub fn update_folder_mode_cmd(app: tauri::AppHandle, id: i64, mode: String) -> R
         return Err(format!("Invalid folder mode: {}", mode));
     }
 
-    let old_mode = get_watched_folders()
-        .ok()
-        .and_then(|folders| folders.into_iter().find(|f| f.id == Some(id)))
-        .map(|f| f.mode);
-
-    with_configuration(&app, || update_folder_mode(id, &mode).map_err(|e| e.to_string()))?;
-
-    if let Some(state) = app.try_state::<crate::AppState>() {
-        let mut watcher = state.watcher.lock().unwrap();
-
+    let previous = with_configuration(&app, || {
+        let folder = get_watched_folders().map_err(|e| e.to_string())?
+            .into_iter().find(|folder| folder.id == Some(id));
+        update_folder_mode(id, &mode).map_err(|e| e.to_string())?;
+        Ok(folder)
+    })?;
+    reconcile_saved_folders(&app, |watcher| {
         // If switching from manual to silent, flush collected files into the auto queue.
         if is_folder_auto_mode(&mode) {
-            if let Some(ref old) = old_mode {
-                if is_folder_manual_mode(old) {
-                    if let Some(folder) = get_watched_folders()
-                        .ok()
-                        .and_then(|folders| folders.into_iter().find(|f| f.id == Some(id)))
-                    {
-                        watcher.flush_manual_to_pending(&folder.path);
-                    }
-                }
+            if let Some(folder) = previous.as_ref().filter(|folder| is_folder_manual_mode(&folder.mode)) {
+                watcher.flush_manual_to_pending(&folder.path);
             }
         }
-
-        watcher.refresh(app.clone()).map_err(|e| format!("Mode saved; watcher refresh failed: {e}"))?;
-    }
-    let _ = app.emit("folders-changed", ());
+        watcher.refresh(app.clone())
+    });
     Ok(())
 }
 

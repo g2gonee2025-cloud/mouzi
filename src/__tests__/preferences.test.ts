@@ -31,6 +31,18 @@ beforeEach(() => {
 });
 
 describe("committed preference and schedule settings", () => {
+  it("sets Only new as part of the folder registration", async () => {
+    const row = { id: 42, path: "C:/fixture", mode: "manual", enabled: true, only_new: true };
+    ipc.invoke.mockResolvedValueOnce(row.id).mockResolvedValueOnce([row]);
+
+    await expect(useAppStore.getState().addFolder(row.path, row.mode, true)).resolves.toBe(row.id);
+    expect(ipc.invoke.mock.calls).toEqual([
+      ["add_folder_cmd", { path: row.path, mode: row.mode, onlyNew: true }],
+      ["get_folders_cmd"],
+    ]);
+    expect(useAppStore.getState().folders).toEqual([row]);
+  });
+
   it("sends only the changed preference and preserves the committed schedule", async () => {
     const committedSchedule = settings({ revision: 2, schedule_enabled: true, schedule_time_1: "21:30" });
     ipc.invoke.mockResolvedValueOnce(committedSchedule);
