@@ -570,26 +570,28 @@ fn process_file(
     }
     let settings = get_settings().map_err(|e| format!("Cannot read organizer settings: {e}"))?;
     let folders = get_watched_folders().map_err(|e| format!("Cannot read watched folders: {e}"))?;
-    let _root_guard = match authority {
+    let (root, _root_guard) = match authority {
         FolderAuthority::Automatic => {
             let Some(folder) = folders.iter().find(|folder| {
                 folder.enabled && crate::db::is_folder_auto_mode(&folder.mode)
                     && same_path(Path::new(&folder.path), root)
             }) else { return Ok(ProcessOutcome::Skipped); };
             let watched = WatchedRoot::capture_unattended(folder, false)?;
-            Some(watched.guard_physical()?)
+            // The compatibility spelling match only locates the registration.
+            // Containment and destination planning must use that physical root.
+            (Path::new(&folder.path), Some(watched.guard_physical()?))
         }
         FolderAuthority::RegisteredWatch(watched) | FolderAuthority::Scheduled { root: watched, .. } => {
             if !folders.iter().any(|folder| watched.matches_registration(folder)
                 && folder.enabled && crate::db::is_folder_auto_mode(&folder.mode)) {
                 return Ok(ProcessOutcome::Skipped);
             }
-            Some(watched.guard_physical()?)
+            (root, Some(watched.guard_physical()?))
         }
-        FolderAuthority::WatchedManual(watched) => Some(watched.guard_current(&folders)?),
+        FolderAuthority::WatchedManual(watched) => (root, Some(watched.guard_current(&folders)?)),
         _ => {
             crate::safe_fs::validate_root(root)?;
-            None
+            (root, None)
         }
     };
     if !path.parent().is_some_and(|parent| crate::safe_fs::directory_contains(parent, root).unwrap_or(false)) {
