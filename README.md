@@ -8,6 +8,8 @@ The supported build target for this fork is Windows 10/11 with WebView2. Upstrea
 
 New profiles start without watched folders, scheduled cleaning, local AI or Windows autostart. Default organizer rules are initialized together with the detected supported system language. Existing profiles keep their saved preferences and rules.
 
+Choose **Add a watched folder** in the tray popup to open Watched Folders in Settings. Once you add a folder, the popup offers **Organize Now** to review proposed changes.
+
 Add a folder in Settings. New folders are added in Manual mode. Choose the behavior deliberately:
 
 | Mode | Behavior |
