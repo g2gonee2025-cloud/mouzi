@@ -62,15 +62,19 @@ impl Scheduler {
         suppression: &SuppressionSet,
         schedule: &ScheduleSettings,
     ) -> Result<(AppSettings, bool), String> {
-        let times = active_times(schedule)?;
         let _operation = suppression.with_operation();
         let current = get_settings().map_err(|error| error.to_string())?;
         let previous = schedule_from_settings(&current);
-        if &previous == schedule {
+        let mut schedule = schedule.clone();
+        if previous.schedule_enabled && !schedule.schedule_enabled {
+            clear_unchanged_invalid_times(&previous, &mut schedule);
+        }
+        let times = active_times(&schedule)?;
+        if previous == schedule {
             return Ok((current, false));
         }
 
-        let committed = update_schedule_settings(schedule).map_err(|error| error.to_string())?;
+        let committed = update_schedule_settings(&schedule).map_err(|error| error.to_string())?;
         // A valid save can repair malformed stored settings. In that case we
         // cannot establish that the previous run used the same times.
         if active_times(&previous).ok().as_ref() != Some(&times) {
@@ -141,6 +145,22 @@ fn schedule_values(schedule: &ScheduleSettings) -> [Option<&str>; 4] {
         schedule.schedule_time_3.as_deref(),
         schedule.schedule_time_4.as_deref(),
     ]
+}
+
+fn clear_unchanged_invalid_times(saved: &ScheduleSettings, disabled: &mut ScheduleSettings) {
+    // Settings sends all four slots, including legacy values hidden by the
+    // selected slot count. A disable can clear unchanged, unparseable values.
+    let submitted = [
+        &mut disabled.schedule_time_1,
+        &mut disabled.schedule_time_2,
+        &mut disabled.schedule_time_3,
+        &mut disabled.schedule_time_4,
+    ];
+    for (before, after) in schedule_values(saved).into_iter().zip(submitted) {
+        if after.as_deref() == before && before.is_some_and(|time| parse_time(time).is_err()) {
+            *after = None;
+        }
+    }
 }
 
 fn parse_time(value: &str) -> Result<NaiveTime, String> {
@@ -385,19 +405,26 @@ mod tests {
     }
 
     #[test]
-    fn disabling_a_malformed_stored_schedule_accepts_valid_replacement_slots() {
+    fn disabling_a_malformed_stored_schedule_repairs_only_unchanged_invalid_slots() {
         let _serial = crate::db::serialise_test_db();
         crate::db::init_test_db();
         let original = schedule_from_settings(&get_settings().unwrap());
-        let malformed = schedule(&["legacy-invalid"]);
+        let malformed = ScheduleSettings {
+            schedule_time_2: Some("hidden-legacy-invalid".into()),
+            schedule_time_3: Some("19:00".into()),
+            ..schedule(&["legacy-invalid"])
+        };
         let invalid_settings = update_schedule_settings(&malformed).unwrap();
         let scheduler = Scheduler::new();
         let suppression = SuppressionSet::new();
-        let invalid_disable = ScheduleSettings { schedule_enabled: false, ..malformed };
+        let disabled = ScheduleSettings { schedule_enabled: false, ..malformed.clone() };
+        let invalid_disable = ScheduleSettings {
+            schedule_time_2: Some("new-hidden-invalid".into()),
+            ..disabled.clone()
+        };
         let rejected = scheduler.save_schedule(&suppression, &invalid_disable);
         let revision_after_rejection = scheduler.revision();
         let settings_after_rejection = get_settings().unwrap();
-        let disabled = ScheduleSettings { schedule_time_1: None, ..invalid_disable };
         let saved = scheduler.save_schedule(&suppression, &disabled);
         let persisted = get_settings().unwrap();
         update_schedule_settings(&original).unwrap();
@@ -405,10 +432,13 @@ mod tests {
         assert!(rejected.is_err());
         assert_eq!(revision_after_rejection, 0);
         assert_eq!(settings_after_rejection.revision, invalid_settings.revision);
+        assert_eq!(schedule_from_settings(&settings_after_rejection), malformed);
         let (committed, changed) = saved.unwrap();
+        let expected = ScheduleSettings { schedule_time_1: None, schedule_time_2: None, ..disabled };
         assert!(changed);
-        assert_eq!(schedule_from_settings(&persisted), disabled);
+        assert_eq!(schedule_from_settings(&persisted), expected);
         assert_eq!(committed.revision, invalid_settings.revision + 1);
+        assert_eq!(scheduler.revision(), 1);
     }
 
     fn now(value: &str) -> DateTime<FixedOffset> {
