@@ -3437,6 +3437,61 @@ mod tests {
     }
 
     #[test]
+    fn rule_update_rejects_id_removed_by_replacement() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+        let mut removed = Rule {
+            name: "Old rule".into(),
+            extensions: vec!["proof".into()],
+            action: "ignore".into(),
+            ..Rule::default()
+        };
+        removed.id = Some(insert_rule_on(&conn, &removed).unwrap());
+        let replacement = Rule {
+            name: "Replacement rule".into(),
+            ..removed.clone()
+        };
+        assert_eq!(import_rules_atomic_on(&mut conn, &[replacement], true).unwrap(), 1);
+        let saved_rules = get_rules_on(&conn).unwrap();
+        assert_ne!(saved_rules[0].id, removed.id);
+
+        removed.name = "Draft from before replacement".into();
+        let outcome = update_rule_on(&conn, &removed);
+        assert_eq!(get_rules_on(&conn).unwrap(), saved_rules);
+        assert!(matches!(outcome, Err(rusqlite::Error::QueryReturnedNoRows)), "{outcome:?}");
+    }
+
+    #[test]
+    fn rule_update_accepts_changed_and_equal_values_for_existing_id() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+        let mut edited = Rule {
+            name: "Rule before editing".into(),
+            enabled: true,
+            extensions: vec!["proof".into()],
+            action: "ignore".into(),
+            ..Rule::default()
+        };
+        edited.id = Some(insert_rule_on(&conn, &edited).unwrap());
+        let mut unrelated = Rule {
+            name: "Unrelated saved rule".into(),
+            extensions: vec!["separate".into()],
+            action: "ignore".into(),
+            ..Rule::default()
+        };
+        unrelated.id = Some(insert_rule_on(&conn, &unrelated).unwrap());
+
+        edited.name = "Renamed rule".into();
+        edited.enabled = false;
+        for _ in 0..2 {
+            update_rule_on(&conn, &edited).unwrap();
+            let mut saved = get_rules_on(&conn).unwrap();
+            saved.sort_by_key(|rule| rule.id);
+            assert_eq!(saved, [edited.clone(), unrelated.clone()]);
+        }
+    }
+
+    #[test]
     fn replacing_rules_is_one_transaction_on_insert_failure() {
         let mut conn=mem_conn_with_inventory();insert_default_rules_on(&conn).unwrap();
         let before:i64=conn.query_row("SELECT COUNT(*) FROM rules",[],|r|r.get(0)).unwrap();
