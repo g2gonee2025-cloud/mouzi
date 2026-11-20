@@ -1602,30 +1602,37 @@ pub fn get_inventory_files_cmd(
 // Cleanup commands
 // ---------------------------------------------------------------------------
 
+#[tauri::command(async)]
+pub fn has_cleanup_inventory_cmd() -> Result<bool, String> {
+    crate::db::has_cleanup_inventory().map_err(|error| format!("Cannot read cleanup inventory: {error}"))
+}
+
+fn require_cleanup_inventory() -> Result<(), String> {
+    if has_cleanup_inventory_cmd()? {
+        Ok(())
+    } else {
+        Err("No scan data — run a scan first".to_string())
+    }
+}
+
 /// Find duplicate files across the scanned inventory.
 #[tauri::command(async)]
 pub fn find_duplicates_cmd() -> Result<crate::cleanup::FinderResult<crate::cleanup::DuplicateGroup>, String> {
-    if !crate::cleanup::has_inventory() {
-        return Err("No scan data — run a scan first".to_string());
-    }
+    require_cleanup_inventory()?;
     crate::cleanup::find_duplicates()
 }
 
 /// Find files larger than a given threshold (in bytes).
 #[tauri::command]
 pub fn find_large_files_cmd(min_bytes: i64) -> Result<crate::cleanup::FinderResult<crate::cleanup::CleanupFile>, String> {
-    if !crate::cleanup::has_inventory() {
-        return Err("No scan data — run a scan first".to_string());
-    }
+    require_cleanup_inventory()?;
     crate::cleanup::find_large_files(min_bytes)
 }
 
 /// Find files not modified in the given number of days.
 #[tauri::command]
 pub fn find_stale_files_cmd(days: i64) -> Result<crate::cleanup::FinderResult<crate::cleanup::CleanupFile>, String> {
-    if !crate::cleanup::has_inventory() {
-        return Err("No scan data — run a scan first".to_string());
-    }
+    require_cleanup_inventory()?;
     crate::cleanup::find_stale_files(days)
 }
 

@@ -106,10 +106,6 @@ impl<T> FinderResult<T> {
     }
 }
 
-pub fn has_inventory() -> bool {
-    db::has_cleanup_inventory().unwrap_or(false)
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FileFingerprint {
     identity: safe_fs::FileIdentity,
@@ -896,7 +892,9 @@ mod tests {
         let fresh = tree.file("fresh.txt", b"fresh");
         let old_time = SystemTime::now() - Duration::from_secs(2 * 86_400);
         fs::OpenOptions::new().write(true).open(&old).unwrap().set_times(fs::FileTimes::new().set_modified(old_time)).unwrap();
+        assert!(!crate::commands::has_cleanup_inventory_cmd().unwrap());
         tree.inventory(&[&old, &fresh]);
+        assert!(crate::commands::has_cleanup_inventory_cmd().unwrap(), "legacy rows are usable before a scan completion is recorded");
         fs::write(&fresh, vec![b'x'; 200]).unwrap();
         let large_result = find_large_files(100).unwrap();
         let large = large_result.candidates();
@@ -917,18 +915,21 @@ mod tests {
         let root = tree.0.to_string_lossy().into_owned();
         let folder_id = db::add_watched_folder(&root, db::FOLDER_MODE_MANUAL).unwrap();
 
+        assert!(!crate::commands::has_cleanup_inventory_cmd().unwrap());
         let before_scan = (
             crate::commands::find_duplicates_cmd(),
             crate::commands::find_large_files_cmd(1),
             crate::commands::find_stale_files_cmd(1),
         );
         let summaries = crate::scan::scan_roots(&[root], |_| {});
+        assert!(crate::commands::has_cleanup_inventory_cmd().unwrap());
         let after_scan = (
             crate::commands::find_duplicates_cmd(),
             crate::commands::find_large_files_cmd(1),
             crate::commands::find_stale_files_cmd(1),
         );
         db::remove_watched_folder(folder_id).unwrap();
+        assert!(!crate::commands::has_cleanup_inventory_cmd().unwrap());
 
         assert!(before_scan.0.is_err());
         assert!(before_scan.1.is_err());
@@ -946,7 +947,7 @@ mod tests {
         init();
         let tree = TestTree::new();
         tree.register();
-        assert!(!has_inventory());
+        assert!(!crate::commands::has_cleanup_inventory_cmd().unwrap());
         assert!(find_empty_dirs().unwrap().candidates().is_empty(), "registered root itself is protected");
         fs::create_dir_all(tree.0.join("a").join("deep")).unwrap();
         fs::create_dir(tree.0.join("b")).unwrap();

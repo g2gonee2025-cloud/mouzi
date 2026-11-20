@@ -255,6 +255,7 @@ pub fn run() {
             is_scanning_cmd,
             get_dashboard_stats_cmd,
             get_inventory_files_cmd,
+            has_cleanup_inventory_cmd,
             find_duplicates_cmd,
             find_large_files_cmd,
             find_stale_files_cmd,
