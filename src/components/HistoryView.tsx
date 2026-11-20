@@ -24,7 +24,7 @@ export default function HistoryView() {
   const [logs, setLogs] = useState<OrganizationLog[]>([]);
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [error, setError] = useState("");
-  const [busy, setBusy] = useState(false);
+  const [busy, setBusy] = useState(true);
   const [confirm, setConfirm] = useState<ConfirmRequest | null>(null);
   const [limit, setLimit] = useState(100);
   const [results, setResults] = useState<Array<SelectedUndoResult & { source: string }>>([]);
@@ -109,6 +109,7 @@ export default function HistoryView() {
     });
   }
 
+  const eligibleLogs = logs.filter(canRestore);
   const groups = new Map<string, OrganizationLog[]>();
   for (const log of logs.slice(0, limit)) {
     const key = log.run_id || "legacy";
@@ -145,8 +146,8 @@ export default function HistoryView() {
       })}
     </div>}
     <div className="flex flex-wrap items-center gap-2">
-      <button className={buttonClass} disabled={busy}
-        onClick={() => setSelected(new Set(logs.filter(canRestore).map((log) => log.id!)))}>{t("beta.selectAll")}</button>
+      <button className={buttonClass} disabled={busy || !eligibleLogs.length}
+        onClick={() => setSelected(new Set(eligibleLogs.map((log) => log.id!)))}>{t("beta.selectAll")}</button>
       <button className={buttonClass} disabled={busy} onClick={() => setSelected(new Set())}>{t("beta.clearSelection")}</button>
       <span>{t("beta.selected", { count: selected.size })}</span>
       <button className={primaryClass} disabled={busy || !selected.size}
