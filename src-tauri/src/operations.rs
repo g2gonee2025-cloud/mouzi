@@ -14,7 +14,7 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
     Mutex,
 };
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 static PLANS: Lazy<Mutex<HashMap<String, CachedPlan>>> = Lazy::new(|| Mutex::new(HashMap::new()));
@@ -81,6 +81,8 @@ pub fn already_processed(path: &Path) -> Result<bool, String> {
 #[derive(Clone, Serialize)]
 pub struct PreviewEntry {
     pub id: String,
+    #[serde(rename = "selectionKey", skip_serializing_if = "Option::is_none")]
+    pub selection_key: Option<String>,
     pub source: String,
     pub destination: Option<String>,
     pub rule: String,
@@ -107,6 +109,33 @@ struct Planned {
     destination_ancestor: PathBuf,
     destination_identity: FileIdentity,
 }
+
+impl Planned {
+    fn selection_key(&self, canonical_source: &Path, owning_root: &Path) -> Option<String> {
+        let modified = match self.modified.duration_since(UNIX_EPOCH) {
+            Ok(duration) => (false, duration),
+            Err(before_epoch) => (true, before_epoch.duration()),
+        };
+        // These are the same file and action details captured for execution.
+        // The key only lets the UI match equivalent rows across previews.
+        let evidence = serde_json::to_vec(&(
+            &self.entry.source,
+            canonical_source,
+            owning_root,
+            self.source_identity.key(),
+            self.root_identity.key(),
+            &self.digest,
+            modified,
+            &self.rule,
+            &self.requested_destination,
+            &self.entry.destination,
+            &self.destination_ancestor,
+            self.destination_identity.key(),
+        )).ok()?;
+        Some(blake3::hash(&evidence).to_hex().to_string())
+    }
+}
+
 struct CachedPlan {
     created: Instant,
     items: Vec<Planned>,
@@ -238,6 +267,7 @@ pub(crate) fn preview(paths: Option<Vec<String>>, suppression: &SuppressionSet) 
         if rule.action == "ignore" { continue; }
         let mut entry = PreviewEntry {
             id: new_run_id(),
+            selection_key: None,
             source: path.to_string_lossy().into_owned(),
             destination: None,
             rule: rule.name.clone(),
@@ -280,7 +310,12 @@ pub(crate) fn preview(paths: Option<Vec<String>>, suppression: &SuppressionSet) 
             }))
         })();
         match planned {
-            Ok(Some(item)) => items.push(item),
+            Ok(Some(item)) => {
+                if !entry.warning {
+                    entry.selection_key = item.selection_key(&file.canonical_path, &file.owning_root);
+                }
+                items.push(item);
+            }
             Ok(None) => continue,
             Err(error) => entry.error = Some(error),
         }

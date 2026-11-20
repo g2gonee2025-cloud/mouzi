@@ -5,8 +5,17 @@ import { buttonClass, primaryClass, errorText, Results, OperationResult } from '
 import { useAppStore } from '../store/useAppStore';
 import ConfirmDialog, { type ConfirmRequest } from './cleanup/ConfirmDialog';
 
-interface Entry { id: string; source: string; destination: string | null; rule: string; action: string; size: number; warning: boolean; error: string | null }
+interface Entry { id: string; selectionKey?: string; source: string; destination: string | null; rule: string; action: string; size: number; warning: boolean; error: string | null }
 interface Preview { id: string; entries: Entry[]; unavailableRoots?: string[] }
+
+function isOrdinaryProposal(entry: Entry) {
+  return !entry.error && !entry.warning && entry.action !== 'delete';
+}
+
+function selectionKeys(entries: Entry[]) {
+  return new Set(entries.flatMap(entry => isOrdinaryProposal(entry) && entry.selectionKey ? [entry.selectionKey] : []));
+}
+
 export default function ReviewQueue({ paths }: { paths: string[] | null }) {
   const { t } = useTranslation();
   const [preview, setPreview] = useState<Preview | null>(null);
@@ -17,9 +26,12 @@ export default function ReviewQueue({ paths }: { paths: string[] | null }) {
   const [results, setResults] = useState<OperationResult[]>([]);
   const currentId = useRef<string | null>(null);
   const generation = useRef(0);
+  // A non-null set means the user chose the selection, even when it is empty.
+  const selectionIntent = useRef<Set<string> | null>(null);
   const heading = useRef<HTMLHeadingElement>(null);
   async function refresh() {
     const request = ++generation.current;
+    const intent = selectionIntent.current;
     const previous = currentId.current;
     currentId.current = null;
     setBusy(true); setError(''); setConfirm(null); setResults([]);
@@ -30,11 +42,15 @@ export default function ReviewQueue({ paths }: { paths: string[] | null }) {
       const plan = await invoke<Preview>('preview_cmd', { paths: paths?.length ? paths : null });
       if (request !== generation.current) { await invoke('discard_preview_cmd', { id: plan.id }); return; }
       currentId.current = plan.id; setPreview(plan);
-      setSelected(new Set(plan.entries.filter(e => !e.error && !e.warning && e.action !== 'delete').map(e => e.id)));
+      const ordinary = plan.entries.filter(isOrdinaryProposal);
+      const carry = intent === null ? ordinary : ordinary.filter(entry => entry.selectionKey && intent.has(entry.selectionKey));
+      setSelected(new Set(carry.map(entry => entry.id)));
+      if (intent !== null) selectionIntent.current = selectionKeys(carry);
     } catch (error) { if (request === generation.current) setError(errorText(error)); }
     finally { if (request === generation.current) setBusy(false); }
   }
   useEffect(() => {
+    selectionIntent.current = null;
     void refresh();
     return () => {
       ++generation.current;
@@ -75,7 +91,16 @@ export default function ReviewQueue({ paths }: { paths: string[] | null }) {
       },
     });
   }
-  const toggle = (id: string) => setSelected(old => { const next = new Set(old); if (next.has(id)) next.delete(id); else next.add(id); return next; });
+  const choose = (ids: Set<string>) => {
+    selectionIntent.current = selectionKeys((preview?.entries ?? []).filter(entry => ids.has(entry.id)));
+    setSelected(ids);
+  };
+  const toggle = (id: string) => {
+    const next = new Set(selected);
+    if (next.has(id)) next.delete(id);
+    else next.add(id);
+    choose(next);
+  };
   return <section className="space-y-4" aria-busy={busy}>
     <div className="flex flex-wrap justify-between items-center gap-3"><h2 ref={heading} tabIndex={-1} className="text-lg font-semibold">{t('beta.review')}</h2><button className={buttonClass} onClick={refresh} disabled={busy}>{t('beta.refresh')}</button></div>
     <p className="text-sm text-text-muted">{t('beta.previewHelp')}</p>
@@ -92,8 +117,8 @@ export default function ReviewQueue({ paths }: { paths: string[] | null }) {
         </div>
       )}
       <div className="flex flex-wrap items-center gap-2">
-        <button className={buttonClass} disabled={busy} onClick={() => setSelected(new Set(preview.entries.filter(e => !e.error && !e.warning && e.action !== 'delete').map(e => e.id)))}>{t('beta.selectAll')}</button>
-        <button className={buttonClass} disabled={busy} onClick={() => setSelected(new Set())}>{t('beta.clearSelection')}</button>
+        <button className={buttonClass} disabled={busy} onClick={() => choose(new Set(preview.entries.filter(isOrdinaryProposal).map(entry => entry.id)))}>{t('beta.selectAll')}</button>
+        <button className={buttonClass} disabled={busy} onClick={() => choose(new Set())}>{t('beta.clearSelection')}</button>
         <span className="text-sm">{t('beta.selected', { count: selected.size })}</span>
       </div>
       {!preview.entries.length && !preview.unavailableRoots?.length && <p className="py-8 text-text-muted">{t('beta.empty')}</p>}
