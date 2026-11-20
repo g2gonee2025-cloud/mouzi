@@ -53,10 +53,12 @@ export default function Cleanup() {
       <header className="flex items-center justify-between px-5 py-3 border-b border-border bg-surface-dark shrink-0">
         <div className="flex items-center gap-2">
           <button
+            type="button"
             onClick={handleBack}
+            aria-label={t("common.back")}
             className="p-1.5 rounded-md hover:bg-border transition-colors"
           >
-            <ChevronLeft size={18} />
+            <ChevronLeft size={18} aria-hidden="true" />
           </button>
           <Sparkles size={18} className="text-primary" />
           <h1 className="text-base font-semibold">{t("cleanup.title")}</h1>

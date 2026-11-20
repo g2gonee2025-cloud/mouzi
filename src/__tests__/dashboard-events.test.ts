@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { DashboardStats } from "../store/useDashboardStore";
 
 const mocks = vi.hoisted(() => ({
   invoke: vi.fn(),
@@ -64,21 +65,58 @@ describe("dashboard scan lifecycle", () => {
   it("does not restart the spinner when terminal arrives before the start response", async () => {
     const dispose = await dashboard.subscribeDashboardEvents();
     mocks.invoke.mockImplementation(async (name) => {
-      if (name === "get_folders_cmd") return [
-        { path: "on", enabled: true, mode: "silent" },
-        { path: "off", enabled: false, mode: "silent" },
-        { path: "paused", enabled: true, mode: "paused" },
-      ];
       if (name === "start_scan_cmd") {
         emit("scan-finished", { runId: "19000000000000000003", status: "finished", errors: [] });
-        return { started: true, runId: "19000000000000000003" };
+        return { started: true, runId: "19000000000000000003", rootCount: 1 };
       }
       return [];
     });
     await dashboard.useDashboardStore.getState().startScan();
     expect(dashboard.useDashboardStore.getState().isScanning).toBe(false);
-    expect(dashboard.useDashboardStore.getState().rootCount).toBe(1);
     dispose();
+  });
+
+  it("uses the actual run root count without pre-reading folder configuration", async () => {
+    mocks.invoke.mockResolvedValue({ started: true, runId: "19000000000000000006", rootCount: 1 });
+    await dashboard.useDashboardStore.getState().startScan();
+    expect(mocks.invoke).toHaveBeenCalledExactlyOnceWith("start_scan_cmd");
+    expect(dashboard.useDashboardStore.getState().rootCount).toBe(1);
+  });
+
+  it("refreshes eligibility when pausing the last root races a scan start", async () => {
+    const retained: DashboardStats = {
+      watchedRoots: [{ path: "C:/work", files: 2, bytes: 100, status: "complete", stale: false, lastScanAt: 1, error: null }],
+      revision: 1, totalFiles: 2, totalBytes: 100, scanEligibleRoots: 1, lastScanAt: 1,
+      categoryBreakdown: [], largestFiles: [], recentFiles: [], insights: dashboard.EMPTY_INSIGHTS, ageBuckets: [],
+    };
+    dashboard.useDashboardStore.setState({ stats: retained });
+    let finishRefresh!: (stats: typeof retained) => void;
+    const refresh = new Promise<typeof retained>((resolve) => { finishRefresh = resolve; });
+    let startRefresh!: () => void;
+    const refreshStarted = new Promise<void>((resolve) => { startRefresh = resolve; });
+    mocks.invoke.mockImplementation(async (command) => {
+      if (command === "start_scan_cmd") return { started: false, reason: "no_roots", rootCount: 0 };
+      if (command === "is_scanning_cmd") return false;
+      if (command === "get_dashboard_stats_cmd") {
+        startRefresh();
+        return refresh;
+      }
+      throw new Error(`Unexpected command: ${command}`);
+    });
+
+    const start = dashboard.useDashboardStore.getState().startScan();
+    await refreshStarted;
+    expect(dashboard.useDashboardStore.getState().scanReason).toBe("no_roots");
+    expect(dashboard.useDashboardStore.getState().stats?.totalFiles).toBe(2);
+    finishRefresh({ ...retained, scanEligibleRoots: 0 });
+    await start;
+    expect(dashboard.useDashboardStore.getState()).toMatchObject({
+      isScanning: false, scanReason: null, stats: { totalFiles: 2, scanEligibleRoots: 0 },
+    });
+
+    mocks.invoke.mockResolvedValue(retained);
+    await dashboard.useDashboardStore.getState().loadStats();
+    expect(dashboard.useDashboardStore.getState().stats?.scanEligibleRoots).toBe(1);
   });
 });
 

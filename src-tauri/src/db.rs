@@ -711,6 +711,18 @@ pub fn get_watched_folders() -> SqliteResult<Vec<WatchedFolder>> {
     Ok(folders)
 }
 
+fn scan_roots_on(conn: &Connection) -> SqliteResult<Vec<String>> {
+    let mut statement = conn.prepare(
+        "SELECT path FROM watched_folders WHERE enabled<>0 AND mode<>?1 ORDER BY id",
+    )?;
+    let roots = statement.query_map([FOLDER_MODE_PAUSED], |row| row.get(0))?;
+    roots.collect()
+}
+
+pub(crate) fn get_scan_roots() -> SqliteResult<Vec<String>> {
+    scan_roots_on(&*sqlite_lock()?)
+}
+
 fn configured_inventory_ancestors(path: &str, folders: &[WatchedFolder]) -> Vec<String> {
     let path = Path::new(path);
     if !path.is_absolute() {
@@ -1731,6 +1743,7 @@ pub struct DashboardSnapshot {
     pub largest_files: Vec<InventoryFile>,
     pub recent_files: Vec<InventoryFile>,
     pub watched_roots: Vec<RootStat>,
+    pub scan_eligible_roots: usize,
     pub last_scan_at: Option<i64>,
     pub insights: DashboardInsights,
     pub age_buckets: Vec<AgeBucket>,
@@ -2139,6 +2152,7 @@ pub fn get_dashboard_snapshot() -> SqliteResult<DashboardSnapshot> {
     let mut roots_stmt=tx.prepare("SELECT w.path,COUNT(i.id),COALESCE(SUM(i.size),0),COALESCE(r.status,'unscanned'),COALESCE(r.stale,1),r.last_scan_at,r.error FROM watched_folders w LEFT JOIN inventory_roots r ON r.root_path=w.path LEFT JOIN file_inventory i ON i.root_path=w.path GROUP BY w.id ORDER BY 3 DESC,w.path")?;
     let roots=roots_stmt.query_map([],|r|Ok(RootStat{path:r.get(0)?,files:r.get(1)?,bytes:r.get(2)?,status:r.get(3)?,stale:r.get(4)?,last_scan_at:r.get(5)?,error:r.get(6)?}))?.collect::<SqliteResult<Vec<_>>>()?;
     drop(roots_stmt);
+    let scan_eligible_roots = scan_roots_on(&tx)?.len();
     let last_scan_at = roots.iter().filter_map(|root|root.last_scan_at).max();
     let largest_files=get_snapshot_files_on(&tx,"size")?;
     let recent_files=get_snapshot_files_on(&tx,"mtime")?;
@@ -2161,7 +2175,7 @@ pub fn get_dashboard_snapshot() -> SqliteResult<DashboardSnapshot> {
     }
     drop(age_stmt);
     let revision=tx.query_row("SELECT revision FROM inventory_state WHERE id=1",[],|r|r.get(0))?;
-    let snapshot=DashboardSnapshot{total_files,total_bytes,category_breakdown,largest_files,recent_files,watched_roots:roots,last_scan_at,insights,age_buckets,revision};
+    let snapshot=DashboardSnapshot{total_files,total_bytes,category_breakdown,largest_files,recent_files,watched_roots:roots,scan_eligible_roots,last_scan_at,insights,age_buckets,revision};
     tx.commit()?;
     Ok(snapshot)
 }

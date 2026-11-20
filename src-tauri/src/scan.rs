@@ -382,6 +382,31 @@ mod tests {
     }
 
     #[test]
+    fn dashboard_counts_scan_roots_without_dropping_paused_inventory() {
+        let _guard = db::serialise_test_db();
+        let fixture = ScanFixture::new("dashboard-scan-eligibility");
+        let root = fixture.root.to_string_lossy().into_owned();
+        fs::write(fixture.root.join("kept.txt"), "retained").unwrap();
+        assert_eq!(scan_roots(std::slice::from_ref(&root), |_| {})[0].status, "complete");
+
+        let active = db::get_dashboard_snapshot().unwrap();
+        assert!(db::get_scan_roots().unwrap().contains(&root));
+        db::update_folder_mode(fixture.folder_id, db::FOLDER_MODE_PAUSED).unwrap();
+        let paused = db::get_dashboard_snapshot().unwrap();
+        assert_eq!(paused.scan_eligible_roots + 1, active.scan_eligible_roots);
+        assert!(!db::get_scan_roots().unwrap().contains(&root));
+        let retained = paused.watched_roots.iter().find(|stat| stat.path == root).unwrap();
+        assert_eq!(retained.files, 1);
+        assert_eq!(retained.bytes, 8);
+        assert_eq!(retained.status, "complete");
+
+        db::update_folder_mode(fixture.folder_id, db::FOLDER_MODE_MANUAL).unwrap();
+        let resumed = db::get_dashboard_snapshot().unwrap();
+        assert_eq!(resumed.scan_eligible_roots, active.scan_eligible_roots);
+        assert!(db::get_scan_roots().unwrap().contains(&root));
+    }
+
+    #[test]
     fn directory_ignore_keeps_a_regular_file_with_the_same_name() {
         let _guard = db::serialise_test_db();
         let fixture = ScanFixture::new("directory-ignore");

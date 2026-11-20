@@ -1400,6 +1400,7 @@ pub struct ScanStarted {
     pub started: bool,
     pub reason: Option<String>,
     pub run_id: Option<String>,
+    pub root_count: usize,
 }
 
 /// Scan all watched (non-paused) folders in the background.
@@ -1407,17 +1408,14 @@ pub struct ScanStarted {
 /// `scan-complete` per root when done.
 #[tauri::command]
 pub fn start_scan_cmd(app: AppHandle, state: tauri::State<'_, AppState>) -> Result<ScanStarted, String> {
-    let roots: Vec<String> = get_watched_folders()
-        .map_err(|e| e.to_string())?
-        .into_iter()
-        .filter(|f| f.enabled && !is_folder_paused_mode(&f.mode))
-        .map(|f| f.path)
-        .collect();
+    let roots = get_scan_roots().map_err(|e| e.to_string())?;
+    let root_count = roots.len();
     if roots.is_empty() {
         return Ok(ScanStarted {
             started: false,
             reason: Some("no_roots".into()),
             run_id: None,
+            root_count: 0,
         });
     }
     let is_scanning = state.is_scanning.clone();
@@ -1426,6 +1424,7 @@ pub fn start_scan_cmd(app: AppHandle, state: tauri::State<'_, AppState>) -> Resu
             started: false,
             reason: Some("already_running".into()),
             run_id: None,
+            root_count: 0,
         });
     }
     let run_id = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0).to_string();
@@ -1435,6 +1434,7 @@ pub fn start_scan_cmd(app: AppHandle, state: tauri::State<'_, AppState>) -> Resu
             ScanEvent::Progress(p) => {
                 let mut payload = serde_json::to_value(p).unwrap_or_default();
                 payload["runId"] = serde_json::Value::String(run_id.clone());
+                payload["rootCount"] = serde_json::json!(root_count);
                 let _ = app.emit("scan-progress", payload);
             }
             ScanEvent::Complete(s) => {
@@ -1464,6 +1464,7 @@ pub fn start_scan_cmd(app: AppHandle, state: tauri::State<'_, AppState>) -> Resu
         started: true,
         reason: None,
         run_id: Some(response_run_id),
+        root_count,
     })
 }
 
@@ -1482,6 +1483,7 @@ pub struct DashboardStats {
     pub largest_files: Vec<InventoryFile>,
     pub recent_files: Vec<InventoryFile>,
     pub watched_roots: Vec<RootStat>,
+    pub scan_eligible_roots: usize,
     pub last_scan_at: Option<i64>,
     pub insights: DashboardInsights,
     pub age_buckets: Vec<AgeBucket>,
@@ -1499,6 +1501,7 @@ pub fn get_dashboard_stats_cmd() -> Result<DashboardStats, String> {
         largest_files: snapshot.largest_files,
         recent_files: snapshot.recent_files,
         watched_roots: snapshot.watched_roots,
+        scan_eligible_roots: snapshot.scan_eligible_roots,
         last_scan_at: snapshot.last_scan_at,
         insights: snapshot.insights,
         age_buckets: snapshot.age_buckets,

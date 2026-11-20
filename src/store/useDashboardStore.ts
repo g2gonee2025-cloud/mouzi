@@ -1,7 +1,6 @@
 import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import type { WatchedFolder } from "./useAppStore";
 
 /* ─── Types ─────────────────────────────────────────────────── */
 
@@ -53,6 +52,7 @@ export interface DashboardStats {
   largestFiles: InventoryFile[];
   recentFiles: InventoryFile[];
   watchedRoots: RootStat[];
+  scanEligibleRoots: number;
   lastScanAt: number | null;
   insights: DashboardInsights;
   ageBuckets: AgeBucket[];
@@ -65,6 +65,7 @@ export interface WeeklyStat {
 
 export interface ScanProgress {
   runId: string;
+  rootCount: number;
   root: string;
   processed: number;
   total?: number | null;
@@ -89,6 +90,7 @@ export interface ScanStarted {
   started: boolean;
   reason?: string | null;
   runId?: string | null;
+  rootCount: number;
 }
 
 const EMPTY_INSIGHTS: DashboardInsights = {
@@ -162,7 +164,13 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
     set({ isLoading: true, error: null });
     try {
       const stats = await invoke<DashboardStats>("get_dashboard_stats_cmd");
-      if (request === statsRequest) set({ stats, isLoading: false });
+      if (request === statsRequest) {
+        set((state) => ({
+          stats,
+          isLoading: false,
+          scanReason: state.scanReason === "no_roots" ? null : state.scanReason,
+        }));
+      }
     } catch (e) {
       if (request === statsRequest) set({ error: String(e), isLoading: false });
     }
@@ -182,11 +190,13 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
   },
 
   startScan: async () => {
-    ++scanStateRevision;
+    if (get().isScanning) return;
+    const startRevision = ++scanStateRevision;
     set({
       isScanning: true,
       scanProgress: null,
       completedRoots: [],
+      rootCount: 0,
       error: null,
       scanReason: null,
       scanRunId: null,
@@ -194,29 +204,26 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
       scanErrors: [],
     });
     try {
-      const folders = await invoke<WatchedFolder[]>("get_folders_cmd");
-      const active = folders.filter((f) => f.enabled && f.mode !== "paused");
-      set({ rootCount: active.length });
-
       const result = await invoke<ScanStarted>("start_scan_cmd");
       if (result.runId) {
         if (obsoleteRun(result.runId, get())) return;
         ++scanStateRevision;
-        set({ scanRunId: result.runId, isScanning: true, scanReason: result.reason ?? null });
+        set({ scanRunId: result.runId, isScanning: true, rootCount: result.rootCount });
+        return;
       }
       if (!result.started) {
-        if (result.runId) return;
         const revision = scanStateRevision;
         const scanning = await invoke<boolean>("is_scanning_cmd");
         if (revision !== scanStateRevision) return;
         ++scanStateRevision;
         set({
           isScanning: scanning,
-          scanReason: result.reason ?? "no_roots",
+          scanReason: result.reason === "no_roots" ? "no_roots" : null,
         });
+        if (result.reason === "no_roots") await get().loadStats();
       }
     } catch (e) {
-      set({ error: String(e), isScanning: false });
+      if (startRevision === scanStateRevision) set({ error: String(e), isScanning: false });
     }
   },
 
@@ -273,6 +280,7 @@ export async function subscribeDashboardEvents(signal?: AbortSignal): Promise<()
         isScanning: true,
         scanRunId: progress.runId,
         scanProgress: progress,
+        rootCount: progress.rootCount,
         ...(state.scanRunId !== progress.runId ? { completedRoots: [], scanErrors: [], scanStatus: null } : {}),
       });
     });

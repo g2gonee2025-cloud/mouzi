@@ -1,13 +1,19 @@
 import { describe, expect, it, vi } from "vitest";
+import { Children, isValidElement, type ReactNode } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import Dashboard from "../pages/Dashboard";
+import FileBrowser from "../components/dashboard/FileBrowser";
 import StorageTreemap from "../components/dashboard/StorageTreemap";
 import StorageRibbon from "../components/dashboard/StorageRibbon";
 import ActivityTimeline from "../components/dashboard/ActivityTimeline";
-import { EMPTY_INSIGHTS, useDashboardStore, type DashboardStats, type RootStat } from "../store/useDashboardStore";
+import { EMPTY_INSIGHTS, useDashboardStore, type DashboardStats, type InventoryFile, type RootStat } from "../store/useDashboardStore";
 import en from "../i18n/locales/en.json";
 import { DEFAULT_DASHBOARD_VIEW } from "../utils/dashboard";
 import { formatTimestamp } from "../utils/format";
+
+const revealItemInDir = vi.hoisted(() => vi.fn());
+vi.mock("@tauri-apps/plugin-opener", () => ({ revealItemInDir }));
+vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 
 vi.mock("react-i18next", () => ({
   useTranslation: () => ({
@@ -31,11 +37,19 @@ const root: RootStat = {
   path: "C:/empty-work", files: 0, bytes: 0, status: "complete", stale: false, lastScanAt: 1, error: null,
 };
 
-function renderDashboard(watchedRoots: RootStat[], view = DEFAULT_DASHBOARD_VIEW) {
+function renderDashboard(
+  watchedRoots: RootStat[],
+  view = DEFAULT_DASHBOARD_VIEW,
+  scanEligibleRoots = watchedRoots.length,
+  largestFiles: InventoryFile[] = [],
+) {
+  const totalFiles = watchedRoots.reduce((total, root) => total + root.files, 0);
+  const totalBytes = watchedRoots.reduce((total, root) => total + root.bytes, 0);
   const stats: DashboardStats = {
-    revision: 1, totalFiles: 0, totalBytes: 0, categoryBreakdown: [],
-    largestFiles: [], recentFiles: [], watchedRoots, lastScanAt: null,
-    insights: EMPTY_INSIGHTS, ageBuckets: [],
+    revision: 1, totalFiles, totalBytes,
+    categoryBreakdown: totalFiles ? [{ category: "Other", files: totalFiles, bytes: totalBytes }] : [],
+    largestFiles, recentFiles: [], watchedRoots, lastScanAt: null,
+    insights: EMPTY_INSIGHTS, ageBuckets: [], scanEligibleRoots,
   };
   useDashboardStore.setState({ stats });
   try {
@@ -66,6 +80,50 @@ describe("dashboard entry points", () => {
     expect(html).toMatch(/<button[^>]*disabled=""[^>]*>(?:(?!<\/button>).)*dashboard\.scanNow<\/button>/);
   });
 
+  it("offers to resume inactive folders and keeps their inventory visible", () => {
+    const retained = { path: `${root.path}/retained.txt`, rootPath: root.path, size: 100, mtime: 1, category: "Other" };
+    const html = renderDashboard([{ ...root, files: 1, bytes: 100 }], DEFAULT_DASHBOARD_VIEW, 0, [retained]);
+    expect(html).toContain("dashboard.scanInactiveRoots");
+    expect(html).not.toContain("dashboard.scanNoRoots");
+    expect(html).toContain("dashboard.watchedRoots");
+    expect(html).toContain("empty-work");
+    expect(html).toContain(retained.path);
+    expect(renderDashboard([root], DEFAULT_DASHBOARD_VIEW, 0)).not.toContain("dashboard.leadEmpty");
+    expect(renderDashboard([root])).not.toContain("dashboard.scanInactiveRoots");
+  });
+
+  it("reveals the exact file represented by the row", async () => {
+    const path = "C:\\work\\quarterly report.txt";
+    let reveal: (() => Promise<void>) | undefined;
+    function capture(node: ReactNode) {
+      Children.forEach(node, (child) => {
+        if (!isValidElement<{ children?: ReactNode; "aria-label"?: string; onClick?: () => Promise<void> }>(child)) return;
+        if (child.props["aria-label"] === "dashboard.openFolder") reveal = child.props.onClick;
+        capture(child.props.children);
+      });
+    }
+    function CaptureBrowser() {
+      const browser = FileBrowser({
+        ...DEFAULT_DASHBOARD_VIEW,
+        initialLargest: [{ path, rootPath: "C:\\work", size: 2, mtime: 1, category: "Other" }],
+        initialRecent: [],
+        rootScope: "C:\\work",
+        totalFiles: 1,
+        revision: 1,
+        onSort: vi.fn(),
+        onQuery: vi.fn(),
+        onClearCategory: vi.fn(),
+        onClearRoot: vi.fn(),
+      });
+      capture(browser);
+      return browser;
+    }
+    renderToStaticMarkup(<CaptureBrowser />);
+    expect(reveal).toBeTypeOf("function");
+    await reveal!();
+    expect(revealItemInDir).toHaveBeenCalledExactlyOnceWith(path);
+  });
+
   it("renders supplied view options and excludes a root missing from the current scope", () => {
     const view = { sort: "mtime" as const, query: "receipts", category: "Documents", root: root.path };
     const html = renderDashboard([root], view);
@@ -89,12 +147,13 @@ describe("dashboard search translations", () => {
   it("includes search guidance and preserves placeholders across all shipped locales", () => {
     expect(locales).toHaveProperty(["../i18n/locales/zh-CN.json"]);
     for (const { dashboard } of Object.values(locales)) {
-      for (const key of ["searchFiles", "noIndexedFiles", "refreshingFiles", "scanConnectionFailed"]) {
+      for (const key of ["searchFiles", "noIndexedFiles", "refreshingFiles", "scanConnectionFailed", "scanInactiveRoots"]) {
         expect(dashboard[key]?.trim()).toBeTruthy();
       }
       expect(dashboard.filesShown).toContain("{{shown}}");
       expect(dashboard.limitedFiles).toContain("{{shown}}");
       expect(dashboard.clearFilter).toContain("{{name}}");
+      expect(dashboard.revealFailed).toContain("{{file}}");
     }
   });
 });

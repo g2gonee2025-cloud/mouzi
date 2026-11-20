@@ -1,9 +1,10 @@
 import { useEffect, useId, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { invoke } from "@tauri-apps/api/core";
+import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { Copy, ExternalLink, Search, X } from "lucide-react";
 import { formatBytes, formatTimestamp } from "../../utils/format";
-import { fileName, parentDir } from "../../utils/paths";
+import { fileName } from "../../utils/paths";
 import {
   categoryClass, categoryLabel, createInventoryBrowserLoader, inventoryBrowserScope,
   type DashboardViewOptions, type InventoryBrowserView,
@@ -40,6 +41,8 @@ export default function FileBrowser({
   const { t } = useTranslation();
   const [view, setView] = useState<InventoryBrowserView>();
   const [copied, setCopied] = useState<string | null>(null);
+  const [revealError, setRevealError] = useState<string | null>(null);
+  const revealAttempt = useRef(0);
   const searchId = useId();
   const searchRef = useRef<HTMLInputElement>(null);
   const copyTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -81,11 +84,13 @@ export default function FileBrowser({
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
-  const handleOpen = async (path: string) => {
+  const handleReveal = async (path: string) => {
+    const attempt = ++revealAttempt.current;
+    setRevealError(null);
     try {
-      await invoke("open_folder_cmd", { path: parentDir(path) });
+      await revealItemInDir(path);
     } catch {
-      // ignore
+      if (mounted.current && attempt === revealAttempt.current) setRevealError(path);
     }
   };
 
@@ -194,6 +199,11 @@ export default function FileBrowser({
         {status && <p className={isEmpty ? undefined : "mb-2"}>{status}</p>}
       </div>
       {error && <div className="text-xs text-red-700 dark:text-red-400 mb-2" role="alert">{error}</div>}
+      {revealError && (
+        <p className="mb-2 text-xs text-red-700 dark:text-red-400 break-words" role="alert">
+          {t("dashboard.revealFailed", { file: revealError })}
+        </p>
+      )}
       {files.length > 0 && (
         <div className="space-y-0.5 max-h-[18rem] overflow-auto">
           {files.map((file) => (
@@ -229,7 +239,7 @@ export default function FileBrowser({
                 </button>
                 <button
                   type="button"
-                  onClick={() => handleOpen(file.path)}
+                  onClick={() => handleReveal(file.path)}
                   aria-label={t("dashboard.openFolder")}
                   className="inline-flex items-center justify-center w-6 h-6 shrink-0 rounded text-text-muted hover:text-text hover:bg-border opacity-0 group-hover:opacity-100 focus-visible:opacity-100 pointer-coarse:opacity-100 focus-visible:outline-2 focus-visible:outline-primary focus-visible:outline-offset-1 transition-opacity"
                   title={t("dashboard.openFolder")}

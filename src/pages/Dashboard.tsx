@@ -35,6 +35,7 @@ export default function Dashboard({ view, setView }: DashboardProps) {
   const {
     stats,
     weeklyStats,
+    isLoading,
     isScanning,
     scanProgress,
     completedRoots,
@@ -110,14 +111,8 @@ export default function Dashboard({ view, setView }: DashboardProps) {
     setView((current) => ({ ...current, root: current.root === value ? null : value }));
   };
 
-  const reasonMessage =
-    scanReason === "no_roots"
-      ? t("dashboard.scanNoRoots")
-      : scanReason === "already_running"
-        ? t("dashboard.scanAlready")
-        : null;
-
   const hasRoots = Boolean(stats?.watchedRoots.length);
+  const canScan = Boolean(stats && stats.scanEligibleRoots > 0 && scanReason !== "no_roots");
   const scanFailed = scanStatus === "failed";
 
   return (
@@ -148,7 +143,7 @@ export default function Dashboard({ view, setView }: DashboardProps) {
           <button
             type="button"
             onClick={startScan}
-            disabled={isScanning || !scanListenersReady || Boolean(stats && !hasRoots)}
+            disabled={isScanning || isLoading || !scanListenersReady || !canScan}
             className="rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-on-primary hover:bg-primary-hover disabled:opacity-50 transition-colors inline-flex items-center gap-1.5"
           >
             <RefreshCw size={13} className={isScanning ? "animate-spin" : ""} />
@@ -199,22 +194,19 @@ export default function Dashboard({ view, setView }: DashboardProps) {
             {scanErrors.map((message, index) => <p key={index} className="mt-1">{message}</p>)}
           </div>
         )}
-        {reasonMessage && !isScanning && (
+        {hasRoots && !canScan && !isScanning && (
           <div className="rounded-lg border border-border bg-surface-dark px-4 py-3 text-sm text-text flex items-center justify-between gap-3">
-            <span>{reasonMessage}</span>
-            {scanReason === "no_roots" && (
-              <button
-                type="button"
-                onClick={() => navigateHash("settings")}
-                className="text-xs font-medium text-primary hover:underline inline-flex items-center gap-1"
-              >
-                <Settings size={12} />
-                {t("dashboard.openSettings")}
-              </button>
-            )}
+            <span role="status">{t("dashboard.scanInactiveRoots")}</span>
+            <button
+              type="button"
+              onClick={() => navigateHash("settings")}
+              className="text-xs font-medium text-primary hover:underline inline-flex items-center gap-1"
+            >
+              <Settings size={12} aria-hidden="true" />
+              {t("dashboard.openSettings")}
+            </button>
           </div>
         )}
-
         {!stats && !error ? (
           <div className="flex items-center justify-center h-64">
             <div className="animate-pulse text-sm text-text-muted">{t("app.loading")}</div>
@@ -255,12 +247,14 @@ export default function Dashboard({ view, setView }: DashboardProps) {
               onClearRoot={() => toggleRoot(null)}
             />
 
-            <StorageRibbon
-              data={stats!.categoryBreakdown}
-              totalBytes={stats!.totalBytes}
-              selected={category}
-              onSelect={(c) => toggleCategory(c)}
-            />
+            {(canScan || stats!.totalBytes > 0) && (
+              <StorageRibbon
+                data={stats!.categoryBreakdown}
+                totalBytes={stats!.totalBytes}
+                selected={category}
+                onSelect={(c) => toggleCategory(c)}
+              />
+            )}
 
             <StatCards
               totalFiles={stats!.totalFiles}
