@@ -1501,10 +1501,39 @@ mod tests {
 
     #[test]
     fn scheduled_scan_stops_after_a_committed_mid_batch_disable() {
+        assert_scheduled_save_between_moves(|schedule| schedule.schedule_enabled = false, 1, 1);
+    }
+
+    #[test]
+    fn scheduled_scan_stops_after_a_committed_mid_batch_time_change() {
+        assert_scheduled_save_between_moves(|schedule| schedule.schedule_time_1 = Some("09:00".into()), 1, 1);
+    }
+
+    #[test]
+    fn scheduled_scan_completes_after_an_unchanged_mid_batch_save() {
+        assert_scheduled_save_between_moves(|_| {}, 2, 0);
+    }
+
+    #[test]
+    fn scheduled_scan_completes_after_an_equivalent_mid_batch_schedule_edit() {
+        assert_scheduled_save_between_moves(|schedule| {
+            schedule.schedule_time_1 = Some("14:00:00".into());
+            schedule.schedule_time_2 = Some("08:00".into());
+            schedule.schedule_time_3 = Some("19:00".into());
+        }, 2, 1);
+    }
+
+    fn assert_scheduled_save_between_moves(
+        edit: impl Fn(&mut crate::db::ScheduleSettings),
+        expected_organized: usize,
+        expected_revision_delta: i64,
+    ) {
         use crate::db;
         let _serial = db::serialise_test_db();
         db::init_test_db();
+        const SLOT: &str = "v2|2026-11-20|08:00:00";
         let original = crate::scheduler::schedule_from_settings(db::get_settings().unwrap());
+        let original_checkpoint = db::get_schedule_last_check().unwrap();
         let path = std::env::temp_dir().join(format!(
             "mouzi-schedule-{}-{}", std::process::id(), Utc::now().timestamp_nanos_opt().unwrap()
         ));
@@ -1515,18 +1544,27 @@ mod tests {
         custom.extensions = vec!["scheduledrevocation".into()];
         custom.priority = i32::MIN;
         let rule_id = db::add_rule(&custom).unwrap();
-        let run = {
-            let conn = db::lock_db().unwrap();
-            conn.execute("INSERT INTO schedule_runs(status,claimed_at,occurrences) VALUES('claimed','fixture',1)", []).unwrap();
-            conn.last_insert_rowid()
-        };
-        struct Fixture { path: PathBuf, folder: i64, rule: i64, run: i64, original: db::ScheduleSettings }
+        let run = db::claim_schedule_occurrences(&[SLOT], "fixture").unwrap().unwrap().id;
+        struct Fixture {
+            path: PathBuf,
+            folder: i64,
+            rule: i64,
+            run: i64,
+            original: db::ScheduleSettings,
+            original_checkpoint: Option<String>,
+        }
         impl Drop for Fixture {
             fn drop(&mut self) {
                 if let Ok(conn) = db::lock_db() {
                     let _ = conn.execute("DELETE FROM action_logs WHERE source_path IN (SELECT source_path FROM operation_intents WHERE schedule_run_id=?1)", [self.run]);
                     let _ = conn.execute("DELETE FROM operation_intents WHERE schedule_run_id=?1", [self.run]);
                     let _ = conn.execute("DELETE FROM schedule_runs WHERE id=?1", [self.run]);
+                    let _ = conn.execute("DELETE FROM schedule_occurrences WHERE key=?1", [SLOT]);
+                    if let Some(value) = &self.original_checkpoint {
+                        let _ = conn.execute("UPDATE scheduler_state SET value=?1 WHERE key='last_check'", [value]);
+                    } else {
+                        let _ = conn.execute("DELETE FROM scheduler_state WHERE key='last_check'", []);
+                    }
                 }
                 let _ = db::update_schedule_settings(&self.original);
                 let _ = db::delete_rule(self.rule);
@@ -1534,7 +1572,7 @@ mod tests {
                 let _ = fs::remove_dir_all(&self.path);
             }
         }
-        let _fixture = Fixture { path: path.clone(), folder, rule: rule_id, run, original };
+        let _fixture = Fixture { path: path.clone(), folder, rule: rule_id, run, original, original_checkpoint };
         for name in ["first.scheduledrevocation", "second.scheduledrevocation"] {
             let file = path.join(name);
             fs::write(&file, name.as_bytes()).unwrap();
@@ -1544,39 +1582,57 @@ mod tests {
         let scheduler = crate::scheduler::Scheduler::new();
         let suppression = SuppressionSet::new();
         let mut schedule = db::ScheduleSettings {
-            schedule_enabled: true, schedule_times_per_day: 1, schedule_time_1: Some("08:00".into()),
-            schedule_time_2: None, schedule_time_3: None, schedule_time_4: None,
+            schedule_enabled: true, schedule_times_per_day: 2, schedule_time_1: Some("08:00".into()),
+            schedule_time_2: Some("14:00".into()), schedule_time_3: None, schedule_time_4: None,
         };
-        scheduler.save_schedule(&suppression, &schedule).unwrap();
+        let initial_settings = scheduler.save_schedule(&suppression, &schedule).unwrap();
         let revision = scheduler.revision();
         db::start_schedule_run(run).unwrap();
         let mut selected = Vec::new();
+        let mut saved_settings = None;
         let mut progress = ScheduleRunProgress::default();
         let row = get_watched_folders().unwrap().into_iter().find(|row| row.id == Some(folder)).unwrap();
         let root = WatchedRoot::capture(&row).unwrap();
         scan_scheduled_folder(&root, &suppression, run, &|| scheduler.revision() == revision, &mut progress, |file| {
             selected.push(file.to_path_buf());
             if selected.len() == 2 {
-                assert!(!selected[0].exists(), "first move must finish before disable");
-                schedule.schedule_enabled = false;
-                assert!(!scheduler.save_schedule(&suppression, &schedule).unwrap().schedule_enabled);
+                assert!(!selected[0].exists(), "first move must finish before saving");
+                edit(&mut schedule);
+                saved_settings = Some(scheduler.save_schedule(&suppression, &schedule).unwrap());
             }
         }).unwrap();
         assert_eq!(selected.len(), 2);
-        assert_eq!((progress.organized, progress.errors, progress.revoked), (1, 0, true));
-        let first = selected[0].file_name().unwrap().to_str().unwrap();
-        let second = selected[1].file_name().unwrap().to_str().unwrap();
-        assert_eq!(fs::read(path.join("Filed").join(first)).unwrap(), first.as_bytes());
-        assert_eq!(fs::read(&selected[1]).unwrap(), second.as_bytes());
-        assert!(!path.join("Filed").join(second).exists());
+        let expected_revoked = expected_organized == 1;
+        assert_eq!((progress.organized, progress.errors, progress.revoked), (expected_organized, 0, expected_revoked));
+        let committed = saved_settings.unwrap();
+        assert_eq!(committed.revision, initial_settings.revision + expected_revision_delta);
+        let persisted = db::get_settings().unwrap();
+        assert_eq!(persisted.revision, committed.revision);
+        assert_eq!(persisted.schedule_enabled, schedule.schedule_enabled);
+        assert_eq!(persisted.schedule_time_1, schedule.schedule_time_1);
+        assert_eq!(persisted.schedule_time_2, schedule.schedule_time_2);
+        assert_eq!(persisted.schedule_time_3, schedule.schedule_time_3);
+        for (index, source) in selected.iter().enumerate() {
+            let name = source.file_name().unwrap().to_str().unwrap();
+            let destination = path.join("Filed").join(name);
+            if index < expected_organized {
+                assert!(!source.exists());
+                assert_eq!(fs::read(destination).unwrap(), name.as_bytes());
+            } else {
+                assert_eq!(fs::read(source).unwrap(), name.as_bytes());
+                assert!(!destination.exists());
+            }
+        }
         db::finish_schedule_run(run, &progress).unwrap();
         let receipt = db::recent_schedule_runs().unwrap().into_iter().find(|row| row.id == run).unwrap();
-        assert_eq!((receipt.status.as_str(), receipt.organized), ("interrupted", 1));
+        let expected_status = if expected_revoked { "interrupted" } else { "completed" };
+        assert_eq!((receipt.status.as_str(), receipt.organized), (expected_status, expected_organized));
+        assert!(db::claim_schedule_occurrences(&[SLOT], "fixture").unwrap().is_none());
         let conn = db::lock_db().unwrap();
         let linked: i64 = conn.query_row("SELECT COUNT(*) FROM operation_intents WHERE schedule_run_id=?1 AND status='completed'", [run], |row| row.get(0)).unwrap();
-        let history: i64 = conn.query_row("SELECT COUNT(*) FROM action_logs WHERE source_path=?1", [selected[0].to_string_lossy().as_ref()], |row| row.get(0)).unwrap();
-        let denied: i64 = conn.query_row("SELECT COUNT(*) FROM operation_intents WHERE source_path=?1", [selected[1].to_string_lossy().as_ref()], |row| row.get(0)).unwrap();
-        assert_eq!((linked, history, denied), (1, 1, 0));
+        let history: i64 = conn.query_row("SELECT COUNT(*) FROM action_logs WHERE source_path IN (SELECT source_path FROM operation_intents WHERE schedule_run_id=?1)", [run], |row| row.get(0)).unwrap();
+        let intents: i64 = conn.query_row("SELECT COUNT(*) FROM operation_intents WHERE schedule_run_id=?1", [run], |row| row.get(0)).unwrap();
+        assert_eq!((linked, history, intents), (expected_organized as i64, expected_organized as i64, expected_organized as i64));
     }
 
     #[test]
