@@ -1103,10 +1103,12 @@ mod tests {
     #[test]
     fn partial_archive_receipts_keep_the_actual_destination() {
         use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc::sync_channel;
 
         struct Fixture {
             root: PathBuf,
             first: PathBuf,
+            second: PathBuf,
             rule: i64,
             intent: i64,
         }
@@ -1114,8 +1116,9 @@ mod tests {
             fn drop(&mut self) {
                 if let Ok(conn) = crate::db::lock_db() {
                     let source = self.first.to_string_lossy();
-                    let _ = conn.execute("DELETE FROM action_logs WHERE source_path=?1", [source.as_ref()]);
-                    let _ = conn.execute("DELETE FROM operation_intents WHERE source_path=?1", [source.as_ref()]);
+                    let next = self.second.to_string_lossy();
+                    let _ = conn.execute("DELETE FROM action_logs WHERE source_path IN (?1,?2)", [source.as_ref(), next.as_ref()]);
+                    let _ = conn.execute("DELETE FROM operation_intents WHERE source_path IN (?1,?2)", [source.as_ref(), next.as_ref()]);
                     let _ = conn.execute("DELETE FROM operation_intents WHERE id=?1", [self.intent]);
                 }
                 let _ = crate::db::delete_rule(self.rule);
@@ -1125,7 +1128,7 @@ mod tests {
 
         let _serial = crate::db::serialise_test_db();
         crate::db::init_test_db();
-        for stop in ["entry", "cancel", "warning"] {
+        for stop in ["entry", "cancel", "warning", "cancel-wait"] {
             let root = std::env::temp_dir().join(format!(
                 "mouzi-partial-archive-{stop}-{}-{}", std::process::id(), Utc::now().timestamp_nanos_opt().unwrap()
             ));
@@ -1150,7 +1153,7 @@ mod tests {
             let rule_id = crate::db::add_rule(&custom).unwrap();
             let source = root.join("input.zip");
             let intent = crate::db::begin_operation_intent("archive_import", &source.to_string_lossy(), None).unwrap();
-            let _fixture = Fixture { root, first: first.clone(), rule: rule_id, intent };
+            let _fixture = Fixture { root, first: first.clone(), second: second.clone(), rule: rule_id, intent };
             crate::archive::save_manifest(&staging, Some(&source), "extracted", &[], None).unwrap();
             crate::db::observe_pending_archive_staging(intent, &staging.to_string_lossy()).unwrap();
 
@@ -1172,6 +1175,26 @@ mod tests {
             ];
             let sorting = scan_folder_entries(entries, Some(&cancelled), |path| {
                 if path == second.as_path() {
+                    if stop == "cancel-wait" {
+                        // The outer check has already admitted this entry to the
+                        // process closure. Cut in before it gets the move gate.
+                        return std::thread::scope(|scope| {
+                            let (locked, gate_ready) = sync_channel(0);
+                            let (contend, cancel_now) = sync_channel(0);
+                            let (suppression, cancelled) = (&suppression, &cancelled);
+                            scope.spawn(move || {
+                                let _gate = suppression.with_operation();
+                                locked.send(()).unwrap();
+                                cancel_now.recv().unwrap();
+                                cancelled.store(true, Ordering::Relaxed);
+                            });
+                            gate_ready.recv().unwrap();
+                            contend.send(()).unwrap();
+                            process_file(
+                                path, true, &staging, suppression, &suppression.ticket(path), None, FolderAuthority::ArchiveStaging,
+                            )
+                        });
+                    }
                     return Err("forced second-file error".into());
                 }
                 let mut outcome = process_file(
@@ -1190,10 +1213,10 @@ mod tests {
                 Ok(outcome)
             });
             let summary = crate::commands::finish_archive_sort(intent, &staging, 2, sorting);
-            let error = summary.issue.as_deref().expect("partial import issue");
+            let error = summary.issue.as_deref().unwrap_or_else(|| panic!("{stop}: expected partial import issue; moved {}", summary.sorted_count));
             assert!(error.contains(match stop {
                 "entry" => "forced directory entry failure",
-                "cancel" => "Import cancelled",
+                "cancel" | "cancel-wait" => "Import cancelled after organizing 1 files",
                 _ => "forced history warning",
             }), "{error}");
             assert_eq!(summary.staging_path, expected_staging);
@@ -1219,7 +1242,17 @@ mod tests {
             assert!(!first.exists());
             assert_eq!(fs::read(destination).unwrap(), b"first");
             assert_eq!(fs::read(occupied).unwrap(), b"occupied");
-            assert_eq!(fs::read(second).unwrap(), b"second");
+            assert_eq!(fs::read(&second).unwrap(), b"second");
+            assert!(!filed.join("second.archivepartialx").exists());
+            let conn = crate::db::lock_db().unwrap();
+            let log_and_intent_counts = |path: &Path| conn.query_row(
+                "SELECT (SELECT COUNT(*) FROM action_logs WHERE source_path=?1),
+                        (SELECT COUNT(*) FROM operation_intents WHERE source_path=?1 AND action='move')",
+                [path.to_string_lossy().as_ref()],
+                |row| Ok((row.get::<_, usize>(0)?, row.get::<_, usize>(1)?)),
+            ).unwrap();
+            assert_eq!(log_and_intent_counts(&first), (1, 1));
+            assert_eq!(log_and_intent_counts(&second), (0, 0));
         }
     }
 
