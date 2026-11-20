@@ -1632,9 +1632,8 @@ mod tests {
         let base = std::env::var("USERPROFILE")
             .map(PathBuf::from)
             .unwrap_or_else(|_| std::env::temp_dir());
-        let dir = base.join(format!("mouzi-safe-fs-{}-{}", name, std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
+        let dir = base.join(format!("mouzi-safe-fs-{name}-{}", crate::operations::new_run_id()));
+        fs::create_dir(&dir).unwrap();
         dir
     }
 
@@ -1651,10 +1650,12 @@ mod tests {
 
         let root = long_form_dir("trash_test");
         let file = root.join("to-trash.txt");
-        fs::write(&file, "delete me").unwrap();
+        let payload = b"Mouzi native Recycle Bin fixture";
+        fs::write(&file, payload).unwrap();
         assert!(file.exists());
 
         let before = trash_snapshot();
+        assert!(before.known, "Cannot read the Recycle Bin before testing the fixture");
         let original_identity = file_identity(&file).unwrap();
         // Previously the Err arm printed a note and the test passed anyway, so a
         // totally broken trash path was invisible to CI. A failure here is a
@@ -1675,12 +1676,27 @@ mod tests {
         // The strongest form of the assertion: the snapshot has to positively
         // find the item and attribute it, not merely notice a larger bin.
         assert_eq!(
-            classify_trash_outcomes_with_identity(&before, &after, &[(file.clone(), original_identity)]),
+            classify_trash_outcomes_with_identity(&before, &after, &[(file.clone(), original_identity.clone())]),
             vec![TrashVerdict::InRecycleBin],
             "the item landed but the snapshot could not match it back to its path"
         );
 
-        fs::remove_dir_all(&root).ok();
+        // Restore only the newly binned fixture we can identify by its
+        // physical identity and its unique original parent.
+        let mut owned: Vec<_> = trash::os_limited::list().unwrap().into_iter().filter(|item| {
+            normalize_lexically(&item.original_parent) == normalize_lexically(&root)
+                && !before.items.iter().any(|previous| previous.id == item.id)
+                && file_identity(Path::new(&item.id)).ok().as_ref() == Some(&original_identity)
+        }).collect();
+        assert_eq!(owned.len(), 1, "Cannot uniquely identify the fixture for recovery");
+        let mut item = owned.pop().unwrap();
+        // Windows Shell display labels can omit the original extension.
+        item.name = file.file_name().unwrap().to_os_string();
+        trash::os_limited::restore_all([item]).unwrap();
+        assert_eq!(fs::read(&file).unwrap(), payload);
+        assert_eq!(file_identity(&file).unwrap(), original_identity);
+        fs::remove_file(&file).unwrap();
+        fs::remove_dir(&root).unwrap();
     }
 
     #[test]
