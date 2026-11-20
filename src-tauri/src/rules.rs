@@ -4,6 +4,7 @@ use crate::safe_fs::{AncestorGuard, FileIdentity, MoveFailure};
 use crate::suppress::{CancellationTicket, SuppressionSet, SUPPRESSION_TTL};
 use chrono::{DateTime, NaiveDate, Utc};
 use regex::Regex;
+use std::cell::Cell;
 use std::fs;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
@@ -516,13 +517,31 @@ enum FolderAuthority<'a> {
         revoked: &'a std::cell::Cell<bool>,
     },
     WatchedManual(&'a WatchedManualRoot),
-    ArchiveStaging,
+    ArchiveStaging(Option<&'a ArchiveSortCancellation<'a>>),
 }
 
 impl FolderAuthority<'_> {
     fn uses_folder_protection(self) -> bool {
         // Imported payloads cannot supply the organizer's folder policy.
-        !matches!(self, Self::ArchiveStaging)
+        !matches!(self, Self::ArchiveStaging(_))
+    }
+}
+
+struct ArchiveSortCancellation<'a> {
+    requested: &'a AtomicBool,
+    stopped: Cell<bool>,
+}
+
+impl<'a> ArchiveSortCancellation<'a> {
+    fn new(requested: &'a AtomicBool) -> Self {
+        Self { requested, stopped: Cell::new(false) }
+    }
+
+    fn stop_requested(&self) -> bool {
+        if self.requested.load(Ordering::Relaxed) {
+            self.stopped.set(true);
+        }
+        self.stopped.get()
     }
 }
 
@@ -535,7 +554,7 @@ pub fn process_file_with_suppression(
     expected_identity: Option<&FileIdentity>,
     require_auto_root: bool,
 ) -> Result<ProcessOutcome, String> {
-    let authority = if require_auto_root { FolderAuthority::Automatic } else { FolderAuthority::ArchiveStaging };
+    let authority = if require_auto_root { FolderAuthority::Automatic } else { FolderAuthority::ArchiveStaging(None) };
     process_file(path, bypass_grace, root, suppression, ticket, expected_identity, authority)
 }
 
@@ -559,6 +578,13 @@ fn process_file(
     authority: FolderAuthority<'_>,
 ) -> Result<ProcessOutcome, String> {
     let _operation = suppression.with_operation();
+    if let FolderAuthority::ArchiveStaging(Some(cancellation)) = authority {
+        // The scan may have selected this file before waiting for the gate.
+        // Once admitted, finish the move and its receipt even if Cancel arrives.
+        if cancellation.stop_requested() {
+            return Ok(ProcessOutcome::Skipped);
+        }
+    }
     if let FolderAuthority::Scheduled { is_current, revoked, .. } = authority {
         if !is_current() {
             revoked.set(true);
@@ -729,7 +755,7 @@ pub fn manual_scan_folder_with_suppression(folder: &str, suppression: &Suppressi
 pub(crate) fn scan_watched_manual_folder(root: &WatchedManualRoot, suppression: &SuppressionSet)
     -> Result<Vec<(String, String, String)>, String>
 {
-    scan_folder(&root.path, suppression, FolderAuthority::WatchedManual(root), None)
+    scan_folder(&root.path, suppression, FolderAuthority::WatchedManual(root))
         .map_err(|error| error.message)
 }
 
@@ -744,13 +770,14 @@ pub(crate) struct FolderScanError {
 pub(crate) fn manual_scan_folder_cancelable(root: &Path, suppression: &SuppressionSet, cancelled: &std::sync::atomic::AtomicBool)
     -> Result<SortedFiles, FolderScanError>
 {
-    scan_folder(root, suppression, FolderAuthority::ArchiveStaging, Some(cancelled))
+    let cancellation = ArchiveSortCancellation::new(cancelled);
+    scan_folder(root, suppression, FolderAuthority::ArchiveStaging(Some(&cancellation)))
 }
 
 pub fn scheduled_scan_folder(folder: &str, suppression: &SuppressionSet)
     -> Result<Vec<(String, String, String)>, String>
 {
-    scan_folder(Path::new(folder), suppression, FolderAuthority::Automatic, None)
+    scan_folder(Path::new(folder), suppression, FolderAuthority::Automatic)
         .map_err(|error| error.message)
 }
 
@@ -810,7 +837,7 @@ fn scan_scheduled_entries(
     }
 }
 
-fn scan_folder(root: &Path, suppression: &SuppressionSet, authority: FolderAuthority<'_>, cancelled: Option<&std::sync::atomic::AtomicBool>)
+fn scan_folder(root: &Path, suppression: &SuppressionSet, authority: FolderAuthority<'_>)
     -> Result<SortedFiles, FolderScanError>
 {
     let entries = (|| {
@@ -820,27 +847,29 @@ fn scan_folder(root: &Path, suppression: &SuppressionSet, authority: FolderAutho
         }
         fs::read_dir(root).map_err(|error| error.to_string())
     })().map_err(|message| FolderScanError { results: Vec::new(), message })?;
-    let bypass_grace = matches!(authority, FolderAuthority::WatchedManual(_) | FolderAuthority::ArchiveStaging);
+    let bypass_grace = matches!(authority, FolderAuthority::WatchedManual(_) | FolderAuthority::ArchiveStaging(_));
+    let cancellation = match authority {
+        FolderAuthority::ArchiveStaging(cancellation) => cancellation,
+        _ => None,
+    };
     scan_folder_entries(
         entries.map(|entry| entry.map(|entry| entry.path()).map_err(|error| error.to_string())),
-        cancelled,
+        cancellation,
         |path| process_file(path, bypass_grace, root, suppression, &suppression.ticket(path), None, authority),
     )
 }
 
 fn scan_folder_entries(
     entries: impl IntoIterator<Item = Result<PathBuf, String>>,
-    cancelled: Option<&std::sync::atomic::AtomicBool>,
+    cancellation: Option<&ArchiveSortCancellation<'_>>,
     mut process: impl FnMut(&Path) -> Result<ProcessOutcome, String>,
 ) -> Result<SortedFiles, FolderScanError> {
     let mut results = Vec::new();
     let mut errors = Vec::new();
     for entry in entries {
-        let entry = if cancelled.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)) {
-            Err(format!("Import cancelled after organizing {} files", results.len()))
-        } else {
-            entry
-        };
+        if cancellation.is_some_and(ArchiveSortCancellation::stop_requested) {
+            break;
+        }
         let path = match entry {
             Ok(path) => path,
             Err(mut message) => {
@@ -853,7 +882,11 @@ fn scan_folder_entries(
         };
         if !path.is_file() { continue; }
         let file_name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
-        match process(&path) {
+        let outcome = process(&path);
+        if cancellation.is_some_and(|cancel| cancel.stopped.get()) {
+            break;
+        }
+        match outcome {
             Ok(ProcessOutcome::Organized { rule, destination, warning }) => {
                 results.push((file_name, rule.name, destination));
                 if let Some(warning) = warning { errors.push(warning); }
@@ -861,6 +894,10 @@ fn scan_folder_entries(
             Ok(ProcessOutcome::Skipped | ProcessOutcome::Retry { .. }) => {}
             Ok(ProcessOutcome::Retained { message }) | Err(message) => errors.push(format!("{file_name}: {message}")),
         }
+    }
+    if cancellation.is_some_and(|cancel| cancel.stopped.get()) {
+        errors.insert(0, format!("Import cancelled after organizing {} files", results.len()));
+        return Err(FolderScanError { results, message: errors.join("; ") });
     }
     if errors.is_empty() { Ok(results) }
     else {
@@ -1168,12 +1205,14 @@ mod tests {
             assert_eq!(intent_state(), ("pending".to_owned(), expected_staging.clone()));
 
             let cancelled = AtomicBool::new(false);
+            let cancellation = ArchiveSortCancellation::new(&cancelled);
+            let authority = FolderAuthority::ArchiveStaging(Some(&cancellation));
             let suppression = SuppressionSet::new();
             let entries = [
                 Ok(first.clone()),
                 if stop == "entry" { Err("forced directory entry failure".into()) } else { Ok(second.clone()) },
             ];
-            let sorting = scan_folder_entries(entries, Some(&cancelled), |path| {
+            let sorting = scan_folder_entries(entries, Some(&cancellation), |path| {
                 if path == second.as_path() {
                     if stop == "cancel-wait" {
                         // The outer check has already admitted this entry to the
@@ -1191,14 +1230,14 @@ mod tests {
                             gate_ready.recv().unwrap();
                             contend.send(()).unwrap();
                             process_file(
-                                path, true, &staging, suppression, &suppression.ticket(path), None, FolderAuthority::ArchiveStaging,
+                                path, true, &staging, suppression, &suppression.ticket(path), None, authority,
                             )
                         });
                     }
                     return Err("forced second-file error".into());
                 }
                 let mut outcome = process_file(
-                    path, true, &staging, &suppression, &suppression.ticket(path), None, FolderAuthority::ArchiveStaging,
+                    path, true, &staging, &suppression, &suppression.ticket(path), None, authority,
                 )?;
                 let warning = match &mut outcome {
                     ProcessOutcome::Organized { warning, .. } => warning,
