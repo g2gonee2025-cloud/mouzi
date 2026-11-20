@@ -4,7 +4,7 @@ use crate::rules::{scan_watched_manual_folder, WatchedManualRoot};
 use crate::scan::{self, ScanEvent};
 use crate::suppress::{SuppressionSet, SUPPRESSION_TTL};
 use crate::AppState;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -947,7 +947,122 @@ pub fn get_recent_scheduler_runs_cmd() -> Result<Vec<ScheduleRun>, String> {
 }
 
 const MAX_RULE_TRANSFER_BYTES: u64 = 16 * 1024 * 1024;
+const RULE_TRANSFER_VERSION: u32 = 1;
 static RULE_TRANSFER: PlanMutex<()> = PlanMutex::new(());
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RuleTransferInput {
+    Document(RuleTransferDocument),
+    Legacy(Vec<Rule>),
+}
+
+#[derive(Deserialize, Serialize)]
+struct RuleTransferDocument {
+    version: u32,
+    rules: Vec<RuleTransferEntry>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct RuleTransferEntry {
+    rule: Rule,
+    scope: RuleTransferScope,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum RuleTransferScope {
+    Global,
+    Folder { path: PathBuf, identity: String },
+}
+
+fn rule_transfer_folder(
+    folder: &WatchedFolder,
+) -> Result<(PathBuf, String, crate::safe_fs::AncestorGuard), String> {
+    let configured_path = Path::new(&folder.path);
+    let guard = crate::safe_fs::guard_directory(configured_path)?;
+    let path = crate::safe_fs::validate_root(configured_path)?;
+    let identity = crate::safe_fs::file_identity(configured_path)?.key();
+    Ok((path, identity, guard))
+}
+
+fn encode_rule_transfer(rules: Vec<Rule>, folders: &[WatchedFolder]) -> Result<Vec<u8>, String> {
+    if rules.iter().all(|rule| rule.folder_id == 0) {
+        return serde_json::to_vec_pretty(&rules).map_err(|error| error.to_string());
+    }
+
+    let mut scopes = HashMap::new();
+    let mut entries = Vec::with_capacity(rules.len());
+    for mut rule in rules {
+        let scope = if rule.folder_id == 0 {
+            RuleTransferScope::Global
+        } else {
+            use std::collections::hash_map::Entry;
+
+            let (path, identity, _) = match scopes.entry(rule.folder_id) {
+                Entry::Occupied(entry) => entry.into_mut(),
+                Entry::Vacant(entry) => {
+                    let folder = folders.iter().find(|folder| folder.id == Some(rule.folder_id))
+                        .ok_or_else(|| format!("Cannot export rule '{}': its watched folder is missing. Edit the rule's folder scope and export again.", rule.name))?;
+                    let snapshot = rule_transfer_folder(folder).map_err(|error| {
+                        format!("Cannot export rule '{}': its watched folder '{}' is unavailable ({error}). Reconnect it and export again.", rule.name, folder.path)
+                    })?;
+                    entry.insert(snapshot)
+                }
+            };
+            RuleTransferScope::Folder { path: path.clone(), identity: identity.clone() }
+        };
+        rule.id = None;
+        rule.folder_id = 0;
+        entries.push(RuleTransferEntry { rule, scope });
+    }
+
+    serde_json::to_vec_pretty(&RuleTransferDocument {
+        version: RULE_TRANSFER_VERSION,
+        rules: entries,
+    }).map_err(|error| error.to_string())
+}
+
+struct ResolvedRuleImport {
+    rules: Vec<Rule>,
+    _folders: Vec<(i64, PathBuf, String, crate::safe_fs::AncestorGuard)>,
+}
+
+fn resolve_rule_import(
+    entries: &[RuleTransferEntry], folders: &[WatchedFolder],
+) -> Result<ResolvedRuleImport, String> {
+    // Inspect only folders already registered in this profile. A path read
+    // from the import file never opens a directory or registers a new root.
+    let snapshots: Vec<_> = if entries.iter().any(|entry| matches!(entry.scope, RuleTransferScope::Folder { .. })) {
+        folders.iter().filter_map(|folder| {
+            let id = folder.id.filter(|id| *id > 0)?;
+            let (path, identity, guard) = rule_transfer_folder(folder).ok()?;
+            Some((id, path, identity, guard))
+        }).collect()
+    } else {
+        Vec::new()
+    };
+
+    let mut rules = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let mut rule = entry.rule.clone();
+        if let RuleTransferScope::Folder { path, identity } = &entry.scope {
+            let mut matches = snapshots.iter().filter(|(_, current_path, current_identity, _)| {
+                current_path == path && current_identity == identity
+            });
+            let (id, ..) = matches.next().ok_or_else(|| {
+                format!("Cannot import rule '{}': the original watched folder '{}' is unavailable in this profile. Add or reconnect that folder, or recreate the rule for its new location.", rule.name, path.display())
+            })?;
+            if matches.next().is_some() {
+                return Err(format!("Cannot import rule '{}': more than one watched entry points to '{}'. Remove the duplicate registration and try again.", rule.name, path.display()));
+            }
+            rule.folder_id = *id;
+        }
+        rules.push(rule);
+    }
+
+    Ok(ResolvedRuleImport { rules, _folders: snapshots })
+}
 
 fn validate_rule_transfer_path(path: &Path) -> Result<(), String> {
     if !path.is_absolute() || !path.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("json")) {
@@ -1006,7 +1121,33 @@ fn write_rule_export(path: &Path, bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-fn read_rule_import(path: &Path) -> Result<Vec<Rule>, String> {
+fn decode_rule_transfer(data: &[u8]) -> Result<Vec<RuleTransferEntry>, String> {
+    let input: RuleTransferInput = serde_json::from_slice(data).map_err(|error| error.to_string())?;
+    let entries = match input {
+        RuleTransferInput::Legacy(rules) => {
+            if let Some(rule) = rules.iter().find(|rule| rule.folder_id != 0) {
+                return Err(format!("Cannot import rule '{}': this older export does not identify its watched folder. Export it again with an updated Mouzi, or recreate the rule in this profile.", rule.name));
+            }
+            rules.into_iter().map(|rule| RuleTransferEntry { rule, scope: RuleTransferScope::Global }).collect()
+        }
+        RuleTransferInput::Document(document) if document.version == RULE_TRANSFER_VERSION => document.rules,
+        RuleTransferInput::Document(document) => {
+            return Err(format!("Unsupported rule export version {}. Update Mouzi and try again.", document.version));
+        }
+    };
+
+    for (index, entry) in entries.iter().enumerate() {
+        let rule = &entry.rule;
+        if rule.folder_id != 0 {
+            return Err(format!("Cannot import rule '{}': this export contains a profile-specific folder identifier. Export the rule again from its original profile.", rule.name));
+        }
+        validate_rule_destination(rule)
+            .map_err(|error| format!("Rule {} of {} ({}) is not usable: {error}", index + 1, entries.len(), rule.name))?;
+    }
+    Ok(entries)
+}
+
+fn read_rule_import(path: &Path) -> Result<Vec<RuleTransferEntry>, String> {
     use std::io::Read;
 
     validate_rule_transfer_path(path)?;
@@ -1023,13 +1164,7 @@ fn read_rule_import(path: &Path) -> Result<Vec<Rule>, String> {
     if data.len() as u64 > MAX_RULE_TRANSFER_BYTES {
         return Err(size_error.into());
     }
-    let rules: Vec<Rule> = serde_json::from_slice(&data).map_err(|error| error.to_string())?;
-    // Validate every rule before offering to replace the saved set.
-    for (index, rule) in rules.iter().enumerate() {
-        validate_rule_destination(rule)
-            .map_err(|error| format!("Rule {} of {} ({}) is not usable: {error}", index + 1, rules.len(), rule.name))?;
-    }
-    Ok(rules)
+    decode_rule_transfer(&data)
 }
 
 /// Pick the export destination in Rust, keeping its path outside renderer IPC.
@@ -1045,8 +1180,11 @@ pub async fn export_rules_cmd(window: tauri::WebviewWindow) -> Result<bool, Stri
             .add_filter("JSON", &["json"]).set_file_name("mouzi-rules.json").blocking_save_file()
         else { return Ok(false); };
         let path = selected.into_path().map_err(|error| error.to_string())?;
-        let rules = get_rules().map_err(|error| error.to_string())?;
-        let bytes = serde_json::to_vec_pretty(&rules).map_err(|error| error.to_string())?;
+        let bytes = with_configuration(window.app_handle(), || {
+            let rules = get_rules().map_err(|error| error.to_string())?;
+            let folders = get_watched_folders().map_err(|error| error.to_string())?;
+            encode_rule_transfer(rules, &folders)
+        })?;
         write_rule_export(&path, &bytes)?;
         Ok(true)
     }).await.map_err(|error| error.to_string())?
@@ -1112,12 +1250,20 @@ pub async fn import_rules_cmd(window: tauri::WebviewWindow, replace: bool) -> Re
             .add_filter("JSON", &["json"]).blocking_pick_file()
         else { return Ok(None); };
         let path = selected.into_path().map_err(|error| error.to_string())?;
-        let rules = read_rule_import(&path)?;
-        if replace && !confirm_rule_replacement(&window, rules.len())? {
-            return Ok(None);
+        let entries = read_rule_import(&path)?;
+        if replace {
+            // Catch any unavailable scopes before asking for replacement.
+            let folders = get_watched_folders().map_err(|error| error.to_string())?;
+            resolve_rule_import(&entries, &folders)?;
+            if !confirm_rule_replacement(&window, entries.len())? {
+                return Ok(None);
+            }
         }
         with_configuration(window.app_handle(), || {
-            import_rules_atomic(&rules, replace).map(Some).map_err(|error| error.to_string())
+            // Folder configuration can change while a native dialog is open.
+            let folders = get_watched_folders().map_err(|error| error.to_string())?;
+            let resolved = resolve_rule_import(&entries, &folders)?;
+            import_rules_atomic(&resolved.rules, replace).map(Some).map_err(|error| error.to_string())
         })
     }).await.map_err(|error| error.to_string())?
 }
@@ -1127,6 +1273,79 @@ mod rule_transfer_tests {
     use super::*;
     use std::fs;
 
+    fn test_move_rule(name: &str, folder_id: i64) -> Rule {
+        Rule {
+            name: name.into(),
+            enabled: true,
+            extensions: vec!["pdf".into()],
+            destination: "Documents".into(),
+            action: "move".into(),
+            folder_id,
+            ..Rule::default()
+        }
+    }
+
+    fn test_watched_folder(id: i64, path: &Path) -> WatchedFolder {
+        WatchedFolder {
+            id: Some(id),
+            path: path.to_str().unwrap().into(),
+            enabled: true,
+            mode: FOLDER_MODE_MANUAL.into(),
+            only_new: false,
+        }
+    }
+
+    #[test]
+    fn scoped_rule_transfer_matches_physical_folder_instead_of_profile_id() {
+        struct Fixture(PathBuf);
+        impl Drop for Fixture {
+            fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); }
+        }
+
+        let path = std::env::temp_dir().join(format!("mouzi-rule-transfer-scope-{}", std::process::id()));
+        fs::create_dir(&path).unwrap();
+        let root = Fixture(path);
+        let downloads = root.0.join("Downloads");
+        let desktop = root.0.join("Desktop");
+        fs::create_dir(&downloads).unwrap();
+        fs::create_dir(&desktop).unwrap();
+
+        let export = encode_rule_transfer(
+            vec![test_move_rule("Global", 0), test_move_rule("Invoices", 1)],
+            &[test_watched_folder(1, &downloads), test_watched_folder(2, &desktop)],
+        ).unwrap();
+        let file = root.0.join("rules.json");
+        write_rule_export(&file, &export).unwrap();
+        let entries = read_rule_import(&file).unwrap();
+        let unrelated = test_watched_folder(1, &desktop);
+        let original = test_watched_folder(2, &downloads);
+        let resolved = resolve_rule_import(&entries, &[unrelated.clone(), original.clone()]).unwrap();
+        assert_eq!(resolved.rules[0].folder_id, 0);
+        assert_eq!(resolved.rules[1].folder_id, 2);
+        drop(resolved);
+
+        let error = resolve_rule_import(&entries, &[unrelated]).err().unwrap();
+        assert!(error.contains("Invoices") && error.contains("Downloads"), "{error}");
+
+        fs::rename(&downloads, root.0.join("Old Downloads")).unwrap();
+        fs::create_dir(&downloads).unwrap();
+        let error = resolve_rule_import(&entries, &[original]).err().unwrap();
+        assert!(error.contains("original watched folder") && error.contains("Downloads"), "{error}");
+    }
+
+    #[test]
+    fn global_legacy_exports_round_trip_and_scoped_legacy_exports_fail_closed() {
+        let global = test_move_rule("Global", 0);
+        let bytes = encode_rule_transfer(vec![global.clone()], &[]).unwrap();
+        assert_eq!(serde_json::from_slice::<Vec<Rule>>(&bytes).unwrap(), vec![global.clone()]);
+        let entries = decode_rule_transfer(&bytes).unwrap();
+        assert_eq!(resolve_rule_import(&entries, &[]).unwrap().rules, vec![global.clone()]);
+
+        let legacy_scoped = serde_json::to_vec(&vec![global, test_move_rule("Invoices", 1)]).unwrap();
+        let error = decode_rule_transfer(&legacy_scoped).err().unwrap();
+        assert!(error.contains("Invoices") && error.contains("Export it again"), "{error}");
+    }
+
     #[test]
     fn exports_valid_rules_without_replacing_a_selected_file() {
         let root = std::env::temp_dir().join(format!("mouzi-rule-transfer-{}", std::process::id()));
@@ -1134,7 +1353,9 @@ mod rule_transfer_tests {
         let path = root.join("Rules.JSON");
         let rules = br#"[{"id":null,"name":"Invoices","priority":10,"enabled":true,"extensions":["pdf"],"pattern":null,"destination":"Documents","action":"move","folder_id":0}]"#;
         write_rule_export(&path, rules).unwrap();
-        assert_eq!(read_rule_import(&path).unwrap()[0].name, "Invoices");
+        let entries = read_rule_import(&path).unwrap();
+        assert_eq!(entries[0].rule.name, "Invoices");
+        assert!(matches!(entries[0].scope, RuleTransferScope::Global));
         assert!(write_rule_export(&path, b"[]").unwrap_err().contains("already exists"));
         assert_eq!(fs::read(&path).unwrap().as_slice(), rules);
         assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
