@@ -281,6 +281,8 @@
       "history.unverified": "Starsza operacja nie ma danych weryfikacyjnych. Przywróć plik ręcznie."
     },
     "allWatched": "Wszystkie obserwowane foldery",
+    "ruleFolderById": "Obserwowany folder nr {{id}}",
+    "removedRuleFolder": "Folder usunięty z obserwowanych (nr {{id}})",
     "recoveryUnavailable": "Usuwanie plików wymaga zweryfikowanej metody odzyskiwania."
   },
   "dashboard": {

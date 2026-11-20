@@ -281,6 +281,8 @@
       "history.unverified": "此旧操作没有验证记录。请手动恢复文件。"
     },
     "allWatched": "所有监控文件夹",
+    "ruleFolderById": "监控文件夹 #{{id}}",
+    "removedRuleFolder": "已移出监控列表的文件夹 #{{id}}",
     "recoveryUnavailable": "验证恢复方法后才能移除文件。"
   },
   "dashboard": {

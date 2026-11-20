@@ -281,6 +281,8 @@
       "history.unverified": "この古い操作には検証データがありません。手動でファイルを復元してください。"
     },
     "allWatched": "すべての監視対象フォルダー",
+    "ruleFolderById": "監視対象フォルダー #{{id}}",
+    "removedRuleFolder": "監視対象から削除されたフォルダー #{{id}}",
     "recoveryUnavailable": "復元方法が検証されるまでファイルは削除できません。"
   },
   "dashboard": {

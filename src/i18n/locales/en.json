@@ -281,6 +281,8 @@
       "history.unverified": "This older operation has no verification record. Restore it manually."
     },
     "allWatched": "All watched folders",
+    "ruleFolderById": "Watched folder #{{id}}",
+    "removedRuleFolder": "Removed from watched folders (#{{id}})",
     "recoveryUnavailable": "File removal is unavailable until a recovery method is verified."
   },
   "dashboard": {

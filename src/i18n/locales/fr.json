@@ -281,6 +281,8 @@
       "history.unverified": "Cette ancienne opération n'a pas de données de vérification. Restaurez le fichier manuellement."
     },
     "allWatched": "Tous les dossiers surveillés",
+    "ruleFolderById": "Dossier surveillé nº {{id}}",
+    "removedRuleFolder": "Dossier retiré de la surveillance (nº {{id}})",
     "recoveryUnavailable": "La suppression des fichiers nécessite une méthode de récupération vérifiée."
   },
   "dashboard": {

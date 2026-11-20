@@ -281,6 +281,8 @@
       "history.unverified": "Questa vecchia operazione non ha dati di verifica. Ripristina il file manualmente."
     },
     "allWatched": "Tutte le cartelle monitorate",
+    "ruleFolderById": "Cartella monitorata n. {{id}}",
+    "removedRuleFolder": "Cartella rimossa dal monitoraggio (n. {{id}})",
     "recoveryUnavailable": "La rimozione dei file richiede un metodo di recupero verificato."
   },
   "dashboard": {

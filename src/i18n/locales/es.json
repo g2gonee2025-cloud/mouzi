@@ -281,6 +281,8 @@
       "history.unverified": "Esta operación antigua no tiene datos de verificación. Restaura el archivo manualmente."
     },
     "allWatched": "Todas las carpetas supervisadas",
+    "ruleFolderById": "Carpeta supervisada n.º {{id}}",
+    "removedRuleFolder": "Carpeta supervisada retirada (n.º {{id}})",
     "recoveryUnavailable": "La eliminación de archivos requiere un método de recuperación verificado."
   },
   "dashboard": {

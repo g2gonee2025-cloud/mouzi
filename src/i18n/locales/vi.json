@@ -287,6 +287,8 @@
       "history.unverified": "Thao tác cũ này không có dữ liệu xác minh. Hãy khôi phục tệp thủ công."
     },
     "allWatched": "Tất cả thư mục được theo dõi",
+    "ruleFolderById": "Thư mục theo dõi số {{id}}",
+    "removedRuleFolder": "Thư mục đã bỏ theo dõi (số {{id}})",
     "recoveryUnavailable": "Cần xác minh phương thức khôi phục trước khi có thể xóa tệp."
   },
   "dashboard": {

@@ -281,6 +281,8 @@
       "history.unverified": "Für diese ältere Aktion fehlen Prüfdaten. Stelle die Datei manuell wieder her."
     },
     "allWatched": "Alle überwachten Ordner",
+    "ruleFolderById": "Überwachter Ordner Nr. {{id}}",
+    "removedRuleFolder": "Entfernter überwachter Ordner Nr. {{id}}",
     "recoveryUnavailable": "Dateien können erst entfernt werden, wenn eine Wiederherstellungsmethode geprüft wurde."
   },
   "dashboard": {

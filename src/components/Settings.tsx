@@ -187,6 +187,7 @@ export default function Settings() {
   const {
     rules,
     folders,
+    folderRead,
     historyCounts,
     loadRules,
     loadFolders,
@@ -212,6 +213,13 @@ export default function Settings() {
   const [tab, setTab] = useState<Tab>("folders");
   const [reviewPaths, setReviewPaths] = useState<string[] | null>(null);
   const [editingRule, setEditingRule] = useState<Rule | null>(null);
+  const folderPaths = new Map(folders.map((folder) => [folder.id, folder.path]));
+  const missingRuleFolder = !!editingRule?.folder_id && !folderPaths.has(editingRule.folder_id);
+  const ruleScopeReady = !editingRule?.folder_id || (folderRead.status === "ready" && !missingRuleFolder);
+  const ruleScopeLabel = (id: number) => {
+    if (id === 0) return t("beta.allWatched");
+    return folderPaths.get(id) ?? t(folderRead.status === "ready" ? "beta.removedRuleFolder" : "beta.ruleFolderById", { id });
+  };
   const [newFolderPath, setNewFolderPath] = useState("");
   const [newOnlyNew, setNewOnlyNew] = useState(false);
   const [watchIssues, setWatchIssues] = useState<Record<string, string>>({});
@@ -334,7 +342,7 @@ export default function Settings() {
   };
 
   const handleSaveRule = async () => {
-    if (!editingRule) return;
+    if (!editingRule || !ruleScopeReady) return;
     const rule = editingRule;
     if (await runWrite(() => rule.id ? updateRule(rule) : addRule(rule))) setEditingRule(null);
   };
@@ -764,6 +772,9 @@ export default function Settings() {
                     <select className="mt-1 block w-full rounded-md border border-border bg-surface p-2" value={editingRule.folder_id}
                       onChange={(event) => setEditingRule({ ...editingRule, folder_id: Number(event.target.value) })}>
                       <option value={0}>{t("beta.allWatched")}</option>
+                      {missingRuleFolder && (
+                        <option value={editingRule.folder_id} disabled>{ruleScopeLabel(editingRule.folder_id)}</option>
+                      )}
                       {folders.filter((folder) => folder.id !== undefined).map((folder) => <option key={folder.id} value={folder.id}>{folder.path}</option>)}
                     </select>
                   </label>
@@ -795,7 +806,8 @@ export default function Settings() {
                 <div className="flex gap-2">
                   <button
                     onClick={handleSaveRule}
-                    className="flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-on-primary hover:bg-primary-hover"
+                    disabled={!ruleScopeReady}
+                    className="flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-on-primary hover:bg-primary-hover disabled:opacity-50"
                   >
                     <Save size={14} />
                     {t("settings.rules.edit")}
@@ -829,6 +841,7 @@ export default function Settings() {
                     <div className="text-xs text-text-muted mt-0.5">
                       {r.extensions.join(", ")} → {r.destination}
                     </div>
+                    <div className="break-all text-xs text-text-muted">{ruleScopeLabel(r.folder_id)}</div>
                   </div>
                   <div className="flex items-center gap-1">
                     <button
