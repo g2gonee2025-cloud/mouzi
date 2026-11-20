@@ -342,7 +342,7 @@ pub fn get_stats_cmd() -> Result<Vec<(String, i64)>, String> {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UndoResult {
-    pub status: String, // "ok" | "collision" | "missing" | "failed"
+    pub status: String, // "ok" | "collision" | "restored_pending" | "missing" | "failed"
     pub message: Option<String>,
     pub restored_to: Option<String>,
 }
@@ -497,8 +497,8 @@ fn finish_undo(target: &UndoTarget, ignored_files: &IgnoredFiles) -> Result<Undo
             restored_to: Some(actual),
         },
         Err(error) => UndoResult {
-            status: "failed".into(),
-            message: Some(format!("File moved to {actual}. Undo history or inventory could not be finalized: {error}. Recovery record {intent} remains pending.")),
+            status: "restored_pending".into(),
+            message: Some(format!("Undo history or inventory could not be finalized: {error}. Recovery record {intent} remains pending.")),
             restored_to: Some(actual),
         },
     })
@@ -567,7 +567,7 @@ fn undo_all_with(
         finish_undo(target, ignored_files).unwrap_or_else(failed_undo)
     }).collect();
 
-    let count = results.iter().filter(|r| matches!(r.status.as_str(), "ok" | "collision")).count();
+    let count = results.iter().filter(|r| matches!(r.status.as_str(), "ok" | "collision" | "restored_pending")).count();
     Ok(UndoAllResult { count, results })
 }
 
@@ -2435,6 +2435,43 @@ mod undo_tests {
         assert_eq!(std::fs::read(&dest).unwrap(), b"payload");
         assert!(!Path::new(&source).exists());
         assert_eq!(undone_of(&source), 0);
+    }
+
+    #[test]
+    fn undo_reports_the_actual_restore_when_history_cannot_finalize() {
+        let fixture = UndoFixture::new("restored_pending");
+        let (original, organized) = stage(fixture.root(), "receipt.undocheck");
+        let id = insert_log("2026-01-01T00:00:00Z", &original, Some(&organized));
+        std::fs::write(&original, b"existing occupant").unwrap();
+
+        lock_db().unwrap().execute_batch(&format!(
+            "CREATE TEMP TRIGGER interrupt_undo_history BEFORE UPDATE OF undone ON action_logs
+             WHEN OLD.id={id} AND NEW.undone=1
+             BEGIN SELECT RAISE(ABORT,'fixture history write failed'); END;"
+        )).unwrap();
+        let batch = undo_all_with(&ignored_files(), &[id], |_| {});
+        lock_db().unwrap().execute_batch("DROP TRIGGER interrupt_undo_history").unwrap();
+
+        let batch = batch.unwrap();
+        assert_eq!(batch.results.len(), 1);
+        let result = &batch.results[0];
+        let actual = result.restored_to.as_deref().unwrap();
+        assert_ne!(actual, original);
+        assert_eq!(std::fs::read(actual).unwrap(), b"payload");
+        assert_eq!(std::fs::read(&original).unwrap(), b"existing occupant");
+        assert!(!Path::new(&organized).exists());
+        assert_eq!(undone_of(&original), 0);
+        let (intent, observed): (i64, String) = lock_db().unwrap().query_row(
+            "SELECT id, actual_destination FROM operation_intents
+             WHERE action='undo' AND status='pending' AND undo_action_log_id=?1",
+            [id], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(observed, actual);
+        let reason = result.message.as_deref().unwrap();
+        assert!(reason.contains("fixture history write failed"));
+        assert!(reason.contains(&format!("Recovery record {intent}")));
+        assert_eq!(result.status, "restored_pending");
+        assert_eq!(batch.count, 1);
     }
 
     #[test]
