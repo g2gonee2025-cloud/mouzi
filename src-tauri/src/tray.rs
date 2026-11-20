@@ -9,6 +9,7 @@ use crate::i18n::TrayI18n;
 pub(crate) enum WindowAction {
     Popup,
     Settings,
+    WatchedFolders,
     Dashboard,
     Suggestions,
     Cleanup,
@@ -20,6 +21,7 @@ impl WindowAction {
         match self {
             Self::Popup => show_popup_window(app),
             Self::Settings => show_settings_window(app),
+            Self::WatchedFolders => show_watched_folders_window(app),
             Self::Dashboard => show_dashboard_window(app),
             Self::Suggestions => show_app_window(app, "/#/suggestions", "suggestions_title"),
             Self::Cleanup => show_app_window(app, "/#/cleanup", "cleanup_title"),
@@ -237,6 +239,15 @@ pub fn hide_app_window(app: &AppHandle) {
 
 pub fn show_settings_window(app: &AppHandle) -> tauri::Result<()> {
     show_app_window(app, "/#/settings", "settings_title")
+}
+
+fn show_watched_folders_window(app: &AppHandle) -> tauri::Result<()> {
+    show_settings_window(app)?;
+    app.emit_to("app", "open-watched-folders", ())?;
+    if let Some(popup) = app.get_webview_window("popup") {
+        popup.hide()?;
+    }
+    Ok(())
 }
 
 pub fn show_dashboard_window(app: &AppHandle) -> tauri::Result<()> {

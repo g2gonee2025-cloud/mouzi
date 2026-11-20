@@ -112,6 +112,11 @@ pub async fn show_review_cmd(app: AppHandle, paths: Vec<String>) -> Result<(), S
 }
 
 #[tauri::command]
+pub async fn show_folders_cmd(app: AppHandle) -> Result<(), String> {
+    crate::tray::open_window(&app, crate::tray::WindowAction::WatchedFolders).await
+}
+
+#[tauri::command]
 pub fn take_review_request_cmd(window: tauri::WebviewWindow) -> Result<Option<Vec<String>>, String> {
     if window.label() != "app" { return Err("Organization review is available only in the workspace window".into()); }
     let state = window.state::<AppState>();
@@ -897,21 +902,15 @@ fn open_web_url(url: &str) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn get_downloads_folder() -> String {
+pub fn get_downloads_folder() -> Result<String, String> {
     directories::UserDirs::new()
         .and_then(|d| d.download_dir().map(|p| p.to_string_lossy().to_string()))
-        .unwrap_or_else(|| {
-            if cfg!(target_os = "windows") {
-                "C:/Users".to_string()
-            } else {
-                std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string())
-            }
-        })
+        .ok_or_else(|| "The system Downloads folder is unavailable".into())
 }
 
 #[tauri::command(async)]
 pub fn initialize_defaults_cmd(app: AppHandle) -> Result<(), String> {
-    let downloads = get_downloads_folder();
+    let downloads = get_downloads_folder()?;
     crate::safe_fs::validate_root(Path::new(&downloads))?;
     with_configuration(&app, || initialize_defaults_atomic(&downloads, FOLDER_MODE_MANUAL).map_err(|e| e.to_string()))
 }

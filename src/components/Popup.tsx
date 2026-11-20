@@ -4,6 +4,7 @@ import { useAppStore } from "../store/useAppStore";
 import ActionRefreshWarnings from "./ActionRefreshWarnings";
 import {
   FolderOpen,
+  FolderPlus,
   Sparkles,
   RotateCcw,
   X,
@@ -50,10 +51,12 @@ export default function Popup() {
     loadFolders,
     undoAction,
     folders,
+    folderRead,
     pendingFiles,
     getPendingFiles,
   } = useAppStore();
-  const [reviewError, setReviewError] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [openingFolders, setOpeningFolders] = useState(false);
   const [selectedFiles, setSelectedFiles] = useState<Set<string>>(new Set());
   const [toast, setToast] = useState<{
     file: string;
@@ -115,12 +118,24 @@ export default function Popup() {
 
 
   const openReview = async (paths: string[]) => {
-    setReviewError(null);
+    setActionError(null);
     try {
       await invoke("show_review_cmd", { paths });
       setSelectedFiles(new Set());
     } catch (error) {
-      setReviewError(String(error));
+      setActionError(String(error));
+    }
+  };
+
+  const openWatchedFolders = async () => {
+    setActionError(null);
+    setOpeningFolders(true);
+    try {
+      await invoke("show_folders_cmd");
+    } catch (error) {
+      setActionError(String(error));
+    } finally {
+      setOpeningFolders(false);
     }
   };
 
@@ -131,8 +146,13 @@ export default function Popup() {
   const selectedPaths = pendingPaths.filter(({ path }) => selectedFiles.has(path)).map(({ path }) => path);
 
   const handleOpenDownloads = async () => {
-    const downloads = folders[0]?.path || (await invoke<string>("get_downloads_folder"));
-    await invoke("open_folder_cmd", { path: downloads });
+    setActionError(null);
+    try {
+      const downloads = await invoke<string>("get_downloads_folder");
+      await invoke("open_folder_cmd", { path: downloads });
+    } catch (error) {
+      setActionError(String(error));
+    }
   };
 
   const handleOpenActionFolder = async (filePath: string | null | undefined) => {
@@ -165,6 +185,8 @@ export default function Popup() {
   };
 
   const totalStats = stats.reduce((sum, s) => sum + s.count, 0);
+  const hasFolders = folders.length > 0;
+  const showPendingFiles = folderRead.status === "ready" && hasFolders && pendingPaths.length > 0;
 
   return (
     <div className="flex h-full flex-col bg-surface text-text border border-border overflow-hidden">
@@ -186,22 +208,34 @@ export default function Popup() {
 
       {/* Actions */}
       <div className="p-3 space-y-2">
-        <button
-          onClick={() => void openReview([])}
-          disabled={isLoading}
-          className="w-full flex items-center justify-center gap-2 rounded-lg bg-primary px-3 py-2.5 text-sm font-medium text-on-primary hover:bg-primary-hover transition-colors disabled:opacity-60"
-        >
-          <Sparkles size={15} />
-          {isLoading ? "..." : t("popup.cleanNow")}
-        </button>
-        {pendingFiles.length > 0 && (
+        {folderRead.status === "ready" && (
+          <>
+            {!hasFolders && <p className="text-xs text-text-muted">{t("popup.chooseWatchedFolder")}</p>}
+            <button
+              onClick={hasFolders ? () => openReview([]) : openWatchedFolders}
+              disabled={isLoading || openingFolders}
+              className="w-full flex items-center justify-center gap-2 rounded-lg bg-primary px-3 py-2.5 text-sm font-medium text-on-primary hover:bg-primary-hover transition-colors disabled:opacity-60"
+            >
+              {hasFolders ? <Sparkles size={15} aria-hidden="true" /> : <FolderPlus size={15} aria-hidden="true" />}
+              {t(hasFolders ? "popup.cleanNow" : "popup.addWatchedFolder")}
+            </button>
+          </>
+        )}
+        {folderRead.status === "loading" && <p role="status" className="text-xs text-text-muted">{t("common.loading")}</p>}
+        {folderRead.status === "failed" && (
+          <div className="space-y-1 text-xs text-red-700 dark:text-red-300">
+            <p role="alert" className="break-words">{t("popup.foldersLoadError", { error: folderRead.error })}</p>
+            <button type="button" onClick={() => loadFolders().catch(console.error)} className="underline">{t("common.retry")}</button>
+          </div>
+        )}
+        {showPendingFiles && (
           <div className="text-center text-xs text-text-muted">
             {t("popup.pendingFiles", { count: pendingFiles.length })}
           </div>
         )}
-        {reviewError && <p role="alert" className="mt-2 break-words text-xs text-red-600">{reviewError}</p>}
+        {actionError && <p role="alert" className="mt-2 break-words text-xs text-red-700 dark:text-red-300">{t("confirm.failed", { error: actionError })}</p>}
         <ActionRefreshWarnings />
-        {pendingPaths.length > 0 && <div className="mt-2 space-y-2">
+        {showPendingFiles && <div className="mt-2 space-y-2">
           <div className="max-h-24 space-y-1 overflow-auto text-xs">
             {pendingPaths.map(({ name, path }) => <label key={path} className="flex items-center gap-2" title={path}>
               <input type="checkbox" checked={selectedFiles.has(path)} onChange={(event) => {

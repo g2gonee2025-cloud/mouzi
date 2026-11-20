@@ -133,10 +133,12 @@ export interface ArchiveImportState {
 }
 
 type ActionRefreshErrors = Record<'history' | 'historyCounts' | 'stats', string | null>;
+type FolderRead = { status: 'loading' | 'ready' } | { status: 'failed'; error: string };
 
 interface AppState {
   rules: Rule[];
   folders: WatchedFolder[];
+  folderRead: FolderRead;
   logs: ActionLog[];
   historyCounts: HistoryCounts | null;
   stats: { file_type: string; count: number }[];
@@ -213,6 +215,7 @@ function withActionRefreshError(state: AppState, key: keyof ActionRefreshErrors,
 export const useAppStore = create<AppState>((set, get) => ({
   rules: [],
   folders: [],
+  folderRead: { status: 'loading' },
   logs: [],
   historyCounts: null,
   stats: [],
@@ -276,8 +279,14 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   loadFolders: async () => {
     const request = ++foldersRequest;
-    const folders = await invoke<WatchedFolder[]>('get_folders_cmd');
-    if (request === foldersRequest) set({ folders });
+    set({ folderRead: { status: 'loading' } });
+    try {
+      const folders = await invoke<WatchedFolder[]>('get_folders_cmd');
+      if (request === foldersRequest) set({ folders, folderRead: { status: 'ready' } });
+    } catch (error) {
+      if (request === foldersRequest) set({ folderRead: { status: 'failed', error: String(error) } });
+      throw error;
+    }
   },
 
   loadLogs: async (reportActionWarning = false) => {

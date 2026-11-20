@@ -290,6 +290,10 @@ export default function Settings() {
         else { stops.push(stop); return consume(); }
       }).catch(onError);
     }
+    void listen("open-watched-folders", () => { if (!disposed) setTab("folders"); }).then((stop) => {
+      if (disposed) stop();
+      else stops.push(stop);
+    }).catch(onError);
     void invoke<[boolean, boolean]>("explorer_integration_status_cmd")
       .then((status) => { if (!disposed) setExplorer(status); }).catch(onError);
     return () => { disposed = true; stops.forEach((stop) => stop()); };
