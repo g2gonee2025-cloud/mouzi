@@ -1649,7 +1649,8 @@ mod tests {
         }
 
         let root = long_form_dir("trash_test");
-        let file = root.join("to-trash.txt");
+        let name = "to-trash.txt";
+        let file = root.join(name);
         let payload = b"Mouzi native Recycle Bin fixture";
         fs::write(&file, payload).unwrap();
         assert!(file.exists());
@@ -1691,7 +1692,7 @@ mod tests {
         assert_eq!(owned.len(), 1, "Cannot uniquely identify the fixture for recovery");
         let mut item = owned.pop().unwrap();
         // Windows Shell display labels can omit the original extension.
-        item.name = file.file_name().unwrap().to_os_string();
+        item.name = name.into();
         trash::os_limited::restore_all([item]).unwrap();
         assert_eq!(fs::read(&file).unwrap(), payload);
         assert_eq!(file_identity(&file).unwrap(), original_identity);
