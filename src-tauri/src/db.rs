@@ -1477,6 +1477,17 @@ pub(crate) fn observe_pending_archive_staging(intent: i64, staging: &str) -> Res
     if changed == 1 { Ok(()) } else { Err("Archive import intent is unavailable".into()) }
 }
 
+pub(crate) fn pending_archive_imports() -> SqliteResult<Vec<(i64, String, String)>> {
+    let conn = sqlite_lock()?;
+    let mut statement = conn.prepare(
+        "SELECT id,source_path,actual_destination FROM operation_intents
+         WHERE action='archive_import' AND status='pending' AND actual_destination IS NOT NULL ORDER BY id",
+    )?;
+    let pending = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+        .collect();
+    pending
+}
+
 pub fn finalize_operation_intent(id:i64,status:&str,actual_destination:Option<&str>,message:Option<&str>)->SqliteResult<()> {
     let conn=sqlite_lock()?;
     let changed=conn.execute("UPDATE operation_intents SET completed_at=?2,status=?3,actual_destination=?4,message=?5 WHERE id=?1 AND status='pending'",params![id,Utc::now().to_rfc3339(),status,actual_destination,message])?;

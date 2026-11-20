@@ -1,8 +1,9 @@
 use crate::safe_fs::{self, AncestorGuard};
 use flate2::read::GzDecoder;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::fs::{self, File, FileTimes, OpenOptions};
-use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::sync::{Arc, Mutex};
@@ -65,12 +66,33 @@ struct IncompleteEntry {
     expected_bytes: u64,
 }
 
+/// The journal records the handle identity before any payload is written,
+/// then the exact destination before its atomic no-replace publication.
+#[derive(Deserialize, Serialize)]
+#[serde(tag = "state", rename_all = "camelCase", rename_all_fields = "camelCase")]
+enum EntryEvent {
+    Staged { name: String, archive_path: String, expected_bytes: u64, identity: String },
+    Ready { name: String, destination: String },
+}
+
+struct EntryJournal(File);
+
+impl EntryJournal {
+    fn append(&mut self, event: &EntryEvent) -> Result<(), String> {
+        let mut line = serde_json::to_vec(event).map_err(|error| error.to_string())?;
+        line.push(b'\n');
+        self.0.write_all(&line).and_then(|()| self.0.sync_data())
+            .map_err(|error| format!("Cannot persist archive entry journal: {error}"))
+    }
+}
+
 struct Budget<'a> {
     limits: Limits,
     started: Instant,
     cancelled: &'a AtomicBool,
     bytes: u64,
     receipt: ExtractionReceipt,
+    journal: Option<&'a mut EntryJournal>,
     last_progress: Instant,
     progress_interval: Duration,
     progress: &'a mut dyn FnMut(u64, usize),
@@ -135,16 +157,29 @@ impl Budget<'_> {
         check_disk_space(staging, size)?;
         let (stage_name, stage, mut output) = create_entry_stage(staging, self.receipt.extracted.len(), file_name)?;
         self.receipt.incomplete = Some(IncompleteEntry {
-            name: stage_name,
+            name: stage_name.clone(),
             archive_path: entry_path.to_string_lossy().into_owned(),
             expected_bytes: size,
         });
 
+        if let Some(journal) = &mut self.journal {
+            journal.append(&EntryEvent::Staged {
+                name: stage_name.clone(),
+                archive_path: entry_path.to_string_lossy().into_owned(),
+                expected_bytes: size,
+                identity: safe_fs::identity_from_handle(&output)?.key(),
+            })?;
+        }
         self.copy(input, &mut output, size)?;
         preserve_modified_time(&output, &stage, modified)?;
         output.sync_all().map_err(|error| error.to_string())?;
         self.check()?;
-        let name = publish_entry(staging, &stage, &output, entry_path, file_name)?;
+        let name = publish_entry(staging, &stage, &output, entry_path, file_name, |destination| {
+            if let Some(journal) = &mut self.journal {
+                journal.append(&EntryEvent::Ready { name: stage_name.clone(), destination: destination.into() })?;
+            }
+            self.check()
+        })?;
         self.receipt.incomplete = None;
         self.receipt.extracted.push(ExtractedEntry { name, bytes: size, is_file: true });
         Ok(())
@@ -172,11 +207,16 @@ fn extract_archive_in(
     let (staging_dir, staging_guard) = create_staging_dir_in(base_dir)?;
     let retained_error = |error| format!("Import staging retained at {}. {error}", staging_dir.display());
     observe_staging(&staging_dir).map_err(retained_error)?;
-    save_manifest(&staging_dir, Some(path), "extracting", &[], None).map_err(retained_error)?;
-    let (result, receipt) = extract_archive_from(source, format, &staging_dir, LIMITS, cancelled, &mut progress);
+    let journal_path = staging_dir.with_extension("entries.jsonl");
+    let mut journal = EntryJournal(safe_fs::create_guarded_staging_file(&journal_path)
+        .map_err(|error| retained_error(format!("Cannot create archive entry journal: {error}")))?);
+    let journal_name = journal_path.file_name().ok_or("Archive entry journal has no filename")?.to_string_lossy();
+    save_manifest_with_receipt(&staging_dir, Some(path), "extracting", &[], None, None, Some(&journal_name))
+        .map_err(retained_error)?;
+    let (result, receipt) = extract_archive_from(source, format, &staging_dir, LIMITS, cancelled, &mut progress, Some(&mut journal));
     match result {
         Ok(()) => {
-            save_manifest_with_receipt(&staging_dir, Some(path), "extracted", &[], None, Some(&receipt))
+            save_manifest_with_receipt(&staging_dir, Some(path), "extracted", &[], None, Some(&receipt), None)
                 .map_err(retained_error)?;
             Ok(ArchiveExtraction {
                 staging_dir,
@@ -187,7 +227,7 @@ fn extract_archive_in(
         Err(err) => {
             // Successful entries and partially extracted data may be useful for
             // recovery. Never sweep an import folder after sorting may begin.
-            let manifest = save_manifest_with_receipt(&staging_dir, Some(path), "failed", &[], Some(&err), Some(&receipt));
+            let manifest = save_manifest_with_receipt(&staging_dir, Some(path), "failed", &[], Some(&err), Some(&receipt), None);
             Err(format!("{err}. Import data retained at {}{}", staging_dir.display(), manifest.err().map(|e| format!("; {e}")).unwrap_or_default()))
         }
     }
@@ -250,13 +290,16 @@ fn open_archive(path: &Path, limits: Limits) -> Result<(File, AncestorGuard, Arc
 fn extract_archive_to_with_progress(path: &Path, staging_dir: &Path, limits: Limits, cancelled: &AtomicBool, progress: &mut dyn FnMut(u64, usize)) -> Result<usize, String> {
     let (source, _source_guard, format) = open_archive(path, limits)?;
     let _staging_guard = safe_fs::create_guarded_directory(staging_dir)?;
-    let (result, receipt) = extract_archive_from(source, format, staging_dir, limits, cancelled, progress);
+    let (result, receipt) = extract_archive_from(source, format, staging_dir, limits, cancelled, progress, None);
     result.map(|()| receipt.extracted.len())
 }
 
-fn extract_archive_from(source: File, format: ArchiveFormat, staging_dir: &Path, limits: Limits, cancelled: &AtomicBool, progress: &mut dyn FnMut(u64, usize)) -> (Result<(), String>, ExtractionReceipt) {
+fn extract_archive_from<'a>(
+    source: File, format: ArchiveFormat, staging_dir: &Path, limits: Limits,
+    cancelled: &'a AtomicBool, progress: &'a mut dyn FnMut(u64, usize), journal: Option<&'a mut EntryJournal>,
+) -> (Result<(), String>, ExtractionReceipt) {
     let mut budget = Budget {
-        limits, started: Instant::now(), cancelled, bytes: 0, receipt: ExtractionReceipt::default(),
+        limits, started: Instant::now(), cancelled, bytes: 0, receipt: ExtractionReceipt::default(), journal,
         last_progress: Instant::now(), progress_interval: Duration::from_millis(250), progress,
     };
     let result = (|| {
@@ -581,12 +624,17 @@ fn create_entry_stage(staging: &Path, entry_index: usize, target_name: &str) -> 
     Err("No free archive staging filename".into())
 }
 
-fn publish_entry(staging: &Path, stage: &Path, output: &File, entry_path: &Path, file_name: &str) -> Result<String, String> {
+fn publish_entry(
+    staging: &Path, stage: &Path, output: &File, entry_path: &Path, file_name: &str,
+    mut record_destination: impl FnMut(&str) -> Result<(), String>,
+) -> Result<String, String> {
     let stem = entry_path.file_stem().and_then(|s| s.to_str()).unwrap_or(file_name);
     let extension = entry_path.extension().and_then(|s| s.to_str());
     for index in 0..10_000 {
         let name = if index == 0 { file_name.to_string() } else { match extension { Some(ext) => format!("{stem} ({index}).{ext}"), None => format!("{stem} ({index})") } };
         let target = staging.join(&name);
+        if safe_fs::path_occupied(&target)? { continue; }
+        record_destination(&name)?;
         match safe_fs::publish_staged_file(output, stage, &target) {
             Ok(true) => return Ok(name),
             Ok(false) => continue,
@@ -644,7 +692,7 @@ fn check_disk_space(path: &Path, bytes: u64) -> Result<(), String> {
 /// The manifest is beside the staging directory so the organizer cannot file
 /// it as imported content. It survives failed/cancelled and successful imports.
 pub fn save_manifest(staging: &Path, source: Option<&Path>, status: &str, results: &[(String, String, String)], message: Option<&str>) -> Result<(), String> {
-    save_manifest_with_receipt(staging, source, status, results, message, None)
+    save_manifest_with_receipt(staging, source, status, results, message, None, None)
 }
 
 fn save_manifest_with_receipt(
@@ -654,6 +702,7 @@ fn save_manifest_with_receipt(
     results: &[(String, String, String)],
     message: Option<&str>,
     extraction: Option<&ExtractionReceipt>,
+    journal_name: Option<&str>,
 ) -> Result<(), String> {
     let _staging_guard = safe_fs::guard_directory(staging)?;
     let manifest = staging.with_extension("manifest.json");
@@ -666,6 +715,9 @@ fn save_manifest_with_receipt(
             serde_json::json!({"version":1,"createdAt":chrono::Utc::now().to_rfc3339(),"source":source.map(|p|p.to_string_lossy().into_owned()),"staging":staging.to_string_lossy(),"limits":{"entries":LIMITS.entries,"fileBytes":LIMITS.file_bytes,"totalBytes":LIMITS.total_bytes,"zipMetadataBytes":LIMITS.zip_metadata_bytes,"seconds":LIMITS.duration.as_secs()}}),
         Err(error) => return Err(error.to_string()),
     };
+    if let Some(name) = journal_name {
+        value["entryJournal"] = serde_json::json!(name);
+    }
     let incomplete = extraction.and_then(|receipt| receipt.incomplete.as_ref());
     let mut incomplete_bytes = None;
     let mut remaining = Vec::new();
@@ -722,6 +774,217 @@ fn replace_manifest(manifest: &Path, bytes: &[u8]) -> io::Result<()> {
         return result;
     }
     Err(io::Error::other("Import manifest temporary filename limit exceeded"))
+}
+
+const MAX_RECOVERY_RECORD_BYTES: u64 = 1024 * 1024;
+const MAX_RECOVERY_JOURNAL_BYTES: u64 = 512 * 1024 * 1024;
+
+struct RecordedEntry {
+    stage: IncompleteEntry,
+    identity: String,
+    destination: Option<String>,
+}
+
+fn is_recovery_leaf(name: &str) -> bool {
+    output_name(Path::new(name)).is_ok_and(|leaf| leaf == name)
+}
+
+// A crash can tear the last write. Replay only the complete, well-formed
+// prefix. Directory entries outside that evidence are left unverified.
+fn read_entry_journal(file: File) -> Result<(Vec<RecordedEntry>, bool), String> {
+    let length = file.metadata().map_err(|error| error.to_string())?.len();
+    let mut reader = BufReader::new(file).take(MAX_RECOVERY_JOURNAL_BYTES);
+    let mut entries: Vec<RecordedEntry> = Vec::new();
+    let mut names = HashSet::new();
+    let mut identities = HashSet::new();
+    let mut line = Vec::new();
+    let mut expected_total = 0u64;
+    loop {
+        line.clear();
+        let count = (&mut reader).take(MAX_RECOVERY_RECORD_BYTES + 1).read_until(b'\n', &mut line)
+            .map_err(|error| error.to_string())?;
+        if count == 0 {
+            return Ok((entries, length > MAX_RECOVERY_JOURNAL_BYTES));
+        }
+        if count as u64 > MAX_RECOVERY_RECORD_BYTES || !line.ends_with(b"\n") {
+            break;
+        }
+        match serde_json::from_slice::<EntryEvent>(&line) {
+            Ok(EntryEvent::Staged { name, archive_path, expected_bytes, identity })
+                if entries.len() < LIMITS.entries
+                    && is_recovery_leaf(&name)
+                    && name.starts_with(".mouzi-archive-entry-") && name.ends_with(".part")
+                    && expected_bytes <= LIMITS.file_bytes
+                    && expected_bytes <= LIMITS.total_bytes.saturating_sub(expected_total)
+                    && names.insert(name.clone())
+                    && identities.insert(identity.clone()) =>
+            {
+                expected_total += expected_bytes;
+                entries.push(RecordedEntry {
+                    stage: IncompleteEntry { name, archive_path, expected_bytes },
+                    identity,
+                    destination: None,
+                });
+            }
+            Ok(EntryEvent::Ready { name, destination }) if is_recovery_leaf(&destination)
+                && !name.eq_ignore_ascii_case(&destination) =>
+            {
+                let Some(entry) = entries.last_mut().filter(|entry| entry.stage.name == name) else { break; };
+                entry.destination = Some(destination);
+            }
+            _ => break,
+        }
+    }
+    Ok((entries, true))
+}
+
+fn matching_payload_size(path: &Path, identity: &str) -> Option<u64> {
+    let (metadata, observed) = safe_fs::inventory_file_snapshot(path).ok()??;
+    (observed.key() == identity).then_some(metadata.len())
+}
+
+fn reconcile_extraction(staging: &Path, journal: File, manifest: &mut serde_json::Value) -> Result<(), String> {
+    let (entries, truncated) = read_entry_journal(journal)?;
+    let mut extracted = Vec::new();
+    let mut incomplete = Vec::new();
+    let mut unverified = Vec::new();
+    let mut recorded = HashSet::new();
+    let mut partial_names = HashSet::new();
+    for RecordedEntry { stage, identity, destination } in entries {
+        let staged_path = staging.join(&stage.name);
+        if let Some(bytes) = matching_payload_size(&staged_path, &identity)
+            .filter(|bytes| *bytes <= stage.expected_bytes)
+        {
+            recorded.insert(stage.name.clone());
+            partial_names.insert(stage.name.clone());
+            incomplete.push(serde_json::json!({
+                "name": stage.name, "archivePath": stage.archive_path, "bytes": bytes,
+                "expectedBytes": stage.expected_bytes,
+            }));
+        } else if let Some(name) = destination.as_ref().filter(|name| {
+            safe_fs::source_absence(&staged_path) == safe_fs::SourceAbsence::Absent
+                && matching_payload_size(&staging.join(name), &identity) == Some(stage.expected_bytes)
+        }) {
+            recorded.insert(name.clone());
+            extracted.push(ExtractedEntry { name: name.clone(), bytes: stage.expected_bytes, is_file: true });
+        } else {
+            unverified.push(serde_json::json!({
+                "name": stage.name, "archivePath": stage.archive_path, "destination": destination,
+                "expectedBytes": stage.expected_bytes,
+            }));
+        }
+    }
+    let (remaining, directory_truncated) = recovery_remaining_entries(staging, &partial_names)?;
+    for row in &remaining {
+        if let Some(name) = row["name"].as_str().filter(|name| !recorded.contains(*name)) {
+            unverified.push(serde_json::json!({"name":name}));
+        }
+    }
+    manifest["extractedCount"] = serde_json::json!(extracted.len());
+    manifest["extractedEntries"] = serde_json::json!(extracted);
+    manifest["incompleteEntries"] = serde_json::json!(incomplete);
+    manifest["unverifiedEntries"] = serde_json::json!(unverified);
+    manifest["remainingEntries"] = serde_json::json!(remaining);
+    manifest["recoveryEvidenceTruncated"] = serde_json::json!(truncated || directory_truncated);
+    Ok(())
+}
+
+fn recovery_remaining_entries(staging: &Path, partial_names: &HashSet<String>)
+    -> Result<(Vec<serde_json::Value>, bool), String>
+{
+    let mut remaining = Vec::new();
+    for item in fs::read_dir(staging).map_err(|error| error.to_string())? {
+        if remaining.len() == LIMITS.entries {
+            return Ok((remaining, true));
+        }
+        let item = item.map_err(|error| error.to_string())?;
+        let metadata = fs::symlink_metadata(item.path()).map_err(|error| error.to_string())?;
+        let name = item.file_name().to_string_lossy().into_owned();
+        let mut value = serde_json::json!({"name":name,"bytes":metadata.len(),"isFile":metadata.is_file()});
+        if partial_names.contains(&name) {
+            value["incomplete"] = serde_json::json!(true);
+        }
+        remaining.push(value);
+    }
+    Ok((remaining, false))
+}
+
+fn reconcile_pending_manifest(base: &Path, source: &str, staging: &Path) -> Result<bool, String> {
+    // Only a direct child registered by this profile is eligible. The
+    // manifest and journal names are computed here, never followed from JSON.
+    if staging.parent() != Some(base) || !staging.file_name().is_some_and(|name| name.to_string_lossy().starts_with("import-")) {
+        return Ok(false);
+    }
+    let _staging_guard = safe_fs::guard_directory(staging)?;
+    let manifest_path = staging.with_extension("manifest.json");
+    if safe_fs::source_absence(&manifest_path) == safe_fs::SourceAbsence::Absent {
+        return Ok(false);
+    }
+    let mut manifest = {
+        let (file, _guard) = safe_fs::open_guarded_regular_file(&manifest_path)?;
+        serde_json::from_reader::<_, serde_json::Value>(BufReader::new(file).take(64 * 1024 * 1024))
+            .map_err(|error| error.to_string())?
+    };
+    let journal_path = staging.with_extension("entries.jsonl");
+    let journal_name = journal_path.file_name().and_then(|name| name.to_str());
+    if manifest["version"].as_u64() != Some(1)
+        || manifest["source"].as_str() != Some(source)
+        || manifest["staging"].as_str() != staging.to_str()
+        || journal_name.is_none()
+        || manifest["entryJournal"].as_str() != journal_name
+    {
+        return Ok(false);
+    }
+    match manifest["status"].as_str() {
+        Some("extracting") => {
+            let (journal, _guard) = safe_fs::open_guarded_regular_file(&journal_path)?;
+            reconcile_extraction(staging, journal, &mut manifest)?;
+        }
+        Some("extracted") => {
+            // Sorting may already have moved some published entries. Keep the
+            // recorded extraction receipt and refresh only remaining entries.
+            let (remaining, truncated) = recovery_remaining_entries(staging, &HashSet::new())?;
+            manifest["remainingEntries"] = serde_json::json!(remaining);
+            manifest["recoveryEvidenceTruncated"] = serde_json::json!(truncated);
+        }
+        Some("interrupted") => return Ok(true),
+        _ => return Ok(false),
+    }
+    manifest["status"] = serde_json::json!("interrupted");
+    manifest["message"] = serde_json::json!(ARCHIVE_INTERRUPTED_MESSAGE);
+    manifest["updatedAt"] = serde_json::json!(chrono::Utc::now().to_rfc3339());
+    let bytes = serde_json::to_vec_pretty(&manifest).map_err(|error| error.to_string())?;
+    replace_manifest(&manifest_path, &bytes).map_err(|error| error.to_string())?;
+    Ok(true)
+}
+
+const ARCHIVE_INTERRUPTED_MESSAGE: &str = "Archive import was interrupted when Mouzi closed. Review the retained files and recovery records.";
+
+pub(crate) fn recover_pending_imports(data_dir: &Path) {
+    // Take the prior-process snapshot before any new import can start.
+    let pending = match crate::db::pending_archive_imports() {
+        Ok(pending) if pending.is_empty() => return,
+        Ok(pending) => pending,
+        Err(error) => { log::warn!("Cannot read archive recovery records: {error}"); return; }
+    };
+    let base = data_dir.join("archive-imports");
+    if let Err(error) = std::thread::Builder::new().name("mouzi-archive-recovery".into()).spawn(move || {
+        for (id, source, staging) in pending {
+            match reconcile_pending_manifest(&base, &source, Path::new(&staging)) {
+                Ok(true) => {
+                    if let Err(error) = crate::db::finalize_operation_intent(
+                        id, "interrupted", Some(&staging), Some(ARCHIVE_INTERRUPTED_MESSAGE),
+                    ) {
+                        log::warn!("Cannot record interrupted archive import {id}: {error}");
+                    }
+                }
+                Ok(false) => {}
+                Err(error) => log::warn!("Cannot reconcile archive import {id}: {error}"),
+            }
+        }
+    }) {
+        log::warn!("Cannot start archive recovery: {error}");
+    }
 }
 
 #[cfg(test)]
@@ -930,6 +1193,7 @@ mod tests {
             cancelled: &cancelled,
             bytes: 0,
             receipt: ExtractionReceipt::default(),
+            journal: None,
             last_progress: Instant::now(),
             progress_interval: Duration::from_millis(250),
             progress: &mut |_, _| {},
@@ -1149,7 +1413,7 @@ mod tests {
             };
             let mut budget = Budget {
                 limits: LIMITS, started: Instant::now(), cancelled: &cancelled, bytes: 0,
-                receipt: ExtractionReceipt::default(), last_progress: Instant::now(),
+                receipt: ExtractionReceipt::default(), journal: None, last_progress: Instant::now(),
                 progress_interval: Duration::ZERO, progress: &mut progress,
             };
             let canonical_staging = fs::canonicalize(&staging).unwrap();
@@ -1159,7 +1423,7 @@ mod tests {
             };
             let error = result.unwrap_err();
             assert!(error.contains("cancelled"), "{error}");
-            save_manifest_with_receipt(&staging, Some(&source), "failed", &[], Some(&error), Some(&budget.receipt)).unwrap();
+            save_manifest_with_receipt(&staging, Some(&source), "failed", &[], Some(&error), Some(&budget.receipt), None).unwrap();
 
             let receipt: serde_json::Value =
                 serde_json::from_slice(&fs::read(staging.with_extension("manifest.json")).unwrap()).unwrap();
@@ -1203,6 +1467,96 @@ mod tests {
         assert_eq!(fs::read(staging.join("report (1).txt")).unwrap(), b"previous contents");
         assert_eq!(fs::read(staging.join("report (2).txt")).unwrap(), b"new contents");
         assert!(file_names(&staging).iter().all(|name| !name.ends_with(".part")));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn interrupted_manifest_replays_the_journal_by_identity_without_changing_payloads() {
+        let root = test_dir("interrupted-extraction");
+        let base = root.join("archive-imports");
+        let staging = base.join("import-1-2-0");
+        fs::create_dir_all(&staging).unwrap();
+        let source = root.join("original.zip");
+        fs::write(&source, b"fixture archive").unwrap();
+        let manifest_path = staging.with_extension("manifest.json");
+        let journal_path = staging.with_extension("entries.jsonl");
+        let mut journal = EntryJournal(safe_fs::create_guarded_staging_file(&journal_path).unwrap());
+        let journal_name = journal_path.file_name().unwrap().to_str().unwrap();
+        save_manifest_with_receipt(&staging, Some(&source), "extracting", &[], None, None, Some(journal_name)).unwrap();
+        let canonical_staging = fs::canonicalize(&staging).unwrap();
+        let make_entry = |journal: &mut EntryJournal, index, archive_path: &str, bytes: &[u8], size| {
+            let (name, path, mut file) = create_entry_stage(&canonical_staging, index, archive_path).unwrap();
+            journal.append(&EntryEvent::Staged {
+                name: name.clone(), archive_path: archive_path.into(), expected_bytes: size,
+                identity: safe_fs::identity_from_handle(&file).unwrap().key(),
+            }).unwrap();
+            file.write_all(bytes).unwrap();
+            file.sync_all().unwrap();
+            (name, path, file)
+        };
+        let (name, path, file) = make_entry(&mut journal, 0, "normal.txt", b"complete", 8);
+        let destination = "normal.txt";
+        journal.append(&EntryEvent::Ready { name, destination: destination.into() }).unwrap();
+        assert!(safe_fs::publish_staged_file(&file, &path, &canonical_staging.join(destination)).unwrap());
+        drop(file);
+
+        let (name, path, file) = make_entry(&mut journal, 1, "changed.txt", b"original", 8);
+        journal.append(&EntryEvent::Ready { name, destination: "changed.txt".into() }).unwrap();
+        drop(file);
+        // Create the foreign file before removing the recorded one so a
+        // filesystem cannot recycle its identity for the replacement.
+        fs::write(staging.join("changed.txt"), b"external").unwrap();
+        let (partial_name, _, file) = make_entry(&mut journal, 2, "unfinished.bin", b"partial", 12);
+        drop(file);
+        fs::remove_file(path).unwrap();
+        journal.0.write_all(b"{\"state\":\"rea").unwrap();
+        journal.0.sync_data().unwrap();
+        drop(journal);
+        fs::write(staging.join(".mouzi-archive-entry-3-0.part"), b"unrecorded").unwrap();
+
+        let source_text = source.to_str().unwrap();
+        assert!(reconcile_pending_manifest(&base, source_text, &staging).unwrap());
+        let observed = fs::read(&manifest_path).unwrap();
+        let manifest: serde_json::Value = serde_json::from_slice(&observed).unwrap();
+        assert_eq!(manifest["status"], "interrupted");
+        assert_eq!(manifest["source"], source_text);
+        assert_eq!(manifest["staging"], staging.to_str().unwrap());
+        assert_eq!(manifest["extractedCount"], 1);
+        assert_eq!(manifest["extractedEntries"][0]["name"], "normal.txt");
+        assert_eq!(manifest["incompleteEntries"].as_array().unwrap().len(), 1);
+        assert_eq!(manifest["incompleteEntries"][0]["name"], partial_name);
+        assert_eq!(manifest["incompleteEntries"][0]["expectedBytes"], 12);
+        assert_eq!(manifest["incompleteEntries"][0]["bytes"], 7);
+        assert_eq!(manifest["recoveryEvidenceTruncated"], true);
+        let unverified = manifest["unverifiedEntries"].as_array().unwrap();
+        assert!(unverified.iter().any(|entry| entry["destination"] == "changed.txt"));
+        assert!(unverified.iter().any(|entry| entry["name"] == ".mouzi-archive-entry-3-0.part"));
+        assert_eq!(fs::read(staging.join("normal.txt")).unwrap(), b"complete");
+        assert_eq!(fs::read(staging.join("changed.txt")).unwrap(), b"external");
+        assert_eq!(fs::read(staging.join(partial_name)).unwrap(), b"partial");
+        assert_eq!(fs::read(&source).unwrap(), b"fixture archive");
+        assert!(reconcile_pending_manifest(&base, source_text, &staging).unwrap());
+        assert_eq!(fs::read(&manifest_path).unwrap(), observed);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recovery_leaves_legacy_and_terminal_manifests_intact() {
+        let root = test_dir("old-manifest-recovery");
+        let staging = root.join("import-1-2-0");
+        fs::create_dir(&staging).unwrap();
+        let source = root.join("legacy.zip");
+        let manifest = staging.with_extension("manifest.json");
+        let source_text = source.to_str().unwrap();
+        save_manifest(&staging, Some(&source), "extracting", &[], None).unwrap();
+        let original = fs::read(&manifest).unwrap();
+        assert!(!reconcile_pending_manifest(&root, source_text, &staging).unwrap());
+        assert_eq!(fs::read(&manifest).unwrap(), original);
+        let journal = staging.with_extension("entries.jsonl");
+        save_manifest_with_receipt(&staging, Some(&source), "failed", &[], Some("fixture failure"), None, journal.file_name().unwrap().to_str()).unwrap();
+        let terminal = fs::read(&manifest).unwrap();
+        assert!(!reconcile_pending_manifest(&root, source_text, &staging).unwrap());
+        assert_eq!(fs::read(&manifest).unwrap(), terminal);
         fs::remove_dir_all(root).unwrap();
     }
 

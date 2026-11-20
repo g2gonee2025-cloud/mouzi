@@ -133,7 +133,8 @@ pub fn run() {
             // Initialize database
             let data_dir = application_data_dir()?;
             std::fs::create_dir_all(&data_dir)?;
-            init_db(data_dir).map_err(|e| format!("Failed to initialize database: {e}"))?;
+            init_db(data_dir.clone()).map_err(|e| format!("Failed to initialize database: {e}"))?;
+            archive::recover_pending_imports(&data_dir);
 
             // Initialize default rules on first run
             let is_first_run = if let Ok(settings) = db::get_settings() {
