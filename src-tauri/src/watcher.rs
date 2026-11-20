@@ -88,6 +88,7 @@ struct WatchFailure {
 pub struct FolderWatcher {
     watchers: HashMap<String, ActiveWatch>,
     failures: HashMap<String, WatchFailure>,
+    callback_warnings: Arc<Mutex<HashMap<String, String>>>,
     pending: Arc<Mutex<Vec<PendingFile>>>,
     pending_manual: Arc<Mutex<HashMap<String, Arc<WatchedRoot>>>>,
     suppression: Arc<SuppressionSet>,
@@ -97,12 +98,12 @@ pub struct FolderWatcher {
 
 impl FolderWatcher {
     pub fn new(suppression: Arc<SuppressionSet>) -> Self {
-        Self { watchers: HashMap::new(), failures: HashMap::new(), pending: Arc::new(Mutex::new(Vec::new())),
+        Self { watchers: HashMap::new(), failures: HashMap::new(), callback_warnings: Arc::new(Mutex::new(HashMap::new())), pending: Arc::new(Mutex::new(Vec::new())),
             pending_manual: Arc::new(Mutex::new(HashMap::new())), suppression, handle: None, app_handle: None }
     }
 
     fn processing_view(&self, app_handle: tauri::AppHandle) -> Self {
-        Self { watchers: HashMap::new(), failures: HashMap::new(), pending: self.pending.clone(), pending_manual: self.pending_manual.clone(),
+        Self { watchers: HashMap::new(), failures: HashMap::new(), callback_warnings: self.callback_warnings.clone(), pending: self.pending.clone(), pending_manual: self.pending_manual.clone(),
             suppression: self.suppression.clone(), handle: None, app_handle: Some(app_handle) }
     }
 
@@ -256,12 +257,18 @@ impl FolderWatcher {
         self.watchers.retain(|path, watch| folders.iter().any(|folder|
             &folder.path == path && configured(folder) && watch.root.matches_registration(folder)));
         self.failures.retain(|path, _| folders.iter().any(|folder| &folder.path == path && configured(folder)));
+        self.callback_warnings.lock().unwrap_or_else(|error| error.into_inner())
+            .retain(|path, _| self.watchers.contains_key(path));
         let mut queues_changed = force || previous_count != self.watchers.len();
         let mut errors = Vec::new();
         for folder in folders.iter().filter(|folder| configured(folder)) {
             if let Some(watch) = self.watchers.get(&folder.path) {
                 if let Err(error) = watch.root.guard_physical() {
+                    let retired = !watch.root.watch_is_active();
                     self.watchers.remove(&folder.path);
+                    let warning = self.callback_warnings.lock().unwrap_or_else(|error| error.into_inner())
+                        .remove(&folder.path);
+                    let error = if retired { warning.unwrap_or(error) } else { error };
                     queues_changed = true;
                     errors.push(format!("{}: {error}", folder.path));
                     self.record_watch_failure(&folder.path, error, now);
@@ -320,6 +327,7 @@ impl FolderWatcher {
         let pending = self.pending.clone();
         let manual = self.pending_manual.clone();
         let suppression = self.suppression.clone();
+        let warnings = self.callback_warnings.clone();
         let app = self.app_handle.clone();
         let callback_root = root.clone();
         let watcher = register_root_watch(&root, move |result: Result<Event, notify::Error>| {
@@ -327,16 +335,14 @@ impl FolderWatcher {
             let event = match result {
                 Ok(event) => event,
                 Err(error) => {
-                    callback_root.retire_watch();
-                    if let Some(app) = app.as_ref() {
-                        report_health(app, &callback_root.path.to_string_lossy(), "error", Some(&error.to_string()));
-                    }
+                    record_callback_health(app.as_ref(), &warnings, &callback_root, Some(error.to_string()), true);
                     return;
                 }
             };
             let may_remove = matches!(event.kind, notify::EventKind::Remove(_)
                 | notify::EventKind::Modify(notify::event::ModifyKind::Name(
                     notify::event::RenameMode::From | notify::event::RenameMode::Both)));
+            let mut warning = None;
             for path in event.paths {
                 if !callback_root.watch_is_active() { return; }
                 let result = (|| {
@@ -347,10 +353,13 @@ impl FolderWatcher {
                     }
                     enqueue_path(&path, &callback_root, &pending, &manual, &suppression, app.as_ref())
                 })();
-                if let (Some(app), Err(error)) = (app.as_ref(), result) {
-                    report_health(app, &callback_root.path.to_string_lossy(), "error", Some(&error));
+                if let Err(error) = result {
+                    if warning.is_none() {
+                        warning = Some(format!("{}: {error}", path.display()));
+                    }
                 }
             }
+            record_callback_health(app.as_ref(), &warnings, &callback_root, warning, false);
         })?;
         // Install the notifier before enumerating arrivals missed offline.
         self.watchers.insert(folder.path.clone(), ActiveWatch { _watcher: watcher, root: root.clone(), mode: folder.mode.clone() });
@@ -387,7 +396,9 @@ impl FolderWatcher {
     }
 
     pub(crate) fn issues(&self) -> HashMap<String, String> {
-        self.failures.iter().map(|(path, failure)| (path.clone(), failure.message.clone())).collect()
+        let mut issues = self.callback_warnings.lock().unwrap_or_else(|error| error.into_inner()).clone();
+        issues.extend(self.failures.iter().map(|(path, failure)| (path.clone(), failure.message.clone())));
+        issues
     }
 
     fn prune_queues(&self, folders: &[WatchedFolder]) {
@@ -538,6 +549,30 @@ fn enqueue_path(path: &Path, root: &Arc<WatchedRoot>, pending: &Mutex<Vec<Pendin
 fn report_health(app: &tauri::AppHandle, root: &str, status: &str, error: Option<&str>) {
     let _ = app.emit("watcher-health", serde_json::json!({ "folder": root, "status": status, "error": error }));
     if let Some(error) = error { eprintln!("[watcher] {root}: {error}"); }
+}
+
+fn record_callback_health(
+    app: Option<&tauri::AppHandle>,
+    warnings: &Mutex<HashMap<String, String>>,
+    root: &WatchedRoot,
+    warning: Option<String>,
+    retire: bool,
+) {
+    let path = root.path.to_string_lossy();
+    let changed = {
+        let mut warnings = warnings.lock().unwrap_or_else(|error| error.into_inner());
+        if !root.watch_is_active() { return; }
+        if retire { root.retire_watch(); }
+        if let Some(message) = warning.as_ref() {
+            if warnings.get(path.as_ref()) == Some(message) { false }
+            else { warnings.insert(path.to_string(), message.clone()); true }
+        } else {
+            warnings.remove(path.as_ref()).is_some()
+        }
+    };
+    if let Some(app) = app.filter(|_| changed) {
+        report_health(app, &path, if warning.is_some() { "error" } else { "active" }, warning.as_deref());
+    }
 }
 
 fn recursive_watch_enabled() -> bool {
@@ -703,13 +738,18 @@ mod tests {
         assert_eq!(watcher.get_pending_files().into_iter().map(|(_, name)| name).collect::<Vec<_>>(),
             ["missed-while-offline.txt"]);
         let recovered = watcher.watchers[path].root.clone();
+        record_callback_health(None, &watcher.callback_warnings, &recovered, Some("Fixture entry could not be read".into()), false);
         watcher.reconcile_watches_for_folders(&folders, retry_at + WATCH_CHECK_INTERVAL, false, false).unwrap();
         assert!(Arc::ptr_eq(&watcher.watchers[path].root, &recovered));
+        assert_eq!(watcher.issues()[path], "Fixture entry could not be read");
+        record_callback_health(None, &watcher.callback_warnings, &recovered, None, false);
+        assert!(!watcher.issues().contains_key(path));
         assert_eq!(fs::read_to_string(fixture.parent.join("replacement/wrong-drive.txt")).unwrap(), "keep");
 
-        recovered.retire_watch();
+        record_callback_health(None, &watcher.callback_warnings, &recovered, Some("Fixture notifier stopped".into()), true);
         let after_retirement = retry_at + WATCH_CHECK_INTERVAL * 2;
         assert!(watcher.reconcile_watches_for_folders(&folders, after_retirement, false, false).is_err());
+        assert_eq!(watcher.issues()[path], "Fixture notifier stopped");
         assert!(watcher.get_pending_files().is_empty());
         let retry_at = watcher.failures[path].retry_at;
         watcher.reconcile_watches_for_folders(&folders, retry_at, false, false).unwrap();
@@ -742,6 +782,45 @@ mod tests {
         assert!(!watcher.watchers.contains_key(configured));
         watcher.reconcile_watches_for_folders(folders, Instant::now(), true, true).unwrap();
         assert!(WatchedRoot::capture_unattended(&row, false).is_ok());
+    }
+
+    #[test]
+    fn public_automatic_processing_leaves_a_replacement_folder_untouched() {
+        use crate::db::{self, FOLDER_MODE_MANUAL, FOLDER_MODE_SILENT};
+        use std::fs;
+
+        let _serial = db::serialise_test_db();
+        db::init_test_db();
+        let mut fixture = RecoveryFixture::new();
+        let root = fixture.root();
+        let id = db::register_watched_folder(root.to_str().unwrap(), FOLDER_MODE_SILENT, false).unwrap();
+        fixture.id = Some(id);
+        let rule = db::add_rule(&db::Rule {
+            name: "Automatic watcher authority fixture".into(), priority: i32::MIN, enabled: true,
+            extensions: vec!["mouziwatchrecovery".into()], destination: "Filed".into(),
+            action: "move".into(), folder_id: id, ..db::Rule::default()
+        }).unwrap();
+        struct RemoveRule(i64);
+        impl Drop for RemoveRule {
+            fn drop(&mut self) { let _ = db::delete_rule(self.0); }
+        }
+        let _rule = RemoveRule(rule);
+
+        fs::rename(&root, fixture.parent.join("original")).unwrap();
+        fs::create_dir(&root).unwrap();
+        let source = root.join("replacement.mouziwatchrecovery");
+        fs::write(&source, b"keep this folder's file").unwrap();
+        let suppression = SuppressionSet::new();
+        let run = || crate::rules::process_file_with_suppression(
+            &source, true, &root, &suppression, &suppression.ticket(&source), None, true,
+        );
+        assert!(run().err().unwrap().contains("different physical folder"));
+        assert_eq!(fs::read(&source).unwrap(), b"keep this folder's file");
+        assert!(!root.join("Filed").exists());
+
+        db::update_folder_mode(id, FOLDER_MODE_MANUAL).unwrap();
+        assert!(matches!(run().unwrap(), ProcessOutcome::Skipped));
+        assert_eq!(fs::read(&source).unwrap(), b"keep this folder's file");
     }
 
     #[cfg(windows)]

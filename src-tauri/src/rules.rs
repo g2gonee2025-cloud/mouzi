@@ -570,13 +570,15 @@ fn process_file(
     }
     let settings = get_settings().map_err(|e| format!("Cannot read organizer settings: {e}"))?;
     let folders = get_watched_folders().map_err(|e| format!("Cannot read watched folders: {e}"))?;
-    if matches!(authority, FolderAuthority::Automatic) && !folders.iter().any(|folder| {
-        folder.enabled && crate::db::is_folder_auto_mode(&folder.mode)
-            && same_path(Path::new(&folder.path), root)
-    }) {
-        return Ok(ProcessOutcome::Skipped);
-    }
     let _root_guard = match authority {
+        FolderAuthority::Automatic => {
+            let Some(folder) = folders.iter().find(|folder| {
+                folder.enabled && crate::db::is_folder_auto_mode(&folder.mode)
+                    && same_path(Path::new(&folder.path), root)
+            }) else { return Ok(ProcessOutcome::Skipped); };
+            let watched = WatchedRoot::capture_unattended(folder, false)?;
+            Some(watched.guard_physical()?)
+        }
         FolderAuthority::RegisteredWatch(watched) | FolderAuthority::Scheduled { root: watched, .. } => {
             if !folders.iter().any(|folder| watched.matches_registration(folder)
                 && folder.enabled && crate::db::is_folder_auto_mode(&folder.mode)) {
