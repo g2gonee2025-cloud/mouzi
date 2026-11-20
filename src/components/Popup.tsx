@@ -20,6 +20,7 @@ import {
 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { parentDir } from "../utils/paths";
 import { UNDO_TONE_CLASS, undoNotice, type UndoNotice } from "../utils/undo";
 
 function getIconForType(typeName: string) {
@@ -31,13 +32,6 @@ function getIconForType(typeName: string) {
   if (lower.includes("install")) return <Package size={14} />;
   if (lower.includes("document")) return <FileText size={14} />;
   return <File size={14} />;
-}
-
-function getFolderFromPath(filePath: string | null | undefined): string | null {
-  if (!filePath) return null;
-  const lastSlash = Math.max(filePath.lastIndexOf("/"), filePath.lastIndexOf("\\"));
-  if (lastSlash === -1) return filePath;
-  return filePath.slice(0, lastSlash) || filePath;
 }
 
 export default function Popup() {
@@ -165,13 +159,13 @@ export default function Popup() {
     }
   };
 
-  const handleOpenActionFolder = async (filePath: string | null | undefined) => {
-    const folderPath = getFolderFromPath(filePath);
-    if (!folderPath) return;
+  const handleOpenActionFolder = async (filePath: string | null) => {
+    if (!filePath) return;
+    setActionError(null);
     try {
-      await invoke("open_folder_cmd", { path: folderPath });
-    } catch {
-      console.error("Failed to open folder");
+      await invoke("open_folder_cmd", { path: parentDir(filePath) });
+    } catch (error) {
+      setActionError(String(error));
     }
   };
 
@@ -294,14 +288,16 @@ export default function Popup() {
                 </span>
                 {!log.undone && log.id && (
                   <>
-                    <button
-                      onClick={() => handleOpenActionFolder(log.destination_path)}
-                      className="p-1 rounded hover:bg-border text-text-muted hover:text-text"
-                      title={t("cleanup.openFolder")}
-                      aria-label={t("cleanup.openFolder")}
-                    >
-                      <FolderOpen size={12} />
-                    </button>
+                    {log.destination_path && (
+                      <button
+                        onClick={() => handleOpenActionFolder(log.destination_path)}
+                        className="p-1 rounded hover:bg-border text-text-muted hover:text-text"
+                        title={t("cleanup.openFolder")}
+                        aria-label={t("cleanup.openFolder")}
+                      >
+                        <FolderOpen size={12} />
+                      </button>
+                    )}
                     <button
                       onClick={() => void handleUndo(log.id)}
                       className="p-1 rounded hover:bg-border text-text-muted hover:text-text"

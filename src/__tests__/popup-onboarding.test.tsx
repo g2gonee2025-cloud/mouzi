@@ -45,6 +45,8 @@ interface ElementProps {
   onChange?: (event: { target: { checked: boolean } }) => void;
   checked?: boolean;
   disabled?: boolean;
+  role?: string;
+  title?: string;
 }
 
 function label(node: ReactNode): string {
@@ -85,6 +87,50 @@ function renderRetainedPopup() {
   fixture.retained.index = 0;
   return Popup();
 }
+
+function renderRecentActivity(destination: string | null) {
+  useAppStore.setState({ logs: [{
+    id: 1, timestamp: "2026-11-20", source_path: "C:/Fixture/arrival.txt",
+    destination_path: destination, action: "move", file_name: "arrival.txt", file_type: "text", undone: false,
+  }] });
+  return renderRetainedPopup();
+}
+
+function recentButton(popup: ReactNode, title: string) {
+  return findElement(popup, (element) => element.type === "button" && element.props.title === title);
+}
+
+it.each([
+  ["C:\\arrival.txt", "C:\\"],
+  ["\\\\?\\C:\\arrival.txt", "\\\\?\\C:\\"],
+  ["C:\\Fixture\\arrival.txt", "C:\\Fixture"],
+])("opens the recorded parent folder for %s", async (destination, parent) => {
+  const popup = renderRecentActivity(destination);
+  await recentButton(popup, en.cleanup.openFolder)?.props.onClick?.();
+  expect(fixture.invoke.mock.calls).toEqual([["open_folder_cmd", { path: parent }]]);
+});
+
+it("shows a failed activity-folder open until the next successful open", async () => {
+  const popup = renderRecentActivity("C:/Fixture/arrival.txt");
+  const reporter = vi.spyOn(console, "error").mockImplementation(() => {});
+  try {
+    fixture.invoke.mockRejectedValueOnce(new Error("Fixture folder disappeared"));
+    await recentButton(popup, en.cleanup.openFolder)?.props.onClick?.();
+    const failed = renderRetainedPopup();
+    expect(findElement(failed, (element) => element.props.role === "alert")).toBeDefined();
+    fixture.invoke.mockResolvedValueOnce(undefined);
+    await recentButton(failed, en.cleanup.openFolder)?.props.onClick?.();
+    expect(findElement(renderRetainedPopup(), (element) => element.props.role === "alert")).toBeUndefined();
+  } finally {
+    reporter.mockRestore();
+  }
+});
+
+it("keeps Undo available for recent activity without a destination", () => {
+  const popup = renderRecentActivity(null);
+  expect(recentButton(popup, en.cleanup.openFolder)).toBeUndefined();
+  expect(recentButton(popup, en.popup.undo)).toBeDefined();
+});
 
 function pendingCheckbox(popup: ReactNode, filename: string) {
   const row = findElement(popup, (element) => element.type === "label" && label(element) === filename);
