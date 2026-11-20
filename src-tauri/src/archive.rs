@@ -18,6 +18,33 @@ pub struct ArchiveExtraction {
     _staging_guard: AncestorGuard,
 }
 
+#[derive(Debug)]
+pub(crate) struct ArchiveExtractionError {
+    pub(crate) message: String,
+    pub(crate) retained: Option<RetainedArchiveExtraction>,
+}
+
+#[derive(Debug)]
+pub(crate) struct RetainedArchiveExtraction {
+    pub(crate) staging_dir: PathBuf,
+    pub(crate) extracted_files: Option<usize>,
+}
+
+impl ArchiveExtractionError {
+    fn retained(staging_dir: &Path, extracted_files: Option<usize>, message: String) -> Self {
+        Self {
+            message,
+            retained: Some(RetainedArchiveExtraction { staging_dir: staging_dir.to_path_buf(), extracted_files }),
+        }
+    }
+}
+
+impl From<String> for ArchiveExtractionError {
+    fn from(message: String) -> Self {
+        Self { message, retained: None }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ArchiveFormat {
     Zip,
@@ -203,12 +230,12 @@ fn check_extraction_active(cancelled: &AtomicBool, started: Instant, duration: D
     Ok(())
 }
 
-pub fn extract_archive(
+pub(crate) fn extract_archive(
     path: &Path,
     cancelled: &AtomicBool,
     observe_staging: impl FnOnce(&Path) -> Result<(), String>,
     progress: impl FnMut(u64, usize),
-) -> Result<ArchiveExtraction, String> {
+) -> Result<ArchiveExtraction, ArchiveExtractionError> {
     let base_dir = crate::application_data_dir().map_err(|e| e.to_string())?.join("archive-imports");
     extract_archive_in(path, &base_dir, cancelled, observe_staging, progress)
 }
@@ -219,25 +246,32 @@ fn extract_archive_in(
     cancelled: &AtomicBool,
     observe_staging: impl FnOnce(&Path) -> Result<(), String>,
     mut progress: impl FnMut(u64, usize),
-) -> Result<ArchiveExtraction, String> {
+) -> Result<ArchiveExtraction, ArchiveExtractionError> {
     let (source, _source_guard, format) = open_archive(path, LIMITS)?;
     let (staging_dir, staging_guard) = create_staging_dir_in(base_dir)?;
-    let retained_error = |error| format!("Import staging retained at {}. {error}", staging_dir.display());
-    observe_staging(&staging_dir).map_err(retained_error)?;
+    let setup_error = |error| ArchiveExtractionError::retained(
+        &staging_dir, None, format!("Import staging retained at {}. {error}", staging_dir.display()),
+    );
+    observe_staging(&staging_dir).map_err(setup_error)?;
     let journal_path = staging_dir.with_extension("entries.jsonl");
     let mut journal = EntryJournal(safe_fs::create_guarded_staging_file(&journal_path)
-        .map_err(|error| retained_error(format!("Cannot create archive entry journal: {error}")))?);
-    let journal_name = journal_path.file_name().ok_or("Archive entry journal has no filename")?.to_string_lossy();
+        .map_err(|error| setup_error(format!("Cannot create archive entry journal: {error}")))?);
+    let journal_name = journal_path.file_name()
+        .ok_or_else(|| setup_error("Archive entry journal has no filename".into()))?
+        .to_string_lossy();
     save_manifest_with_receipt(&staging_dir, Some(path), "extracting", &[], None, None, Some(&journal_name))
-        .map_err(retained_error)?;
+        .map_err(setup_error)?;
     let (result, receipt) = extract_archive_from(source, format, &staging_dir, LIMITS, cancelled, &mut progress, Some(&mut journal));
+    let extracted_files = receipt.extracted.len();
     match result {
         Ok(()) => {
             save_manifest_with_receipt(&staging_dir, Some(path), "extracted", &[], None, Some(&receipt), None)
-                .map_err(retained_error)?;
+                .map_err(|error| ArchiveExtractionError::retained(&staging_dir, Some(extracted_files), format!(
+                    "Import staging retained at {}. Manifest finalization failed: {error}", staging_dir.display(),
+                )))?;
             Ok(ArchiveExtraction {
                 staging_dir,
-                extracted_files: receipt.extracted.len(),
+                extracted_files,
                 _staging_guard: staging_guard,
             })
         }
@@ -245,7 +279,12 @@ fn extract_archive_in(
             // Successful entries and partially extracted data may be useful for
             // recovery. Never sweep an import folder after sorting may begin.
             let manifest = save_manifest_with_receipt(&staging_dir, Some(path), "failed", &[], Some(&err), Some(&receipt), None);
-            Err(format!("{err}. Import data retained at {}{}", staging_dir.display(), manifest.err().map(|e| format!("; {e}")).unwrap_or_default()))
+            let mut message = format!("{err}. Import data retained at {}", staging_dir.display());
+            if let Err(error) = manifest {
+                message.push_str(&format!(". Manifest finalization failed: {error}"));
+            }
+            let known_count = (extracted_files != 0 || receipt.incomplete.is_some()).then_some(extracted_files);
+            Err(ArchiveExtractionError::retained(&staging_dir, known_count, message))
         }
     }
 }
@@ -1206,10 +1245,137 @@ mod tests {
             |_, _| panic!("extraction started without a staging receipt"),
         ).unwrap_err();
         let staging = observed.expect("staging receipt attempted");
-        assert!(error.contains("forced journal error"), "{error}");
-        assert!(error.contains(staging.to_string_lossy().as_ref()), "{error}");
+        assert!(error.message.contains("forced journal error"), "{error:?}");
+        assert!(error.message.contains(staging.to_string_lossy().as_ref()), "{error:?}");
+        let retained = error.retained.unwrap();
+        assert_eq!(retained.staging_dir, staging);
+        assert_eq!(retained.extracted_files, None);
         assert!(file_names(&staging).is_empty());
         assert!(!staging.with_extension("manifest.json").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn retained_archive_summary_reports_completed_entry_at_count_limit() {
+        let _db = crate::db::serialise_test_db();
+        crate::db::init_test_db();
+        let root = test_dir("archive-limit-summary");
+        let source = root.join("fixture.tgz");
+        let mut compressed = flate2::write::GzEncoder::new(File::create(&source).unwrap(), flate2::Compression::default());
+        let mut entries = tar::Builder::new(&mut compressed);
+        let mut header = tar::Header::new_gnu();
+        header.set_mode(0o644);
+        header.set_size(4);
+        entries.append_data(&mut header, "first.txt", &b"kept"[..]).unwrap();
+        // Directory headers count against the limit but do not produce files.
+        // The final regular entry falls one past the normal 20,000-entry limit.
+        for index in 1..LIMITS.entries {
+            let mut directory = tar::Header::new_gnu();
+            directory.set_entry_type(tar::EntryType::Directory);
+            directory.set_mode(0o755);
+            directory.set_size(0);
+            entries.append_data(&mut directory, format!("folder-{index}/"), io::empty()).unwrap();
+        }
+        entries.append_data(&mut header, "last.txt", &b"last"[..]).unwrap();
+        entries.finish().unwrap();
+        drop(entries);
+        compressed.finish().unwrap();
+
+        let intent = crate::db::begin_operation_intent("archive_import", source.to_str().unwrap(), None).unwrap();
+        let error = extract_archive_in(
+            &source, &root.join("archive-imports"), &AtomicBool::new(false),
+            |staging| crate::db::observe_pending_archive_staging(intent, staging.to_str().unwrap())
+                .map_err(|error| error.to_string()),
+            |_, _| {},
+        ).unwrap_err();
+        let receipt = crate::commands::finish_archive_extraction_failure(intent, error).unwrap();
+        let staging = Path::new(&receipt.staging_path);
+        let kept = fs::read(staging.join("first.txt")).unwrap();
+        let last_exists = staging.join("last.txt").exists();
+        let manifest: serde_json::Value = serde_json::from_slice(&fs::read(staging.with_extension("manifest.json")).unwrap()).unwrap();
+        crate::db::lock_db().unwrap().execute("DELETE FROM operation_intents WHERE id=?1", [intent]).unwrap();
+        fs::remove_dir_all(root).unwrap();
+
+        assert_eq!(kept, b"kept");
+        assert!(!last_exists);
+        assert_eq!(manifest["status"], "failed");
+        assert_eq!(manifest["extractedCount"], 1);
+        assert!(receipt.issue.unwrap().contains("entry count limit"));
+        assert_eq!(receipt.sorted_count, 0);
+        assert!(receipt.results.is_empty());
+        assert_eq!(receipt.extracted_count, Some(1));
+    }
+
+    #[test]
+    fn archive_extraction_counts_distinguish_unstarted_incomplete_and_success() {
+        let root = test_dir("archive-extraction-count-controls");
+        let base = root.join("archive-imports");
+        let cancelled = AtomicBool::new(false);
+        let unsupported = extract_archive_in(&root.join("unsupported.txt"), &base, &cancelled,
+            |_| panic!("unsupported input allocated staging"), |_, _| {}).unwrap_err();
+        assert!(unsupported.retained.is_none());
+
+        let broken_zip = root.join("broken.zip");
+        fs::write(&broken_zip, b"ZIP header is missing").unwrap();
+        let invalid = extract_archive_in(&broken_zip, &base, &cancelled, |_| Ok(()), |_, _| {})
+            .unwrap_err().retained.unwrap();
+        assert_eq!(invalid.extracted_files, None);
+
+        let truncated_tar = root.join("truncated.tgz");
+        let mut compressed = flate2::write::GzEncoder::new(File::create(&truncated_tar).unwrap(), flate2::Compression::default());
+        let mut header = tar::Header::new_gnu();
+        header.set_path("first.txt").unwrap();
+        header.set_mode(0o644);
+        header.set_size(8);
+        header.set_cksum();
+        compressed.write_all(header.as_bytes()).unwrap();
+        compressed.write_all(b"part").unwrap();
+        compressed.finish().unwrap();
+        let incomplete = extract_archive_in(&truncated_tar, &base, &cancelled, |_| Ok(()), |_, _| {})
+            .unwrap_err().retained.unwrap();
+        assert_eq!(incomplete.extracted_files, Some(0));
+        let retained = file_names(&incomplete.staging_dir);
+        assert_eq!(retained.len(), 1);
+        assert_eq!(fs::read(incomplete.staging_dir.join(&retained[0])).unwrap(), b"part");
+
+        let valid_zip = root.join("valid.zip");
+        write_zip(&valid_zip, &[("first.txt", b"complete")]);
+        let success = extract_archive_in(&valid_zip, &base, &cancelled, |_| Ok(()), |_, _| {}).unwrap();
+        assert_eq!(success.extracted_files, 1);
+        assert_eq!(fs::read(success.staging_dir.join("first.txt")).unwrap(), b"complete");
+        drop(success);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn manifest_and_journal_finalization_failures_keep_archive_count_and_path() {
+        let _db = crate::db::serialise_test_db();
+        crate::db::init_test_db();
+        let root = test_dir("archive-extraction-finalization");
+        let source = root.join("fixture.zip");
+        write_zip(&source, &[("first.txt", b"complete")]);
+        let staged = std::cell::OnceCell::new();
+        let error = extract_archive_in(
+            &source, &root.join("archive-imports"), &AtomicBool::new(false),
+            |staging| {
+                staged.set(staging.to_path_buf()).unwrap();
+                Ok(())
+            },
+            |_, count| {
+                if count == 1 {
+                    let manifest = staged.get().unwrap().with_extension("manifest.json");
+                    fs::remove_file(&manifest).unwrap();
+                    fs::create_dir(manifest).unwrap();
+                }
+            },
+        ).unwrap_err();
+        let summary = crate::commands::finish_archive_extraction_failure(-1, error).unwrap();
+        assert_eq!(summary.extracted_count, Some(1));
+        assert_eq!(Path::new(&summary.staging_path), staged.get().unwrap());
+        assert_eq!(fs::read(staged.get().unwrap().join("first.txt")).unwrap(), b"complete");
+        let issue = summary.issue.unwrap();
+        assert!(issue.contains("Manifest finalization failed"));
+        assert!(issue.contains("Import journal finalization failed"));
         fs::remove_dir_all(root).unwrap();
     }
 

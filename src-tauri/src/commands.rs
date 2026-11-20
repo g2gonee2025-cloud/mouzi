@@ -727,44 +727,49 @@ pub struct ArchiveImportSummary {
 pub fn import_archive_cmd(app: AppHandle, path: String, state: tauri::State<AppState>) -> Result<ArchiveImportSummary, String> {
     let job = crate::archive::ImportJob::start()?;
     let intent = begin_operation_intent("archive_import", &path, None).map_err(|e| format!("Import was not started: cannot persist intent: {e}"))?;
-    let mut observed_staging = None;
     let extraction = match crate::archive::extract_archive(
         Path::new(&path),
         &job.cancelled,
         |staging| {
-            let path = staging.to_string_lossy().into_owned();
-            let observation = observe_pending_archive_staging(intent, &path);
-            observed_staging = Some(path);
-            observation.map_err(|error| format!("Cannot record import staging before extraction: {error}"))
+            observe_pending_archive_staging(intent, &staging.to_string_lossy())
+                .map_err(|error| format!("Cannot record import staging before extraction: {error}"))
         },
         |bytes, files| {
             let _ = app.emit("archive-import-progress", serde_json::json!({"bytes":bytes,"files":files}));
         },
     ) {
         Ok(extraction) => extraction,
-        Err(error) => {
-            let journal = finalize_operation_intent(intent, "failed", observed_staging.as_deref(), Some(&error));
-            let issue = match journal {
-                Ok(()) => error,
-                Err(e) => format!("{error}; import journal finalization failed: {e}"),
-            };
-            return match observed_staging {
-                Some(staging_path) => Ok(ArchiveImportSummary {
-                    extracted_count: None,
-                    sorted_count: 0,
-                    staging_path,
-                    results: Vec::new(),
-                    issue: Some(issue),
-                }),
-                None => Err(issue),
-            };
-        }
+        Err(error) => return finish_archive_extraction_failure(intent, error),
     };
     let staging = &extraction.staging_dir;
     let sorting = crate::rules::manual_scan_folder_cancelable(staging, &state.ignored_files, &job.cancelled);
     let result = finish_archive_sort(intent, staging, extraction.extracted_files, sorting);
     let _ = app.emit("mutation-completed", ());
     Ok(result)
+}
+
+pub(crate) fn finish_archive_extraction_failure(
+    intent: i64,
+    error: crate::archive::ArchiveExtractionError,
+) -> Result<ArchiveImportSummary, String> {
+    let crate::archive::ArchiveExtractionError { message, retained } = error;
+    let retained = retained.map(|receipt| (receipt.staging_dir.to_string_lossy().into_owned(), receipt.extracted_files));
+    let staging = retained.as_ref().map(|(path, _)| path.as_str());
+    let journal = finalize_operation_intent(intent, "failed", staging, Some(&message));
+    let issue = match journal {
+        Ok(()) => message,
+        Err(error) => format!("{message}. Import journal finalization failed: {error}"),
+    };
+    match retained {
+        Some((staging_path, extracted_count)) => Ok(ArchiveImportSummary {
+            extracted_count,
+            sorted_count: 0,
+            staging_path,
+            results: Vec::new(),
+            issue: Some(issue),
+        }),
+        None => Err(issue),
+    }
 }
 
 pub(crate) fn finish_archive_sort(
