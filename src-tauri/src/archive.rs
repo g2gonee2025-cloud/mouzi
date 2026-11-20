@@ -235,10 +235,20 @@ struct ExtractionReceipt {
     published_names: PublishedArchiveNames,
 }
 
-#[derive(Default)]
 struct PublishedArchiveNames {
     names: HashSet<String>,
     next_owned_suffix: HashMap<String, usize>,
+    foreign_probe_limit: usize,
+}
+
+impl Default for PublishedArchiveNames {
+    fn default() -> Self {
+        Self {
+            names: HashSet::new(),
+            next_owned_suffix: HashMap::new(),
+            foreign_probe_limit: 10_000,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -850,7 +860,7 @@ fn publish_entry(
     let mut next_owned = published_names.next_owned_suffix.get(file_name).copied().unwrap_or(0);
     // The import can publish up to LIMITS.entries files with the same basename.
     // Bound filesystem probes separately when other occupants block publication.
-    let mut probes_remaining = 10_000;
+    let mut probes_remaining = published_names.foreign_probe_limit;
     for index in next_owned.. {
         check_active()?;
         let name = if index == 0 { file_name.to_string() } else { match extension { Some(ext) => format!("{stem} ({index}).{ext}"), None => format!("{stem} ({index})") } };
@@ -1955,6 +1965,72 @@ mod tests {
         assert_eq!(result.unwrap(), name);
         assert_eq!(ready, [name]);
         assert_eq!(contents.as_deref(), Some(b"last entry".as_slice()));
+    }
+
+    fn assert_mixed_case_publication(root: PathBuf, require_case_sensitive: bool) {
+        let staging = fs::canonicalize(&root).unwrap();
+        let mut published = PublishedArchiveNames {
+            foreign_probe_limit: 3,
+            ..PublishedArchiveNames::default()
+        };
+        let mut ready = Vec::new();
+        let mut publish = |index, name, bytes: &[u8]| {
+            let (_, stage, mut output) = create_entry_stage(&staging, index, name).unwrap();
+            output.write_all(bytes).unwrap();
+            publish_entry(&staging, &stage, &output, name, &mut published, || Ok(()), |name| {
+                ready.push(name.to_owned());
+                Ok(())
+            })
+        };
+        for index in 0..3 {
+            publish(index, "index.txt", b"lowercase import").unwrap();
+        }
+        let aliases = fs::read(staging.join("INDEX.txt")).ok().as_deref() == Some(b"lowercase import");
+        let expected = if aliases { "INDEX (3).txt" } else { "INDEX.txt" };
+        let mixed_case = publish(3, "INDEX.txt", b"uppercase import");
+        let original_files = ["index.txt", "index (1).txt", "index (2).txt"]
+            .map(|name| fs::read(staging.join(name)).ok());
+        let mixed_case_bytes = fs::read(staging.join(expected)).ok();
+        let disk_names = file_names(&staging);
+
+        let foreign = staging.join("report.txt");
+        fs::write(&foreign, b"foreign").unwrap();
+        let occupied_slot = publish(4, "report.txt", b"import beside foreign");
+        let foreign_bytes = fs::read(&foreign).unwrap();
+        fs::remove_file(&foreign).unwrap();
+        let freed_slot = publish(5, "report.txt", b"import in vacated slot");
+        let freed_bytes = fs::read(&foreign).ok();
+        fs::remove_dir_all(root).unwrap();
+
+        assert!(!require_case_sensitive || !aliases, "fixture must distinguish ASCII case");
+        assert_eq!(mixed_case.as_deref(), Ok(expected));
+        assert!(disk_names.iter().any(|name| name == expected));
+        assert!(original_files.iter().all(|bytes| bytes.as_deref() == Some(b"lowercase import")));
+        assert_eq!(mixed_case_bytes.as_deref(), Some(b"uppercase import".as_slice()));
+        assert_eq!(occupied_slot.as_deref(), Ok("report (1).txt"));
+        assert_eq!(foreign_bytes, b"foreign");
+        assert_eq!(freed_slot.as_deref(), Ok("report.txt"));
+        assert_eq!(freed_bytes.as_deref(), Some(b"import in vacated slot".as_slice()));
+        assert_eq!(ready, ["index.txt", "index (1).txt", "index (2).txt", expected, "report (1).txt", "report.txt"]);
+    }
+
+    #[test]
+    fn mixed_case_publications_do_not_spend_foreign_probe_budget() {
+        assert_mixed_case_publication(test_dir("archive-case-publication"), false);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires a case-sensitive NTFS parent directory"]
+    fn mixed_case_publications_keep_distinct_sensitive_names() {
+        let parent = std::env::var_os("MOUZI_ARCHIVE_CASE_SENSITIVE_TEST_ROOT")
+            .expect("provide a case-sensitive NTFS parent directory");
+        let root = PathBuf::from(parent).join(format!(
+            "mouzi-archive-case-{}-{}", std::process::id(),
+            TEST_DIR_COUNTER.fetch_add(1, Ordering::SeqCst)
+        ));
+        fs::create_dir(&root).unwrap();
+        assert_mixed_case_publication(root, true);
     }
 
     #[test]
