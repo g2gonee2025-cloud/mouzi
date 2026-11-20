@@ -118,6 +118,11 @@ pub fn run() {
             review_request: Mutex::new(None),
             add_folder_request: Mutex::new(None),
         })
+        .on_window_event(|window, event| {
+            if window.label() == "app" && matches!(event, tauri::WindowEvent::Destroyed) {
+                commands::cancel_workspace_suggestion_preparations();
+            }
+        })
         .setup(|app| {
             // Hid app from dock on macOS
             #[cfg(target_os = "macos")]
@@ -251,7 +256,9 @@ pub fn run() {
             prepare_cleanup_cmd,
             execute_cleanup_cmd,
             get_suggestions_cmd,
+            begin_suggestion_preparation_cmd,
             prepare_suggestions_cmd,
+            cancel_suggestion_preparation_cmd,
             discard_suggestion_plans_cmd,
             dismiss_suggestion_cmd,
             reset_dismissed_suggestions_cmd,

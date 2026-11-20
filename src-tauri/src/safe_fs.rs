@@ -628,7 +628,7 @@ pub(crate) fn try_unique_destination_with(
     Err(format!("No collision-free destination is available for {}", file_name))
 }
 
-fn path_occupied(path: &Path) -> Result<bool, String> {
+pub(crate) fn path_occupied(path: &Path) -> Result<bool, String> {
     match std::fs::symlink_metadata(path) {
         Ok(_) => Ok(true), Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(e) => Err(format!("Cannot inspect destination {}: {}", path.display(), e)),
@@ -728,11 +728,25 @@ fn stable_metadata(before: &Metadata, after: &Metadata) -> bool {
 }
 
 pub(crate) fn hash_handle(file: &mut File) -> Result<blake3::Hash, String> {
+    hash_handle_with_check(file, || Ok(()))
+}
+
+pub(crate) fn hash_handle_with_check(
+    file: &mut File,
+    mut check: impl FnMut() -> Result<(), String>,
+) -> Result<blake3::Hash, String> {
     file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
     let mut hash = blake3::Hasher::new();
     let mut buffer = [0u8; 64 * 1024];
-    loop { let count = file.read(&mut buffer).map_err(|e| e.to_string())?; if count == 0 { break; } hash.update(&buffer[..count]); }
-    Ok(hash.finalize())
+    loop {
+        check()?;
+        let count = file.read(&mut buffer).map_err(|e| e.to_string())?;
+        if count == 0 {
+            check()?;
+            return Ok(hash.finalize());
+        }
+        hash.update(&buffer[..count]);
+    }
 }
 
 pub(crate) fn create_guarded_staging_file(path: &Path) -> io::Result<File> {

@@ -6,9 +6,9 @@ use crate::suppress::{SuppressionSet, SUPPRESSION_TTL};
 use crate::AppState;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime};
 use std::collections::{HashMap, HashSet};
 use once_cell::sync::Lazy;
 use std::sync::Mutex as PlanMutex;
@@ -1625,10 +1625,11 @@ pub struct SuggestionPlanPreview {
 
 struct SuggestionPlan {
     preview: SuggestionPlanPreview,
+    preparation_id: String,
     root: PathBuf,
     root_identity: crate::safe_fs::FileIdentity,
     identity: crate::safe_fs::FileIdentity,
-    digest: String,
+    content: SuggestionContent,
     destination_ancestor: PathBuf,
     destination_identity: crate::safe_fs::FileIdentity,
     configuration: String,
@@ -1636,7 +1637,104 @@ struct SuggestionPlan {
     create_rule: bool,
 }
 
-static SUGGESTION_PLANS: Lazy<PlanMutex<HashMap<String, SuggestionPlan>>> = Lazy::new(|| PlanMutex::new(HashMap::new()));
+struct SuggestionContent {
+    digest: String,
+    size: u64,
+    modified: Option<SystemTime>,
+}
+
+enum SuggestionPreparation {
+    Reserved(Instant),
+    Running(Arc<AtomicBool>),
+}
+
+#[derive(Default)]
+struct SuggestionReviews {
+    preparations: HashMap<String, SuggestionPreparation>,
+    plans: HashMap<String, SuggestionPlan>,
+}
+
+static SUGGESTION_REVIEWS: Lazy<PlanMutex<SuggestionReviews>> =
+    Lazy::new(|| PlanMutex::new(SuggestionReviews::default()));
+const SUGGESTION_RESERVATION_TTL: Duration = Duration::from_secs(30);
+const SUGGESTION_CANCELLED: &str = "Suggestion preparation cancelled or expired";
+
+fn reserve_suggestion_preparation() -> Result<String, String> {
+    let mut reviews = SUGGESTION_REVIEWS.lock().map_err(|_| "Suggestion plan store unavailable")?;
+    reviews.preparations.retain(|_, preparation| match preparation {
+        SuggestionPreparation::Reserved(created) => created.elapsed() < SUGGESTION_RESERVATION_TTL,
+        SuggestionPreparation::Running(_) => true,
+    });
+    if reviews.preparations.len() >= 4 {
+        return Err("Too many suggestion previews are already being prepared".into());
+    }
+    let id = crate::operations::new_run_id();
+    reviews.preparations.insert(id.clone(), SuggestionPreparation::Reserved(Instant::now()));
+    Ok(id)
+}
+
+struct RunningSuggestionPreparation {
+    id: String,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl RunningSuggestionPreparation {
+    fn start(id: String) -> Result<Self, String> {
+        let mut reviews = SUGGESTION_REVIEWS.lock().map_err(|_| "Suggestion plan store unavailable")?;
+        let preparation = reviews.preparations.get_mut(&id).ok_or(SUGGESTION_CANCELLED)?;
+        match preparation {
+            SuggestionPreparation::Reserved(created) if created.elapsed() < SUGGESTION_RESERVATION_TTL => {
+                let cancelled = Arc::new(AtomicBool::new(false));
+                *preparation = SuggestionPreparation::Running(cancelled.clone());
+                Ok(Self { id, cancelled })
+            }
+            SuggestionPreparation::Reserved(_) => {
+                reviews.preparations.remove(&id);
+                Err(SUGGESTION_CANCELLED.into())
+            }
+            SuggestionPreparation::Running(_) => Err("Suggestion preparation is already running".into()),
+        }
+    }
+
+    fn check(&self) -> Result<(), String> {
+        if self.cancelled.load(Ordering::Acquire) {
+            return Err(SUGGESTION_CANCELLED.into());
+        }
+        Ok(())
+    }
+}
+
+impl Drop for RunningSuggestionPreparation {
+    fn drop(&mut self) {
+        SUGGESTION_REVIEWS.lock().unwrap_or_else(|error| error.into_inner())
+            .preparations.remove(&self.id);
+    }
+}
+
+fn cancel_suggestion_preparation(id: &str) -> Result<(), String> {
+    let mut reviews = SUGGESTION_REVIEWS.lock().map_err(|_| "Suggestion plan store unavailable")?;
+    match reviews.preparations.get(id) {
+        // Keep a running slot until the worker exits. Cancelled I/O still
+        // counts toward the limit if the operating system has not returned.
+        Some(SuggestionPreparation::Running(flag)) => flag.store(true, Ordering::Release),
+        Some(SuggestionPreparation::Reserved(_)) => { reviews.preparations.remove(id); }
+        None => {}
+    }
+    reviews.plans.retain(|_, plan| plan.preparation_id != id);
+    Ok(())
+}
+
+pub(crate) fn cancel_workspace_suggestion_preparations() {
+    let mut reviews = SUGGESTION_REVIEWS.lock().unwrap_or_else(|error| error.into_inner());
+    reviews.preparations.retain(|_, preparation| match preparation {
+        SuggestionPreparation::Reserved(_) => false,
+        SuggestionPreparation::Running(flag) => {
+            flag.store(true, Ordering::Release);
+            true
+        }
+    });
+    reviews.plans.clear();
+}
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1645,14 +1743,18 @@ pub struct SuggestionRequest {
     suggested_category: String,
 }
 
-fn live_suggestion_digest(path: &Path, validated: &mut crate::safe_fs::ValidatedFile) -> Result<String, String> {
+fn live_suggestion_content(
+    path: &Path,
+    validated: &mut crate::safe_fs::ValidatedFile,
+    check: impl FnMut() -> Result<(), String>,
+) -> Result<SuggestionContent, String> {
     let before = validated.file.metadata().map_err(|e| e.to_string())?;
-    let digest = crate::safe_fs::hash_handle(&mut validated.file)?;
+    let digest = crate::safe_fs::hash_handle_with_check(&mut validated.file, check)?;
     let after = validated.file.metadata().map_err(|e| e.to_string())?;
     if before.len() != after.len() || before.modified().ok() != after.modified().ok()
         || crate::safe_fs::file_identity(path)? != validated.identity
     { return Err("File changed while its suggestion was being reviewed".into()); }
-    Ok(digest.to_hex().to_string())
+    Ok(SuggestionContent { digest: digest.to_hex().to_string(), size: before.len(), modified: before.modified().ok() })
 }
 
 fn suggestion_rule_preview(file_name: &str, category: &str, rules: &[Rule]) -> SuggestionRulePreview {
@@ -1697,36 +1799,53 @@ fn suggestion_rule_preview(file_name: &str, category: &str, rules: &[Rule]) -> S
     preview
 }
 
-fn prepare_suggestions(requests: Vec<SuggestionRequest>, create_rule: bool) -> Result<Vec<SuggestionPlanPreview>, String> {
+fn require_indexed_suggestion(path: &str) -> Result<(), String> {
+    let conn = lock_db()?;
+    let present: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM file_inventory WHERE path=?1)", [path], |row| row.get(0))
+        .map_err(|error| error.to_string())?;
+    if !present {
+        return Err("Suggestion is no longer in the inventory; scan again".into());
+    }
+    Ok(())
+}
+
+fn prepare_suggestion_review(
+    requests: Vec<SuggestionRequest>,
+    create_rule: bool,
+    preparation: &RunningSuggestionPreparation,
+    suppression: &SuppressionSet,
+    mut check_hash: impl FnMut() -> Result<(), String>,
+) -> Result<Vec<SuggestionPlanPreview>, String> {
     const MAX_BATCH: usize = 200;
     if requests.is_empty() || requests.len() > MAX_BATCH {
         return Err(format!("Choose between 1 and {MAX_BATCH} suggestions to review"));
     }
-    let folders = get_watched_folders().map_err(|e| e.to_string())?;
+    let (folders, rules) = {
+        let _operation = suppression.with_operation();
+        preparation.check()?;
+        let folders = get_watched_folders().map_err(|error| error.to_string())?;
+        let rules = if create_rule { get_rules().map_err(|error| error.to_string())? } else { Vec::new() };
+        (folders, rules)
+    };
     let scope = crate::safe_fs::eligible_scope(&folders)?;
     let configuration = serde_json::to_string(&folders).map_err(|e| e.to_string())?;
-    let rules = if create_rule { get_rules().map_err(|e| e.to_string())? } else { Vec::new() };
     let mut reviewed = Vec::with_capacity(requests.len());
     let mut sources = HashSet::new();
     let mut destinations = HashSet::new();
     let mut proposed_rules = HashMap::new();
 
     for SuggestionRequest { path, suggested_category } in requests {
+        preparation.check()?;
         if !crate::categories::is_valid_category(&suggested_category) || suggested_category == "Other" {
             return Err("Choose a supported category".into());
         }
-        {
-            let conn = lock_db()?;
-            let present: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM file_inventory WHERE path=?1)", [&path], |row| row.get(0))
-                .map_err(|e| e.to_string())?;
-            if !present { return Err("Suggestion is no longer in the inventory; scan again".into()); }
-        }
+        require_indexed_suggestion(&path)?;
         let source = Path::new(&path);
         let mut validated = scope.validate_file(source)?;
         if !sources.insert(validated.identity.clone()) {
             return Err("The same physical file appears more than once in the suggestion review".into());
         }
-        let digest = live_suggestion_digest(source, &mut validated)?;
+        let content = live_suggestion_content(source, &mut validated, &mut check_hash)?;
         let root = validated.owning_root.clone();
         let root_identity = crate::safe_fs::file_identity(&root)?;
         let file_name = source.file_name().and_then(|name| name.to_str()).ok_or("Suggestion has no valid filename")?;
@@ -1763,18 +1882,49 @@ fn prepare_suggestions(requests: Vec<SuggestionRequest>, create_rule: bool) -> R
             rule,
         };
         reviewed.push(SuggestionPlan {
-            preview, root, root_identity, identity: validated.identity, digest,
+            preview, preparation_id: preparation.id.clone(), root, root_identity, identity: validated.identity, content,
             destination_ancestor, destination_identity, configuration: configuration.clone(),
             expires: Instant::now(), create_rule,
         });
     }
 
+    // Hashing takes place outside the mutation coordinator. Before publishing,
+    // recheck the saved configuration and metadata without re-reading contents.
+    let _operation = suppression.with_operation();
+    preparation.check()?;
+    let current_folders = get_watched_folders().map_err(|error| error.to_string())?;
+    if serde_json::to_string(&current_folders).map_err(|error| error.to_string())? != configuration
+        || (create_rule && get_rules().map_err(|error| error.to_string())? != rules)
+    {
+        return Err("Suggestion configuration changed; preview again".into());
+    }
+    for plan in &reviewed {
+        preparation.check()?;
+        require_indexed_suggestion(&plan.preview.path)?;
+        let source = Path::new(&plan.preview.path);
+        let file = scope.validate_file(source)?;
+        if file.owning_root != plan.root || file.identity != plan.identity
+            || file.metadata.len() != plan.content.size || file.metadata.modified().ok() != plan.content.modified
+        {
+            return Err("Suggestion file or owning folder changed; preview again".into());
+        }
+        let destination = Path::new(&plan.preview.destination);
+        let (ancestor, identity, _guard) = crate::operations::destination_guard(destination)?;
+        if ancestor != plan.destination_ancestor || identity != plan.destination_identity
+            || (source != destination && crate::safe_fs::path_occupied(destination)?)
+        {
+            return Err("Reviewed destination changed; preview again".into());
+        }
+    }
+
     // Publish the complete review together. A failed batch leaves no live plans.
-    let mut plans = SUGGESTION_PLANS.lock().map_err(|_| "Suggestion plan store unavailable")?;
+    let mut reviews = SUGGESTION_REVIEWS.lock().map_err(|_| "Suggestion plan store unavailable")?;
+    preparation.check()?;
+    let plans = &mut reviews.plans;
     let now = Instant::now();
     plans.retain(|_, plan| plan.expires > now);
     if plans.len() + reviewed.len() > 512 { return Err("Too many pending previews; close older previews and retry".into()); }
-    let expires = now + std::time::Duration::from_secs(600);
+    let expires = now + Duration::from_secs(600);
     let previews = reviewed.iter().map(|plan| plan.preview.clone()).collect();
     for mut plan in reviewed {
         plan.expires = expires;
@@ -1783,17 +1933,41 @@ fn prepare_suggestions(requests: Vec<SuggestionRequest>, create_rule: bool) -> R
     Ok(previews)
 }
 
-#[tauri::command(async)]
-pub fn prepare_suggestions_cmd(requests: Vec<SuggestionRequest>, create_rule: bool, state: tauri::State<AppState>) -> Result<Vec<SuggestionPlanPreview>, String> {
-    let _operation = state.ignored_files.with_operation();
-    prepare_suggestions(requests, create_rule)
+#[tauri::command]
+pub fn begin_suggestion_preparation_cmd(window: tauri::WebviewWindow) -> Result<String, String> {
+    if window.label() != "app" {
+        return Err("Suggestion review is available only in the workspace window".into());
+    }
+    reserve_suggestion_preparation()
+}
+
+#[tauri::command]
+pub async fn prepare_suggestions_cmd(
+    window: tauri::WebviewWindow, preparation_id: String, requests: Vec<SuggestionRequest>, create_rule: bool,
+) -> Result<Vec<SuggestionPlanPreview>, String> {
+    if window.label() != "app" {
+        return Err("Suggestion review is available only in the workspace window".into());
+    }
+    let preparation = RunningSuggestionPreparation::start(preparation_id)?;
+    let suppression = window.state::<AppState>().ignored_files.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        prepare_suggestion_review(requests, create_rule, &preparation, &suppression, || preparation.check())
+    }).await.map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub fn cancel_suggestion_preparation_cmd(window: tauri::WebviewWindow, preparation_id: String) -> Result<(), String> {
+    if window.label() != "app" {
+        return Err("Suggestion review is available only in the workspace window".into());
+    }
+    cancel_suggestion_preparation(&preparation_id)
 }
 
 #[tauri::command]
 pub fn discard_suggestion_plans_cmd(plan_ids: Vec<String>) -> Result<(), String> {
-    let mut plans = SUGGESTION_PLANS.lock().map_err(|_| "Suggestion plan store unavailable")?;
+    let mut reviews = SUGGESTION_REVIEWS.lock().map_err(|_| "Suggestion plan store unavailable")?;
     for plan_id in plan_ids {
-        plans.remove(&plan_id);
+        reviews.plans.remove(&plan_id);
     }
     Ok(())
 }
@@ -1823,7 +1997,8 @@ pub fn accept_suggestion_cmd(
 }
 
 fn accept_reviewed_suggestion(plan_id: &str, suppression: &IgnoredFiles) -> Result<AcceptOutcome, String> {
-    let plan = SUGGESTION_PLANS.lock().map_err(|_| "Suggestion plan store unavailable")?.remove(plan_id).ok_or("Suggestion preview expired or was already used; preview again")?;
+    let plan = SUGGESTION_REVIEWS.lock().map_err(|_| "Suggestion plan store unavailable")?.plans.remove(plan_id)
+        .ok_or("Suggestion preview expired or was already used; preview again")?;
     let _operation = suppression.with_operation();
     let folders = get_watched_folders().map_err(|e| e.to_string())?;
     if plan.expires <= Instant::now() || plan.configuration != serde_json::to_string(&folders).map_err(|e| e.to_string())? {
@@ -1841,7 +2016,7 @@ fn accept_reviewed_suggestion(plan_id: &str, suppression: &IgnoredFiles) -> Resu
     let path = Path::new(&plan.preview.path);
     let mut validated = scope.validate_file(path)?;
     if validated.owning_root != plan.root || crate::safe_fs::file_identity(&plan.root)? != plan.root_identity
-        || validated.identity != plan.identity || live_suggestion_digest(path, &mut validated)? != plan.digest
+        || validated.identity != plan.identity || live_suggestion_content(path, &mut validated, || Ok(()))?.digest != plan.content.digest
     {
         return Err("Suggestion file or owning folder changed; preview again".into());
     }
@@ -1850,7 +2025,7 @@ fn accept_reviewed_suggestion(plan_id: &str, suppression: &IgnoredFiles) -> Resu
     if crate::safe_fs::file_identity(&plan.destination_ancestor)? != plan.destination_identity {
         return Err("Reviewed destination folder changed; preview again".into());
     }
-    accept_suggestion_validated_with(plan.preview.path, plan.preview.category, plan.create_rule, suppression, &plan.root, Some(&plan.identity), Some(&plan.digest), Some(Path::new(&plan.preview.destination)))
+    accept_suggestion_validated_with(plan.preview.path, plan.preview.category, plan.create_rule, suppression, &plan.root, Some(&plan.identity), Some(&plan.content.digest), Some(Path::new(&plan.preview.destination)))
 }
 
 /// The body of `accept_suggestion_cmd`, callable without a Tauri state.
@@ -2857,6 +3032,11 @@ mod accept_tests {
         }
     }
 
+    fn prepare_suggestions(requests: Vec<SuggestionRequest>, create_rule: bool) -> Result<Vec<SuggestionPlanPreview>, String> {
+        let preparation = RunningSuggestionPreparation::start(reserve_suggestion_preparation()?)?;
+        prepare_suggestion_review(requests, create_rule, &preparation, &ignored_files(), || preparation.check())
+    }
+
     fn prepare_suggestion(path: String, suggested_category: String, create_rule: bool) -> Result<SuggestionPlanPreview, String> {
         prepare_suggestions(vec![SuggestionRequest { path, suggested_category }], create_rule)?
             .pop().ok_or("No suggestion was prepared".into())
@@ -2894,20 +3074,107 @@ mod accept_tests {
         let fixture = AcceptFixture::new("review_batch_discard");
         let first = inventory_fixture(&fixture);
         let missing = fixture.root().join("missing.xyz");
-        let count = SUGGESTION_PLANS.lock().unwrap().len();
+        let count = SUGGESTION_REVIEWS.lock().unwrap().plans.len();
         let error = prepare_suggestions(vec![
             suggestion_request(&first, "Documents"), suggestion_request(&missing, "Documents"),
         ], false).unwrap_err();
         assert!(error.contains("no longer in the inventory"));
-        assert_eq!(SUGGESTION_PLANS.lock().unwrap().len(), count);
+        assert_eq!(SUGGESTION_REVIEWS.lock().unwrap().plans.len(), count);
 
         let reviewed = prepare_suggestions(vec![suggestion_request(&first, "Documents")], false).unwrap();
         let id = &reviewed[0].plan_id;
-        assert!(SUGGESTION_PLANS.lock().unwrap().contains_key(id));
+        assert!(SUGGESTION_REVIEWS.lock().unwrap().plans.contains_key(id));
         discard_suggestion_plans_cmd(vec![id.clone()]).unwrap();
-        assert!(!SUGGESTION_PLANS.lock().unwrap().contains_key(id));
+        assert!(!SUGGESTION_REVIEWS.lock().unwrap().plans.contains_key(id));
         assert!(accept_reviewed_suggestion(id, &ignored_files()).is_err());
         assert!(first.exists());
+    }
+
+    #[test]
+    fn cancelling_during_suggestion_hashing_keeps_the_operation_gate_free_and_publishes_no_plans() {
+        let fixture = AcceptFixture::new("cancel_suggestion_hash");
+        let source = fixture.put("large.xyz");
+        std::fs::write(&source, vec![b's'; 128 * 1024]).unwrap();
+        index_fixture(&fixture);
+        let suppression = ignored_files();
+        let id = reserve_suggestion_preparation().unwrap();
+        let preparation = RunningSuggestionPreparation::start(id.clone()).unwrap();
+        let mut chunk_checks = 0;
+        let mut concurrent_operation = None;
+        let mut operation_was_free = false;
+        let result = prepare_suggestion_review(vec![suggestion_request(&source, "Documents")], false, &preparation, &suppression, || {
+            chunk_checks += 1;
+            if chunk_checks == 2 {
+                // The first chunk has already been read. A different
+                // operation must be able to enter even while hashing pauses.
+                let other = suppression.clone();
+                let (entered, observed) = std::sync::mpsc::channel();
+                concurrent_operation = Some(std::thread::spawn(move || {
+                    let _operation = other.with_operation();
+                    let _ = entered.send(());
+                }));
+                operation_was_free = observed.recv_timeout(Duration::from_secs(3)).is_ok();
+                cancel_suggestion_preparation(&id)?;
+            }
+            preparation.check()
+        });
+        if let Some(operation) = concurrent_operation { operation.join().unwrap(); }
+        drop(preparation);
+
+        assert_eq!(chunk_checks, 2);
+        assert!(operation_was_free);
+        assert_eq!(result.unwrap_err(), SUGGESTION_CANCELLED);
+        let reviews = SUGGESTION_REVIEWS.lock().unwrap();
+        assert!(!reviews.preparations.contains_key(&id));
+        assert!(!reviews.plans.values().any(|plan| plan.preparation_id == id));
+        assert!(source.is_file());
+    }
+
+    #[test]
+    fn suggestion_cancellation_covers_reservations_and_published_batches() {
+        let fixture = AcceptFixture::new("cancel_suggestion_lifecycle");
+        let source = inventory_fixture(&fixture);
+        let unused = reserve_suggestion_preparation().unwrap();
+        cancel_suggestion_preparation(&unused).unwrap();
+        assert!(RunningSuggestionPreparation::start(unused).is_err());
+
+        let id = reserve_suggestion_preparation().unwrap();
+        let preparation = RunningSuggestionPreparation::start(id.clone()).unwrap();
+        assert!(RunningSuggestionPreparation::start(id.clone()).is_err());
+        let cancelled = prepare_suggestion_review(vec![suggestion_request(&source, "Documents")], false, &preparation, &ignored_files(), || preparation.check()).unwrap();
+        drop(preparation);
+        let independent = prepare_suggestions(vec![suggestion_request(&source, "Documents")], false).unwrap();
+        cancel_suggestion_preparation(&id).unwrap();
+        assert!(accept_reviewed_suggestion(&cancelled[0].plan_id, &ignored_files()).is_err());
+        let accepted = accept_reviewed_suggestion(&independent[0].plan_id, &ignored_files()).unwrap();
+        assert_eq!(accepted.status, "ok");
+    }
+
+    #[test]
+    fn suggestion_preparation_rechecks_the_exact_destination_before_publishing() {
+        let fixture = AcceptFixture::new("suggestion_stale_destination_while_hashing");
+        let first = fixture.put("incoming-one/first.xyz");
+        let second = fixture.put("incoming-two/second.xyz");
+        index_fixture(&fixture);
+        let preparation = RunningSuggestionPreparation::start(reserve_suggestion_preparation().unwrap()).unwrap();
+        let mut chunk_checks = 0;
+        let result = prepare_suggestion_review(
+            vec![suggestion_request(&first, "Documents"), suggestion_request(&second, "Documents")],
+            false, &preparation, &ignored_files(), || {
+                chunk_checks += 1;
+                if chunk_checks == 4 {
+                    let destination = fixture.root().join("Documents");
+                    std::fs::create_dir(&destination).unwrap();
+                    std::fs::write(destination.join("first.xyz"), b"occupied").unwrap();
+                }
+                preparation.check()
+            },
+        );
+        assert!(result.unwrap_err().contains("Reviewed destination changed"));
+        assert_eq!(std::fs::read(fixture.root().join("Documents/first.xyz")).unwrap(), b"occupied");
+        assert!(first.is_file());
+        assert!(second.is_file());
+        assert!(!SUGGESTION_REVIEWS.lock().unwrap().plans.values().any(|plan| plan.preparation_id == preparation.id));
     }
 
     #[test]

@@ -71,6 +71,7 @@ export default function Suggestions() {
 
   const [createRule, setCreateRule] = useState(createRuleDefault);
   const [pending, setPending] = useState<ConfirmDialogProps | null>(null);
+  const [preparing, setPreparing] = useState<AbortController | null>(null);
   const beginPreview = usePreviewOwner();
   const pageHeading = useRef<HTMLHeadingElement>(null);
   const resultsHeading = useRef<HTMLHeadingElement>(null);
@@ -97,6 +98,7 @@ export default function Suggestions() {
     if (!captured.length || busy || loading || pending) return;
     const owner = beginPreview();
     if (!owner) return;
+    setPreparing(owner);
     try {
       const plans = await prepareSuggestions(captured, createRule, owner.signal);
       if (owner.signal.aborted) return;
@@ -118,6 +120,8 @@ export default function Suggestions() {
       });
     } catch {
       owner.abort();
+    } finally {
+      setPreparing(current => current === owner ? null : current);
     }
   };
   return (
@@ -136,6 +140,15 @@ export default function Suggestions() {
           <h1 ref={pageHeading} tabIndex={-1} className="text-base font-semibold">{t("suggestions.title")}</h1>
         </div>
         <div className="flex items-center gap-2">
+          {busy && preparing && !preparing.signal.aborted && (
+            <button
+              type="button"
+              onClick={() => preparing.abort()}
+              className="rounded-md border border-border px-2.5 py-1 text-xs font-medium hover:bg-border"
+            >
+              {t("common.cancel")}
+            </button>
+          )}
           <button
             onClick={loadSuggestions}
             disabled={loading || busy || !!preparedPlans}
