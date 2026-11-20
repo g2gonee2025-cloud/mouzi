@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useAppStore, Rule, ScheduleSettings, WatchedFolder, type PreferencesPatch } from "../store/useAppStore";
 import { invoke } from "@tauri-apps/api/core";
@@ -39,11 +39,12 @@ import {
 
 type Tab = "folders" | "rules" | "review" | "history" | "ignore" | "general" | "about";
 type GraceUnit = "seconds" | "minutes" | "hours";
+type GraceDraft = { value: string; unit: GraceUnit };
 
+const MAX_GRACE_SECONDS = 7 * 24 * 60 * 60;
 const GRACE_STEPS = [
-  0, 30, 60, 300, 900, 1800, 3600, 7200, 21600, 43200, 86400, 172800, 604800,
+  0, 30, 60, 300, 900, 1800, 3600, 7200, 21600, 43200, 86400, 172800, MAX_GRACE_SECONDS,
 ];
-const MAX_GRACE_SECONDS = 604800; // 7 days
 
 function formatDuration(seconds: number): string {
   if (seconds <= 0) return "0s";
@@ -207,9 +208,8 @@ export default function Settings() {
   const [scheduleDirty, setScheduleDirty] = useState(false);
   const [aiModel, setAiModel] = useState("");
 
-  const [graceValue, setGraceValue] = useState(300);
-  const [graceUnit, setGraceUnit] = useState<GraceUnit>("seconds");
-  const [graceError, setGraceError] = useState<string | null>(null);
+  const [graceDraft, setGraceDraft] = useState<GraceDraft | null>(null);
+  const graceInput = useRef<HTMLInputElement>(null);
 
   const [localSchedule, setLocalSchedule] = useState<ScheduleSettings>(defaultSchedule());
   const [ruleToast, setRuleToast] = useState<{ message: string; type: "success" | "error" } | null>(null);
@@ -296,17 +296,6 @@ export default function Settings() {
   };
 
   const savePreferences = (patch: PreferencesPatch) => runWrite(() => saveSettings(patch));
-
-  // Sync local grace editor with loaded settings
-  useEffect(() => {
-    if (settings) {
-      const clamped = Math.min(settings.grace_period_seconds, MAX_GRACE_SECONDS);
-      const converted = secondsToUnit(clamped);
-      setGraceValue(converted.value);
-      setGraceUnit(converted.unit);
-      setGraceError(null);
-    }
-  }, [settings?.grace_period_seconds]);
 
   // Sync local schedule editor with loaded schedule
   useEffect(() => {
@@ -410,41 +399,6 @@ export default function Settings() {
     await savePreferences({ language: lang });
   };
 
-  const saveGracePeriod = async (seconds: number) => {
-    if (await savePreferences({ grace_period_seconds: seconds })) return;
-    const committed = useAppStore.getState().settings;
-    if (!committed) return;
-    const converted = secondsToUnit(Math.min(committed.grace_period_seconds, MAX_GRACE_SECONDS));
-    setGraceValue(converted.value);
-    setGraceUnit(converted.unit);
-  };
-
-  const handleGraceSliderChange = (stepIndex: number) => {
-    if (!settings) return;
-    const seconds = GRACE_STEPS[stepIndex];
-    const converted = secondsToUnit(seconds);
-    setGraceValue(converted.value);
-    setGraceUnit(converted.unit);
-    setGraceError(null);
-    void saveGracePeriod(seconds);
-  };
-
-  const handleGraceNumberChange = (value: number, unit: GraceUnit) => {
-    if (!settings) return;
-    const nonnegative = Math.max(0, value);
-    const seconds = unitToSeconds(nonnegative, unit);
-    if (seconds > MAX_GRACE_SECONDS) {
-      setGraceError(t("settings.general.gracePeriodMaxError"));
-      setGraceValue(value);
-      setGraceUnit(unit);
-      return;
-    }
-    setGraceError(null);
-    setGraceValue(nonnegative);
-    setGraceUnit(unit);
-    void saveGracePeriod(seconds);
-  };
-
   const handleScheduleChange = (patch: Partial<ScheduleSettings>) => {
     setScheduleDirty(true);
     setLocalSchedule((prev) => {
@@ -521,16 +475,22 @@ export default function Settings() {
     }
   };
 
-  const currentGraceSeconds = useMemo(
-    () => unitToSeconds(graceValue, graceUnit),
-    [graceValue, graceUnit]
-  );
+  const committedGraceSeconds = settings?.grace_period_seconds ?? 300;
+  const committedGrace = secondsToUnit(committedGraceSeconds);
+  const graceValue = graceDraft?.value ?? String(committedGrace.value);
+  const graceUnit = graceDraft?.unit ?? committedGrace.unit;
+  const graceNumber = graceValue === "" ? NaN : Number(graceValue);
+  const graceSeconds = unitToSeconds(graceNumber, graceUnit);
+  const graceValid = Number.isSafeInteger(graceNumber) && graceSeconds >= 0 && graceSeconds <= MAX_GRACE_SECONDS;
+  const sliderIndex = GRACE_STEPS.indexOf(nearestGraceStep(graceValid ? graceSeconds : committedGraceSeconds));
+  const canSaveGrace = settings !== null && graceDraft !== null && graceValid && graceSeconds !== committedGraceSeconds;
 
-  const sliderIndex = useMemo(() => {
-    const clamped = Math.min(currentGraceSeconds, MAX_GRACE_SECONDS);
-    const nearest = nearestGraceStep(clamped);
-    return GRACE_STEPS.indexOf(nearest);
-  }, [currentGraceSeconds]);
+  const saveGracePeriod = async () => {
+    if (canSaveGrace && await savePreferences({ grace_period_seconds: graceSeconds })) {
+      setGraceDraft(null);
+      requestAnimationFrame(() => graceInput.current?.focus());
+    }
+  };
 
   return (
     <div className="flex h-full bg-surface text-text">
@@ -1088,13 +1048,16 @@ export default function Settings() {
               </div>
 
               {/* Grace Period */}
-              <div className="space-y-2">
+              <form className="space-y-2" aria-label={t("settings.general.gracePeriod")} onSubmit={(event) => {
+                event.preventDefault();
+                void saveGracePeriod();
+              }}>
                 <div className="flex items-center justify-between">
-                  <label className="text-sm font-medium text-text-muted">
+                  <span className="text-sm font-medium text-text-muted">
                     {t("settings.general.gracePeriod")}
-                  </label>
+                  </span>
                   <span className="text-xs text-text-muted">
-                    {formatDuration(currentGraceSeconds)}
+                    {graceValid && formatDuration(graceSeconds)}
                   </span>
                 </div>
                 <input
@@ -1104,26 +1067,31 @@ export default function Settings() {
                   max={GRACE_STEPS.length - 1}
                   step={1}
                   value={sliderIndex}
-                  onChange={(e) => handleGraceSliderChange(parseInt(e.target.value, 10))}
+                  aria-valuetext={formatDuration(GRACE_STEPS[sliderIndex])}
+                  onChange={(e) => {
+                    const preset = secondsToUnit(GRACE_STEPS[Number(e.target.value)]);
+                    setGraceDraft({ value: String(preset.value), unit: preset.unit });
+                  }}
                   className="w-full"
                 />
                 <div className="flex items-center gap-2">
                   <input
+                    ref={graceInput}
                     aria-label={t("settings.general.gracePeriod")}
                     type="number"
                     min={0}
+                    max={MAX_GRACE_SECONDS / unitToSeconds(1, graceUnit)}
+                    step={1}
+                    required
+                    aria-invalid={graceDraft !== null && !graceValid}
                     value={graceValue}
-                    onChange={(e) =>
-                      handleGraceNumberChange(parseInt(e.target.value, 10) || 0, graceUnit)
-                    }
+                    onChange={(e) => setGraceDraft({ value: e.target.value, unit: graceUnit })}
                     className="w-24 rounded-md border border-border bg-surface px-2 py-1.5 text-sm outline-none focus:border-primary"
                   />
                   <select
                     aria-label={t("settings.general.gracePeriodUnit")}
                     value={graceUnit}
-                    onChange={(e) =>
-                      handleGraceNumberChange(graceValue, e.target.value as GraceUnit)
-                    }
+                    onChange={(e) => setGraceDraft({ value: graceValue, unit: e.target.value as GraceUnit })}
                     className="appearance-none rounded-md border border-border bg-surface px-2 py-1.5 text-sm outline-none focus:border-primary"
                   >
                     <option value="seconds">{t("settings.general.gracePeriodSeconds")}</option>
@@ -1131,13 +1099,28 @@ export default function Settings() {
                     <option value="hours">{t("settings.general.gracePeriodHours")}</option>
                   </select>
                 </div>
-                {graceError && (
-                  <p className="text-xs text-red-500">{graceError}</p>
+                {graceSeconds > MAX_GRACE_SECONDS && (
+                  <p role="alert" className="text-xs text-red-500">{t("settings.general.gracePeriodMaxError")}</p>
                 )}
                 <p className="text-xs text-text-muted">
                   {t("settings.general.gracePeriodDesc")}
                 </p>
-              </div>
+                {graceDraft && (
+                  <div className="flex gap-2">
+                    <button type="submit" disabled={!canSaveGrace}
+                      className="rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-on-primary disabled:opacity-50">
+                      {t("common.save")}
+                    </button>
+                    <button type="button" onClick={() => {
+                      setGraceDraft(null);
+                      graceInput.current?.focus();
+                    }}
+                      className="rounded-md border border-border px-3 py-1.5 text-sm text-text">
+                      {t("common.cancel")}
+                    </button>
+                  </div>
+                )}
+              </form>
 
               {/* Lock Check */}
               <div className="flex items-center justify-between">

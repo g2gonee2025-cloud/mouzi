@@ -620,11 +620,15 @@ pub fn get_settings_cmd() -> Result<AppSettings, String> {
     get_settings().map_err(|e| e.to_string())
 }
 
+const MAX_GRACE_PERIOD_SECONDS: i64 = 7 * 24 * 60 * 60;
+
 #[tauri::command(async)]
 pub fn update_settings_cmd(app: AppHandle, settings: PreferencesPatch) -> Result<AppSettings, String> {
     if settings.theme.as_deref().is_some_and(|theme| !matches!(theme, "light" | "dark" | "system")) { return Err("Choose a supported theme".into()); }
     if settings.language.as_deref().is_some_and(|language| !matches!(language, "en" | "de" | "es" | "fr" | "it" | "ja" | "pl" | "ru" | "uk" | "vi" | "zh-CN")) { return Err("Choose a supported language".into()); }
-    if settings.grace_period_seconds.is_some_and(|seconds| !(0..=86_400).contains(&seconds)) { return Err("Grace period must be between 0 and 86400 seconds".into()); }
+    if settings.grace_period_seconds.is_some_and(|seconds| !(0..=MAX_GRACE_PERIOD_SECONDS).contains(&seconds)) {
+        return Err(format!("Grace period must be between 0 and {MAX_GRACE_PERIOD_SECONDS} seconds"));
+    }
     if settings.local_ai_model.as_deref().is_some_and(|model| model.trim().is_empty() || model.len() > 128 || model.chars().any(char::is_control)) { return Err("Choose a valid local model name".into()); }
     let committed = crate::classify::update_preferences(&settings)?;
     let _ = app.emit("settings-changed", &committed);
