@@ -360,6 +360,7 @@ fn rename_run_history_and_undo_verify_content_and_preserve_collisions() {
 #[test]
 fn only_new_and_suggest_respect_baseline_and_keep_suspicious_files_reviewable() {
     let mut f = Fixture::new();
+    assert_eq!(db::register_watched_folder(f.root.to_str().unwrap(), db::FOLDER_MODE_MANUAL, false).unwrap(), f.folder);
     let mut rule = f.rule();
     rule.extensions = vec!["*".into()];
     f.add(&rule);

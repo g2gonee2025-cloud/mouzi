@@ -987,9 +987,11 @@ pub(crate) fn set_only_new(id: i64, enabled: bool) -> Result<bool, String> {
         let root = crate::safe_fs::validate_root(Path::new(&folder.path))?;
         let configured = Path::new(&folder.path);
         let guard = crate::safe_fs::guard_directory(configured)?;
-        if crate::safe_fs::file_identity(configured)? != crate::safe_fs::file_identity(&root)? {
+        let identity = crate::safe_fs::file_identity(configured)?;
+        if identity != crate::safe_fs::file_identity(&root)? {
             return Err("Watched folder changed while preparing the new-files setting".into());
         }
+        verify_watch_identity(id, &folder.path, &identity.key(), false)?;
         paths = capture_folder_baseline(&root)?;
         Some(guard)
     } else {
@@ -2697,6 +2699,91 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         create_file_inventory_table(&conn).unwrap();
         conn
+    }
+
+    #[test]
+    fn only_new_settings_verify_saved_identity_before_capturing_files() {
+        use std::fs;
+
+        let _serial = serialise_test_db();
+        init_test_db();
+        let parent = std::env::temp_dir().join(format!("mouzi-only-new-settings-{}", crate::operations::new_run_id()));
+        fs::create_dir(&parent).unwrap();
+        struct Fixture { parent: PathBuf, registrations: Vec<i64> }
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                for &id in &self.registrations { let _ = remove_watched_folder(id); }
+                let _ = std::fs::remove_dir_all(&self.parent);
+            }
+        }
+        let mut fixture = Fixture { parent, registrations: Vec::new() };
+        let read_state = |conn: &Connection, id| {
+            let (enabled, identity): (bool, Option<String>) = conn.query_row(
+                "SELECT only_new,watch_identity FROM watched_folders WHERE id=?1", [id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            ).unwrap();
+            let mut stmt = conn.prepare("SELECT path FROM folder_baseline WHERE folder_id=?1 ORDER BY path").unwrap();
+            let baseline = stmt.query_map([id], |row| row.get::<_, String>(0)).unwrap()
+                .collect::<SqliteResult<Vec<_>>>().unwrap();
+            (enabled, identity, baseline)
+        };
+
+        let root = fixture.parent.join("watched");
+        let parked = fixture.parent.join("parked");
+        let replacement = fixture.parent.join("replacement");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("original.txt"), b"original").unwrap();
+        let id = register_watched_folder(root.to_str().unwrap(), FOLDER_MODE_MANUAL, false).unwrap();
+        fixture.registrations.push(id);
+        let registered_identity = crate::safe_fs::file_identity(&root).unwrap().key();
+        let initial = (false, Some(registered_identity.clone()), Vec::<String>::new());
+        assert_eq!(read_state(&lock_db().unwrap(), id), initial);
+
+        fs::rename(&root, &parked).unwrap();
+        assert!(set_only_new(id, true).is_err());
+        assert_eq!(read_state(&lock_db().unwrap(), id), initial);
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("different.txt"), b"replacement").unwrap();
+        assert_ne!(crate::safe_fs::file_identity(&root).unwrap().key(), registered_identity);
+        let error = set_only_new(id, true).unwrap_err();
+        assert!(error.contains("different physical folder"), "{error}");
+        assert_eq!(read_state(&lock_db().unwrap(), id), initial);
+        assert_eq!(fs::read(root.join("different.txt")).unwrap(), b"replacement");
+        assert_eq!(fs::read(parked.join("original.txt")).unwrap(), b"original");
+
+        fs::rename(&root, &replacement).unwrap();
+        fs::rename(&parked, &root).unwrap();
+        assert!(set_only_new(id, true).unwrap());
+        let baseline = fs::canonicalize(&root).unwrap().join("original.txt").to_string_lossy().into_owned();
+        let expected = (true, Some(registered_identity), vec![baseline]);
+        let database: String = lock_db().unwrap().query_row("PRAGMA database_list", [], |row| row.get(2)).unwrap();
+        let reopened = Connection::open_with_flags(database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        assert_eq!(read_state(&reopened, id), expected);
+        assert_eq!(fs::read(root.join("original.txt")).unwrap(), b"original");
+        assert_eq!(fs::read(replacement.join("different.txt")).unwrap(), b"replacement");
+
+        fs::rename(&root, &parked).unwrap();
+        assert!(!set_only_new(id, true).unwrap());
+        assert_eq!(read_state(&reopened, id), expected);
+        assert!(set_only_new(id, false).unwrap());
+        assert!(!set_only_new(id, false).unwrap());
+        assert_eq!(read_state(&reopened, id), initial);
+
+        let legacy = fixture.parent.join("legacy");
+        fs::create_dir(&legacy).unwrap();
+        fs::write(legacy.join("existing.txt"), b"legacy").unwrap();
+        let older = add_watched_folder(legacy.to_str().unwrap(), FOLDER_MODE_MANUAL).unwrap();
+        fixture.registrations.push(older);
+        let error = set_only_new(older, true).unwrap_err();
+        assert!(error.contains("older registration"), "{error}");
+        assert_eq!(read_state(&reopened, older), (false, None, Vec::<String>::new()));
+        assert_eq!(register_watched_folder(legacy.to_str().unwrap(), FOLDER_MODE_MANUAL, false).unwrap(), older);
+        assert!(set_only_new(older, true).unwrap());
+        assert!(is_organization_baseline(
+            legacy.join("existing.txt").to_str().unwrap(),
+            fs::canonicalize(&legacy).unwrap().join("existing.txt").to_str().unwrap(),
+        ).unwrap());
+        assert_eq!(fs::read(legacy.join("existing.txt")).unwrap(), b"legacy");
     }
 
     #[test]
