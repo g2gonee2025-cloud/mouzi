@@ -14,6 +14,7 @@ import Cleanup from "./pages/Cleanup";
 import Suggestions from "./pages/Suggestions";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { onAction } from "@tauri-apps/plugin-notification";
 
 function applyTheme(theme: string) {
@@ -88,13 +89,22 @@ function App() {
       Promise.all([store.loadLogs(), store.loadStats(), store.getPendingFiles()])
         .catch(console.error);
     };
+    const refreshVisibleSuggestions = async () => {
+      if (parseHash().route !== "suggestions") return;
+      const workspace = getCurrentWindow();
+      if (workspace.label !== "app" || !(await workspace.isVisible())) return;
+      if (disposed || parseHash().route !== "suggestions") return;
+      const suggestions = useSuggestionsStore.getState();
+      if (!suggestions.busy) await suggestions.loadSuggestions();
+    };
     const invalidateInventory = () => {
       if (disposed) return;
       useDashboardStore.getState().refresh().catch(console.error);
       useDashboardStore.getState().syncScanState().catch(console.error);
       useCleanupStore.getState().invalidateCandidates();
-      const suggestions = useSuggestionsStore.getState();
-      if (!suggestions.busy) suggestions.loadSuggestions().catch(console.error);
+      // Suggestion collection is process-wide. A background renderer must
+      // not replace the live workspace request while invalidating its caches.
+      void refreshVisibleSuggestions().catch(console.error);
     };
     listen("file-organized", refreshActivity).then(keepListener).catch(console.error);
     listen("mutation-completed", () => {
