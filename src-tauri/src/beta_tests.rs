@@ -81,6 +81,49 @@ impl Drop for Fixture {
 }
 
 #[test]
+fn review_selection_evidence_matches_only_unchanged_proposals() {
+    let mut fixture = Fixture::new();
+    let path = fixture.write("ordinary.txt", "first");
+    let mut rule = fixture.rule();
+    rule.id = Some(fixture.add(&rule));
+    let snapshot = || {
+        let preview = fixture.preview(&[&path]);
+        assert_eq!(preview.entries.len(), 1);
+        let entry = serde_json::to_value(&preview.entries[0]).unwrap();
+        op::discard(&preview.id);
+        assert!(entry["error"].is_null());
+        assert!(entry["selectionKey"].as_str().is_some());
+        (preview.id, entry)
+    };
+
+    let (first_plan, first) = snapshot();
+    let (next_plan, next) = snapshot();
+    assert_ne!(first_plan, next_plan);
+    assert_ne!(first["id"], next["id"]);
+    assert_eq!(first["selectionKey"], next["selectionKey"]);
+
+    let modified = fs::metadata(&path).unwrap().modified().unwrap();
+    let identity = crate::safe_fs::file_identity(&path).unwrap();
+    fs::write(&path, b"other").unwrap();
+    fs::OpenOptions::new().write(true).open(&path).unwrap().set_modified(modified).unwrap();
+    let (_, changed) = snapshot();
+    assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), modified);
+    assert_eq!(crate::safe_fs::file_identity(&path).unwrap(), identity);
+    assert_eq!(first["size"], changed["size"]);
+    assert_eq!(first["source"], changed["source"]);
+    assert_eq!(first["destination"], changed["destination"]);
+    assert_ne!(first["selectionKey"], changed["selectionKey"]);
+
+    rule.notification_message = Some("Updated receipt".into());
+    db::update_rule(&rule).unwrap();
+    let (_, edited_rule) = snapshot();
+    assert_eq!(changed["rule"], edited_rule["rule"]);
+    assert_eq!(changed["destination"], edited_rule["destination"]);
+    assert_ne!(changed["selectionKey"], edited_rule["selectionKey"]);
+    assert_eq!(fs::read(&path).unwrap(), b"other");
+}
+
+#[test]
 fn scoped_rule_conditions_and_normalized_extensions_survive_storage() {
     let mut f = Fixture::new();
     let path = f.write("invoice.txt", "12345");
