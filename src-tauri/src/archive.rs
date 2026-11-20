@@ -15,7 +15,13 @@ use zip::ZipArchive;
 pub struct ArchiveExtraction {
     pub staging_dir: PathBuf,
     pub extracted_files: usize,
-    _staging_guard: AncestorGuard,
+    staging_guard: AncestorGuard,
+}
+
+impl ArchiveExtraction {
+    pub(crate) fn staging_guard(&self) -> &AncestorGuard {
+        &self.staging_guard
+    }
 }
 
 #[derive(Debug)]
@@ -442,7 +448,7 @@ fn extract_archive_in(
             Ok(ArchiveExtraction {
                 staging_dir,
                 extracted_files,
-                _staging_guard: staging_guard,
+                staging_guard,
             })
         }
         Err(err) => {

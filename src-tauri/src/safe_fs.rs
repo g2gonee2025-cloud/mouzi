@@ -340,6 +340,10 @@ pub fn validate_root(path: &Path) -> Result<PathBuf, String> {
 }
 
 fn inspect_watched_root(path: &Path) -> Result<(PathBuf, FileIdentity), DirectoryPinError<'_>> {
+    inspect_root_with_guard(path).map(|(canonical, identity, _guard)| (canonical, identity))
+}
+
+fn inspect_root_with_guard(path: &Path) -> Result<(PathBuf, FileIdentity, AncestorGuard), DirectoryPinError<'_>> {
     if !path.is_absolute() || has_dot_component(path) {
         return Err(DirectoryPinError::Unsafe("Choose an absolute folder without dot segments".into()));
     }
@@ -355,7 +359,7 @@ fn inspect_watched_root(path: &Path) -> Result<(PathBuf, FileIdentity), Director
     if identity != file_identity(&canonical).map_err(DirectoryPinError::Unsafe)? {
         return Err(DirectoryPinError::Unsafe("Folder identity changed during validation".into()));
     }
-    Ok((canonical, identity))
+    Ok((canonical, identity, AncestorGuard { _files: guards }))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -495,8 +499,47 @@ pub fn directory_contains(directory: &Path, ancestor: &Path) -> Result<bool, Str
     Ok(pin_ancestry(directory)?.iter().any(|file| identity_from_handle(file).ok().as_ref() == Some(&identity)))
 }
 
+pub(crate) fn archive_entry_is_contained(
+    root: &Path, entry: &Path, staging_guard: &AncestorGuard,
+) -> Result<bool, String> {
+    let parent = entry.parent();
+    #[cfg(windows)]
+    if let Some(parent) = parent.filter(|parent| {
+        parent.as_os_str() == root.as_os_str()
+            && ordinary_registration(entry) && !has_dot_component(entry) && local_windows_volume(root)
+    }) {
+        if let Some(pinned_identity) = staging_guard._files.first().and_then(|file| identity_from_handle(file).ok()) {
+            // The root walk also inspects the direct child's entire parent ancestry.
+            // Bind that walk to both the import's pinned directory and the live path.
+            let (_, identity, _parent_guard) = inspect_root_with_guard(root).map_err(|error| error.to_string())?;
+            return Ok(identity == pinned_identity && file_identity(parent).is_ok_and(|current| current == identity));
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = staging_guard;
+
+    validate_root(root)?;
+    Ok(parent.is_some_and(|parent| directory_contains(parent, root).unwrap_or(false)))
+}
+
 pub(crate) fn guard_directory(path: &Path) -> Result<AncestorGuard, String> {
     Ok(AncestorGuard { _files: pin_ancestry(path)? })
+}
+
+#[cfg(windows)]
+fn local_windows_volume(path: &Path) -> bool {
+    use std::path::Prefix;
+    let drive = match path.components().next() {
+        Some(Component::Prefix(prefix)) => match prefix.kind() {
+            Prefix::Disk(drive) | Prefix::VerbatimDisk(drive) => drive,
+            _ => return false,
+        },
+        _ => return false,
+    };
+    const DRIVE_REMOVABLE: u32 = 2;
+    const DRIVE_FIXED: u32 = 3;
+    const DRIVE_RAMDISK: u32 = 6;
+    matches!(windows_fs::drive_type(drive), DRIVE_REMOVABLE | DRIVE_FIXED | DRIVE_RAMDISK)
 }
 
 #[cfg(windows)]
@@ -504,18 +547,7 @@ pub(crate) fn guarded_directory_identities(path: &Path) -> Result<(AncestorGuard
     if !path.is_absolute() || has_dot_component(path) || !ordinary_registration(path) {
         return Err("Cannot establish physical ancestry for this directory spelling".into());
     }
-    use std::path::Prefix;
-    let drive = match path.components().next() {
-        Some(Component::Prefix(prefix)) => match prefix.kind() {
-            Prefix::Disk(drive) | Prefix::VerbatimDisk(drive) => drive,
-            _ => return Err("Cannot establish complete local-volume ancestry".into()),
-        },
-        _ => return Err("Cannot establish complete local-volume ancestry".into()),
-    };
-    const DRIVE_REMOVABLE: u32 = 2;
-    const DRIVE_FIXED: u32 = 3;
-    const DRIVE_RAMDISK: u32 = 6;
-    if !matches!(windows_fs::drive_type(drive), DRIVE_REMOVABLE | DRIVE_FIXED | DRIVE_RAMDISK) {
+    if !local_windows_volume(path) {
         return Err("Cannot establish complete local-volume ancestry".into());
     }
     let files = pin_ancestry(path)?;
@@ -1502,6 +1534,44 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         root
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn direct_archive_entry_requires_the_pinned_staging_identity() {
+        let fixture = test_dir("archive-entry-parent");
+        let root = fs::canonicalize(&fixture).unwrap();
+        if !local_windows_volume(&root) {
+            fs::remove_dir_all(fixture).unwrap();
+            return;
+        }
+        let staging = root.join("staging");
+        let nested = staging.join("nested");
+        let sibling = root.join("other");
+        fs::create_dir_all(&nested).unwrap();
+        fs::create_dir(&sibling).unwrap();
+        let direct = staging.join("report.txt");
+        let nested_entry = nested.join("report.txt");
+        let sibling_entry = sibling.join("report.txt");
+        for path in [&direct, &nested_entry, &sibling_entry] {
+            fs::write(path, b"archive fixture").unwrap();
+        }
+        let staging_guard = guard_directory(&staging).unwrap();
+        let sibling_guard = guard_directory(&sibling).unwrap();
+        let listed = fs::read_dir(&staging).unwrap().find_map(|item| {
+            let item = item.unwrap();
+            (item.file_name() == "report.txt").then(|| item.path())
+        }).unwrap();
+        assert_eq!(listed.parent().unwrap().as_os_str(), staging.as_os_str());
+        let results = [
+            archive_entry_is_contained(&staging, &listed, &staging_guard),
+            archive_entry_is_contained(&staging, &listed, &sibling_guard),
+            archive_entry_is_contained(&staging, &nested_entry, &staging_guard),
+            archive_entry_is_contained(&staging, &sibling_entry, &staging_guard),
+        ];
+        drop((staging_guard, sibling_guard));
+        fs::remove_dir_all(fixture).unwrap();
+        assert_eq!(results, [Ok(true), Ok(false), Ok(true), Ok(false)]);
     }
 
     fn registered_root(id: i64, path: &Path, mode: &str) -> crate::db::WatchedFolder {
