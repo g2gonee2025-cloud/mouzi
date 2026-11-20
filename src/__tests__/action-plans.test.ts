@@ -46,6 +46,10 @@ it("discards a late finder and refuses a preview invalidated during preparation"
   useCleanupStore.getState().invalidateCandidates(); pending.resolve(cleanupPlan);
   await rejection;
   expect(useCleanupStore.getState().preparedPlan).toBeNull();
+  expect(useCleanupStore.getState().largeFiles).toEqual({ minBytes: 20, files: [row("current")] });
+  expect(useCleanupStore.getState().unavailableRoots.largeFiles).toEqual(["W:/current"]);
+  useCleanupStore.getState().invalidateCandidates();
+  expect(useCleanupStore.getState().largeFiles).toBeNull();
   expect(useCleanupStore.getState().unavailableRoots).toEqual({});
 });
 

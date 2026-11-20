@@ -149,9 +149,9 @@ export const useCleanupStore = create<CleanupState>((set, get) => {
     invalidateCandidates: () => {
       ++candidatesGeneration;
       ++historyGeneration;
-      // Completion can arrive before the command result. Keep these candidates
-      // until per-file outcomes identify failed items that can be retried.
-      if (get().busy) set({ unavailableRoots: {}, loading: false, history: null, historyLoading: false });
+      // Completion can arrive before the command result. Keep the candidates
+      // and their coverage together until per-file outcomes identify retryable items.
+      if (get().busy) set({ loading: false, history: null, historyLoading: false });
       else {
         preview.clear();
         set({ ...emptyCandidates, unavailableRoots: {}, preparedPlan: null, loading: false, history: null, historyLoading: false });
