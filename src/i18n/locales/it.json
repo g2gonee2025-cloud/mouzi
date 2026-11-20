@@ -436,8 +436,8 @@
     "ruleCount": "Nuove regole: {{count}}",
     "planChanged": "Il file o le impostazioni sono cambiati. Esamina un nuovo piano.",
     "alreadyFiled": "Già archiviato; categoria salvata",
-    "localAiModelMissing": "Il modello selezionato manca in Ollama. Installalo o scegli un modello installato in Impostazioni → Generale, quindi aggiorna i suggerimenti.",
-    "localAiUnreachable": "Ollama non è raggiungibile. Avvia Ollama, quindi aggiorna i suggerimenti."
+    "localAiModelMissing": "Il modello selezionato manca in Ollama. Installalo o scegli un modello installato in Impostazioni → Generale. Se il messaggio rimane dopo l’aggiornamento, aggiorna di nuovo i suggerimenti tra un minuto.",
+    "localAiUnreachable": "Ollama non è raggiungibile. Avvia Ollama e aggiorna i suggerimenti. Se il messaggio rimane, riprova tra un minuto."
   },
   "confirm": {
     "impactItems": "{{count}} elemento",

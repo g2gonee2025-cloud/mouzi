@@ -436,8 +436,8 @@
     "ruleCount": "新しいルール: {{count}}",
     "planChanged": "ファイルまたは設定が変更されました。新しい計画を確認してください。",
     "alreadyFiled": "分類済み・カテゴリーを保存しました",
-    "localAiModelMissing": "選択したモデルが Ollama にありません。モデルをインストールするか、設定 → 一般でインストール済みのモデルを選んでから、提案を更新してください。",
-    "localAiUnreachable": "Ollama に接続できません。Ollama を起動してから、提案を更新してください。"
+    "localAiModelMissing": "選択したモデルが Ollama にありません。モデルをインストールするか、設定 → 一般でインストール済みのモデルを選んでください。提案を更新してもメッセージが消えない場合は、1 分後にもう一度更新してください。",
+    "localAiUnreachable": "Ollama に接続できません。Ollama を起動して提案を更新してください。メッセージが消えない場合は、1 分後にもう一度更新してください。"
   },
   "confirm": {
     "impactItems": "{{count}} 件",

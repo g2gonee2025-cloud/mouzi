@@ -436,8 +436,8 @@
     "ruleCount": "Nowe reguły: {{count}}",
     "planChanged": "Plik lub ustawienia uległy zmianie. Przejrzyj nowy plan.",
     "alreadyFiled": "Już uporządkowano; zapisano kategorię",
-    "localAiModelMissing": "W Ollama brakuje wybranego modelu. Zainstaluj go lub wybierz zainstalowany model w sekcji Ustawienia → Ogólne, a następnie odśwież sugestie.",
-    "localAiUnreachable": "Nie można połączyć się z Ollama. Uruchom Ollama, a następnie odśwież sugestie."
+    "localAiModelMissing": "W Ollama brakuje wybranego modelu. Zainstaluj go lub wybierz zainstalowany model w sekcji Ustawienia → Ogólne. Jeśli po odświeżeniu komunikat nadal się wyświetla, odśwież sugestie ponownie za minutę.",
+    "localAiUnreachable": "Nie można połączyć się z Ollama. Uruchom Ollama i odśwież sugestie. Jeśli komunikat nadal się wyświetla, odśwież je ponownie za minutę."
   },
   "confirm": {
     "impactItems": "{{count}} element",

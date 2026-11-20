@@ -436,8 +436,8 @@
     "ruleCount": "New rules: {{count}}",
     "planChanged": "The file or settings changed. Review a new plan.",
     "alreadyFiled": "Already filed; category saved",
-    "localAiModelMissing": "Ollama is missing the selected model. Install it or choose an installed model under Settings → General, then refresh.",
-    "localAiUnreachable": "Ollama is unreachable. Start Ollama, then refresh."
+    "localAiModelMissing": "Ollama is missing the selected model. Install it or choose an installed model under Settings → General. If a refresh still shows this message, refresh again in a minute.",
+    "localAiUnreachable": "Ollama is unreachable. Start Ollama and refresh. If the message persists, refresh again in a minute."
   },
   "confirm": {
     "impactItems": "{{count}} item",

@@ -436,8 +436,8 @@
     "ruleCount": "Reglas nuevas: {{count}}",
     "planChanged": "El archivo o la configuración ha cambiado. Revisa un plan nuevo.",
     "alreadyFiled": "Ya archivado; categoría guardada",
-    "localAiModelMissing": "Falta el modelo seleccionado en Ollama. Instálalo o elige un modelo instalado en Configuración → General y luego actualiza las sugerencias.",
-    "localAiUnreachable": "No se puede conectar con Ollama. Inicia Ollama y luego actualiza las sugerencias."
+    "localAiModelMissing": "Falta el modelo seleccionado en Ollama. Instálalo o elige un modelo instalado en Configuración → General. Si el aviso sigue apareciendo al actualizar las sugerencias, vuelve a actualizarlas en un minuto.",
+    "localAiUnreachable": "No se puede conectar con Ollama. Inicia Ollama y actualiza las sugerencias. Si el aviso sigue apareciendo, vuelve a actualizarlas en un minuto."
   },
   "confirm": {
     "impactItems": "{{count}} elemento",
