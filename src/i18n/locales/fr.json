@@ -350,7 +350,10 @@
     "rootStale": "L’analyse précédente est obsolète",
     "rootFailed": "Échec de l’analyse",
     "rootLastScan": "Dernière analyse : {{date}}",
-    "scanFailed": "L’analyse ne s’est pas terminée correctement."
+    "scanFailed": "L’analyse ne s’est pas terminée correctement.",
+    "scanFailedRoots": "Dossiers surveillés dont l’analyse a échoué",
+    "scanRetainedSnapshot": "Affichage de la dernière analyse terminée pour ce dossier.",
+    "scanNoSnapshot": "Aucune analyse de ce dossier n’a abouti."
   },
   "cleanup": {
     "title": "Nettoyage intelligent",

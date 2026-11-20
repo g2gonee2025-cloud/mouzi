@@ -107,6 +107,7 @@ const EMPTY_INSIGHTS: DashboardInsights = {
 
 interface DashboardState {
   stats: DashboardStats | null;
+  statsReadRevision: number;
   weeklyStats: WeeklyStat[];
   isScanning: boolean;
   scanProgress: ScanProgress | null;
@@ -146,6 +147,7 @@ let scanStateRevision = 0;
 
 export const useDashboardStore = create<DashboardState>((set, get) => ({
   stats: null,
+  statsReadRevision: 0,
   weeklyStats: [],
   isScanning: false,
   scanProgress: null,
@@ -167,12 +169,13 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
       if (request === statsRequest) {
         set((state) => ({
           stats,
+          statsReadRevision: request,
           isLoading: false,
           scanReason: state.scanReason === "no_roots" ? null : state.scanReason,
         }));
       }
     } catch (e) {
-      if (request === statsRequest) set({ error: String(e), isLoading: false });
+      if (request === statsRequest) set({ statsReadRevision: request, error: String(e), isLoading: false });
     }
   },
 
@@ -262,6 +265,14 @@ export async function subscribeDashboardEvents(signal?: AbortSignal): Promise<()
   signal?.addEventListener("abort", dispose, { once: true });
   if (signal?.aborted) dispose();
 
+  const refreshSoon = () => {
+    if (refreshTimer) clearTimeout(refreshTimer);
+    refreshTimer = setTimeout(() => {
+      refreshTimer = null;
+      void useDashboardStore.getState().refresh();
+    }, 200);
+  };
+
   const register = async <T,>(name: string, handler: (payload: T) => void) => {
     if (disposed) return;
     const unlisten = await listen<T>(name, (event) => {
@@ -290,9 +301,14 @@ export async function subscribeDashboardEvents(signal?: AbortSignal): Promise<()
       ++scanStateRevision;
       useDashboardStore.setState({
         scanRunId: completed.runId,
+        ...(state.scanRunId !== completed.runId ? { scanStatus: null, scanErrors: [] } : {}),
         completedRoots: [...(state.scanRunId === completed.runId ? state.completedRoots : [])
           .filter((root) => root.root !== completed.root), completed],
       });
+      if (completed.status === "failed" ||
+          state.stats?.watchedRoots.some((root) => root.path === completed.root && root.status === "failed")) {
+        refreshSoon();
+      }
     });
     await register<ScanFinished>("scan-finished", (finished) => {
       const state = useDashboardStore.getState();
@@ -303,15 +319,12 @@ export async function subscribeDashboardEvents(signal?: AbortSignal): Promise<()
         isScanning: false,
         scanProgress: null,
         scanRunId: finished.runId,
+        ...(state.scanRunId !== finished.runId ? { completedRoots: [] } : {}),
         lastFinishedRunId: finished.runId,
         scanStatus: finished.status,
         scanErrors: finished.errors,
       });
-      if (refreshTimer) clearTimeout(refreshTimer);
-      refreshTimer = setTimeout(() => {
-        refreshTimer = null;
-        void useDashboardStore.getState().refresh();
-      }, 200);
+      refreshSoon();
     });
     return dispose;
   } catch (error) {

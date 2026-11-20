@@ -350,7 +350,10 @@
     "rootStale": "Previous scan is stale",
     "rootFailed": "Scan failed",
     "rootLastScan": "Last scan: {{date}}",
-    "scanFailed": "The scan did not finish successfully."
+    "scanFailed": "The scan did not finish successfully.",
+    "scanFailedRoots": "Watched folders with scan errors",
+    "scanRetainedSnapshot": "Showing the last completed scan for this folder.",
+    "scanNoSnapshot": "There is no completed scan for this folder."
   },
   "cleanup": {
     "title": "Smart Cleanup",

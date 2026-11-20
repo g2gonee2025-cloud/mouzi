@@ -350,7 +350,10 @@
     "rootStale": "Poprzedni skan jest nieaktualny",
     "rootFailed": "Skan nie powiódł się",
     "rootLastScan": "Ostatni skan: {{date}}",
-    "scanFailed": "Skanowanie nie zakończyło się pomyślnie."
+    "scanFailed": "Skanowanie nie zakończyło się pomyślnie.",
+    "scanFailedRoots": "Obserwowane foldery z błędami skanowania",
+    "scanRetainedSnapshot": "Wyświetlane są wyniki ostatniego ukończonego skanowania tego folderu.",
+    "scanNoSnapshot": "Nie ukończono jeszcze skanowania tego folderu."
   },
   "cleanup": {
     "title": "Inteligentne sprzątanie",

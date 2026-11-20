@@ -350,7 +350,10 @@
     "rootStale": "扫描结果已过时",
     "rootFailed": "扫描失败",
     "rootLastScan": "上次扫描：{{date}}",
-    "scanFailed": "扫描未成功完成。"
+    "scanFailed": "扫描未成功完成。",
+    "scanFailedRoots": "扫描出错的监控文件夹",
+    "scanRetainedSnapshot": "正在显示此文件夹上次完成的扫描结果。",
+    "scanNoSnapshot": "此文件夹尚无已完成的扫描。"
   },
   "cleanup": {
     "title": "智能清理",

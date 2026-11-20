@@ -350,7 +350,10 @@
     "rootStale": "Vorheriger Scan ist veraltet",
     "rootFailed": "Scan fehlgeschlagen",
     "rootLastScan": "Letzter Scan: {{date}}",
-    "scanFailed": "Der Scan wurde nicht erfolgreich abgeschlossen."
+    "scanFailed": "Der Scan wurde nicht erfolgreich abgeschlossen.",
+    "scanFailedRoots": "Überwachte Ordner mit Scanfehlern",
+    "scanRetainedSnapshot": "Der letzte abgeschlossene Scan dieses Ordners wird angezeigt.",
+    "scanNoSnapshot": "Für diesen Ordner liegt kein abgeschlossener Scan vor."
   },
   "cleanup": {
     "title": "Intelligente Bereinigung",

@@ -350,7 +350,10 @@
     "rootStale": "前回のスキャンは古くなっています",
     "rootFailed": "スキャンに失敗しました",
     "rootLastScan": "前回のスキャン: {{date}}",
-    "scanFailed": "スキャンは正常に完了しませんでした。"
+    "scanFailed": "スキャンは正常に完了しませんでした。",
+    "scanFailedRoots": "スキャンエラーが発生した監視フォルダー",
+    "scanRetainedSnapshot": "このフォルダーの前回完了したスキャン結果を表示しています。",
+    "scanNoSnapshot": "このフォルダーには完了したスキャンがありません。"
   },
   "cleanup": {
     "title": "スマートクリーンアップ",

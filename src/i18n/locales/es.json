@@ -350,7 +350,10 @@
     "rootStale": "El análisis anterior está desactualizado",
     "rootFailed": "Error de análisis",
     "rootLastScan": "Último análisis: {{date}}",
-    "scanFailed": "El análisis no se completó correctamente."
+    "scanFailed": "El análisis no se completó correctamente.",
+    "scanFailedRoots": "Carpetas supervisadas con errores de escaneo",
+    "scanRetainedSnapshot": "Se muestra el último escaneo completado de esta carpeta.",
+    "scanNoSnapshot": "No hay ningún escaneo completado para esta carpeta."
   },
   "cleanup": {
     "title": "Limpieza inteligente",

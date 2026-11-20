@@ -33,17 +33,19 @@ interface DashboardProps {
 export default function Dashboard({ view, setView }: DashboardProps) {
   const { t } = useTranslation();
   const {
-    stats,
+    stats: cachedStats,
+    statsReadRevision,
     weeklyStats,
     isLoading,
     isScanning,
     scanProgress,
     completedRoots,
     rootCount,
-    error,
+    error: cachedError,
     scanReason,
     scanErrors,
     scanStatus,
+    lastFinishedRunId,
     startScan,
     refresh,
     syncScanState,
@@ -53,6 +55,10 @@ export default function Dashboard({ view, setView }: DashboardProps) {
   const [scanListenersReady, setScanListenersReady] = useState(false);
   const [scanListenerError, setScanListenerError] = useState<string | null>(null);
   const [scanListenerAttempt, setScanListenerAttempt] = useState(0);
+  const [entry] = useState({ statsReadRevision, lastFinishedRunId });
+  const hasReadStats = statsReadRevision !== entry.statsReadRevision;
+  const stats = hasReadStats ? cachedStats : null;
+  const error = hasReadStats ? cachedError : null;
 
   useEffect(() => {
     const controller = new AbortController();
@@ -113,7 +119,14 @@ export default function Dashboard({ view, setView }: DashboardProps) {
 
   const hasRoots = Boolean(stats?.watchedRoots.length);
   const canScan = Boolean(stats && stats.scanEligibleRoots > 0 && scanReason !== "no_roots");
-  const scanFailed = scanStatus === "failed";
+  const failedRoots = stats?.watchedRoots.filter((item) => item.status === "failed") ?? [];
+  const scanFailed = scanStatus === "failed" && lastFinishedRunId !== entry.lastFinishedRunId;
+  const failedPaths = new Set(failedRoots.map(({ path }) => path));
+  const reportedRootErrors = new Set([
+    ...failedRoots.map(({ error }) => error),
+    ...completedRoots.filter((item) => item.status === "failed" && failedPaths.has(item.root)).map(({ error }) => error),
+  ]);
+  const remainingScanErrors = scanFailed ? scanErrors.filter((message) => !reportedRootErrors.has(message)) : [];
 
   return (
     <div className="h-full flex flex-col bg-surface text-text">
@@ -188,10 +201,24 @@ export default function Dashboard({ view, setView }: DashboardProps) {
             {error}
           </div>
         )}
-        {scanFailed && (
+        {scanFailed && (remainingScanErrors.length > 0 || failedRoots.length === 0) && (
           <div role="alert" className="rounded-lg border border-red-200 dark:border-red-800 px-4 py-3 text-sm text-red-700 dark:text-red-400">
             <p>{t("dashboard.scanFailed")}</p>
-            {scanErrors.map((message, index) => <p key={index} className="mt-1">{message}</p>)}
+            {remainingScanErrors.map((message, index) => <p key={index} className="mt-1 break-words">{message}</p>)}
+          </div>
+        )}
+        {failedRoots.length > 0 && (
+          <div role="alert" className="rounded-lg border border-red-200 dark:border-red-800 px-4 py-3 text-sm text-red-700 dark:text-red-400">
+            <p className="font-medium">{t("dashboard.scanFailedRoots")}</p>
+            <ul className="mt-2 space-y-2">
+              {failedRoots.map((item) => (
+                <li key={item.path} className="break-words">
+                  <p className="font-medium [overflow-wrap:anywhere]">{item.path}</p>
+                  <p>{t(item.lastScanAt === null ? "dashboard.scanNoSnapshot" : "dashboard.scanRetainedSnapshot")}</p>
+                  {item.error && <p>{item.error}</p>}
+                </li>
+              ))}
+            </ul>
           </div>
         )}
         {hasRoots && !canScan && !isScanning && (

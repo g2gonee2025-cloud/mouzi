@@ -350,7 +350,10 @@
     "rootStale": "La scansione precedente è obsoleta",
     "rootFailed": "Scansione non riuscita",
     "rootLastScan": "Ultima scansione: {{date}}",
-    "scanFailed": "La scansione non è terminata correttamente."
+    "scanFailed": "La scansione non è terminata correttamente.",
+    "scanFailedRoots": "Cartelle monitorate con errori di scansione",
+    "scanRetainedSnapshot": "Viene mostrata l’ultima scansione completata per questa cartella.",
+    "scanNoSnapshot": "Nessuna scansione è stata completata per questa cartella."
   },
   "cleanup": {
     "title": "Pulizia intelligente",

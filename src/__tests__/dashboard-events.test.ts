@@ -118,6 +118,47 @@ describe("dashboard scan lifecycle", () => {
     await dashboard.useDashboardStore.getState().loadStats();
     expect(dashboard.useDashboardStore.getState().stats?.scanEligibleRoots).toBe(1);
   });
+
+  it("refreshes root health before the whole run ends when a failed root recovers", async () => {
+    const dispose = await dashboard.subscribeDashboardEvents();
+    const path = "C:/first";
+    const failed = { path, files: 0, bytes: 0, status: "failed", stale: true, lastScanAt: 1, error: "Unavailable" };
+    mocks.invoke.mockImplementation(async (name) => name === "get_stats_cmd" ? [] : {
+      watchedRoots: [{ ...failed, status: "complete", stale: false, error: null }],
+    });
+    dashboard.useDashboardStore.setState({
+      stats: { watchedRoots: [failed] } as DashboardStats,
+    });
+    const runId = "19000000000000000007";
+    emit("scan-progress", { runId, root: path, processed: 0, rootCount: 2 });
+    emit("scan-complete", { runId, root: path, status: "complete", error: null });
+    emit("scan-progress", { runId, root: "C:/second", processed: 0, rootCount: 2 });
+    await vi.advanceTimersByTimeAsync(200);
+    expect(mocks.invoke.mock.calls.filter(([name]) => name === "get_dashboard_stats_cmd")).toHaveLength(1);
+    expect(dashboard.useDashboardStore.getState()).toMatchObject({
+      isScanning: true,
+      stats: { watchedRoots: [{ path, status: "complete", stale: false, error: null }] },
+    });
+    dispose();
+  });
+
+  it("does not settle a newer dashboard read with an older failed-root snapshot", async () => {
+    const store = dashboard.useDashboardStore;
+    let finishOlder!: (stats: { watchedRoots: { status: string }[] }) => void;
+    mocks.invoke.mockImplementationOnce(() => new Promise((resolve) => { finishOlder = resolve; }))
+      .mockResolvedValueOnce({ watchedRoots: [{ status: "complete" }] });
+    const older = store.getState().loadStats();
+    await store.getState().loadStats();
+    const revision = store.getState().statsReadRevision;
+    finishOlder({ watchedRoots: [{ status: "failed" }] });
+    await older;
+    expect(revision).toBeGreaterThan(0);
+    expect(store.getState()).toMatchObject({
+      statsReadRevision: revision,
+      isLoading: false,
+      stats: { watchedRoots: [{ status: "complete" }] },
+    });
+  });
 });
 
 describe("dashboard subscription ownership", () => {

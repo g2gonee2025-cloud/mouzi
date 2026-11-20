@@ -356,7 +356,10 @@
     "rootStale": "Lần quét trước đã cũ",
     "rootFailed": "Quét thất bại",
     "rootLastScan": "Lần quét cuối: {{date}}",
-    "scanFailed": "Quá trình quét không hoàn tất thành công."
+    "scanFailed": "Quá trình quét không hoàn tất thành công.",
+    "scanFailedRoots": "Thư mục đang theo dõi gặp lỗi khi quét",
+    "scanRetainedSnapshot": "Đang hiển thị kết quả lần quét hoàn tất gần nhất của thư mục này.",
+    "scanNoSnapshot": "Thư mục này chưa có lần quét nào hoàn tất."
   },
   "cleanup": {
     "title": "Dọn dẹp thông minh",

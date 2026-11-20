@@ -1,5 +1,5 @@
-import { describe, expect, it, vi } from "vitest";
-import { Children, isValidElement, type ReactNode } from "react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { Children, isValidElement, type EffectCallback, type ReactNode } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import Dashboard from "../pages/Dashboard";
 import FileBrowser from "../components/dashboard/FileBrowser";
@@ -11,9 +11,37 @@ import en from "../i18n/locales/en.json";
 import { DEFAULT_DASHBOARD_VIEW } from "../utils/dashboard";
 import { formatTimestamp } from "../utils/format";
 
-const revealItemInDir = vi.hoisted(() => vi.fn());
-vi.mock("@tauri-apps/plugin-opener", () => ({ revealItemInDir }));
-vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
+const mock = vi.hoisted(() => ({
+  revealItemInDir: vi.fn(),
+  invoke: vi.fn(),
+  listen: vi.fn(),
+  renderingDashboard: false,
+  state: [] as unknown[],
+  cursor: 0,
+  effects: [] as EffectCallback[],
+}));
+vi.mock("@tauri-apps/plugin-opener", () => ({ revealItemInDir: mock.revealItemInDir }));
+vi.mock("@tauri-apps/api/core", () => ({ invoke: mock.invoke }));
+vi.mock("@tauri-apps/api/event", () => ({ listen: mock.listen }));
+vi.mock("react", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("react")>();
+  return {
+    ...actual,
+    useEffect: (effect: EffectCallback, dependencies?: readonly unknown[]) => {
+      if (mock.renderingDashboard) mock.effects.push(effect);
+      else actual.useEffect(effect, dependencies);
+    },
+    useState: (initial: unknown) => {
+      if (!mock.renderingDashboard) return actual.useState(initial);
+      const index = mock.cursor++;
+      if (!(index in mock.state)) mock.state[index] = initial;
+      return [
+        mock.state[index],
+        (next: unknown) => { mock.state[index] = typeof next === "function" ? next(mock.state[index]) : next; },
+      ];
+    },
+  };
+});
 
 vi.mock("react-i18next", () => ({
   useTranslation: () => ({
@@ -37,27 +65,57 @@ const root: RootStat = {
   path: "C:/empty-work", files: 0, bytes: 0, status: "complete", stale: false, lastScanAt: 1, error: null,
 };
 
-function renderDashboard(
+function dashboardStats(
   watchedRoots: RootStat[],
-  view = DEFAULT_DASHBOARD_VIEW,
   scanEligibleRoots = watchedRoots.length,
   largestFiles: InventoryFile[] = [],
-) {
+): DashboardStats {
   const totalFiles = watchedRoots.reduce((total, root) => total + root.files, 0);
   const totalBytes = watchedRoots.reduce((total, root) => total + root.bytes, 0);
-  const stats: DashboardStats = {
+  return {
     revision: 1, totalFiles, totalBytes,
     categoryBreakdown: totalFiles ? [{ category: "Other", files: totalFiles, bytes: totalBytes }] : [],
     largestFiles, recentFiles: [], watchedRoots, lastScanAt: null,
     insights: EMPTY_INSIGHTS, ageBuckets: [], scanEligibleRoots,
   };
-  useDashboardStore.setState({ stats });
-  try {
-    return renderToStaticMarkup(<Dashboard view={view} setView={vi.fn()} />);
-  } finally {
-    useDashboardStore.setState({ stats: null });
-  }
 }
+
+function mountedDashboard(view = DEFAULT_DASHBOARD_VIEW) {
+  function CaptureDashboard() {
+    mock.cursor = 0;
+    mock.renderingDashboard = true;
+    try {
+      return Dashboard({ view, setView: vi.fn() });
+    } finally {
+      mock.renderingDashboard = false;
+    }
+  }
+  const html = renderToStaticMarkup(<CaptureDashboard />);
+  return { html, effects: mock.effects.splice(0) };
+}
+
+function renderDashboard(
+  watchedRoots: RootStat[],
+  view = DEFAULT_DASHBOARD_VIEW,
+  scanEligibleRoots = watchedRoots.length,
+  largestFiles: InventoryFile[] = [],
+  previousRun?: { lastFinishedRunId: string; scanStatus: "failed"; scanErrors: string[] },
+) {
+  mock.state.length = 0;
+  useDashboardStore.setState({ stats: null, ...previousRun });
+  mountedDashboard(view);
+  useDashboardStore.setState({ stats: dashboardStats(watchedRoots, scanEligibleRoots, largestFiles), statsReadRevision: useDashboardStore.getState().statsReadRevision + 1 });
+  return mountedDashboard(view).html;
+}
+
+beforeEach(() => {
+  useDashboardStore.setState(useDashboardStore.getInitialState(), true);
+  mock.state.length = 0;
+  mock.invoke.mockReset();
+  mock.listen.mockReset();
+});
+
+afterEach(() => vi.unstubAllGlobals());
 
 describe("dashboard entry points", () => {
   it("guides a user with no watched folders to Settings", () => {
@@ -73,6 +131,89 @@ describe("dashboard entry points", () => {
     expect(html.indexOf('role="search"')).toBeLessThan(html.indexOf("dashboard.watchedRoots"));
     expect(html).toContain("dashboard.noIndexedFiles");
     expect(html).not.toContain("dashboard.noFiles");
+  });
+
+  it("warns above retained rows when reopening after a root failed outside the dashboard", () => {
+    const retained = { path: `${root.path}/retained.txt`, rootPath: root.path, size: 100, mtime: 1, category: "Other" };
+    const failed = { ...root, status: "failed" as const, stale: true, files: 1, bytes: 100, error: "Folder is unavailable" };
+    const firstFailure = { ...failed, path: "C:/first-scan", files: 0, bytes: 0, lastScanAt: null, error: "Folder could not be read" };
+    const html = renderDashboard([failed, firstFailure], DEFAULT_DASHBOARD_VIEW, 2, [retained]);
+    const warning = html.match(/<div role="alert"[^>]*>[\s\S]*?<\/ul><\/div>/)?.[0];
+    expect(warning).toContain("dashboard.scanFailedRoots");
+    expect(warning).toContain(failed.path);
+    expect(warning).toContain(firstFailure.path);
+    expect(warning).toContain("dashboard.scanRetainedSnapshot");
+    expect(warning).toContain("dashboard.scanNoSnapshot");
+    expect(warning).toContain(failed.error);
+    expect(warning).toContain(firstFailure.error);
+    expect(html.indexOf(failed.error)).toBeLessThan(html.indexOf('role="search"'));
+    expect(html).toContain(retained.path);
+    expect(html.match(/Folder is unavailable/g)).toHaveLength(1);
+    expect(renderDashboard([root])).not.toContain("dashboard.scanFailedRoots");
+  });
+
+  it("does not show a retained terminal event as a current error on a fresh mount", () => {
+    const html = renderDashboard([root], DEFAULT_DASHBOARD_VIEW, 1, [], {
+      lastFinishedRunId: "19000000000000000001", scanStatus: "failed", scanErrors: ["Expired worker error"],
+    });
+    expect(html).not.toContain("Expired worker error");
+  });
+
+  it("rechecks cached inventory on entry, preserves a live worker error, and clears a root warning after recovery", async () => {
+    vi.stubGlobal("window", new EventTarget());
+    const listeners = new Map<string, (event: { payload: unknown }) => void>();
+    mock.listen.mockImplementation(async (name: string, onEvent: (event: { payload: unknown }) => void) => {
+      listeners.set(name, onEvent);
+      return () => { listeners.delete(name); };
+    });
+    function publish(name: string, payload: unknown) {
+      listeners.get(name)?.({ payload });
+    }
+    const settle = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+    const retained = { path: `${root.path}/prior.txt`, rootPath: root.path, size: 100, mtime: 1, category: "Other" };
+    const cached = dashboardStats([{ ...root, files: 1, bytes: 100 }], 1, [retained]);
+    const failed = dashboardStats([{ ...cached.watchedRoots[0], status: "failed", stale: true, error: "Folder unreachable" }], 1, [retained]);
+    const recovered = dashboardStats([root]);
+    let finishRead!: (stats: DashboardStats) => void;
+    let read = new Promise<DashboardStats>((resolve) => { finishRead = resolve; });
+    mock.invoke.mockImplementation(async (name: string) => {
+      if (name === "get_dashboard_stats_cmd") return read;
+      if (name === "get_stats_cmd") return [];
+      if (name === "is_scanning_cmd") return false;
+      throw new Error(`Unexpected command: ${name}`);
+    });
+    useDashboardStore.setState({ stats: cached });
+    const initial = mountedDashboard();
+    expect(initial.html).not.toContain(retained.path);
+    expect(initial.html).toContain("app.loading");
+    const cleanups = initial.effects.map((effect) => effect());
+    try {
+      await settle();
+      finishRead(failed);
+      await settle();
+      expect(mountedDashboard().html).toContain("Folder unreachable");
+      expect(mountedDashboard().html).toContain(retained.path);
+
+      const runId = "19000000000000000002";
+      publish("scan-complete", { runId, root: root.path, status: "failed", error: "Folder unreachable" });
+      publish("scan-finished", { runId, status: "failed", errors: ["Folder unreachable", "Worker stopped unexpectedly"] });
+      const live = mountedDashboard().html;
+      expect(live).toContain("Worker stopped unexpectedly");
+      expect(live.match(/Folder unreachable/g)).toHaveLength(1);
+
+      const nextRunId = "19000000000000000003";
+      publish("scan-complete", { runId: nextRunId, root: root.path, status: "complete", error: null });
+      publish("scan-finished", { runId: nextRunId, status: "finished", errors: [] });
+      read = Promise.resolve(recovered);
+      await useDashboardStore.getState().refresh();
+      publish("scan-finished", { runId, status: "failed", errors: ["Worker stopped unexpectedly"] });
+      const updated = mountedDashboard().html;
+      expect(updated).not.toContain("dashboard.scanFailedRoots");
+      expect(updated).not.toContain("Worker stopped unexpectedly");
+      expect(updated).not.toContain(retained.path);
+    } finally {
+      for (const cleanup of cleanups) cleanup?.();
+    }
   });
 
   it("renders Scan Now disabled before the scan listeners connect", () => {
@@ -121,7 +262,7 @@ describe("dashboard entry points", () => {
     renderToStaticMarkup(<CaptureBrowser />);
     expect(reveal).toBeTypeOf("function");
     await reveal!();
-    expect(revealItemInDir).toHaveBeenCalledExactlyOnceWith(path);
+    expect(mock.revealItemInDir).toHaveBeenCalledExactlyOnceWith(path);
   });
 
   it("renders supplied view options and excludes a root missing from the current scope", () => {
@@ -147,7 +288,7 @@ describe("dashboard search translations", () => {
   it("includes search guidance and preserves placeholders across all shipped locales", () => {
     expect(locales).toHaveProperty(["../i18n/locales/zh-CN.json"]);
     for (const { dashboard } of Object.values(locales)) {
-      for (const key of ["searchFiles", "noIndexedFiles", "refreshingFiles", "scanConnectionFailed", "scanInactiveRoots"]) {
+      for (const key of ["searchFiles", "noIndexedFiles", "refreshingFiles", "scanConnectionFailed", "scanInactiveRoots", "scanFailedRoots", "scanRetainedSnapshot", "scanNoSnapshot"]) {
         expect(dashboard[key]?.trim()).toBeTruthy();
       }
       expect(dashboard.filesShown).toContain("{{shown}}");
@@ -168,16 +309,19 @@ describe("configured root presentation", () => {
   });
 
   it("distinguishes an unscanned root from an empty completed scan", () => {
-    const html = renderToStaticMarkup(<StorageTreemap data={[{ ...root, status: "unscanned", lastScanAt: null }]} totalBytes={0} />);
+    const html = renderToStaticMarkup(<StorageTreemap data={[{ ...root, status: "unscanned", stale: true, lastScanAt: null }]} totalBytes={0} />);
     expect(html).toContain("dashboard.rootPending");
+    expect(html).not.toContain("dashboard.rootStale");
     expect(html).not.toContain(en.dashboard.rootLastScan.split("{{date}}")[0]);
   });
 
-  it("shows retained stale snapshot health and the failure", () => {
-    const html = renderToStaticMarkup(<StorageTreemap data={[{ ...root, status: "failed", stale: true, error: "Access denied" }]} totalBytes={0} />);
+  it("marks a failed empty snapshot stale only if a prior scan completed", () => {
+    const failed = { ...root, status: "failed" as const, stale: true };
+    const html = renderToStaticMarkup(<StorageTreemap data={[failed]} totalBytes={0} />);
     expect(html).toContain("dashboard.rootStale");
     expect(html).toContain("dashboard.rootFailed");
-    expect(html).toContain("Access denied");
+    expect(renderToStaticMarkup(<StorageTreemap data={[{ ...failed, lastScanAt: null }]} totalBytes={0} />))
+      .not.toContain("dashboard.rootStale");
   });
 
   it("localizes canonical categories while retaining arbitrary rule labels", () => {
