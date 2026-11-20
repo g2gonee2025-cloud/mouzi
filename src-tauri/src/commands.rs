@@ -982,13 +982,13 @@ struct RuleTransferDocument {
     rules: Vec<RuleTransferEntry>,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct RuleTransferEntry {
     rule: Rule,
     scope: RuleTransferScope,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum RuleTransferScope {
     Global,

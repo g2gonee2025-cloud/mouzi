@@ -42,7 +42,10 @@ describe("cleanup selection", () => {
     { kind: "large", label: en.cleanup.minBytes },
     { kind: "stale", label: en.cleanup.staleDays },
   ] as const)("names the $kind threshold and file checkboxes", ({ kind, label }) => {
-    useCleanupStore.setState({ largeFiles: files, staleFiles: files });
+    useCleanupStore.setState({
+      largeFiles: { files, minBytes: 100 * 1_048_576 },
+      staleFiles: { files, days: 100 },
+    });
     const html = renderToStaticMarkup(
       <FileListTab
         kind={kind}
