@@ -222,6 +222,7 @@
     "ignore": "Ignorar",
     "warning": "Este nombre disfraza un ejecutable como otro tipo de archivo. Revísalo antes de aprobarlo. Es una advertencia sobre el nombre, no un resultado de análisis antivirus.",
     "done": "Completado",
+    "movedWithHistoryWarning": "Movido con un aviso del historial",
     "failed": "Error",
     "results": "Resultados de las operaciones",
     "suggest": "Sugerir (aprobar en la cola)",

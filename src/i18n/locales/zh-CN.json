@@ -222,6 +222,7 @@
     "ignore": "忽略",
     "warning": "此名称将可执行文件伪装成其他文件类型。批准前请检查文件。这只是文件名警告，不是病毒扫描结果。",
     "done": "已完成",
+    "movedWithHistoryWarning": "已移动（历史记录有警告）",
     "failed": "失败",
     "results": "操作结果",
     "suggest": "建议（在队列中批准）",

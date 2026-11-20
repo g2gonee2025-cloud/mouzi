@@ -38,6 +38,8 @@ const NOTICE_KEY = {
   permanent: "confirm.permanentNotice",
 } as const;
 
+type PreviewItem = string | { source: string; destination: string };
+
 /** The one place the tiers are decided, so no two call sites can disagree. */
 export function confirmTier(count: number, bytes?: number): ConfirmTier {
   const size = bytes ?? 0;
@@ -64,8 +66,8 @@ export interface ConfirmRequest {
   notice: ConfirmNotice;
   /** Operation-specific consequence, already translated by the caller. */
   note?: string;
-  /** Paths shown so the user sees what they are agreeing to. */
-  preview?: readonly string[];
+  /** One reviewed item per row. Moves can include a destination. */
+  preview?: readonly PreviewItem[];
   opener?: HTMLElement;
   focusFallback?: () => HTMLElement | null;
   onConfirm: () => void | Promise<void>;
@@ -230,13 +232,22 @@ export default function ConfirmDialog({
 
           {shownPreview.length > 0 && (
             <ul className="rounded-md border border-border bg-surface-dark max-h-28 overflow-auto">
-              {shownPreview.map((path) => (
+              {shownPreview.map((item) => typeof item === "string" ? (
                 <li
-                  key={path}
+                  key={item}
                   className="px-2.5 py-1 text-[10px] text-text-muted truncate border-b border-border last:border-b-0"
-                  title={path}
+                  title={item}
                 >
-                  {path}
+                  {item}
+                </li>
+              ) : (
+                <li
+                  key={item.source}
+                  className="px-2.5 py-1 text-xs break-all border-b border-border last:border-b-0"
+                  title={`${item.source} → ${item.destination}`}
+                >
+                  <span className="block"><span className="text-text-muted">{t("beta.source")}</span> {item.source}</span>
+                  <span className="block"><span className="text-text-muted">{t("beta.destination")}</span> {item.destination}</span>
                 </li>
               ))}
             </ul>

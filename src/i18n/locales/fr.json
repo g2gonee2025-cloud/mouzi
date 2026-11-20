@@ -222,6 +222,7 @@
     "ignore": "Ignorer",
     "warning": "Ce nom fait passer un fichier exécutable pour un autre type de fichier. Vérifiez-le avant de l'approuver. Cet avertissement concerne le nom, ce n'est pas un résultat d'analyse antivirus.",
     "done": "Terminé",
+    "movedWithHistoryWarning": "Déplacé avec un avertissement sur l’historique",
     "failed": "Échec",
     "results": "Résultats des opérations",
     "suggest": "Suggérer (approuver dans la file)",

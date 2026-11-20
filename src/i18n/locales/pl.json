@@ -222,6 +222,7 @@
     "ignore": "Pomiń",
     "warning": "Nazwa sugeruje inny typ pliku niż końcowe rozszerzenie wykonywalne. Sprawdź plik przed zatwierdzeniem. To ostrzeżenie o nazwie, nie wynik skanowania antywirusowego.",
     "done": "Wykonano",
+    "movedWithHistoryWarning": "Przeniesiono z ostrzeżeniem dotyczącym historii",
     "failed": "Niepowodzenie",
     "results": "Wyniki operacji",
     "suggest": "Proponuj (zatwierdzanie w kolejce)",

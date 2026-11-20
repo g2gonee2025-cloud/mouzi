@@ -188,7 +188,10 @@ fn apply_uses_only_the_selected_entries_and_rechecks_the_review() {
 
     let plan = f.preview(&[&b]);
     fs::write(&b, "edit").unwrap();
-    assert!(!f.apply(&plan, 0).success);
+    let failed = f.apply(&plan, 0);
+    assert!(!failed.success);
+    assert_eq!(failed.source, b.to_string_lossy());
+    assert!(serde_json::to_value(failed).unwrap().get("actualDestination").is_none());
     let plan = f.preview(&[&b]);
     let destination = plan.entries[0].destination.as_ref().unwrap();
     fs::write(destination, "occupied").unwrap();
@@ -201,6 +204,81 @@ fn apply_uses_only_the_selected_entries_and_rechecks_the_review() {
     db::update_rule(&rule).unwrap();
     assert!(!f.apply(&plan, 0).success);
     assert!(b.exists());
+}
+
+#[test]
+fn reviewed_move_receipt_matches_the_collision_destination_and_history() {
+    let mut fixture = Fixture::new();
+    fixture.add(&fixture.rule());
+    let source = fixture.write("sample.txt", "selected payload");
+    let sibling = fixture.write("sibling.txt", "unselected payload");
+    fs::create_dir(fixture.root.join("Sorted")).unwrap();
+    let occupied = fixture.write("Sorted/sample.txt", "occupied payload");
+    let plan = fixture.preview(&[&source, &sibling]);
+    let index = plan.entries.iter().position(|item| item.source == source.to_string_lossy()).unwrap();
+    let reviewed = plan.entries[index].destination.as_deref().unwrap();
+    assert!(reviewed.ends_with("sample_0.txt"));
+
+    let result = fixture.apply(&plan, index);
+    assert!(result.success, "{:?}", result.error);
+    let wire = serde_json::to_value(&result).unwrap();
+    let committed = fs::canonicalize(reviewed).unwrap();
+    assert_eq!(wire["actualDestination"].as_str(), committed.to_str());
+    let history = op::history(&op::HistoryFilter::default()).unwrap();
+    let recorded = history.iter().find(|row| row.action.source_path == result.source).unwrap();
+    assert_eq!(recorded.action.destination_path.as_deref(), wire["actualDestination"].as_str());
+    assert!(!source.exists());
+    assert_eq!(fs::read_to_string(reviewed).unwrap(), "selected payload");
+    assert_eq!(fs::read_to_string(occupied).unwrap(), "occupied payload");
+    assert_eq!(fs::read_to_string(sibling).unwrap(), "unselected payload");
+}
+
+#[test]
+fn reviewed_move_receipt_keeps_the_known_destination_if_history_fails() {
+    let mut fixture = Fixture::new();
+    fixture.add(&fixture.rule());
+    let source = fixture.write("history-failure.txt", "reviewed payload");
+    let plan = fixture.preview(&[&source]);
+    let destination = plan.entries[0].destination.as_deref().unwrap();
+    let source_path = source.to_string_lossy().replace('\'', "''");
+    {
+        let conn = db::lock_db().unwrap();
+        conn.execute_batch(&format!(
+            "CREATE TEMP TRIGGER fail_review_history BEFORE INSERT ON action_logs
+             WHEN NEW.source_path='{source_path}'
+             BEGIN SELECT RAISE(ABORT,'injected review history failure'); END;"
+        )).unwrap();
+    }
+    struct TriggerGuard;
+    impl Drop for TriggerGuard {
+        fn drop(&mut self) {
+            let _ = db::lock_db().unwrap().execute("DROP TRIGGER IF EXISTS fail_review_history", []);
+        }
+    }
+    let trigger = TriggerGuard;
+    let result = fixture.apply(&plan, 0);
+    drop(trigger);
+
+    let wire = serde_json::to_value(&result).unwrap();
+    let conn = db::lock_db().unwrap();
+    let pending: String = conn.query_row(
+        "SELECT status FROM operation_intents WHERE source_path=?1",
+        [result.source.as_str()], |row| row.get(0),
+    ).unwrap();
+    conn.execute("DELETE FROM operation_intents WHERE source_path=?1", [result.source.as_str()]).unwrap();
+    let recorded: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM action_logs WHERE source_path=?1)",
+        [result.source.as_str()], |row| row.get(0),
+    ).unwrap();
+    drop(conn);
+
+    assert!(!result.success);
+    assert!(!source.exists());
+    assert_eq!(fs::read_to_string(destination).unwrap(), "reviewed payload");
+    assert_eq!(wire["actualDestination"].as_str(), fs::canonicalize(destination).unwrap().to_str());
+    assert!(result.error.unwrap().contains("injected review history failure"));
+    assert_eq!(pending, "pending");
+    assert!(!recorded);
 }
 
 #[test]
@@ -319,7 +397,10 @@ fn rename_run_history_and_undo_verify_content_and_preserve_collisions() {
     let renamed = PathBuf::from(plan.entries[0].destination.as_ref().unwrap());
     assert!(renamed.ends_with("renamed-note_0.txt"));
     let selected = plan.entries.iter().map(|entry| entry.id.clone()).collect::<Vec<_>>();
-    assert!(op::apply(&plan.id, &selected, &f.suppression).unwrap().iter().all(|row| row.success));
+    let results = op::apply(&plan.id, &selected, &f.suppression).unwrap();
+    assert!(results.iter().all(|row| row.success));
+    let receipt = results.iter().find(|row| row.source == a.to_string_lossy()).unwrap();
+    assert_eq!(serde_json::to_value(receipt).unwrap()["actualDestination"].as_str(), fs::canonicalize(&renamed).unwrap().to_str());
     assert!(op::already_processed(&renamed).unwrap());
     let repeat = f.preview(&[&renamed]);
     assert!(repeat.entries.is_empty());

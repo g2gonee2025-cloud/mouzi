@@ -228,6 +228,7 @@
     "ignore": "Bỏ qua",
     "warning": "Tên này ngụy trang tệp thực thi thành một loại tệp khác. Hãy kiểm tra trước khi phê duyệt. Đây là cảnh báo về tên tệp, không phải kết quả quét vi-rút.",
     "done": "Hoàn tất",
+    "movedWithHistoryWarning": "Đã di chuyển kèm cảnh báo về lịch sử",
     "failed": "Thất bại",
     "results": "Kết quả thao tác",
     "suggest": "Đề xuất (phê duyệt trong hàng đợi)",

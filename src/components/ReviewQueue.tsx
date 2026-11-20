@@ -68,7 +68,7 @@ export default function ReviewQueue({ paths }: { paths: string[] | null }) {
       count: entries.length,
       bytes: entries.reduce((size, entry) => size + entry.size, 0),
       notice: 'move',
-      preview: entries.map((entry) => entry.source),
+      preview: entries.map(({ source, destination }) => destination === null ? source : { source, destination }),
       opener,
       focusFallback: () => heading.current,
       onConfirm: async () => {

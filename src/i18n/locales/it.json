@@ -222,6 +222,7 @@
     "ignore": "Ignora",
     "warning": "Questo nome fa sembrare un eseguibile un altro tipo di file. Controllalo prima di approvarlo. È un avviso sul nome, non il risultato di una scansione antivirus.",
     "done": "Completato",
+    "movedWithHistoryWarning": "Spostato con un avviso sulla cronologia",
     "failed": "Non riuscito",
     "results": "Risultati delle operazioni",
     "suggest": "Suggerisci (approva nella coda)",

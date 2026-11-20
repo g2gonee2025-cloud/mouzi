@@ -222,6 +222,7 @@
     "ignore": "Ignore",
     "warning": "This filename disguises an executable as another file type. Inspect it before approving. This is a filename warning, not an antivirus verdict.",
     "done": "Completed",
+    "movedWithHistoryWarning": "Moved with a History warning",
     "failed": "Failed",
     "results": "Operation results",
     "suggest": "Suggest (approve in review queue)",

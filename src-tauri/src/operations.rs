@@ -146,6 +146,13 @@ pub struct OperationResult {
     pub source: String,
     pub success: bool,
     pub error: Option<String>,
+    #[serde(rename = "actualDestination", skip_serializing_if = "Option::is_none")]
+    pub actual_destination: Option<String>,
+}
+
+struct AppliedMove {
+    destination: String,
+    history_error: Option<String>,
 }
 
 const PLAN_LIFETIME: Duration = Duration::from_secs(1800);
@@ -358,12 +365,16 @@ pub(crate) fn apply(
     let run_id = new_run_id();
     let mut results = Vec::new();
     for item in plan.items.into_iter().filter(|item| selected.contains(item.entry.id.as_str())) {
-        let result = apply_item(&item, &scope, &folders, &rules, &run_id, suppression);
+        let (actual_destination, error) = match apply_item(&item, &scope, &folders, &rules, &run_id, suppression) {
+            Ok(AppliedMove { destination, history_error }) => (Some(destination), history_error),
+            Err(error) => (None, Some(error)),
+        };
         results.push(OperationResult {
             id: item.entry.id,
             source: item.entry.source,
-            success: result.is_ok(),
-            error: result.err(),
+            success: error.is_none(),
+            error,
+            actual_destination,
         });
     }
     Ok(results)
@@ -372,7 +383,7 @@ pub(crate) fn apply(
 fn apply_item(
     item: &Planned, scope: &RootScope, folders: &[WatchedFolder], rules: &[Rule],
     run_id: &str, suppression: &SuppressionSet,
-) -> Result<(), String> {
+) -> Result<AppliedMove, String> {
     let path = Path::new(&item.entry.source);
     let destination = Path::new(item.entry.destination.as_deref().ok_or("Missing reviewed destination")?);
     let file = eligible_file(scope, path)?.ok_or("preview.changed")?;
@@ -414,11 +425,12 @@ fn apply_item(
         }
     };
     suppression.arm(std::slice::from_ref(&moved.destination), Instant::now(), SUPPRESSION_TTL);
+    let actual_destination = moved.destination.to_string_lossy().into_owned();
     let log = ActionLog {
         id: None,
         timestamp: Utc::now(),
         source_path: item.entry.source.clone(),
-        destination_path: Some(moved.destination.to_string_lossy().into_owned()),
+        destination_path: Some(actual_destination.clone()),
         action: rule.action.clone(),
         file_name: info.name,
         file_type: rule.name.clone(),
@@ -427,9 +439,9 @@ fn apply_item(
     let history = OrganizationHistory {
         run_id, trigger: "approved", extension: &info.extension, size: info.size, digest: &item.digest,
     };
-    db::finalize_organization_move(intent, &log, &moved, history).map_err(|error| {
-        format!("Moved to {}, but recovery record {intent} is pending: {error}", moved.destination.display())
-    })
+    let history_error = db::finalize_organization_move(intent, &log, &moved, history).err()
+        .map(|error| format!("Moved to {actual_destination}, but recovery record {intent} is pending: {error}"));
+    Ok(AppliedMove { destination: actual_destination, history_error })
 }
 
 #[derive(Default, Deserialize)]

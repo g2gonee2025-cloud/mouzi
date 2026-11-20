@@ -222,6 +222,7 @@
     "ignore": "Ignorieren",
     "warning": "Dieser Dateiname tarnt eine ausführbare Datei als anderen Dateityp. Prüfe sie vor der Freigabe. Dies ist eine Warnung zum Dateinamen, kein Virenscan-Ergebnis.",
     "done": "Abgeschlossen",
+    "movedWithHistoryWarning": "Verschoben mit einem Hinweis zum Verlauf",
     "failed": "Fehlgeschlagen",
     "results": "Aktionsergebnisse",
     "suggest": "Vorschlagen (in der Warteschlange freigeben)",

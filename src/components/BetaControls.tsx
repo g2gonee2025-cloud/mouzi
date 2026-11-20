@@ -11,14 +11,21 @@ export function errorText(error: unknown): string {
   if (match) return i18n.t(`beta.${match[0]}`);
   return i18n.t(`beta.errors.${raw}`, { defaultValue: raw });
 }
-export interface OperationResult { id: string; source: string; success: boolean; error: string | null }
+export interface OperationResult {
+  id: string;
+  source: string;
+  success: boolean;
+  error: string | null;
+  actualDestination?: string;
+}
 export function Results({ results }: { results: OperationResult[] }) {
   const { t } = useTranslation();
   if (!results.length) return null;
   return <div role="status" className="space-y-2 rounded-lg border border-border p-3">
     <h3 className="font-medium">{t('beta.results')}</h3>
     {results.map(result => <div key={result.id} className="text-sm break-all">
-      <strong>{t(result.success ? 'beta.done' : 'beta.failed')}</strong>: {result.source}
+      <strong>{t(result.success ? 'beta.done' : result.actualDestination ? 'beta.movedWithHistoryWarning' : 'beta.failed')}</strong>: {result.source}
+      {result.actualDestination && <p><span className="text-text-muted">{t('beta.destination')}</span> {result.actualDestination}</p>}
       {result.error && <p className="text-red-700 dark:text-red-300">{errorText(result.error)}</p>}
     </div>)}
   </div>;
