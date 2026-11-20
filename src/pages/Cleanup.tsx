@@ -27,13 +27,12 @@ export default function Cleanup() {
     window.addEventListener("hashchange", onHash);
     return () => window.removeEventListener("hashchange", onHash);
   }, []);
-  const hasAnyData = useCleanupStore((s) =>
-    s.duplicates !== null ||
-    s.largeFiles !== null ||
-    s.staleFiles !== null ||
-    s.emptyDirs !== null ||
-    s.history !== null,
-  );
+  const needsInventory = tab === "duplicates" || tab === "large" || tab === "stale";
+  const inventoryReady = useCleanupStore((state) => state.inventoryReady);
+  const observeInventoryReadiness = useCleanupStore((state) => state.observeInventoryReadiness);
+  useEffect(() => {
+    if (needsInventory) return observeInventoryReadiness();
+  }, [needsInventory, observeInventoryReadiness]);
 
   const handleBack = () => {
     navigateHash("dashboard");
@@ -93,7 +92,7 @@ export default function Cleanup() {
 
       {/* Content */}
       <div className="flex-1 overflow-auto p-4">
-        {!hasAnyData && (
+        {needsInventory && inventoryReady === false && (
           <div className="mb-3 rounded-lg border border-border bg-surface-dark px-4 py-3 text-xs text-text-muted flex items-center gap-2">
             <Info size={14} className="text-primary shrink-0" />
             <span>{t("cleanup.scanFirstHint")}</span>

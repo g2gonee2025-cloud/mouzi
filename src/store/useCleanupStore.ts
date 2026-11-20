@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { createPreviewSlot } from "./previewRequest";
 import type { DuplicateGroup, CleanupFile, CleanupRequest, CleanupOutcome, CleanupPlan } from "../utils/cleanup";
 
@@ -16,6 +17,7 @@ export interface CleanupLogEntry {
 }
 
 interface CleanupState {
+  inventoryReady: boolean | null;
   duplicates: DuplicateGroup[] | null;
   largeFiles: { files: CleanupFile[]; minBytes: number } | null;
   staleFiles: { files: CleanupFile[]; days: number } | null;
@@ -36,6 +38,7 @@ interface CleanupState {
   prepareCleanup: (actions: CleanupRequest[], owner?: AbortSignal) => Promise<CleanupPlan>;
   executeCleanup: (planId: string) => Promise<void>;
   invalidateCandidates: () => void;
+  observeInventoryReadiness: () => () => void;
   loadHistory: () => Promise<void>;
   clearResults: () => void;
   clearError: () => void;
@@ -44,6 +47,7 @@ interface CleanupState {
 let candidatesGeneration = 0;
 let historyGeneration = 0;
 const emptyCandidates = { duplicates: null, largeFiles: null, staleFiles: null, emptyDirs: null };
+const inventoryEvents = ["scan-complete", "scan-finished", "folders-changed", "mutation-completed"];
 type FinderKey = keyof typeof emptyCandidates;
 type FinderResult<Candidates> = { candidates: Candidates; unavailableRoots: string[] };
 
@@ -83,6 +87,7 @@ export const useCleanupStore = create<CleanupState>((set, get) => {
 
   return {
     ...emptyCandidates,
+    inventoryReady: null,
     unavailableRoots: {},
     loading: false, error: null, busy: false, preparedPlan: null,
     results: null, history: null, historyLoading: false, historyError: null,
@@ -156,6 +161,35 @@ export const useCleanupStore = create<CleanupState>((set, get) => {
         preview.clear();
         set({ ...emptyCandidates, unavailableRoots: {}, preparedPlan: null, loading: false, history: null, historyLoading: false });
       }
+    },
+    observeInventoryReadiness: () => {
+      let stopped = false;
+      let subscribed = false;
+      let latestRead = 0;
+      const refresh = async () => {
+        if (stopped || !subscribed) return;
+        const read = ++latestRead;
+        set({ inventoryReady: null });
+        try {
+          const ready = await invoke<boolean>("has_cleanup_inventory_cmd");
+          if (!stopped && read === latestRead) set({ inventoryReady: ready });
+        } catch {
+          // A failed lookup leaves readiness unknown.
+        }
+      };
+      const listeners = inventoryEvents.map((event) => listen(event, () => { void refresh(); }));
+      // Register first so the entry snapshot covers changes during setup.
+      void Promise.all(listeners).then(() => {
+        subscribed = true;
+        return refresh();
+      }).catch(console.error);
+      return () => {
+        stopped = true;
+        set({ inventoryReady: null });
+        for (const listener of listeners) {
+          void listener.then((unlisten) => unlisten()).catch(() => {});
+        }
+      };
     },
     loadHistory: async () => {
       const generation = ++historyGeneration;
