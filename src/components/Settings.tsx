@@ -225,6 +225,7 @@ export default function Settings() {
   const graceInput = useRef<HTMLInputElement>(null);
 
   const [scheduleDraft, setScheduleDraft] = useState<ScheduleSettings | null>(null);
+  const scheduleSwitch = useRef<HTMLButtonElement>(null);
   const localSchedule = scheduleDraft ? activeScheduleDefaults(scheduleDraft) : schedule ?? defaultSchedule();
   const scheduleDirty = !!schedule && !!scheduleDraft && !schedulesMatch(schedule, localSchedule);
   const [ruleToast, setRuleToast] = useState<{ message: string; type: "success" | "error" } | null>(null);
@@ -1123,6 +1124,7 @@ export default function Settings() {
                   {t("settings.scheduler.enable")}
                 </label>
                 <button
+                  ref={scheduleSwitch}
                   role="switch"
                   aria-label={t("settings.scheduler.enable")}
                   aria-checked={localSchedule.schedule_enabled}
@@ -1181,15 +1183,29 @@ export default function Settings() {
                 })}
               </div>
 
-              <button
-                type="button"
-                disabled={!scheduleDirty}
-                onClick={handleSaveSchedule}
-                className="flex items-center gap-1.5 rounded-md bg-primary px-3 py-2 text-sm font-medium text-on-primary hover:bg-primary-hover disabled:opacity-50"
-              >
-                <Save size={14} />
-                {t("common.save")}
-              </button>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  disabled={!scheduleDirty}
+                  onClick={handleSaveSchedule}
+                  className="flex items-center gap-1.5 rounded-md bg-primary px-3 py-2 text-sm font-medium text-on-primary hover:bg-primary-hover disabled:opacity-50"
+                >
+                  <Save size={14} />
+                  {t("common.save")}
+                </button>
+                {scheduleDirty && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setScheduleDraft(null);
+                      scheduleSwitch.current?.focus();
+                    }}
+                    className="rounded-md border border-border px-3 py-2 text-sm hover:bg-surface-dark"
+                  >
+                    {t("common.cancel")}
+                  </button>
+                )}
+              </div>
             </div>
 
           </div>
