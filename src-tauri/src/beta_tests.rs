@@ -138,6 +138,58 @@ fn apply_uses_only_the_selected_entries_and_rechecks_the_review() {
 }
 
 #[test]
+fn history_extension_filter_includes_rows_without_extension_metadata() {
+    let fixture = Fixture::new();
+    let rule = fixture.root.to_string_lossy().into_owned();
+    let mut ids = Vec::new();
+    for (file_name, action, stored_extension) in [
+        ("legacy.pdf", "move", None),
+        ("accepted.PDF", "accept", None),
+        ("normalized.txt", "move", Some("pdf")),
+        ("extensionless", "move", None),
+        ("different.pdf", "move", Some("txt")),
+    ] {
+        let path = fixture.write(file_name, "sample");
+        let id = db::log_action(&db::ActionLog {
+            id: None,
+            timestamp: chrono::Utc::now(),
+            source_path: path.to_string_lossy().into_owned(),
+            destination_path: None,
+            action: action.into(),
+            file_name: file_name.into(),
+            file_type: rule.clone(),
+            undone: false,
+        }).unwrap();
+        if let Some(extension) = stored_extension {
+            db::lock_db().unwrap().execute(
+                "UPDATE action_logs SET file_extension=?1 WHERE id=?2",
+                rusqlite::params![extension, id],
+            ).unwrap();
+        }
+        ids.push(id);
+    }
+
+    let matches = |extension: &str| {
+        let filter = op::HistoryFilter { rule: rule.clone(), extension: extension.into(), ..Default::default() };
+        let mut names = op::history(&filter).unwrap().into_iter().map(|row| row.action.file_name).collect::<Vec<_>>();
+        names.sort();
+        names
+    };
+    let pdf = matches("pdf");
+    let dotted_pdf = matches(".PDF");
+    let all = matches("");
+    {
+        let conn = db::lock_db().unwrap();
+        for id in ids {
+            conn.execute("DELETE FROM action_logs WHERE id=?1", [id]).unwrap();
+        }
+    }
+    assert_eq!(pdf, ["accepted.PDF", "legacy.pdf", "normalized.txt"]);
+    assert_eq!(dotted_pdf, pdf);
+    assert_eq!(all.len(), 5);
+}
+
+#[test]
 fn rename_run_history_and_undo_verify_content_and_preserve_collisions() {
     let mut f = Fixture::new();
     let mut rule = f.rule();

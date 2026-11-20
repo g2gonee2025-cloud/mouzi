@@ -424,10 +424,16 @@ pub fn history(filter: &HistoryFilter) -> Result<Vec<OrganizationLog>, String> {
                 .with_timezone(&Utc),
         )
     };
+    let extension_query = filter.extension.trim_start_matches('.');
     Ok(db::get_organization_logs()
         .map_err(|e| e.to_string())?
         .into_iter()
         .filter(|log| {
+            let extension = if log.file_extension.is_empty() {
+                Path::new(&log.action.file_name).extension().and_then(|value| value.to_str()).unwrap_or("")
+            } else {
+                log.file_extension.as_str()
+            };
             log.action.file_name
                 .to_lowercase()
                 .contains(&filter.query.to_lowercase())
@@ -435,10 +441,7 @@ pub fn history(filter: &HistoryFilter) -> Result<Vec<OrganizationLog>, String> {
                     .action.file_type
                     .to_lowercase()
                     .contains(&filter.rule.to_lowercase())
-                && (filter.extension.is_empty()
-                    || log
-                        .file_extension
-                        .eq_ignore_ascii_case(filter.extension.trim_start_matches('.')))
+                && (filter.extension.is_empty() || extension.eq_ignore_ascii_case(extension_query))
                 && from.is_none_or(|date| log.action.timestamp >= date)
                 && to.is_none_or(|date| log.action.timestamp <= date)
                 && (filter.run_id.is_empty()
