@@ -149,12 +149,6 @@ export default function Popup() {
     invoke("close_popup");
   };
 
-  /**
-   * `undo_action_cmd` is a no-op on the row when the source is gone, yet the
-   * backend still flips `undone`, so the row below re-renders as a finished
-   * item. Reading the status here is the only thing that stops a file which is
-   * still sitting in its organised folder being reported as restored.
-   */
   const handleUndo = async (id: number | undefined) => {
     if (id === undefined) {
       setUndoToast([{ tone: "error", key: "undo.noId" }]);
@@ -345,9 +339,6 @@ export default function Popup() {
         </div>
       )}
 
-      {/* Pinned near the bottom of the tray, where the rows themselves offer no
-          correction: a `missing` undo just makes the row's Undo button vanish,
-          which looks exactly like a file that went home. */}
       {undoToast && (
         <div
           role="status"

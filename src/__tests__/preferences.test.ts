@@ -110,6 +110,14 @@ describe("committed preference and schedule settings", () => {
 describe("authoritative clean scope and history", () => {
   const restored = { status: "ok", message: null, restoredTo: "original.txt" };
 
+  it("limits Restore all to the history IDs reviewed at confirmation", async () => {
+    ipc.invoke.mockResolvedValue({ count: 0, results: [] });
+
+    await useAppStore.getState().undoAll([42, 17]);
+
+    expect(ipc.invoke).toHaveBeenCalledWith("undo_all_cmd", { reviewedIds: [42, 17] });
+  });
+
   it.each([
     {
       command: "clean_now_cmd",
@@ -122,7 +130,7 @@ describe("authoritative clean scope and history", () => {
       command: "undo_all_cmd",
       response: { count: 1, results: [restored] },
       outcome: { count: 1, results: [restored] },
-      run: () => useAppStore.getState().undoAll(),
+      run: () => useAppStore.getState().undoAll([1]),
     },
   ])("keeps the $command outcome when the history refresh fails", async ({ command, response, outcome, run }) => {
     const history = deferred<never>();

@@ -1,10 +1,6 @@
 import type { UndoAllResult, UndoResult, UndoStatus } from "../store/useAppStore";
 
-/**
- * How an undo outcome reads to the user. `success` is reserved for "the file is
- * back where it was" and nothing else, so `missing` - a row the backend marked
- * undone while the file stayed in its organised folder - can never inherit it.
- */
+/** `success` confirms that the file is back at its original path. */
 export type UndoTone = "success" | "warning" | "error";
 
 export interface UndoNotice {
@@ -20,7 +16,7 @@ export interface UndoAllBreakdown {
   restored: number;
   /** `collision`: restored, but under a different name than the user expects. */
   collision: number;
-  /** `missing`: the row says undone, the file is still in its organised folder. */
+  /** `missing`: the recorded organized file could not be found for restoration. */
   missing: number;
   failed: number;
 }
@@ -107,15 +103,7 @@ export function undoAllBreakdown(results: readonly UndoResult[]): UndoAllBreakdo
   return breakdown;
 }
 
-/**
- * Aggregate one `undo_all_cmd` result.
- *
- * `UndoAllResult.count` is deliberately NOT used for the restored figure: the
- * backend counts every row that is not `failed`, so `missing` rows - where the
- * file was never moved back - land in it. Reporting it as "N restored" is the
- * same lie as the green badge, in bulk. The true restored count is recomputed
- * from `results` above.
- */
+/** Aggregate the per-file outcomes from Restore all. */
 export function undoAllNotices(result: UndoAllResult): UndoNotice[] {
   const breakdown = undoAllBreakdown(result.results);
   const untruthful = breakdown.missing + breakdown.failed;

@@ -142,7 +142,7 @@ interface AppState {
   refreshActionViews: () => Promise<void>;
   cleanNow: () => Promise<{ file: string; rule: string; destination: string }[]>;
   undoAction: (id: number) => Promise<UndoResult>;
-  undoAll: () => Promise<UndoAllResult>;
+  undoAll: (reviewedIds: number[]) => Promise<UndoAllResult>;
   addFolder: (path: string, mode: string, onlyNew?: boolean) => Promise<number>;
   removeFolder: (id: number) => Promise<void>;
   updateFolderMode: (id: number, mode: string) => Promise<void>;
@@ -315,9 +315,9 @@ export const useAppStore = create<AppState>((set, get) => ({
     return result;
   },
 
-  undoAll: async () => {
-    const result = await invoke<UndoAllResult>('undo_all_cmd');
-    if (result.count > 0) {
+  undoAll: async (reviewedIds) => {
+    const result = await invoke<UndoAllResult>('undo_all_cmd', { reviewedIds });
+    if (result.results.length > 0) {
       await get().refreshActionViews();
     }
     return result;

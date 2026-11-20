@@ -218,6 +218,7 @@ pub fn run() {
             get_cleanup_logs_cmd,
             get_stats_cmd,
             undo_action_cmd,
+            preview_undo_all_cmd,
             undo_all_cmd,
             get_settings_cmd,
             update_settings_cmd,

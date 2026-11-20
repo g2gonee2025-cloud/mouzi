@@ -357,28 +357,25 @@ export default function Settings() {
   };
 
   const askUndoAll = async (opener: HTMLButtonElement) => {
-    let restorable: number;
     try {
-      restorable = (await loadHistoryCounts()).undoable;
+      const rows = await invoke<{ id: number; source: string }[]>("preview_undo_all_cmd");
+      if (rows.length === 0) return;
+      const reviewedIds = rows.map(({ id }) => id);
+      setPending({
+        title: t("confirm.op.undoAll"),
+        count: rows.length,
+        notice: "move",
+        note: t("confirm.note.undoAll"),
+        preview: rows.map(({ source }) => source),
+        opener,
+        focusFallback: () => sectionHeading.current,
+        onConfirm: async () => {
+          setUndoToast(undoAllNotices(await undoAll(reviewedIds)));
+        },
+      });
     } catch (e) {
       setWriteError(String(e));
-      return;
     }
-    if (restorable === 0) return;
-    setPending({
-      title: t("confirm.op.undoAll"),
-      count: restorable,
-      notice: "move",
-      note: t("confirm.note.undoAll"),
-      opener,
-      focusFallback: () => sectionHeading.current,
-      // `undoAllNotices` rebuilds the restored count from `results` rather than
-      // reading `UndoAllResult.count`, which the backend fills with every
-      // non-`failed` row and therefore counts `missing` ones too.
-      onConfirm: async () => {
-        setUndoToast(undoAllNotices(await undoAll()));
-      },
-    });
   };
 
   // `clear_logs_cmd` is an unconditional DELETE FROM action_logs, so this takes

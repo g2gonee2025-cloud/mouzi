@@ -51,9 +51,6 @@ describe("undoNotice", () => {
     expect(undoNotice(result("failed"))[0].key).toBe("undo.failed");
   });
 
-  // The whole defect: `missing` is a row the backend marked undone while the
-  // file stayed in its organised folder. If it ever shares a key or a tone with
-  // `ok` the user is told a lie again.
   it("never presents missing as success", () => {
     const success = undoNotice(result("ok"))[0];
     const missing = undoNotice(result("missing"))[0];

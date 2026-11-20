@@ -355,6 +355,12 @@ pub struct UndoAllResult {
     pub results: Vec<UndoResult>,
 }
 
+#[derive(Serialize)]
+pub struct UndoPreviewRow {
+    id: i64,
+    source: String,
+}
+
 /// The watcher's self-suppression guards, shared with `AppState`.
 type IgnoredFiles = Arc<SuppressionSet>;
 
@@ -440,12 +446,12 @@ fn finish_undo(target: &UndoTarget, ignored_files: &IgnoredFiles) -> Result<Undo
     }
 
     let Some(dest) = target.dest.as_deref().filter(|path| !path.is_empty()) else {
-        return record_missing_undo(target.id);
+        return Ok(missing_undo());
     };
     let dest_path = Path::new(dest);
     match std::fs::symlink_metadata(dest_path) {
         Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return record_missing_undo(target.id),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(missing_undo()),
         Err(error) => return Err(format!("Cannot inspect the recorded destination {dest}: {error}")),
     }
     let expected = target.file_identity.as_deref().ok_or_else(|| format!(
@@ -492,10 +498,8 @@ fn finish_undo(target: &UndoTarget, ignored_files: &IgnoredFiles) -> Result<Undo
     })
 }
 
-fn record_missing_undo(id: i64) -> Result<UndoResult, String> {
-    lock_db()?.execute("UPDATE action_logs SET undone=1 WHERE id=?1", [id])
-        .map_err(|error| error.to_string())?;
-    Ok(UndoResult { status: "missing".into(), message: None, restored_to: None })
+fn missing_undo() -> UndoResult {
+    UndoResult { status: "missing".into(), message: None, restored_to: None }
 }
 
 fn failed_undo(message: String) -> UndoResult {
@@ -523,26 +527,39 @@ fn undo_action_with(id: i64, ignored_files: &IgnoredFiles) -> Result<UndoResult,
     Ok(finish_undo(&target, ignored_files).unwrap_or_else(failed_undo))
 }
 
-fn undo_all_with(ignored_files: &IgnoredFiles) -> Result<UndoAllResult, String> {
+fn undo_all_with(
+    ignored_files: &IgnoredFiles,
+    reviewed_ids: &[i64],
+    cancel_pending: impl FnOnce(&[PathBuf]) -> Result<(), String>,
+) -> Result<UndoAllResult, String> {
     let _operation = ignored_files.with_operation();
+    let reviewed: HashSet<_> = reviewed_ids.iter().copied().collect();
     let targets: Vec<UndoTarget> = crate::db::get_undoable_logs()
         .map_err(|e| e.to_string())?
         .into_iter()
+        // Filtering the current rows keeps their newest-first order. History IDs
+        // are AUTOINCREMENT and clearing History never recycles them.
+        .filter(|(id, ..)| reviewed.contains(id))
         .map(|(id, source, dest, file_identity, fingerprint)| UndoTarget { id, source, dest, file_identity, fingerprint })
         .collect();
+    if targets.len() != reviewed.len() {
+        return Err("The reviewed history changed. Close this dialog and reopen Revert All to review the current actions.".into());
+    }
 
     // Include currently absent destinations that a preceding restore may create.
     let armed: Vec<_> = targets.iter().flat_map(|target| {
         std::iter::once(target.source.clone()).chain(target.dest.iter().filter(|path| !path.is_empty()).cloned())
     }).collect();
+    if !armed.is_empty() {
+        cancel_pending(&armed.iter().map(PathBuf::from).collect::<Vec<_>>())?;
+    }
     arm_suppression(ignored_files, &armed)?;
 
     let results: Vec<_> = targets.iter().map(|target| {
         finish_undo(target, ignored_files).unwrap_or_else(failed_undo)
     }).collect();
 
-    // Preserve the wire count of handled rows. The UI counts restores separately.
-    let count = results.iter().filter(|r| r.status != "failed").count();
+    let count = results.iter().filter(|r| matches!(r.status.as_str(), "ok" | "collision")).count();
     Ok(UndoAllResult { count, results })
 }
 
@@ -591,13 +608,23 @@ pub fn undo_action_cmd(app: AppHandle, id: i64, state: tauri::State<AppState>) -
 }
 
 #[tauri::command(async)]
-pub fn undo_all_cmd(app: AppHandle, state: tauri::State<AppState>) -> Result<UndoAllResult, String> {
-    let targets = get_undoable_logs().map_err(|e| e.to_string())?;
-    let paths: Vec<PathBuf> = targets.iter().flat_map(|(_, source, dest, _, _)| {
-        std::iter::once(PathBuf::from(source)).chain(dest.as_ref().map(PathBuf::from))
-    }).collect();
-    state.watcher.lock().map_err(|_| "Watcher state unavailable")?.cancel_paths(&paths);
-    let result = undo_all_with(&state.ignored_files);
+pub fn preview_undo_all_cmd() -> Result<Vec<UndoPreviewRow>, String> {
+    Ok(get_undoable_logs().map_err(|error| error.to_string())?
+        .into_iter()
+        .map(|(id, source, ..)| UndoPreviewRow { id, source })
+        .collect())
+}
+
+#[tauri::command(async)]
+pub fn undo_all_cmd(
+    app: AppHandle,
+    state: tauri::State<AppState>,
+    reviewed_ids: Vec<i64>,
+) -> Result<UndoAllResult, String> {
+    let result = undo_all_with(&state.ignored_files, &reviewed_ids, |paths| {
+        state.watcher.lock().map_err(|_| "Watcher state unavailable")?.cancel_paths(paths);
+        Ok(())
+    });
     let _ = app.emit("mutation-completed", ());
     result
 }
@@ -2313,6 +2340,11 @@ mod undo_tests {
         Arc::new(SuppressionSet::new())
     }
 
+    fn review_and_undo_all(ignored: &IgnoredFiles) -> Result<UndoAllResult, String> {
+        let ids: Vec<_> = preview_undo_all_cmd()?.into_iter().map(|row| row.id).collect();
+        undo_all_with(ignored, &ids, |_| Ok(()))
+    }
+
     /// Put a file where a logged move left it, and return (source, dest).
     fn stage(root: &Path, name: &str) -> (String, String) {
         let source = root.join("in").join(name);
@@ -2360,6 +2392,63 @@ mod undo_tests {
     }
 
     #[test]
+    fn undo_review_leaves_temporarily_missing_file_retryable() {
+        let fixture = UndoFixture::new("missing_retry");
+        let (source, dest) = stage(fixture.root(), "missing.undocheck");
+        let id = insert_log("2026-01-01T00:00:00Z", &source, Some(&dest));
+        let holding = fixture.root().join("holding.undocheck");
+        std::fs::rename(&dest, &holding).unwrap();
+
+        let missing = undo_action_with(id, &ignored_files()).unwrap();
+        assert_eq!(missing.status, "missing");
+        let entry = get_organization_logs().unwrap().pop().unwrap();
+        assert!(!entry.action.undone, "History must not report a missing file as restored");
+        assert_eq!(history_counts().unwrap().undoable, 1);
+
+        std::fs::rename(holding, &dest).unwrap();
+        let retried = undo_action_with(id, &ignored_files()).unwrap();
+        assert_eq!(retried.status, "ok");
+        assert_eq!(std::fs::read(&source).unwrap(), b"payload");
+        assert!(get_organization_logs().unwrap().pop().unwrap().action.undone);
+        assert_eq!(history_counts().unwrap().undoable, 0);
+    }
+
+    #[test]
+    fn undo_review_restores_only_the_reviewed_rows_in_reverse_order() {
+        let fixture = UndoFixture::new("review_scope");
+        let (source, middle) = stage(fixture.root(), "reviewed.undocheck");
+        let end = fixture.root().join("sorted.undocheck");
+        let time = "2026-01-01T00:00:00Z";
+        let older = insert_log(time, &source, Some(&middle));
+        std::fs::rename(&middle, &end).unwrap();
+        let newer = insert_log(time, &middle, end.to_str());
+
+        let preview: Vec<_> = preview_undo_all_cmd().unwrap().into_iter().map(|row| row.id).collect();
+        assert_eq!(preview, [newer, older]);
+
+        let (late_source, late_dest) = stage(fixture.root(), "late.undocheck");
+        insert_log(time, &late_source, Some(&late_dest));
+        let reviewed_ids = [preview[1], preview[0], preview[0]];
+        let restored = undo_all_with(&ignored_files(), &reviewed_ids, |paths| {
+            assert_eq!(paths, [PathBuf::from(&middle), end.clone(), PathBuf::from(&source), PathBuf::from(&middle)]);
+            Ok(())
+        }).unwrap();
+
+        assert_eq!(restored.count, 2, "Only the reviewed rows may be restored");
+        assert_eq!(std::fs::read(source).unwrap(), b"payload");
+        assert_eq!(std::fs::read(&late_dest).unwrap(), b"payload");
+        assert!(!Path::new(&late_source).exists());
+
+        clear_logs().unwrap();
+        insert_log(time, &late_source, Some(&late_dest));
+        let stale = undo_all_with(&ignored_files(), &preview, |_| {
+            panic!("A cleared preview must not reserve any new path");
+        }).unwrap_err();
+        assert!(stale.contains("reviewed history changed"));
+        assert_eq!(std::fs::read(late_dest).unwrap(), b"payload");
+    }
+
+    #[test]
     fn undo_all_rechecks_a_chain_with_tied_timestamps() {
         let fixture = UndoFixture::new("move_chain");
         let (source, middle) = stage(fixture.root(), "chain.undocheck");
@@ -2369,7 +2458,7 @@ mod undo_tests {
         std::fs::rename(&middle, &end).unwrap();
         insert_log(time, &middle, Some(end.to_str().unwrap()));
 
-        let results = undo_all_with(&ignored_files()).unwrap().results;
+        let results = review_and_undo_all(&ignored_files()).unwrap().results;
         assert_eq!(results.iter().map(|row| row.status.as_str()).collect::<Vec<_>>(), ["ok", "ok"]);
         assert_eq!(std::fs::read(&source).unwrap(), b"payload");
         assert!(!Path::new(&middle).exists());
@@ -2411,7 +2500,7 @@ mod undo_tests {
                 assert_eq!(result.status, "failed");
                 assert!(result.message.unwrap().contains(receipt.as_str()));
             }
-            let batch = undo_all_with(&ignored).unwrap();
+            let batch = review_and_undo_all(&ignored).unwrap();
             assert_eq!(batch.results.len(), if moved { 2 } else { 3 });
             for result in &batch.results[..2] {
                 assert_eq!(result.status, "failed");
@@ -2572,7 +2661,7 @@ mod undo_tests {
             observer_samples.lock().unwrap().push((db_free, watcher_free));
         }))));
 
-        let outcome = undo_all_with(&ignored);
+        let outcome = review_and_undo_all(&ignored);
 
         let outcome = outcome.expect("undo_all_with");
         assert_eq!(outcome.results.len(), 3);
@@ -2645,7 +2734,7 @@ mod undo_tests {
         let batch_ignored = ignored.clone();
         let batch_done = batch_done.clone();
         let batch = std::thread::spawn(move || {
-            let result = undo_all_with(&batch_ignored);
+            let result = review_and_undo_all(&batch_ignored);
             batch_done.store(true, Ordering::SeqCst);
             result
         });
@@ -2686,7 +2775,7 @@ mod undo_tests {
         let at_first_move = Arc::new(Mutex::new(Vec::new()));
         let _observer = ObserverReset(snapshot_guard_on_first_move(&ignored, &at_first_move));
 
-        let outcome = undo_all_with(&ignored);
+        let outcome = review_and_undo_all(&ignored);
 
         assert_eq!(outcome.expect("undo_all_with").count, 4);
 
@@ -2775,12 +2864,12 @@ mod undo_tests {
         std::fs::write(&dest4, b"payload").unwrap();
         log_at(4, &source4, Some(&dest4_str));
 
-        let outcome = undo_all_with(&ignored).expect("undo_all_with");
+        let outcome = review_and_undo_all(&ignored).expect("undo_all_with");
 
         // The batch query is ORDER BY timestamp DESC, so rank 4 comes first.
         let statuses: Vec<&str> = outcome.results.iter().map(|r| r.status.as_str()).collect();
         assert_eq!(statuses, vec!["failed", "missing", "missing", "collision", "ok"]);
-        assert_eq!(outcome.count, 4, "only a failure is excluded from count");
+        assert_eq!(outcome.count, 2, "only actual restores count");
 
         let restored: Vec<Option<&str>> = outcome
             .results
@@ -2793,11 +2882,11 @@ mod undo_tests {
         assert!(!Path::new(&dest1).exists(), "the restored file must leave its organised location");
         assert!(dest4.exists(), "a failed move must leave the file alone");
 
-        // A failure is the one outcome that does not mark the row undone.
+        // Missing and failed restores leave the history row eligible for retry.
         assert_eq!(undone_of(&source4), 0);
         assert_eq!(undone_of(&source0), 1);
-        assert_eq!(undone_of(&source2), 1);
-        assert_eq!(undone_of(&source3), 1);
+        assert_eq!(undone_of(&source2), 0);
+        assert_eq!(undone_of(&source3), 0);
 
         // The suffixed name is only knowable after the move, so it is armed
         // then — the path the watcher will actually report.
