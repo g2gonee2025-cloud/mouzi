@@ -1,5 +1,5 @@
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
-use tauri::tray::{MouseButton, TrayIconBuilder, TrayIconEvent};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager};
 use crate::db::get_settings;
 use crate::i18n::TrayI18n;
@@ -20,34 +20,30 @@ pub fn setup_tray(app: &AppHandle, lang: &str) -> Result<(), Box<dyn std::error:
     let mut builder = TrayIconBuilder::with_id("tray")
         .tooltip(i18n.get("tooltip"))
         .menu(&menu)
-        .on_menu_event(|app, event| match event.id.as_ref() {
-            "quit" => {
+        .on_menu_event(|app, event| {
+            if event.id.as_ref() == "quit" {
                 app.exit(0);
+                return;
             }
-            "settings" => {
-                show_settings_window(app);
-            }
-            "dashboard" => {
-                show_dashboard_window(app);
-            }
-            "suggestions" => {
-                show_suggestions_window(app);
-            }
-            "cleanup" => {
-                show_cleanup_window(app);
-            }
-            "clean" => {
-                if let Err(error) = crate::commands::show_review_cmd(app.clone(), Vec::new()) {
-                    eprintln!("[tray] Could not open organization review: {error}");
+            let app = app.clone();
+            // WebView2 needs the Windows event loop to keep pumping while a window is built.
+            tauri::async_runtime::spawn_blocking(move || match event.id.as_ref() {
+                "settings" => show_settings_window(&app),
+                "dashboard" => show_dashboard_window(&app),
+                "suggestions" => show_suggestions_window(&app),
+                "cleanup" => show_cleanup_window(&app),
+                "clean" => {
+                    if let Err(error) = crate::commands::show_review_cmd(app, Vec::new()) {
+                        eprintln!("[tray] Could not open organization review: {error}");
+                    }
                 }
-            }
-            _ => {}
+                _ => {}
+            });
         })
         .on_tray_icon_event(|tray, event| {
-            if let TrayIconEvent::Click { button, .. } = event {
-                if button == MouseButton::Left {
-                    show_popup_window(tray.app_handle());
-                }
+            if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = event {
+                let app = tray.app_handle().clone();
+                tauri::async_runtime::spawn_blocking(move || show_popup_window(&app));
             }
         });
 
