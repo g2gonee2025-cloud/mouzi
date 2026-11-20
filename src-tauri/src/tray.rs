@@ -162,8 +162,11 @@ pub fn update_tray_language(app: &AppHandle, lang: &str) {
     if let (Some(tray), Ok(menu)) = (app.tray_by_id("tray"), result) {
         let _ = tray.set_menu(Some(menu));
     }
-    let pending = app.try_state::<crate::AppState>().and_then(|state| state.watcher.lock().ok().map(|watcher| watcher.get_pending_files().len())).unwrap_or(0);
-    update_tray_tooltip(app, pending);
+    if let Some(pending) = app.try_state::<crate::AppState>()
+        .and_then(|state| state.watcher.lock().ok()?.get_pending_files().ok())
+    {
+        update_tray_tooltip(app, pending.len());
+    }
 }
 
 pub fn update_tray_tooltip(app: &AppHandle, count: usize) {

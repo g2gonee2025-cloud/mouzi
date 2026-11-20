@@ -992,8 +992,8 @@ pub async fn show_popup_cmd(app: AppHandle) -> Result<(), String> {
 pub fn get_pending_files_cmd(
     state: tauri::State<AppState>,
 ) -> Result<Vec<(String, String)>, String> {
-    let watcher = state.watcher.lock().unwrap();
-    Ok(watcher.get_pending_files())
+    let watcher = state.watcher.lock().map_err(|_| "Folder watcher is unavailable")?;
+    watcher.get_pending_files()
 }
 
 #[tauri::command(async)]

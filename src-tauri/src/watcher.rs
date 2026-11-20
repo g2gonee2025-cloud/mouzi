@@ -302,7 +302,9 @@ impl FolderWatcher {
             }
         }
         if queues_changed {
-            self.prune_queues(folders);
+            if let Err(error) = self.prune_queues(folders) {
+                errors.push(error);
+            }
         }
         if errors.is_empty() { Ok(()) } else { Err(errors.join("; ")) }
     }
@@ -381,7 +383,7 @@ impl FolderWatcher {
 
     pub(crate) fn reconcile_baseline(&mut self, id: i64) -> Result<(), String> {
         let folders = get_watched_folders().map_err(|error| error.to_string())?;
-        self.prune_queues(&folders);
+        self.prune_queues(&folders)?;
         let Some(folder) = folders.iter().find(|folder| {
             folder.id == Some(id) && folder.enabled && !folder.only_new
                 && (is_folder_auto_mode(&folder.mode) || is_folder_manual_mode(&folder.mode))
@@ -405,7 +407,7 @@ impl FolderWatcher {
         issues
     }
 
-    fn prune_queues(&self, folders: &[WatchedFolder]) {
+    fn prune_queues(&self, folders: &[WatchedFolder]) -> Result<(), String> {
         let valid = |root: &WatchedRoot, manual: bool| folders.iter().any(|folder| {
             folder.enabled && root.matches_registration(folder)
                 && if manual { is_folder_manual_mode(&folder.mode) } else { is_folder_auto_mode(&folder.mode) }
@@ -418,9 +420,18 @@ impl FolderWatcher {
             removed
         };
         self.suppression.invalidate(&removed);
-        self.pending_manual.lock().unwrap_or_else(|error| error.into_inner())
-            .retain(|path, root| pending_review_is_current(Path::new(path), root, folders).unwrap_or(false));
+        {
+            let mut manual = self.pending_manual.lock().unwrap_or_else(|error| error.into_inner());
+            let mut stale = Vec::new();
+            for (path, root) in manual.iter() {
+                if !pending_review_is_current(Path::new(path), root, folders)? {
+                    stale.push(path.clone());
+                }
+            }
+            for path in stale { manual.remove(&path); }
+        }
         self.update_tray_tooltip();
+        Ok(())
     }
 
     fn update_tray_tooltip(&self) {
@@ -429,14 +440,14 @@ impl FolderWatcher {
         }
     }
 
-    pub fn get_pending_files(&self) -> Vec<(String, String)> {
-        let Ok(folders) = get_watched_folders() else { return Vec::new(); };
-        self.prune_queues(&folders);
-        self.pending_manual.lock().unwrap_or_else(|error| error.into_inner()).keys()
+    pub fn get_pending_files(&self) -> Result<Vec<(String, String)>, String> {
+        let folders = get_watched_folders().map_err(|error| error.to_string())?;
+        self.prune_queues(&folders)?;
+        Ok(self.pending_manual.lock().unwrap_or_else(|error| error.into_inner()).keys()
             .filter_map(|path| {
                 let path = Path::new(path);
                 Some((path.parent()?.to_string_lossy().to_string(), path.file_name()?.to_string_lossy().to_string()))
-            }).collect()
+            }).collect())
     }
 
     pub fn flush_manual_to_pending(&mut self, folder_path: &str) {
@@ -497,7 +508,11 @@ fn pending_review_is_current(path: &Path, root: &WatchedRoot, folders: &[Watched
         folder.enabled && root.matches_registration(folder) && (is_folder_manual_mode(&folder.mode)
             || (is_folder_auto_mode(&folder.mode) && crate::operations::suspicious_name(path)))
     }) else { return Ok(false); };
-    Ok(path.is_file() && !path_is_baselined(path, folder)?)
+    match std::fs::metadata(path) {
+        Ok(metadata) => Ok(metadata.is_file() && !path_is_baselined(path, folder)?),
+        Err(error) if matches!(error.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory) => Ok(false),
+        Err(error) => Err(format!("Cannot inspect pending file {}: {error}", path.display())),
+    }
 }
 
 fn update_pending_tooltip(app: &tauri::AppHandle, manual: &Arc<Mutex<HashMap<String, Arc<WatchedRoot>>>>) {
@@ -717,13 +732,13 @@ mod tests {
         let root = watcher.ensure_watch(&row, false).unwrap();
         watcher.enqueue_existing_files(&root, None).unwrap();
         let pending = || ["new.txt".to_string(), "old.txt".to_string()];
-        assert_eq!(watcher.get_pending_files().into_iter().map(|(_, name)| name).collect::<Vec<_>>(), ["new.txt"]);
+        assert_eq!(watcher.get_pending_files().unwrap().into_iter().map(|(_, name)| name).collect::<Vec<_>>(), ["new.txt"]);
 
         for mode in [FOLDER_MODE_MANUAL, FOLDER_MODE_SUGGEST] {
             db::update_folder_mode(id, mode).unwrap();
             assert!(db::set_only_new(id, false).unwrap());
             watcher.reconcile_baseline(id).unwrap();
-            let mut names = watcher.get_pending_files().into_iter().map(|(_, name)| name).collect::<Vec<_>>();
+            let mut names = watcher.get_pending_files().unwrap().into_iter().map(|(_, name)| name).collect::<Vec<_>>();
             names.sort();
             assert_eq!(names, pending());
 
@@ -731,6 +746,40 @@ mod tests {
             watcher.reconcile_baseline(id).unwrap();
             assert!(watcher.pending_manual.lock().unwrap().is_empty());
         }
+    }
+
+    #[test]
+    fn pending_read_errors_do_not_remove_unverified_arrivals() {
+        let fixture = RecoveryFixture::new();
+        let folder = WatchedFolder {
+            id: Some(1), path: fixture.root().to_string_lossy().into_owned(),
+            enabled: true, mode: crate::db::FOLDER_MODE_MANUAL.into(), only_new: false,
+        };
+        let root = Arc::new(WatchedRoot::capture(&folder).unwrap());
+        let watcher = FolderWatcher::new(Arc::new(SuppressionSet::new()));
+        // A path the OS cannot inspect gives a deterministic metadata error.
+        let unreadable = fixture.root().join("invalid\0entry").to_string_lossy().into_owned();
+        let present = fixture.root().join("present.txt");
+        std::fs::write(&present, b"pending file").unwrap();
+        let present = present.to_string_lossy().into_owned();
+        let absent = fixture.root().join("absent.txt").to_string_lossy().into_owned();
+        let folders = [folder];
+        {
+            let mut pending = watcher.pending_manual.lock().unwrap();
+            for path in [&unreadable, &present, &absent] {
+                pending.insert(path.clone(), root.clone());
+            }
+        }
+        assert!(watcher.prune_queues(&folders).is_err());
+        let mut pending = watcher.pending_manual.lock().unwrap();
+        assert!(pending.contains_key(&unreadable));
+        assert!(pending.contains_key(&present));
+        pending.remove(&unreadable);
+        drop(pending);
+        watcher.prune_queues(&folders).unwrap();
+        let pending = watcher.pending_manual.lock().unwrap();
+        assert!(pending.contains_key(&present));
+        assert!(!pending.contains_key(&absent));
     }
 
     struct RecoveryFixture {
@@ -780,7 +829,7 @@ mod tests {
         assert!(watcher.reconcile_watches_for_folders(&folders, retry_at, false, false).is_err());
         assert!(watcher.issues()[path].contains("different physical folder"));
         assert!(!watcher.watchers.contains_key(path));
-        assert!(watcher.get_pending_files().is_empty());
+        assert!(watcher.get_pending_files().unwrap().is_empty());
 
         fs::rename(&root_path, fixture.parent.join("replacement")).unwrap();
         fs::rename(&offline, &root_path).unwrap();
@@ -791,7 +840,7 @@ mod tests {
         assert!(!watcher.watchers.contains_key(path));
         watcher.reconcile_watches_for_folders(&folders, retry_at, false, false).unwrap();
         assert!(!watcher.issues().contains_key(path));
-        assert_eq!(watcher.get_pending_files().into_iter().map(|(_, name)| name).collect::<Vec<_>>(),
+        assert_eq!(watcher.get_pending_files().unwrap().into_iter().map(|(_, name)| name).collect::<Vec<_>>(),
             ["missed-while-offline.txt"]);
         let recovered = watcher.watchers[path].root.clone();
         record_callback_health(None, &watcher.callback_warnings, &recovered, Some("Fixture entry could not be read".into()), false);
@@ -806,7 +855,7 @@ mod tests {
         let after_retirement = retry_at + WATCH_CHECK_INTERVAL * 2;
         assert!(watcher.reconcile_watches_for_folders(&folders, after_retirement, false, false).is_err());
         assert_eq!(watcher.issues()[path], "Fixture notifier stopped");
-        assert!(watcher.get_pending_files().is_empty());
+        assert!(watcher.get_pending_files().unwrap().is_empty());
         let retry_at = watcher.failures[path].retry_at;
         watcher.reconcile_watches_for_folders(&folders, retry_at, false, false).unwrap();
         assert!(!Arc::ptr_eq(&watcher.watchers[path].root, &recovered));
