@@ -248,7 +248,12 @@ pub fn add_rule_cmd(app: AppHandle, rule: Rule) -> Result<i64, String> {
 #[tauri::command(async)]
 pub fn update_rule_cmd(app: AppHandle, rule: Rule) -> Result<(), String> {
     validate_rule_destination(&rule)?;
-    with_configuration(&app, || update_rule(&rule).map_err(|e| e.to_string()))
+    with_configuration(&app, || {
+        update_rule(&rule).map_err(|error| match error {
+            rusqlite::Error::QueryReturnedNoRows => "This rule no longer exists".into(),
+            _ => error.to_string(),
+        })
+    })
 }
 
 #[tauri::command(async)]

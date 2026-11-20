@@ -683,13 +683,17 @@ fn update_rule_on(conn: &Connection, rule: &Rule) -> SqliteResult<()> {
     let exts = normalize_extensions(&rule.extensions).join(",");
     let options = serde_json::to_string(&rule.options)
         .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
-    conn.execute(
+    let matched = conn.execute(
         "UPDATE rules SET name=?1,priority=?2,enabled=?3,extensions=?4,pattern=?5,destination=?6,action=?7,folder_id=?8,
          notification_message=?9,normalize_extensions=?10,extension_mappings=?11,options=?12 WHERE id=?13",
         params![rule.name,rule.priority,rule.enabled,exts,rule.pattern,rule.destination,rule.action,rule.folder_id,
             rule.notification_message,rule.normalize_extensions,rule.extension_mappings,options,rule.id],
     )?;
-    Ok(())
+    if matched == 1 {
+        Ok(())
+    } else {
+        Err(rusqlite::Error::QueryReturnedNoRows)
+    }
 }
 
 pub fn delete_rule(id: i64) -> SqliteResult<()> {
