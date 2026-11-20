@@ -75,28 +75,33 @@ export const useSuggestionsStore = create<SuggestionsState>((set, get) => ({
   },
   prepareSuggestions: async (suggestions, createRule, owner) => {
     if (!suggestions.length || get().busy || get().preparedPlans) throw new Error("Another suggestion is being reviewed or processed");
-    const isCurrent = preview.begin(owner, () => set({ busy: false, preparedPlans: null }));
+    let planIds: string[] = [];
+    const discard = () => {
+      if (!planIds.length) return;
+      const discarded = planIds;
+      planIds = [];
+      void invoke("discard_suggestion_plans_cmd", { planIds: discarded })
+        .catch((error) => console.error("Could not discard suggestion preview", error));
+    };
+    const isCurrent = preview.begin(owner, () => {
+      discard();
+      set({ busy: false, preparedPlans: null });
+    });
     ++loadGeneration;
-    const captured = suggestions.map((s) => ({ ...s }));
+    const requests = suggestions.map(({ path, suggestedCategory }) => ({ path, suggestedCategory }));
     set({ busy: true, loading: false, error: null });
     try {
-      const plans: SuggestionPlan[] = [];
-      for (const s of captured) {
-        const plan = await invoke<SuggestionPlan>("prepare_suggestion_cmd", { path: s.path, suggestedCategory: s.suggestedCategory, createRule });
-        owner?.throwIfAborted();
-        plans.push(Object.freeze({ ...plan, rule: plan.rule ? Object.freeze({ ...plan.rule }) : null }));
-      }
-      const plannedExtensions = new Map<string, string>();
-      for (const { rule } of plans) {
-        if (rule?.disposition !== "create" || !rule.extension) continue;
-        const previous = plannedExtensions.get(rule.extension);
-        if (previous && previous !== rule.destination) throw new Error(`Conflicting future rules for .${rule.extension}; accept without creating rules or review files individually`);
-        plannedExtensions.set(rule.extension, rule.destination);
-      }
-      const frozen = Object.freeze(plans);
+      const plans = await invoke<SuggestionPlan[]>("prepare_suggestions_cmd", { requests, createRule });
+      planIds = plans.map((plan) => plan.planId);
+      owner?.throwIfAborted();
+      const frozen = Object.freeze(plans.map((plan) => Object.freeze({
+        ...plan,
+        rule: plan.rule ? Object.freeze({ ...plan.rule }) : null,
+      })));
       set({ preparedPlans: frozen, busy: false });
       return frozen;
     } catch (error) {
+      discard();
       if (isCurrent()) {
         preview.clear();
         set({ error: String(error), busy: false });

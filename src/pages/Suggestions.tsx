@@ -93,9 +93,6 @@ export default function Suggestions() {
     navigateHash("dashboard");
   };
 
-  // `createRule` is pre-checked, so one click used to move every file AND leave
-  // behind a permanent enabled rule per file. The dialog states both outcomes
-  // and lets the rule half be called out even when the box is unticked.
   const reviewSuggestions = async (captured: readonly Suggestion[], opener: HTMLButtonElement) => {
     if (!captured.length || busy || loading || pending) return;
     const owner = beginPreview();

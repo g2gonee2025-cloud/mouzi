@@ -48,7 +48,7 @@ pub fn suspicious_name(path: &Path) -> bool {
 }
 
 
-fn path_key(path: &Path) -> String {
+pub(crate) fn path_key(path: &Path) -> String {
     let text = path.to_string_lossy().to_string();
     if cfg!(target_os = "windows") {
         text.to_lowercase()
@@ -181,7 +181,7 @@ pub(crate) fn fingerprints_match(file: &mut fs::File, fingerprints: &[String], d
     Ok(false)
 }
 
-fn destination_guard(path: &Path) -> Result<(PathBuf, FileIdentity, AncestorGuard), String> {
+pub(crate) fn destination_guard(path: &Path) -> Result<(PathBuf, FileIdentity, AncestorGuard), String> {
     let mut ancestor = path.parent().ok_or("Missing destination parent")?;
     loop {
         match fs::symlink_metadata(ancestor) {

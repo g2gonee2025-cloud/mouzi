@@ -87,8 +87,12 @@ it("retains confirmed cleanup results after the preview owner leaves", async () 
 it("executes frozen suggestion plans even if a later list is substituted", async () => {
   const selected = [suggestion("a"), suggestion("b")];
   useSuggestionsStore.setState({ suggestions: selected });
-  ipc.invoke.mockResolvedValueOnce(plan("a")).mockResolvedValueOnce(plan("b"));
+  ipc.invoke.mockResolvedValueOnce([plan("a"), plan("b")]);
   const reviewed = await useSuggestionsStore.getState().prepareSuggestions(selected, true);
+  expect(ipc.invoke).toHaveBeenCalledExactlyOnceWith("prepare_suggestions_cmd", {
+    requests: selected.map(({ path, suggestedCategory }) => ({ path, suggestedCategory })),
+    createRule: true,
+  });
   expect(Object.isFrozen(reviewed)).toBe(true);
   expect(Object.isFrozen(reviewed[0].rule)).toBe(true);
   expect(distinctSuggestionRules(reviewed)).toHaveLength(1);
@@ -102,9 +106,9 @@ it("executes frozen suggestion plans even if a later list is substituted", async
   expect(useSuggestionsStore.getState().results).toHaveLength(2);
 });
 
-it("stops preparing an abandoned suggestion batch and preserves a later confirmed batch", async () => {
-  const abandoned = deferred<SuggestionPlan>();
-  ipc.invoke.mockReturnValueOnce(abandoned.promise).mockResolvedValueOnce(plan("next"));
+it("discards plans from an abandoned suggestion batch and preserves a later confirmed batch", async () => {
+  const abandoned = deferred<SuggestionPlan[]>();
+  ipc.invoke.mockReturnValueOnce(abandoned.promise).mockResolvedValueOnce([plan("next")]).mockResolvedValueOnce(undefined);
   const firstOwner = new AbortController();
   const first = useSuggestionsStore.getState().prepareSuggestions([suggestion("a"), suggestion("b")], false, firstOwner.signal);
   const rejection = expect(first).rejects.toMatchObject({ name: "AbortError" });
@@ -112,9 +116,9 @@ it("stops preparing an abandoned suggestion batch and preserves a later confirme
   const nextOwner = new AbortController();
   const reviewed = await useSuggestionsStore.getState().prepareSuggestions([suggestion("next")], false, nextOwner.signal);
 
-  abandoned.resolve(plan("a"));
+  abandoned.resolve([plan("a"), plan("b")]);
   await rejection;
-  expect(ipc.invoke).toHaveBeenCalledTimes(2);
+  expect(ipc.invoke).toHaveBeenCalledWith("discard_suggestion_plans_cmd", { planIds: ["plan:a", "plan:b"] });
   expect(useSuggestionsStore.getState()).toMatchObject({ busy: false, preparedPlans: reviewed, error: null });
 
   const executing = deferred<{ path: string; status: "ok"; dest: string; message: null }>();
@@ -125,11 +129,23 @@ it("stops preparing an abandoned suggestion batch and preserves a later confirme
   executing.resolve({ path: "next", status: "ok", dest: "root/Documents/next", message: null });
   await execution;
   expect(useSuggestionsStore.getState().results?.[0]).toMatchObject({ path: "next", status: "ok" });
+  expect(ipc.invoke.mock.calls.filter(([command]) => command === "discard_suggestion_plans_cmd")).toHaveLength(1);
+});
+
+it("releases a prepared suggestion batch when its review is dismissed", async () => {
+  const owner = new AbortController();
+  ipc.invoke.mockResolvedValueOnce([plan("a"), plan("b")]).mockResolvedValueOnce(undefined);
+  await useSuggestionsStore.getState().prepareSuggestions([suggestion("a"), suggestion("b")], false, owner.signal);
+
+  owner.abort();
+
+  expect(ipc.invoke).toHaveBeenCalledWith("discard_suggestion_plans_cmd", { planIds: ["plan:a", "plan:b"] });
+  expect(useSuggestionsStore.getState()).toMatchObject({ busy: false, preparedPlans: null, error: null });
 });
 
 it("preserves failed cards for retry and reports a moved file with partial finalization", async () => {
   const selected = [suggestion("a"), suggestion("b")]; useSuggestionsStore.setState({ suggestions: selected });
-  ipc.invoke.mockResolvedValueOnce(plan("a")).mockResolvedValueOnce(plan("b"));
+  ipc.invoke.mockResolvedValueOnce([plan("a"), plan("b")]);
   const reviewed = await useSuggestionsStore.getState().prepareSuggestions(selected, false);
   ipc.invoke.mockRejectedValueOnce(new Error("scope changed")).mockResolvedValueOnce({ path: "b", status: "partial", message: "history failed", dest: "actual/b" });
   await useSuggestionsStore.getState().acceptAll(reviewed);
@@ -141,8 +157,8 @@ it("preserves failed cards for retry and reports a moved file with partial final
 
 it("rejects conflicting proposed global rules and leaves the selection intact", async () => {
   const selected = [suggestion("a"), suggestion("b")]; useSuggestionsStore.setState({ suggestions: selected });
-  ipc.invoke.mockResolvedValueOnce(plan("a")).mockResolvedValueOnce(plan("b", "Images"));
-  await expect(useSuggestionsStore.getState().prepareSuggestions(selected, true)).rejects.toThrow("Conflicting future rules");
+  ipc.invoke.mockRejectedValueOnce("Conflicting future rules for .xyz");
+  await expect(useSuggestionsStore.getState().prepareSuggestions(selected, true)).rejects.toMatch("Conflicting future rules");
   expect(useSuggestionsStore.getState().preparedPlans).toBeNull();
   expect(useSuggestionsStore.getState().suggestions).toHaveLength(2);
 });

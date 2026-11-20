@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use once_cell::sync::Lazy;
 use std::sync::Mutex as PlanMutex;
 // `MOVE_OBSERVER` and the two test modules that read it are the only users.
@@ -1632,8 +1632,11 @@ pub struct SuggestionPlanPreview {
 struct SuggestionPlan {
     preview: SuggestionPlanPreview,
     root: PathBuf,
+    root_identity: crate::safe_fs::FileIdentity,
     identity: crate::safe_fs::FileIdentity,
     digest: String,
+    destination_ancestor: PathBuf,
+    destination_identity: crate::safe_fs::FileIdentity,
     configuration: String,
     expires: Instant,
     create_rule: bool,
@@ -1641,90 +1644,164 @@ struct SuggestionPlan {
 
 static SUGGESTION_PLANS: Lazy<PlanMutex<HashMap<String, SuggestionPlan>>> = Lazy::new(|| PlanMutex::new(HashMap::new()));
 
-fn suggestion_configuration() -> Result<String, String> {
-    serde_json::to_string(&get_watched_folders().map_err(|e| e.to_string())?)
-        .map_err(|e| e.to_string())
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SuggestionRequest {
+    path: String,
+    suggested_category: String,
 }
 
-fn live_suggestion_fingerprint(path: &Path, scope: &crate::safe_fs::RootScope) -> Result<(crate::safe_fs::FileIdentity, String), String> {
-    use std::io::Read;
-    let mut validated = scope.validate_file(path)?;
-    let identity = validated.identity.clone();
+fn live_suggestion_digest(path: &Path, validated: &mut crate::safe_fs::ValidatedFile) -> Result<String, String> {
     let before = validated.file.metadata().map_err(|e| e.to_string())?;
-    let mut digest = blake3::Hasher::new();
-    let mut buffer = [0u8; 64 * 1024];
-    loop {
-        let read = validated.file.read(&mut buffer).map_err(|e| e.to_string())?;
-        if read == 0 { break; }
-        digest.update(&buffer[..read]);
-    }
+    let digest = crate::safe_fs::hash_handle(&mut validated.file)?;
     let after = validated.file.metadata().map_err(|e| e.to_string())?;
     if before.len() != after.len() || before.modified().ok() != after.modified().ok()
-        || crate::safe_fs::file_identity(path)? != identity
+        || crate::safe_fs::file_identity(path)? != validated.identity
     { return Err("File changed while its suggestion was being reviewed".into()); }
-    Ok((identity, digest.finalize().to_hex().to_string()))
+    Ok(digest.to_hex().to_string())
 }
 
-fn suggestion_rule_preview(file_name: &str, category: &str) -> Result<SuggestionRulePreview, String> {
+fn suggestion_rule_preview(file_name: &str, category: &str, rules: &[Rule]) -> SuggestionRulePreview {
     let extension = Path::new(file_name).extension().map(|e| e.to_string_lossy().to_lowercase()).filter(|e| !e.is_empty());
     let mut preview = SuggestionRulePreview {
         extension: extension.clone(), destination: category.into(),
         scope: "All eligible watched folders, including folders added later".into(),
         priority: 10, disposition: "create".into(), message: None,
     };
-    let Some(extension) = extension else { preview.disposition = "not_applicable".into(); preview.message = Some("An extensionless file cannot create an extension rule".into()); return Ok(preview); };
-    let rules = get_rules().map_err(|e| e.to_string())?;
-    for rule in rules.iter().filter(|r| r.enabled) {
-        if rule.extensions.iter().any(|e| e == &extension || e == "*") {
-            // Lower-priority catch-all rules remain fallbacks after this rule.
-            if !rule.extensions.contains(&extension) && rule.priority > preview.priority && rule.destination != category { continue; }
-            if rule.action == "move" && rule.destination == category && rule.pattern.is_none() {
+    let Some(extension) = extension else {
+        preview.disposition = "not_applicable".into();
+        preview.message = Some("An extensionless file cannot create an extension rule".into());
+        return preview;
+    };
+    for rule in rules.iter().filter(|rule| rule.enabled) {
+        let exact_extension = rule.extensions.contains(&extension);
+        if !exact_extension && !rule.extensions.iter().any(|value| value == "*") {
+            continue;
+        }
+        if rule.action == "move" && rule.destination == category && !rule.normalize_extensions {
+            let options = &rule.options;
+            if rule.folder_id == 0 && rule.pattern.as_deref().is_none_or(str::is_empty)
+                && options.min_size.is_none() && options.max_size.is_none()
+                && options.modified_after.is_none() && options.modified_before.is_none()
+            {
                 preview.disposition = "already_covered".into();
                 preview.message = Some(format!("Already covered by {}", rule.name));
-                return Ok(preview);
+                return preview;
             }
-            preview.disposition = "conflict".into();
-            preview.message = Some(format!("Existing rule '{}' can affect .{} files; edit the rules explicitly before adding conflicting automation", rule.name, extension));
-            return Ok(preview);
+            // This move agrees where it applies. Keep checking for other rules
+            // before proposing coverage for files outside these conditions.
+            continue;
         }
+        // Lower-priority catch-all rules remain fallbacks after this rule.
+        if !exact_extension && rule.priority > preview.priority {
+            continue;
+        }
+        preview.disposition = "conflict".into();
+        preview.message = Some(format!("Existing rule '{}' can affect .{} files; edit the rules explicitly before adding conflicting automation", rule.name, extension));
+        return preview;
     }
-    Ok(preview)
+    preview
 }
 
-fn prepare_suggestion(path: String, suggested_category: String, create_rule: bool) -> Result<SuggestionPlanPreview, String> {
-    if !crate::categories::is_valid_category(&suggested_category) || suggested_category == "Other" {
-        return Err("Choose a supported category".into());
+fn prepare_suggestions(requests: Vec<SuggestionRequest>, create_rule: bool) -> Result<Vec<SuggestionPlanPreview>, String> {
+    const MAX_BATCH: usize = 200;
+    if requests.is_empty() || requests.len() > MAX_BATCH {
+        return Err(format!("Choose between 1 and {MAX_BATCH} suggestions to review"));
     }
     let folders = get_watched_folders().map_err(|e| e.to_string())?;
     let scope = crate::safe_fs::eligible_scope(&folders)?;
-    let root = scope.validate_file(Path::new(&path))?.owning_root;
-    {
-        let conn = lock_db()?;
-        let present: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM file_inventory WHERE path=?1)", [&path], |r| r.get(0)).map_err(|e| e.to_string())?;
-        if !present { return Err("Suggestion is no longer in the inventory; scan again".into()); }
+    let configuration = serde_json::to_string(&folders).map_err(|e| e.to_string())?;
+    let rules = if create_rule { get_rules().map_err(|e| e.to_string())? } else { Vec::new() };
+    let mut reviewed = Vec::with_capacity(requests.len());
+    let mut sources = HashSet::new();
+    let mut destinations = HashSet::new();
+    let mut proposed_rules = HashMap::new();
+
+    for SuggestionRequest { path, suggested_category } in requests {
+        if !crate::categories::is_valid_category(&suggested_category) || suggested_category == "Other" {
+            return Err("Choose a supported category".into());
+        }
+        {
+            let conn = lock_db()?;
+            let present: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM file_inventory WHERE path=?1)", [&path], |row| row.get(0))
+                .map_err(|e| e.to_string())?;
+            if !present { return Err("Suggestion is no longer in the inventory; scan again".into()); }
+        }
+        let source = Path::new(&path);
+        let mut validated = scope.validate_file(source)?;
+        if !sources.insert(validated.identity.clone()) {
+            return Err("The same physical file appears more than once in the suggestion review".into());
+        }
+        let digest = live_suggestion_digest(source, &mut validated)?;
+        let root = validated.owning_root.clone();
+        let root_identity = crate::safe_fs::file_identity(&root)?;
+        let file_name = source.file_name().and_then(|name| name.to_str()).ok_or("Suggestion has no valid filename")?;
+        let category_dir = root.join(&suggested_category);
+        let already_filed = validated.canonical_path.parent().is_some_and(|parent| {
+            crate::safe_fs::directory_contains(parent, &category_dir).unwrap_or(false)
+        });
+        let destination = if already_filed {
+            source.to_path_buf()
+        } else {
+            crate::safe_fs::try_unique_destination_with(&category_dir, file_name, |candidate| {
+                destinations.contains(&crate::operations::path_key(candidate))
+            })?
+        };
+        let (destination_ancestor, destination_identity, _destination_guard) = crate::operations::destination_guard(&destination)?;
+        if !already_filed {
+            destinations.insert(crate::operations::path_key(&destination));
+        }
+        let rule = create_rule.then(|| suggestion_rule_preview(file_name, &suggested_category, &rules));
+        if let Some(rule) = &rule {
+            if let Some(extension) = rule.extension.as_ref().filter(|_| rule.disposition == "create") {
+                if proposed_rules.insert(extension.clone(), rule.destination.clone())
+                    .is_some_and(|destination| destination != rule.destination)
+                {
+                    return Err(format!("Conflicting future rules for .{extension}; accept without creating rules or review files individually"));
+                }
+            }
+        }
+        let preview = SuggestionPlanPreview {
+            plan_id: crate::operations::new_run_id(),
+            path,
+            category: suggested_category,
+            destination: destination.to_string_lossy().into_owned(),
+            rule,
+        };
+        reviewed.push(SuggestionPlan {
+            preview, root, root_identity, identity: validated.identity, digest,
+            destination_ancestor, destination_identity, configuration: configuration.clone(),
+            expires: Instant::now(), create_rule,
+        });
     }
-    let (identity, digest) = live_suggestion_fingerprint(Path::new(&path), &scope)?;
-    let file_name = Path::new(&path).file_name().ok_or("Suggestion has no filename")?.to_string_lossy().into_owned();
-    let category_dir = root.join(&suggested_category);
-    let canonical_source = scope.validate_file(Path::new(&path))?.canonical_path;
-    let already_filed = canonical_source.parent().is_some_and(|parent| crate::safe_fs::directory_contains(parent, &category_dir).unwrap_or(false));
-    let destination = if already_filed { path.clone() } else { crate::safe_fs::try_unique_destination(&category_dir, &file_name)?.to_string_lossy().into_owned() };
-    let rule = if create_rule { Some(suggestion_rule_preview(&file_name, &suggested_category)?) } else { None };
-    let serial = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
-    static NEXT_PLAN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let plan_id = format!("suggestion-{serial}-{}-{}", std::process::id(), NEXT_PLAN.fetch_add(1, Ordering::Relaxed));
-    let preview = SuggestionPlanPreview { plan_id: plan_id.clone(), path, category: suggested_category, destination, rule };
+
+    // Publish the complete review together. A failed batch leaves no live plans.
     let mut plans = SUGGESTION_PLANS.lock().map_err(|_| "Suggestion plan store unavailable")?;
-    plans.retain(|_, p| p.expires > Instant::now());
-    if plans.len() >= 512 { return Err("Too many pending previews; close older previews and retry".into()); }
-    plans.insert(plan_id, SuggestionPlan { preview: preview.clone(), root, identity, digest, configuration: suggestion_configuration()?, expires: Instant::now() + std::time::Duration::from_secs(600), create_rule });
-    Ok(preview)
+    let now = Instant::now();
+    plans.retain(|_, plan| plan.expires > now);
+    if plans.len() + reviewed.len() > 512 { return Err("Too many pending previews; close older previews and retry".into()); }
+    let expires = now + std::time::Duration::from_secs(600);
+    let previews = reviewed.iter().map(|plan| plan.preview.clone()).collect();
+    for mut plan in reviewed {
+        plan.expires = expires;
+        plans.insert(plan.preview.plan_id.clone(), plan);
+    }
+    Ok(previews)
 }
 
 #[tauri::command(async)]
-pub fn prepare_suggestion_cmd(path: String, suggested_category: String, create_rule: bool, state: tauri::State<AppState>) -> Result<SuggestionPlanPreview, String> {
+pub fn prepare_suggestions_cmd(requests: Vec<SuggestionRequest>, create_rule: bool, state: tauri::State<AppState>) -> Result<Vec<SuggestionPlanPreview>, String> {
     let _operation = state.ignored_files.with_operation();
-    prepare_suggestion(path, suggested_category, create_rule)
+    prepare_suggestions(requests, create_rule)
+}
+
+#[tauri::command]
+pub fn discard_suggestion_plans_cmd(plan_ids: Vec<String>) -> Result<(), String> {
+    let mut plans = SUGGESTION_PLANS.lock().map_err(|_| "Suggestion plan store unavailable")?;
+    for plan_id in plan_ids {
+        plans.remove(&plan_id);
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -1754,20 +1831,32 @@ pub fn accept_suggestion_cmd(
 fn accept_reviewed_suggestion(plan_id: &str, suppression: &IgnoredFiles) -> Result<AcceptOutcome, String> {
     let plan = SUGGESTION_PLANS.lock().map_err(|_| "Suggestion plan store unavailable")?.remove(plan_id).ok_or("Suggestion preview expired or was already used; preview again")?;
     let _operation = suppression.with_operation();
-    if plan.expires <= Instant::now() || plan.configuration != suggestion_configuration()? {
+    let folders = get_watched_folders().map_err(|e| e.to_string())?;
+    if plan.expires <= Instant::now() || plan.configuration != serde_json::to_string(&folders).map_err(|e| e.to_string())? {
         return Err("Suggestion configuration changed; preview again".into());
     }
     if let Some(reviewed) = &plan.preview.rule {
         let name = Path::new(&plan.preview.path).file_name().ok_or("Suggestion has no filename")?.to_string_lossy();
-        let current = suggestion_rule_preview(&name, &plan.preview.category)?;
+        let rules = get_rules().map_err(|e| e.to_string())?;
+        let current = suggestion_rule_preview(&name, &plan.preview.category, &rules);
         let compatible = current.disposition == reviewed.disposition
             || (reviewed.disposition == "create" && current.disposition == "already_covered");
         if !compatible { return Err("Future rule coverage changed; preview again".into()); }
     }
-    let scope = crate::safe_fs::eligible_scope(&get_watched_folders().map_err(|e| e.to_string())?)?;
-    let (identity, digest) = live_suggestion_fingerprint(Path::new(&plan.preview.path), &scope)?;
-    if identity != plan.identity || digest != plan.digest { return Err("Suggestion file changed; preview again".into()); }
-    accept_suggestion_validated_with(plan.preview.path, plan.preview.category, plan.create_rule, suppression, &plan.root, Some(&identity), Some(&plan.digest), Some(Path::new(&plan.preview.destination)))
+    let scope = crate::safe_fs::eligible_scope(&folders)?;
+    let path = Path::new(&plan.preview.path);
+    let mut validated = scope.validate_file(path)?;
+    if validated.owning_root != plan.root || crate::safe_fs::file_identity(&plan.root)? != plan.root_identity
+        || validated.identity != plan.identity || live_suggestion_digest(path, &mut validated)? != plan.digest
+    {
+        return Err("Suggestion file or owning folder changed; preview again".into());
+    }
+    let _source_guard = validated.into_parent_guard();
+    let _destination_guard = crate::safe_fs::guard_directory(&plan.destination_ancestor)?;
+    if crate::safe_fs::file_identity(&plan.destination_ancestor)? != plan.destination_identity {
+        return Err("Reviewed destination folder changed; preview again".into());
+    }
+    accept_suggestion_validated_with(plan.preview.path, plan.preview.category, plan.create_rule, suppression, &plan.root, Some(&plan.identity), Some(&plan.digest), Some(Path::new(&plan.preview.destination)))
 }
 
 /// The body of `accept_suggestion_cmd`, callable without a Tauri state.
@@ -1925,37 +2014,16 @@ fn accept_suggestion_validated_with(
 /// Create a rule from a suggestion acceptance. Skips insertion if an enabled
 /// move rule already covers the same extension with the same destination.
 fn create_suggestion_rule(file_name: &str, category: &str) -> Result<Option<String>, String> {
-    let preview = suggestion_rule_preview(file_name, category)?;
+    let rules = get_rules().map_err(|e| e.to_string())?;
+    let preview = suggestion_rule_preview(file_name, category, &rules);
     if preview.disposition != "create" {
         return Ok(preview.message);
     }
-    let ext = file_name
-        .rfind('.')
-        .and_then(|dot| file_name.get(dot + 1..))
-        .map(str::to_lowercase);
-    let ext = match ext {
-        Some(e) if !e.is_empty() => e,
-        _ => return Ok(Some("Extensionless file accepted; no extension rule created".into())),
-    };
-
-    let already_covered = get_rules()
-        .map(|rules| {
-            rules.iter().any(|r| {
-                r.enabled
-                    && r.action == "move"
-                    && r.destination == category
-                    && (r.extensions.iter().any(|e| e == &ext) || r.extensions.contains(&"*".to_string()))
-            })
-        })
-        .unwrap_or(false);
-    if already_covered {
-        return Ok(Some("Already covered by an existing rule".into()));
-    }
-
+    let ext = preview.extension.ok_or("Extensionless file cannot create an extension rule")?;
     add_rule(&Rule {
         id: None,
         name: category.to_string(),
-        priority: 10,
+        priority: preview.priority,
         enabled: true,
         extensions: vec![ext.clone()],
         pattern: None,
@@ -2773,16 +2841,116 @@ mod accept_tests {
         assert!(ignored.guarded_keys().is_empty());
     }
 
-    fn inventory_fixture(fixture: &AcceptFixture) -> PathBuf {
+    fn index_fixture(fixture: &AcceptFixture) {
         lock_db().unwrap().execute_batch("DELETE FROM watched_folders; DELETE FROM file_inventory; DELETE FROM inventory_fingerprints; DELETE FROM accepted_suggestion_feedback;").unwrap();
         add_watched_folder(&fixture.root().to_string_lossy(), FOLDER_MODE_MANUAL).unwrap();
-        let path = fixture.put("report.xyz");
         let summary = crate::scan::scan_roots(&[fixture.root().to_string_lossy().into_owned()], |_| {});
         assert_eq!(summary[0].status,"complete");
+    }
+
+    fn inventory_fixture(fixture: &AcceptFixture) -> PathBuf {
+        let path = fixture.put("report.xyz");
+        index_fixture(fixture);
         path
     }
 
     fn ignored_files() -> IgnoredFiles { Arc::new(SuppressionSet::new()) }
+
+    fn suggestion_request(path: &Path, category: &str) -> SuggestionRequest {
+        SuggestionRequest {
+            path: path.to_string_lossy().into_owned(),
+            suggested_category: category.into(),
+        }
+    }
+
+    fn prepare_suggestion(path: String, suggested_category: String, create_rule: bool) -> Result<SuggestionPlanPreview, String> {
+        prepare_suggestions(vec![SuggestionRequest { path, suggested_category }], create_rule)?
+            .pop().ok_or("No suggestion was prepared".into())
+    }
+
+    #[test]
+    fn suggestion_batch_reviews_and_moves_same_named_sources_to_distinct_paths() {
+        let fixture = AcceptFixture::new("review_batch_collision");
+        let first = fixture.put("incoming-one/report.xyz");
+        let second = fixture.put("incoming-two/report.xyz");
+        std::fs::write(&first, b"first").unwrap();
+        std::fs::write(&second, b"second").unwrap();
+        index_fixture(&fixture);
+
+        let reviewed = prepare_suggestions(vec![
+            suggestion_request(&first, "Documents"), suggestion_request(&second, "Documents"),
+        ], false).unwrap();
+        assert!(reviewed[0].destination.ends_with("report.xyz"));
+        assert!(reviewed[1].destination.ends_with("report_0.xyz"));
+        assert_ne!(reviewed[0].destination, reviewed[1].destination);
+
+        let ignored = ignored_files();
+        for (plan, payload) in reviewed.iter().zip([b"first".as_slice(), b"second".as_slice()]) {
+            let outcome = accept_reviewed_suggestion(&plan.plan_id, &ignored).unwrap();
+            assert_eq!(outcome.status, "ok");
+            assert_eq!(outcome.dest.as_deref(), Some(plan.destination.as_str()));
+            assert_eq!(std::fs::read(&plan.destination).unwrap(), payload);
+        }
+        assert!(!first.exists());
+        assert!(!second.exists());
+    }
+
+    #[test]
+    fn invalid_suggestion_batch_leaves_no_plans_and_discard_releases_live_plans() {
+        let fixture = AcceptFixture::new("review_batch_discard");
+        let first = inventory_fixture(&fixture);
+        let missing = fixture.root().join("missing.xyz");
+        let count = SUGGESTION_PLANS.lock().unwrap().len();
+        let error = prepare_suggestions(vec![
+            suggestion_request(&first, "Documents"), suggestion_request(&missing, "Documents"),
+        ], false).unwrap_err();
+        assert!(error.contains("no longer in the inventory"));
+        assert_eq!(SUGGESTION_PLANS.lock().unwrap().len(), count);
+
+        let reviewed = prepare_suggestions(vec![suggestion_request(&first, "Documents")], false).unwrap();
+        let id = &reviewed[0].plan_id;
+        assert!(SUGGESTION_PLANS.lock().unwrap().contains_key(id));
+        discard_suggestion_plans_cmd(vec![id.clone()]).unwrap();
+        assert!(!SUGGESTION_PLANS.lock().unwrap().contains_key(id));
+        assert!(accept_reviewed_suggestion(id, &ignored_files()).is_err());
+        assert!(first.exists());
+    }
+
+    #[test]
+    fn only_an_unconditional_global_move_covers_a_suggested_global_rule() {
+        let global = Rule {
+            enabled: true, action: "move".into(), destination: "Documents".into(),
+            extensions: vec!["xyz".into()], ..Rule::default()
+        };
+        for subset in [
+            Rule { folder_id: 7, ..global.clone() },
+            Rule { pattern: Some("^report".into()), ..global.clone() },
+            Rule { options: RuleOptions { min_size: Some(100), ..RuleOptions::default() }, ..global.clone() },
+            Rule { options: RuleOptions { modified_before: Some("2026-01-01".into()), ..RuleOptions::default() }, ..global.clone() },
+        ] {
+            let preview = suggestion_rule_preview("report.xyz", "Documents", std::slice::from_ref(&subset));
+            assert_eq!(preview.disposition, "create");
+            let conflict = Rule { destination: "Images".into(), ..global.clone() };
+            assert_eq!(suggestion_rule_preview("report.xyz", "Documents", &[subset, conflict]).disposition, "conflict");
+        }
+        assert_eq!(suggestion_rule_preview("report.xyz", "Documents", &[global]).disposition, "already_covered");
+    }
+
+    #[test]
+    fn reviewed_suggestion_rejects_a_replacement_destination_directory() {
+        let fixture = AcceptFixture::new("review_replaced_category");
+        let source = inventory_fixture(&fixture);
+        let category = fixture.root().join("Documents");
+        std::fs::create_dir(&category).unwrap();
+        let reviewed = prepare_suggestions(vec![suggestion_request(&source, "Documents")], false).unwrap();
+        std::fs::rename(&category, fixture.root().join("old-category")).unwrap();
+        std::fs::create_dir(&category).unwrap();
+
+        let error = accept_reviewed_suggestion(&reviewed[0].plan_id, &ignored_files()).unwrap_err();
+        assert!(error.contains("destination folder changed"));
+        assert!(source.exists());
+        assert!(!Path::new(&reviewed[0].destination).exists());
+    }
 
     #[test]
     fn retained_suggestion_records_recovery_without_adopting_the_output() {
