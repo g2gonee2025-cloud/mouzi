@@ -537,6 +537,8 @@ mod tests {
         fs::write(&original, "changed folder").unwrap();
         fs::write(scanned.root.join("untouched.txt"), "scanned folder").unwrap();
         assert_eq!(scan_roots(std::slice::from_ref(&changed_root), |_| {})[0].status, "complete");
+        // Move finalization receives the canonical source, even when TEMP uses a short path.
+        let original = fs::canonicalize(original).unwrap();
         let changed_token = db::begin_inventory_scan(&changed_root).unwrap();
 
         let mut reconciled = false;
