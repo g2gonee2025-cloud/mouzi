@@ -573,9 +573,22 @@ fn execute_cleanup_plan_with(plan_id: &str, io: &mut impl CleanupIo) -> Result<V
     if plan.created.elapsed() >= PLAN_LIFETIME { return Err("Cleanup review expired; review cleanup again".into()); }
     let scope = plan_scope(&plan)?;
     let mut removed = HashSet::new();
-    // All reviewed members are checked before the first mutation, including
-    // members in another group or retained copies not selected for removal.
-    for action in &plan.actions { validate_action(&plan, &scope, action, &removed)?; }
+    // Check every reviewed path before the first mutation. Each action
+    // revalidates its group below against the live filesystem.
+    {
+        let mut checked_paths = HashSet::new();
+        for action in &plan.actions {
+            if action.request.kind == "remove_empty_dir" {
+                validate_action(&plan, &scope, action, &removed)?;
+                continue;
+            }
+            for path in std::iter::once(&action.request.path).chain(&action.group_members) {
+                if checked_paths.insert(path.as_str()) {
+                    check_file(&plan, &scope, path)?;
+                }
+            }
+        }
+    }
     let mut outcomes = Vec::with_capacity(plan.actions.len());
     for action in &plan.actions {
         let request = &action.request;
@@ -737,7 +750,7 @@ mod tests {
         fail_finalize: bool,
         leave_source: bool,
         fail_after_removal: bool,
-        change_keeper_after_first: Option<String>,
+        change_file_after_first: Option<String>,
     }
 
     impl CleanupIo for FakeIo {
@@ -748,8 +761,8 @@ mod tests {
         fn finish_intent(&mut self, _id: i64, outcome: &CleanupOutcome, removed: bool) -> Result<(), String> {
             self.finalized.push((outcome.status.clone(), removed));
             if self.finalized.len() == 1 {
-                if let Some(keeper) = &self.change_keeper_after_first {
-                    fs::write(keeper, b"changed keeper").unwrap();
+                if let Some(path) = &self.change_file_after_first {
+                    fs::write(path, b"changed group member").unwrap();
                 }
             }
             if self.fail_finalize { Err("injected history failure".into()) } else { Ok(()) }
@@ -1142,12 +1155,51 @@ mod tests {
         let second = tree.file("second.txt", b"same");
         tree.inventory(&[&keeper, &first, &second]);
         let preview = prepare_cleanup(&[duplicate(&first, &keeper), duplicate(&second, &keeper)]).unwrap();
-        let mut io = FakeIo { change_keeper_after_first: Some(keeper.clone()), ..FakeIo::default() };
+        let mut io = FakeIo { change_file_after_first: Some(keeper.clone()), ..FakeIo::default() };
         let results = execute_cleanup_plan_with(&preview.plan_id, &mut io).unwrap();
         assert_eq!(io.trash_calls, 1);
         assert_eq!(results[0].status, "ok");
         assert_eq!(results[1].status, "skipped");
         assert!(Path::new(&second).exists());
+    }
+
+    #[test]
+    fn later_duplicate_group_is_checked_before_and_between_removals() {
+        let _guard = db::serialise_test_db();
+        init();
+        let tree = TestTree::new();
+        tree.register();
+        let first_keeper = tree.file("first-keeper.txt", b"alpha");
+        let first_victim = tree.file("first-victim.txt", b"alpha");
+        let second_keeper = tree.file("second-keeper.txt", b"bravo");
+        let second_victim = tree.file("second-victim.txt", b"bravo");
+        let second_unselected = tree.file("second-unselected.txt", b"bravo");
+        tree.inventory(&[&first_keeper, &first_victim, &second_keeper, &second_victim, &second_unselected]);
+        let actions = [duplicate(&first_victim, &first_keeper), duplicate(&second_victim, &second_keeper)];
+
+        let stale_member = prepare_cleanup(&actions).unwrap();
+        let multiple_stale = prepare_cleanup(&actions).unwrap();
+        fs::write(&second_unselected, b"edited").unwrap();
+        let mut io = FakeIo::default();
+        let error = execute_cleanup_plan_with(&stale_member.plan_id, &mut io).unwrap_err();
+        assert_eq!(error, format!("File changed since cleanup review: {second_unselected}"));
+        assert_eq!(fs::read(&first_victim).unwrap(), b"alpha");
+        fs::write(&first_victim, b"edited").unwrap();
+        let error = execute_cleanup_plan_with(&multiple_stale.plan_id, &mut io).unwrap_err();
+        assert_eq!(error, format!("File changed since cleanup review: {first_victim}"));
+        assert_eq!((io.intent_calls, io.trash_calls), (0, 0));
+
+        fs::write(&first_victim, b"alpha").unwrap();
+        fs::write(&second_unselected, b"bravo").unwrap();
+        let review = prepare_cleanup(&actions).unwrap();
+        io.change_file_after_first = Some(second_unselected);
+        let outcomes = execute_cleanup_plan_with(&review.plan_id, &mut io).unwrap();
+        assert_eq!(outcomes.iter().map(|outcome| outcome.status.as_str()).collect::<Vec<_>>(), ["ok", "skipped"]);
+        assert_eq!((io.intent_calls, io.trash_calls), (1, 1));
+        assert!(!Path::new(&first_victim).exists());
+        assert_eq!(fs::read(&first_keeper).unwrap(), b"alpha");
+        assert_eq!(fs::read(&second_keeper).unwrap(), b"bravo");
+        assert_eq!(fs::read(&second_victim).unwrap(), b"bravo");
     }
 
     #[test]
