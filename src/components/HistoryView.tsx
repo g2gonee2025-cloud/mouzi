@@ -134,12 +134,15 @@ export default function HistoryView() {
     {error && <p role="alert" className="text-red-700 dark:text-red-300">{error}</p>}
     {results.length > 0 && <div role="status" className="space-y-2 rounded-lg border border-border p-3">
       <h3 className="font-medium">{t("beta.results")}</h3>
-      {results.map((result) => <div key={result.id} className="space-y-1 break-all text-sm">
-        <p className="font-medium">{result.source}</p>
-        {undoNotice(result).map((notice) => <p key={notice.key} className={`rounded-md px-2 py-1 ${UNDO_TONE_CLASS[notice.tone]}`}>
-          {t(notice.key, notice.values)}
-        </p>)}
-      </div>)}
+      {results.map((result) => {
+        const notices = undoNotice({ ...result, message: result.message && errorText(result.message) });
+        return <div key={result.id} className="space-y-1 break-all text-sm">
+          <p className="font-medium">{result.source}</p>
+          {notices.map((notice) => <p key={notice.key} className={`rounded-md px-2 py-1 ${UNDO_TONE_CLASS[notice.tone]}`}>
+            {t(notice.key, notice.values)}
+          </p>)}
+        </div>;
+      })}
     </div>}
     <div className="flex flex-wrap items-center gap-2">
       <button className={buttonClass} disabled={busy}
