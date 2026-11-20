@@ -230,11 +230,15 @@ impl FolderWatcher {
     /// coordinator. Callers may safely invoke this under the watcher lock.
     pub fn cancel_paths(&self, paths: &[PathBuf]) {
         self.suppression.invalidate(paths);
-        self.pending.lock().unwrap_or_else(|error| error.into_inner())
-            .retain(|item| !paths.iter().any(|path| same_path(path, &item.path)));
-        self.pending_manual.lock().unwrap_or_else(|error| error.into_inner())
-            .retain(|path, _| !paths.iter().any(|cancelled| same_path(cancelled, Path::new(path))));
-        self.update_tray_tooltip();
+        self.queue_cancellation().prepare()(paths);
+    }
+
+    pub(crate) fn queue_cancellation(&self) -> WatcherQueueCancellation {
+        WatcherQueueCancellation {
+            pending: self.pending.clone(),
+            pending_manual: self.pending_manual.clone(),
+            app_handle: self.app_handle.clone(),
+        }
     }
 
     pub fn watch_folders(&mut self, app_handle: tauri::AppHandle) -> Result<(), String> {
@@ -586,9 +590,61 @@ fn recursive_watch_enabled_from(env: Option<&str>, stored: bool) -> bool {
     match env { Some(value) => value == "1", None => stored }
 }
 
+pub(crate) struct WatcherQueueCancellation {
+    pending: Arc<Mutex<Vec<PendingFile>>>,
+    pending_manual: Arc<Mutex<HashMap<String, Arc<WatchedRoot>>>>,
+    app_handle: Option<tauri::AppHandle>,
+}
+
+impl WatcherQueueCancellation {
+    /// Wait for queue access before taking the operation gate. The returned
+    /// callback prunes only validated paths, then releases both queue locks.
+    pub(crate) fn prepare(&self) -> impl FnOnce(&[PathBuf]) + '_ {
+        let mut manual = self.pending_manual.lock().unwrap_or_else(|error| error.into_inner());
+        let mut pending = self.pending.lock().unwrap_or_else(|error| error.into_inner());
+        move |paths| {
+            pending.retain(|item| !paths.iter().any(|path| same_path(path, &item.path)));
+            manual.retain(|path, _| !paths.iter().any(|cancelled| same_path(cancelled, Path::new(path))));
+            drop(pending);
+            drop(manual);
+            if let Some(app) = self.app_handle.as_ref() {
+                update_pending_tooltip(app, &self.pending_manual);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn queue_cancellation_runs_while_watcher_owner_is_busy() {
+        let suppression = Arc::new(SuppressionSet::new());
+        let watcher = Mutex::new(FolderWatcher::new(suppression.clone()));
+        let cancellation = watcher.lock().unwrap().queue_cancellation();
+        let root = Arc::new(WatchedRoot::capture(&WatchedFolder {
+            id: Some(1), path: std::env::temp_dir().canonicalize().unwrap().to_string_lossy().into_owned(),
+            mode: crate::db::FOLDER_MODE_SILENT.into(), enabled: true, only_new: false,
+        }).unwrap());
+        let reviewed = root.path.join("reviewed.undocheck");
+        let later = root.path.join("later.undocheck");
+        for path in [&reviewed, &later] {
+            cancellation.pending.lock().unwrap().push(pending_item(path, &root, &suppression, Duration::ZERO));
+            cancellation.pending_manual.lock().unwrap().insert(path.to_string_lossy().into_owned(), root.clone());
+        }
+        let _busy_watcher = watcher.lock().unwrap();
+        let cancel = cancellation.prepare();
+        let _operation = suppression.with_operation();
+        cancel(&[reviewed]);
+
+        let pending = cancellation.pending.try_lock().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].path, later);
+        let manual = cancellation.pending_manual.try_lock().unwrap();
+        assert_eq!(manual.len(), 1);
+        assert!(manual.contains_key(later.to_str().unwrap()));
+    }
 
     #[test]
     fn recursive_flag_environment_wins_both_ways() {

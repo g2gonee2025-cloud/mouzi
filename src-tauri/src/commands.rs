@@ -530,7 +530,7 @@ fn undo_action_with(id: i64, ignored_files: &IgnoredFiles) -> Result<UndoResult,
 fn undo_all_with(
     ignored_files: &IgnoredFiles,
     reviewed_ids: &[i64],
-    cancel_pending: impl FnOnce(&[PathBuf]) -> Result<(), String>,
+    cancel_pending: impl FnOnce(&[PathBuf]),
 ) -> Result<UndoAllResult, String> {
     let _operation = ignored_files.with_operation();
     let reviewed: HashSet<_> = reviewed_ids.iter().copied().collect();
@@ -551,7 +551,9 @@ fn undo_all_with(
         std::iter::once(target.source.clone()).chain(target.dest.iter().filter(|path| !path.is_empty()).cloned())
     }).collect();
     if !armed.is_empty() {
-        cancel_pending(&armed.iter().map(PathBuf::from).collect::<Vec<_>>())?;
+        let paths: Vec<_> = armed.iter().map(PathBuf::from).collect();
+        ignored_files.invalidate(&paths);
+        cancel_pending(&paths);
     }
     arm_suppression(ignored_files, &armed)?;
 
@@ -621,10 +623,10 @@ pub fn undo_all_cmd(
     state: tauri::State<AppState>,
     reviewed_ids: Vec<i64>,
 ) -> Result<UndoAllResult, String> {
-    let result = undo_all_with(&state.ignored_files, &reviewed_ids, |paths| {
-        state.watcher.lock().map_err(|_| "Watcher state unavailable")?.cancel_paths(paths);
-        Ok(())
-    });
+    let cancellation = state.watcher.lock().map_err(|_| "Watcher state unavailable")?
+        .queue_cancellation();
+    let cancel_paths = cancellation.prepare();
+    let result = undo_all_with(&state.ignored_files, &reviewed_ids, cancel_paths);
     let _ = app.emit("mutation-completed", ());
     result
 }
@@ -2352,7 +2354,7 @@ mod undo_tests {
 
     fn review_and_undo_all(ignored: &IgnoredFiles) -> Result<UndoAllResult, String> {
         let ids: Vec<_> = preview_undo_all_cmd()?.into_iter().map(|row| row.id).collect();
-        undo_all_with(ignored, &ids, |_| Ok(()))
+        undo_all_with(ignored, &ids, |_| {})
     }
 
     /// Put a file where a logged move left it, and return (source, dest).
@@ -2441,7 +2443,6 @@ mod undo_tests {
         let reviewed_ids = [preview[1], preview[0], preview[0]];
         let restored = undo_all_with(&ignored_files(), &reviewed_ids, |paths| {
             assert_eq!(paths, [PathBuf::from(&middle), end.clone(), PathBuf::from(&source), PathBuf::from(&middle)]);
-            Ok(())
         }).unwrap();
 
         assert_eq!(restored.count, 2, "Only the reviewed rows may be restored");
