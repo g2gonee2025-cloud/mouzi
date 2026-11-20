@@ -48,6 +48,13 @@ mod windows_fs {
         fn GetFileInformationByHandleEx(handle: *mut c_void, class: i32, info: *mut c_void, size: u32) -> i32;
         fn GetFileInformationByHandle(handle: *mut c_void, info: *mut ByHandleInfo) -> i32;
         fn SetFileInformationByHandle(handle: *mut c_void, class: i32, info: *const c_void, size: u32) -> i32;
+        fn GetDriveTypeW(root: *const u16) -> u32;
+    }
+
+    pub(super) fn drive_has_no_root(drive: u8) -> bool {
+        const DRIVE_NO_ROOT_DIR: u32 = 1;
+        let root: [u16; 4] = [drive.into(), b':'.into(), b'\\'.into(), 0];
+        unsafe { GetDriveTypeW(root.as_ptr()) == DRIVE_NO_ROOT_DIR }
     }
 
     pub(super) fn open(path: &Path, directory: bool, moving: bool) -> io::Result<File> {
@@ -202,14 +209,84 @@ fn has_dot_component(path: &Path) -> bool {
         .any(|part| part == b"." || part == b"..")
 }
 
+enum DirectoryPinError<'a> {
+    Inspect(&'a Path, io::Error),
+    Unsafe(String),
+}
+
+impl std::fmt::Display for DirectoryPinError<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Inspect(path, error) => write!(formatter, "Cannot inspect {}: {error}", path.display()),
+            Self::Unsafe(error) => formatter.write_str(error),
+        }
+    }
+}
+
+impl DirectoryPinError<'_> {
+    fn proves_unavailable(&self, registered: &Path) -> bool {
+        let Self::Inspect(first_unavailable, error) = self else { return false };
+        if !ordinary_registration(registered) {
+            return false;
+        }
+        if first_unavailable.file_name().is_some() {
+            // This lookup ran below inspected, pinned ancestors. A missing
+            // component cannot be an existing link or alias of a live target.
+            return error.kind() == io::ErrorKind::NotFound;
+        }
+        #[cfg(windows)]
+        if let Some(Component::Prefix(prefix)) = first_unavailable.components().next() {
+            use std::path::Prefix;
+            if let Prefix::Disk(drive) | Prefix::VerbatimDisk(drive) = prefix.kind() {
+                const ERROR_INVALID_DRIVE: i32 = 15;
+                const ERROR_NOT_READY: i32 = 21;
+                return (error.kind() == io::ErrorKind::NotFound
+                    || matches!(error.raw_os_error(), Some(ERROR_INVALID_DRIVE | ERROR_NOT_READY)))
+                    && windows_fs::drive_has_no_root(drive);
+            }
+        }
+        false
+    }
+}
+
+fn ordinary_registration(path: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        use std::path::Prefix;
+        if !matches!(path.components().next(), Some(Component::Prefix(prefix))
+            if matches!(prefix.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_) |
+                Prefix::UNC(..) | Prefix::VerbatimUNC(..)))
+        {
+            return false;
+        }
+        path.components().all(|part| match part {
+            Component::Normal(name) => {
+                let bytes = name.as_encoded_bytes();
+                !bytes.ends_with(b".") && !bytes.ends_with(b" ")
+                    && !bytes.iter().any(|byte| byte.is_ascii_control() || b"<>:\"|?*".contains(byte))
+            }
+            _ => true,
+        })
+    }
+    #[cfg(not(windows))]
+    { path.is_absolute() }
+}
+
 fn pin_ancestry(path: &Path) -> Result<Vec<File>, String> {
     pin_ancestry_with(path, None::<fn(&Path) -> io::Result<()>>)
 }
 
 fn pin_ancestry_with(
     path: &Path,
-    mut create_missing: Option<impl FnMut(&Path) -> io::Result<()>>,
+    create_missing: Option<impl FnMut(&Path) -> io::Result<()>>,
 ) -> Result<Vec<File>, String> {
+    try_pin_ancestry_with(path, create_missing).map_err(|error| error.to_string())
+}
+
+fn try_pin_ancestry_with(
+    path: &Path,
+    mut create_missing: Option<impl FnMut(&Path) -> io::Result<()>>,
+) -> Result<Vec<File>, DirectoryPinError<'_>> {
     let ancestors: Vec<_> = path.ancestors().filter(|part| !part.as_os_str().is_empty()).collect();
     let mut guards = Vec::with_capacity(ancestors.len());
     for ancestor in ancestors.into_iter().rev() {
@@ -220,17 +297,18 @@ fn pin_ancestry_with(
                 match create(ancestor) {
                     Ok(()) => {}
                     Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-                    Err(error) => return Err(format!("Cannot create {}: {}", ancestor.display(), error)),
+                    Err(error) => return Err(DirectoryPinError::Unsafe(format!("Cannot create {}: {error}", ancestor.display()))),
                 }
                 std::fs::symlink_metadata(ancestor)
             }
             (metadata, _) => metadata,
-        }.map_err(|e| format!("Cannot inspect {}: {}", ancestor.display(), e))?;
-        if is_link(&metadata) { return Err(format!("Linked ancestry is not allowed: {}", ancestor.display())); }
-        if !metadata.is_dir() { return Err(format!("An ancestor is not a directory: {}", ancestor.display())); }
-        let guard = open_guard(ancestor, true, false).map_err(|e| format!("Cannot protect {}: {}", ancestor.display(), e))?;
-        let metadata = guard.metadata().map_err(|e| e.to_string())?;
-        if is_link(&metadata) || !metadata.is_dir() { return Err("An ancestor changed type or became a link".into()); }
+        }.map_err(|error| DirectoryPinError::Inspect(ancestor, error))?;
+        if is_link(&metadata) { return Err(DirectoryPinError::Unsafe(format!("Linked ancestry is not allowed: {}", ancestor.display()))); }
+        if !metadata.is_dir() { return Err(DirectoryPinError::Unsafe(format!("An ancestor is not a directory: {}", ancestor.display()))); }
+        let guard = open_guard(ancestor, true, false)
+            .map_err(|error| DirectoryPinError::Unsafe(format!("Cannot protect {}: {error}", ancestor.display())))?;
+        let metadata = guard.metadata().map_err(|error| DirectoryPinError::Unsafe(error.to_string()))?;
+        if is_link(&metadata) || !metadata.is_dir() { return Err(DirectoryPinError::Unsafe("An ancestor changed type or became a link".into())); }
         guards.push(guard);
     }
     // Consumers match the closest owning root first.
@@ -240,32 +318,62 @@ fn pin_ancestry_with(
 
 /// Reject drive/share roots, dot aliases and every reparse/symlink ancestor.
 pub fn validate_root(path: &Path) -> Result<PathBuf, String> {
-    if !path.is_absolute() || has_dot_component(path) { return Err("Choose an absolute folder without dot segments".into()); }
-    let guards = pin_ancestry(path)?;
-    let canonical = std::fs::canonicalize(path).map_err(|e| e.to_string())?;
-    if !canonical.components().any(|part| matches!(part, Component::Normal(_))) { return Err("A volume root cannot be watched".into()); }
-    if identity_from_handle(&guards[0])? != file_identity(&canonical)? { return Err("Folder identity changed during validation".into()); }
-    Ok(canonical)
+    inspect_watched_root(path).map(|(canonical, _)| canonical).map_err(|error| error.to_string())
+}
+
+fn inspect_watched_root(path: &Path) -> Result<(PathBuf, FileIdentity), DirectoryPinError<'_>> {
+    if !path.is_absolute() || has_dot_component(path) {
+        return Err(DirectoryPinError::Unsafe("Choose an absolute folder without dot segments".into()));
+    }
+    if !path.components().any(|part| matches!(part, Component::Normal(_))) {
+        return Err(DirectoryPinError::Unsafe("A volume root cannot be watched".into()));
+    }
+    let guards = try_pin_ancestry_with(path, None::<fn(&Path) -> io::Result<()>>)?;
+    let canonical = std::fs::canonicalize(path).map_err(|error| DirectoryPinError::Unsafe(error.to_string()))?;
+    if !canonical.components().any(|part| matches!(part, Component::Normal(_))) {
+        return Err(DirectoryPinError::Unsafe("A volume root cannot be watched".into()));
+    }
+    let identity = identity_from_handle(&guards[0]).map_err(DirectoryPinError::Unsafe)?;
+    if identity != file_identity(&canonical).map_err(DirectoryPinError::Unsafe)? {
+        return Err(DirectoryPinError::Unsafe("Folder identity changed during validation".into()));
+    }
+    Ok((canonical, identity))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ScopedRoot { path: PathBuf, identity: FileIdentity, active: bool }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RootScope { roots: Vec<ScopedRoot> }
+struct UnavailableRoot { path: PathBuf, active: bool }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RootScope {
+    roots: Vec<ScopedRoot>,
+    unavailable: Vec<UnavailableRoot>,
+}
 
 pub fn eligible_scope(folders: &[crate::db::WatchedFolder]) -> Result<RootScope, String> {
     let mut roots: Vec<ScopedRoot> = Vec::new();
+    let mut unavailable = Vec::new();
     for folder in folders {
-        let path = validate_root(Path::new(&folder.path))?;
-        let identity = file_identity(&path)?;
+        let registered = Path::new(&folder.path);
         let active = folder.enabled && folder.mode != crate::db::FOLDER_MODE_PAUSED;
+        let (path, identity) = match inspect_watched_root(registered) {
+            Ok(root) => root,
+            // Only registered folders can be omitted. Callers supplying
+            // explicit authorization paths still require all of them.
+            Err(error) if folder.id.is_some() && error.proves_unavailable(registered) => {
+                unavailable.push(UnavailableRoot { path: registered.to_path_buf(), active });
+                continue;
+            }
+            Err(error) => return Err(error.to_string()),
+        };
         if let Some(existing) = roots.iter_mut().find(|root| root.identity == identity) {
             // Conflicting legacy aliases fail closed rather than enabling an inactive root.
             existing.active &= active;
         } else { roots.push(ScopedRoot { path, identity, active }); }
     }
-    Ok(RootScope { roots })
+    Ok(RootScope { roots, unavailable })
 }
 
 #[derive(Debug)]
@@ -296,14 +404,15 @@ fn has_stream_syntax(path: &Path) -> bool {
 impl RootScope {
     pub fn active_roots(&self) -> Vec<PathBuf> { self.roots.iter().filter(|r| r.active).map(|r| r.path.clone()).collect() }
     pub fn root_identities(&self) -> Vec<FileIdentity> { self.roots.iter().map(|r| r.identity.clone()).collect() }
+    pub(crate) fn unavailable_active_roots(&self) -> Vec<String> {
+        self.unavailable.iter().filter(|root| root.active)
+            .map(|root| root.path.to_string_lossy().into_owned()).collect()
+    }
 
     fn validate(&self, path: &Path, directory: bool) -> Result<(PathBuf, FileIdentity, File, Metadata, AncestorGuard, PathBuf), String> {
         if !path.is_absolute() || has_dot_component(path) { return Err("Target must be an absolute path without dot segments".into()); }
         #[cfg(windows)]
         if has_stream_syntax(path) { return Err("Alternate data streams are not eligible targets".into()); }
-        for root in &self.roots {
-            if validate_root(&root.path)? != root.path || file_identity(&root.path)? != root.identity { return Err("A configured root changed identity".into()); }
-        }
         let parent = path.parent().ok_or("Target has no parent directory")?;
         let ancestors = pin_ancestry(parent)?;
         let metadata = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
@@ -312,11 +421,23 @@ impl RootScope {
         let metadata = file.metadata().map_err(|e| e.to_string())?;
         if is_link(&metadata) || if directory { !metadata.is_dir() } else { !metadata.is_file() } { return Err("Target changed type".into()); }
         let identity = identity_from_handle(&file)?;
+        for root in &self.roots {
+            let (canonical, current) = inspect_watched_root(&root.path).map_err(|error| error.to_string())?;
+            if canonical != root.path || current != root.identity { return Err("A configured root changed identity".into()); }
+        }
+        // Recheck after pinning the target. A nested root that reappears
+        // cannot grant authority through the parent scope of an older review.
+        for root in &self.unavailable {
+            match inspect_watched_root(&root.path) {
+                Err(error) if error.proves_unavailable(&root.path) => {}
+                Err(error) => return Err(error.to_string()),
+                Ok(_) => return Err(format!("Watched folder is available again: {}. Refresh the review.", root.path.display())),
+            }
+        }
         if self.roots.iter().any(|root| root.identity == identity) { return Err("A watched root cannot be mutated".into()); }
-        let owner = ancestors.iter().find_map(|guard| {
-            let identity = identity_from_handle(guard).ok()?;
-            self.roots.iter().find(|root| root.identity == identity)
-        }).ok_or("Target is not strictly below a registered root")?;
+        let identities = ancestors.iter().map(identity_from_handle).collect::<Result<Vec<_>, _>>()?;
+        let owner = identities.iter().find_map(|identity| self.roots.iter().find(|root| &root.identity == identity))
+            .ok_or("Target is not strictly below a registered root")?;
         if !owner.active { return Err("The owning root is disabled or paused".into()); }
         let canonical = std::fs::canonicalize(path).map_err(|e| e.to_string())?;
         if file_identity(&canonical)? != identity { return Err("Target changed identity during validation".into()); }
@@ -1311,6 +1432,73 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         root
+    }
+
+    fn registered_root(id: i64, path: &Path, mode: &str) -> crate::db::WatchedFolder {
+        crate::db::WatchedFolder {
+            id: Some(id),
+            path: path.to_string_lossy().into_owned(),
+            enabled: true,
+            mode: mode.into(),
+            only_new: false,
+        }
+    }
+
+    #[test]
+    fn restored_paused_nested_root_cannot_borrow_parent_authority() {
+        let parent = test_dir("restored_paused_scope");
+        let nested = parent.join("paused");
+        let parent_file = parent.join("healthy.txt");
+        fs::write(&parent_file, b"healthy").unwrap();
+        let folders = [registered_root(1, &parent, "manual"), registered_root(2, &nested, "paused")];
+
+        let scope = eligible_scope(&folders).unwrap();
+        assert!(scope.unavailable_active_roots().is_empty());
+        assert!(scope.validate_file(&parent_file).is_ok());
+        assert!(scope.validate_dir(&nested).is_err());
+        assert!(validate_scoped_path(&parent_file, &[parent.clone(), nested.clone()], false).is_err());
+
+        fs::create_dir(&nested).unwrap();
+        let protected = nested.join("protected.txt");
+        fs::write(&protected, b"protected").unwrap();
+        assert!(scope.validate_file(&protected).unwrap_err().contains("available again"));
+        let refreshed = eligible_scope(&folders).unwrap();
+        assert!(refreshed.validate_file(&protected).unwrap_err().contains("disabled or paused"));
+        assert!(refreshed.validate_file(&parent_file).is_ok());
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn unusable_root_with_non_directory_ancestry_stays_fail_closed() {
+        let parent = test_dir("invalid_ancestry_scope");
+        let existing_file = parent.join("not-a-directory");
+        fs::write(&existing_file, b"preserve").unwrap();
+        let folders = [
+            registered_root(1, &parent, "manual"),
+            registered_root(2, &existing_file.join("missing"), "manual"),
+        ];
+        assert!(eligible_scope(&folders).unwrap_err().contains("not a directory"));
+        assert_eq!(fs::read(&existing_file).unwrap(), b"preserve");
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unrelated_unmounted_drive_does_not_disable_a_healthy_scope() {
+        let Some(drive) = (b'C'..=b'Z').rev().find(|drive| windows_fs::drive_has_no_root(*drive)) else {
+            eprintln!("No unused DOS drive letter is available for this fixture.");
+            return;
+        };
+        let parent = test_dir("unmounted_drive_scope");
+        let healthy = parent.join("healthy.txt");
+        fs::write(&healthy, b"healthy").unwrap();
+        let offline = PathBuf::from(format!("{}:\\Mouzi offline fixture", char::from(drive)));
+        let folders = [registered_root(1, &parent, "manual"), registered_root(2, &offline, "manual")];
+        let scope = eligible_scope(&folders).unwrap();
+        assert_eq!(scope.unavailable_active_roots(), vec![offline.to_string_lossy().into_owned()]);
+        assert!(scope.validate_file(&healthy).is_ok());
+        assert!(scope.validate_file(&offline.join("outside.txt")).is_err());
+        fs::remove_dir_all(parent).unwrap();
     }
 
     #[cfg(windows)]

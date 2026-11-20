@@ -193,6 +193,7 @@
     "refresh": "Refresh preview",
     "loading": "Preparing preview…",
     "empty": "No matching files to organize.",
+    "unavailableFolders": "The review skipped these unavailable folders.",
     "previewHelp": "Review each rule and destination before applying. Files move only after confirmation. Suspicious filenames start unchecked.",
     "selected": "{{count}} selected",
     "selectAll": "Select eligible files",

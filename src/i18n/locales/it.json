@@ -193,6 +193,7 @@
     "refresh": "Aggiorna anteprima",
     "loading": "Preparazione dell'anteprima…",
     "empty": "Nessun file corrispondente da organizzare.",
+    "unavailableFolders": "La revisione ha ignorato queste cartelle non disponibili.",
     "previewHelp": "Controlla le regole e le destinazioni prima di applicarle. I file vengono spostati dopo la conferma. I nomi sospetti sono inizialmente deselezionati.",
     "selected": "{{count}} selezionati",
     "selectAll": "Seleziona i file idonei",

@@ -193,6 +193,7 @@
     "refresh": "Actualizar vista previa",
     "loading": "Preparando vista previa…",
     "empty": "No hay archivos coincidentes para organizar.",
+    "unavailableFolders": "La revisión omitió estas carpetas que no están disponibles.",
     "previewHelp": "Revisa las reglas y los destinos antes de aplicar los cambios. Los archivos solo se mueven tras confirmar. Los nombres sospechosos no se seleccionan de forma predeterminada.",
     "selected": "{{count}} seleccionados",
     "selectAll": "Seleccionar archivos aptos",

@@ -193,6 +193,7 @@
     "refresh": "Odśwież podgląd",
     "loading": "Przygotowywanie podglądu…",
     "empty": "Brak pasujących plików do uporządkowania.",
+    "unavailableFolders": "Te niedostępne foldery pominięto podczas przeglądu.",
     "previewHelp": "Sprawdź reguły i miejsca docelowe przed ich zastosowaniem. Pliki są przenoszone po potwierdzeniu. Podejrzane nazwy plików są początkowo odznaczone.",
     "selected": "Zaznaczono: {{count}}",
     "selectAll": "Zaznacz dostępne pliki",

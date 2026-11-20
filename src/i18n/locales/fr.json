@@ -193,6 +193,7 @@
     "refresh": "Actualiser l'aperçu",
     "loading": "Préparation de l'aperçu…",
     "empty": "Aucun fichier correspondant à organiser.",
+    "unavailableFolders": "Ces dossiers indisponibles ont été ignorés lors de la vérification.",
     "previewHelp": "Vérifiez les règles et les destinations avant de les appliquer. Les fichiers sont déplacés après confirmation. Les noms suspects sont initialement décochés.",
     "selected": "{{count}} sélectionnés",
     "selectAll": "Sélectionner les fichiers admissibles",

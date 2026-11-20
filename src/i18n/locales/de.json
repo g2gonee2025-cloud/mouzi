@@ -193,6 +193,7 @@
     "refresh": "Vorschau aktualisieren",
     "loading": "Vorschau wird vorbereitet…",
     "empty": "Keine passenden Dateien zum Organisieren.",
+    "unavailableFolders": "Diese Ordner sind nicht verfügbar und wurden bei der Vorschau ausgelassen.",
     "previewHelp": "Prüfen Sie die Regeln und Ziele vor dem Anwenden. Dateien werden erst nach der Bestätigung verschoben. Verdächtige Dateinamen sind zunächst nicht ausgewählt.",
     "selected": "{{count}} ausgewählt",
     "selectAll": "Geeignete Dateien auswählen",

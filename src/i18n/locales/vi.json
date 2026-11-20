@@ -199,6 +199,7 @@
     "refresh": "Làm mới bản xem trước",
     "loading": "Đang chuẩn bị bản xem trước…",
     "empty": "Không có tệp phù hợp để sắp xếp.",
+    "unavailableFolders": "Bản xem trước đã bỏ qua các thư mục không thể truy cập sau đây.",
     "previewHelp": "Xem lại quy tắc và thư mục đích trước khi áp dụng. Tệp chỉ được di chuyển sau khi xác nhận. Tên tệp đáng ngờ mặc định không được chọn.",
     "selected": "Đã chọn {{count}}",
     "selectAll": "Chọn các tệp đủ điều kiện",

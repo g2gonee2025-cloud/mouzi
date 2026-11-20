@@ -6,7 +6,7 @@ import { useAppStore } from '../store/useAppStore';
 import ConfirmDialog, { type ConfirmRequest } from './cleanup/ConfirmDialog';
 
 interface Entry { id: string; source: string; destination: string | null; rule: string; action: string; size: number; warning: boolean; error: string | null }
-interface Preview { id: string; entries: Entry[] }
+interface Preview { id: string; entries: Entry[]; unavailableRoots?: string[] }
 export default function ReviewQueue({ paths }: { paths: string[] | null }) {
   const { t } = useTranslation();
   const [preview, setPreview] = useState<Preview | null>(null);
@@ -83,12 +83,20 @@ export default function ReviewQueue({ paths }: { paths: string[] | null }) {
     {error && <p role="alert" className="text-sm text-red-700 dark:text-red-300">{error}</p>}
     <Results results={results} />
     {preview && <>
+      {!!preview.unavailableRoots?.length && (
+        <div role="status" className="space-y-1 text-sm text-amber-800 dark:text-amber-200">
+          <p>{t('beta.unavailableFolders')}</p>
+          <ul className="list-disc space-y-1 pl-5">
+            {preview.unavailableRoots.map(path => <li key={path} className="break-all">{path}</li>)}
+          </ul>
+        </div>
+      )}
       <div className="flex flex-wrap items-center gap-2">
         <button className={buttonClass} disabled={busy} onClick={() => setSelected(new Set(preview.entries.filter(e => !e.error && !e.warning && e.action !== 'delete').map(e => e.id)))}>{t('beta.selectAll')}</button>
         <button className={buttonClass} disabled={busy} onClick={() => setSelected(new Set())}>{t('beta.clearSelection')}</button>
         <span className="text-sm">{t('beta.selected', { count: selected.size })}</span>
       </div>
-      {!preview.entries.length && <p className="py-8 text-text-muted">{t('beta.empty')}</p>}
+      {!preview.entries.length && !preview.unavailableRoots?.length && <p className="py-8 text-text-muted">{t('beta.empty')}</p>}
       <div className="space-y-2">{preview.entries.map(entry => <div key={entry.id} className="rounded-lg border border-border p-3">
         <label className="flex gap-3 items-start"><input type="checkbox" className="mt-1" checked={selected.has(entry.id)} disabled={busy || !!entry.error} onChange={() => toggle(entry.id)} />
           <span className="min-w-0 text-sm break-all"><span className="block font-medium">{entry.source}</span><span className="block mt-1">{entry.rule} · {t(`beta.${entry.action}`)} · {entry.size.toLocaleString()} B</span>{entry.destination && <span className="block text-text-muted">{entry.destination}</span>}</span>

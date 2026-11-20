@@ -193,6 +193,7 @@
     "refresh": "刷新预览",
     "loading": "正在准备预览…",
     "empty": "没有符合条件的文件可供整理。",
+    "unavailableFolders": "预览已跳过以下无法访问的文件夹。",
     "previewHelp": "应用前请检查规则和目标路径。确认后才会移动文件。可疑文件名默认不选中。",
     "selected": "已选择 {{count}} 项",
     "selectAll": "选择符合条件的文件",

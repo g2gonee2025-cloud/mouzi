@@ -10,6 +10,20 @@ struct Fixture {
     _db: MutexGuard<'static, ()>,
 }
 
+struct RegisteredFolder(i64);
+
+impl RegisteredFolder {
+    fn manual(path: &Path) -> Self {
+        Self(db::add_watched_folder(path.to_str().unwrap(), "manual").unwrap())
+    }
+}
+
+impl Drop for RegisteredFolder {
+    fn drop(&mut self) {
+        db::remove_watched_folder(self.0).unwrap();
+    }
+}
+
 impl Fixture {
     fn new() -> Self {
         let guard = db::serialise_test_db();
@@ -135,6 +149,56 @@ fn apply_uses_only_the_selected_entries_and_rechecks_the_review() {
     db::update_rule(&rule).unwrap();
     assert!(!f.apply(&plan, 0).success);
     assert!(b.exists());
+}
+
+#[test]
+fn unavailable_sibling_is_reported_and_healthy_operations_work() {
+    let mut fixture = Fixture::new();
+    let rule = fixture.rule();
+    fixture.add(&rule);
+    let source = fixture.write("healthy.txt", "healthy file");
+    let sibling = fixture.root.with_extension("unavailable");
+    let _unavailable = RegisteredFolder::manual(&sibling);
+
+    let preview = op::preview(None, &fixture.suppression).unwrap();
+    assert!(preview.unavailable_roots.iter().any(|path| Path::new(path) == sibling.as_path()));
+    let index = preview.entries.iter().position(|entry| Path::new(&entry.source).file_name() == source.file_name()).unwrap();
+    let result = fixture.apply(&preview, index);
+    assert!(result.success, "{:?}", result.error);
+    assert_eq!(fs::read(fixture.root.join("Sorted/healthy.txt")).unwrap(), b"healthy file");
+    assert!(!source.exists());
+    assert!(!sibling.exists());
+}
+
+#[test]
+fn unavailable_reviewed_root_fails_independently_at_apply() {
+    let mut fixture = Fixture::new();
+    let healthy_rule = fixture.rule();
+    fixture.add(&healthy_rule);
+    let healthy = fixture.write("healthy.txt", "healthy data");
+    let transient = fixture.root.join("transient");
+    fs::create_dir(&transient).unwrap();
+    let folder = RegisteredFolder::manual(&transient);
+    let mut transient_rule = fixture.rule();
+    transient_rule.folder_id = folder.0;
+    fixture.add(&transient_rule);
+    let dropped = fixture.write("transient/offline.txt", "offline data");
+
+    let preview = fixture.preview(&[&healthy, &dropped]);
+    assert_eq!(preview.entries.len(), 2);
+    assert!(preview.unavailable_roots.is_empty());
+    let entries = preview.entries.iter().map(|entry| entry.id.clone()).collect::<Vec<_>>();
+    // Renaming the disposable folder models the originals becoming unavailable
+    // after review, with their bytes still present and untouched.
+    let disconnected = fixture.root.join("disconnected");
+    fs::rename(&transient, &disconnected).unwrap();
+    let results = op::apply(&preview.id, &entries, &fixture.suppression).unwrap();
+    assert_eq!(results.len(), 2);
+    assert!(results.iter().any(|item| item.source.ends_with("healthy.txt") && item.success));
+    assert!(results.iter().any(|item| item.source.ends_with("offline.txt") && !item.success));
+    assert_eq!(fs::read(fixture.root.join("Sorted/healthy.txt")).unwrap(), b"healthy data");
+    assert_eq!(fs::read(disconnected.join("offline.txt")).unwrap(), b"offline data");
+    assert!(!transient.exists());
 }
 
 #[test]

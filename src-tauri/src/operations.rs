@@ -93,6 +93,8 @@ pub struct PreviewEntry {
 pub struct Preview {
     pub id: String,
     pub entries: Vec<PreviewEntry>,
+    #[serde(rename = "unavailableRoots", skip_serializing_if = "Vec::is_empty")]
+    pub unavailable_roots: Vec<String>,
 }
 struct Planned {
     entry: PreviewEntry,
@@ -291,7 +293,7 @@ pub(crate) fn preview(paths: Option<Vec<String>>, suppression: &SuppressionSet) 
         return Err("Too many open previews. Close an older preview.".into());
     }
     plans.insert(id.clone(), CachedPlan { created: Instant::now(), items });
-    Ok(Preview { id, entries })
+    Ok(Preview { id, entries, unavailable_roots: scope.unavailable_active_roots() })
 }
 
 pub fn discard(id: &str) {
