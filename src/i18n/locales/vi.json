@@ -243,7 +243,7 @@
     "legacy": "Lịch sử trước đây",
     "undoSelection": "Kiểm tra hoàn tác",
     "confirmUndo": "Khôi phục {{count}} tệp",
-    "undoHelp": "Khôi phục các tệp đã chọn về đường dẫn ban đầu. Tệp bị thay đổi hoặc xung đột sẽ được bỏ qua, kèm kết quả cho từng tệp.",
+    "undoHelp": "Khôi phục các tệp đã chọn vào thư mục ban đầu. Nếu tên đã được sử dụng, tệp được khôi phục sẽ có thêm hậu tố. Các tệp đã thay đổi sẽ bị bỏ qua.",
     "selectRun": "Chọn phiên này",
     "noHistory": "Không có lịch sử khớp với các bộ lọc.",
     "automatic": "Tự động",

@@ -237,7 +237,7 @@
     "legacy": "Wcześniejsza historia",
     "undoSelection": "Przejrzyj cofanie",
     "confirmUndo": "Przywróć pliki: {{count}}",
-    "undoHelp": "Przywróć wybrane pliki do pierwotnych ścieżek. Konflikty i zmienione pliki zostaną pominięte z osobnym wynikiem dla każdego pliku.",
+    "undoHelp": "Przywraca wybrane pliki do pierwotnych folderów. Jeśli nazwa jest już zajęta, do nazwy przywracanego pliku zostanie dodany przyrostek. Zmienione pliki zostaną pominięte.",
     "selectRun": "Zaznacz tę sesję",
     "noHistory": "Brak historii pasującej do filtrów.",
     "automatic": "Automatycznie",

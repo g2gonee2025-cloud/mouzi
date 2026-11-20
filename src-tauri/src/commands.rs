@@ -72,7 +72,7 @@ pub fn history_cmd(filter: crate::operations::HistoryFilter) -> Result<Vec<Organ
 #[tauri::command]
 pub async fn undo_selected_cmd(
     window: tauri::WebviewWindow, mut ids: Vec<i64>,
-) -> Result<Vec<crate::operations::OperationResult>, String> {
+) -> Result<Vec<SelectedUndoResult>, String> {
     if window.label() != "app" {
         return Err("History restoration is available only in the workspace window".into());
     }
@@ -84,16 +84,10 @@ pub async fn undo_selected_cmd(
         ids.dedup();
         let mut results = Vec::with_capacity(ids.len());
         for id in ids {
-            let target = read_undo_target(id);
-            let (source, undo) = match target {
-                Ok(target) => (target.source.clone(), finish_undo(&target, &ignored).unwrap_or_else(failed_undo)),
-                Err(error) => (String::new(), failed_undo(error)),
-            };
-            let success = matches!(undo.status.as_str(), "ok" | "collision");
-            results.push(crate::operations::OperationResult {
-                id: id.to_string(), source, success,
-                error: (!success).then(|| undo.message.unwrap_or_else(|| "history.unverified".into())),
-            });
+            let outcome = read_undo_target(id)
+                .and_then(|target| finish_undo(&target, &ignored))
+                .unwrap_or_else(failed_undo);
+            results.push(SelectedUndoResult { id, outcome });
         }
         if !results.is_empty() {
             let _ = app.emit("mutation-completed", ());
@@ -358,6 +352,13 @@ pub struct UndoResult {
     pub status: String, // "ok" | "collision" | "missing" | "failed"
     pub message: Option<String>,
     pub restored_to: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct SelectedUndoResult {
+    id: i64,
+    #[serde(flatten)]
+    outcome: UndoResult,
 }
 
 #[derive(Debug, Clone, Serialize)]

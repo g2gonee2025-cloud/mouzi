@@ -237,7 +237,7 @@
     "legacy": "Historial anterior",
     "undoSelection": "Revisar deshacer",
     "confirmUndo": "Restaurar {{count}} archivos",
-    "undoHelp": "Restaurar los archivos seleccionados a sus rutas originales. Los archivos modificados o con conflictos se omitirán, con un resultado para cada archivo.",
+    "undoHelp": "Restaura los archivos seleccionados en sus carpetas originales. Si el nombre ya está en uso, se añade un sufijo al archivo restaurado. Los archivos modificados se omiten.",
     "selectRun": "Seleccionar esta sesión",
     "noHistory": "Ninguna entrada coincide con estos filtros.",
     "automatic": "Automático",

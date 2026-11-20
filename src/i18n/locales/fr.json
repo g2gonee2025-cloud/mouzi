@@ -237,7 +237,7 @@
     "legacy": "Ancien historique",
     "undoSelection": "Vérifier l'annulation",
     "confirmUndo": "Restaurer {{count}} fichiers",
-    "undoHelp": "Restaurer les fichiers sélectionnés à leur emplacement d'origine. Les fichiers modifiés ou en conflit seront ignorés, avec un résultat pour chaque fichier.",
+    "undoHelp": "Restaure les fichiers sélectionnés dans leurs dossiers d’origine. Si le nom est déjà utilisé, un suffixe est ajouté au fichier restauré. Les fichiers modifiés sont ignorés.",
     "selectRun": "Sélectionner cette session",
     "noHistory": "Aucune entrée ne correspond à ces filtres.",
     "automatic": "Automatique",

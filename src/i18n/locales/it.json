@@ -237,7 +237,7 @@
     "legacy": "Cronologia precedente",
     "undoSelection": "Controlla il ripristino",
     "confirmUndo": "Ripristina {{count}} file",
-    "undoHelp": "Ripristina i file selezionati nei percorsi originali. I file modificati o in conflitto verranno saltati, con un risultato per ogni file.",
+    "undoHelp": "Ripristina i file selezionati nelle cartelle originali. Se il nome è già in uso, viene aggiunto un suffisso al file ripristinato. I file modificati vengono ignorati.",
     "selectRun": "Seleziona questa sessione",
     "noHistory": "Nessuna voce corrisponde a questi filtri.",
     "automatic": "Automatico",

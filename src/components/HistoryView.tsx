@@ -1,12 +1,18 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { useTranslation } from "react-i18next";
-import { type OrganizationLog, useAppStore } from "../store/useAppStore";
+import { type OrganizationLog, type UndoResult, useAppStore } from "../store/useAppStore";
 import { parentDir } from "../utils/paths";
-import { buttonClass, fieldClass, primaryClass, errorText, type OperationResult, Results } from "./BetaControls";
+import { UNDO_TONE_CLASS, undoNotice } from "../utils/undo";
+import { buttonClass, fieldClass, primaryClass, errorText } from "./BetaControls";
 import ConfirmDialog, { type ConfirmRequest } from "./cleanup/ConfirmDialog";
 
 const emptyFilters = { query: "", rule: "", extension: "", from: "", to: "", run_id: "" };
+
+interface SelectedUndoResult extends UndoResult {
+  id: number;
+}
 
 function canRestore(log: OrganizationLog) {
   return log.id !== undefined && !log.undone && log.undo_verified && ["move", "rename", "accept"].includes(log.action);
@@ -21,17 +27,21 @@ export default function HistoryView() {
   const [busy, setBusy] = useState(false);
   const [confirm, setConfirm] = useState<ConfirmRequest | null>(null);
   const [limit, setLimit] = useState(100);
-  const [results, setResults] = useState<OperationResult[]>([]);
+  const [results, setResults] = useState<Array<SelectedUndoResult & { source: string }>>([]);
+  const appliedFilters = useRef(emptyFilters);
   const generation = useRef(0);
   const heading = useRef<HTMLHeadingElement>(null);
 
-  const load = useCallback(async (value: typeof emptyFilters) => {
+  const load = useCallback(async (resetSelection = false) => {
     const request = ++generation.current;
+    const value = appliedFilters.current;
     setBusy(true);
     setError("");
-    setSelected(new Set());
+    if (resetSelection) {
+      setSelected(new Set());
+      setLimit(100);
+    }
     try {
-      if (value.from && value.to && value.from > value.to) throw new Error(t("beta.validation.date"));
       const rows = await invoke<OrganizationLog[]>("history_cmd", { filter: {
         ...value,
         from: value.from ? new Date(value.from).toISOString() : "",
@@ -39,18 +49,36 @@ export default function HistoryView() {
       } });
       if (request === generation.current) {
         setLogs(rows);
-        setLimit(100);
+        setSelected((previous) => new Set(rows.filter((row) => canRestore(row) && previous.has(row.id!)).map((row) => row.id!)));
       }
     } catch (cause) {
       if (request === generation.current) setError(errorText(cause));
     } finally {
       if (request === generation.current) setBusy(false);
     }
-  }, [t]);
+  }, []);
   useEffect(() => {
-    void load(emptyFilters);
-    return () => { ++generation.current; };
+    let disposed = false;
+    let stop: (() => void) | undefined;
+    const refresh = () => { if (!disposed) void load(); };
+    void listen("mutation-completed", refresh).then((unlisten) => {
+      if (disposed) unlisten();
+      else { stop = unlisten; refresh(); }
+    }).catch((cause) => {
+      console.error("History listener failed", cause);
+      refresh();
+    });
+    return () => { disposed = true; ++generation.current; stop?.(); };
   }, [load]);
+
+  function applyFilters(value: typeof emptyFilters) {
+    if (value.from && value.to && value.from > value.to) {
+      setError(t("beta.validation.date"));
+      return;
+    }
+    appliedFilters.current = value;
+    void load(true);
+  }
 
   function toggle(id: number) {
     setSelected((previous) => {
@@ -73,9 +101,10 @@ export default function HistoryView() {
       opener,
       focusFallback: () => heading.current,
       onConfirm: async () => {
-        const outcomes = await invoke<OperationResult[]>("undo_selected_cmd", { ids: rows.map((log) => log.id) });
-        setResults(outcomes);
-        await Promise.all([load(filters), useAppStore.getState().refreshActionViews()]);
+        const sources = new Map(rows.map((log) => [log.id!, log.source_path]));
+        const outcomes = await invoke<SelectedUndoResult[]>("undo_selected_cmd", { ids: [...sources.keys()] });
+        setResults(outcomes.map((outcome) => ({ ...outcome, source: sources.get(outcome.id) ?? "" })));
+        await Promise.all([load(), useAppStore.getState().refreshActionViews()]);
       },
     });
   }
@@ -89,7 +118,7 @@ export default function HistoryView() {
 
   return <section className="space-y-4" aria-busy={busy}>
     <h3 ref={heading} tabIndex={-1} className="text-sm font-medium">{t("beta.filter")}</h3>
-    <form className="grid grid-cols-1 gap-3 sm:grid-cols-2" onSubmit={(event) => { event.preventDefault(); void load(filters); }}>
+    <form className="grid grid-cols-1 gap-3 sm:grid-cols-2" onSubmit={(event) => { event.preventDefault(); applyFilters(filters); }}>
       {(["query", "rule", "extension", "from", "to"] as const).map((key) =>
         <label key={key} className="text-sm">{t("beta." + (key === "query" ? "search" : key))}
           <input className={fieldClass} type={key === "from" || key === "to" ? "datetime-local" : "text"}
@@ -97,13 +126,21 @@ export default function HistoryView() {
         </label>)}
       <div className="flex items-end gap-2">
         <button className={buttonClass} disabled={busy}>{t("beta.filter")}</button>
-        <button type="button" className={buttonClass} disabled={busy} onClick={() => { setFilters(emptyFilters); void load(emptyFilters); }}>
+        <button type="button" className={buttonClass} disabled={busy} onClick={() => { setFilters(emptyFilters); applyFilters(emptyFilters); }}>
           {t("beta.reset")}
         </button>
       </div>
     </form>
     {error && <p role="alert" className="text-red-700 dark:text-red-300">{error}</p>}
-    <Results results={results} />
+    {results.length > 0 && <div role="status" className="space-y-2 rounded-lg border border-border p-3">
+      <h3 className="font-medium">{t("beta.results")}</h3>
+      {results.map((result) => <div key={result.id} className="space-y-1 break-all text-sm">
+        <p className="font-medium">{result.source}</p>
+        {undoNotice(result).map((notice) => <p key={notice.key} className={`rounded-md px-2 py-1 ${UNDO_TONE_CLASS[notice.tone]}`}>
+          {t(notice.key, notice.values)}
+        </p>)}
+      </div>)}
+    </div>}
     <div className="flex flex-wrap items-center gap-2">
       <button className={buttonClass} disabled={busy}
         onClick={() => setSelected(new Set(logs.filter(canRestore).map((log) => log.id!)))}>{t("beta.selectAll")}</button>

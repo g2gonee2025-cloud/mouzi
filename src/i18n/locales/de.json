@@ -237,7 +237,7 @@
     "legacy": "Älterer Verlauf",
     "undoSelection": "Rückgängig machen prüfen",
     "confirmUndo": "{{count}} Dateien wiederherstellen",
-    "undoHelp": "Die ausgewählten Dateien an ihren ursprünglichen Pfaden wiederherstellen. Konflikte und geänderte Dateien werden übersprungen; für jede Datei wird ein Ergebnis angezeigt.",
+    "undoHelp": "Die ausgewählten Dateien werden am ursprünglichen Ort wiederhergestellt. Ist der Name bereits vergeben, erhält die wiederhergestellte Datei einen Namenszusatz. Geänderte Dateien werden übersprungen.",
     "selectRun": "Diesen Lauf auswählen",
     "noHistory": "Kein Verlauf entspricht diesen Filtern.",
     "automatic": "Automatisch",

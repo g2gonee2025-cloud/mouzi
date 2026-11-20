@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn, execFileSync } from 'node:child_process';
-import { mkdir, writeFile, readFile, access, unlink } from 'node:fs/promises';
+import { mkdir, writeFile, readFile, access, realpath } from 'node:fs/promises';
 import { resolve, join, basename } from 'node:path';
 import { createHash } from 'node:crypto';
 const { chromium } = await import(process.env.MOUZI_PLAYWRIGHT_MODULE || 'playwright');
@@ -142,11 +142,14 @@ try {
     await writeFile(a, 'unrelated conflict'); await button('History').click();
     await page.getByLabel('Filename', { exact: true }).fill('faktura A.mzt'); await button('Filter history').click();
     await button('Select eligible files').click(); await button('Review undo').click(); await button('Restore 1 files').click();
-    await page.getByText('A file already exists at the original path. Nothing was overwritten.', { exact: true }).waitFor();
+    await page.getByText('Restored under a different name', { exact: true }).waitFor();
+    const restored = page.getByText('Now at ', { exact: false });
+    const restoredPath = (await restored.textContent()).slice('Now at '.length);
+    assert.equal(await realpath(restoredPath), await realpath(join(fixture, 'faktura A_0.mzt')));
     assert.equal(await readFile(a, 'utf8'), 'unrelated conflict');
+    assert.equal(await readFile(restoredPath, 'utf8'), 'invoice alpha');
+    assert.equal(await exists(join(fixture, 'Wynik — dokumenty', 'faktura A.mzt')), false);
     await page.screenshot({ path: join(run, '03-undo-conflict.png'), animations: 'disabled' });
-    await unlink(a); await button('Select eligible files').click(); await button('Review undo').click(); await button('Restore 1 files').click();
-    await until(() => exists(a), 'Undo did not restore file'); assert.equal(await readFile(a, 'utf8'), 'invoice alpha');
   });
   await caseOf('A changed file is rejected after preview, with a readable UI error', async () => {
     await review([b]); await writeFile(b, 'changed since preview'); await applySelected(1);
@@ -168,6 +171,27 @@ try {
     const renamed = join(fixture, 'gotowe-faktura B.mzt'); assert.equal(await exists(b), false); assert.equal(await readFile(renamed, 'utf8'), 'changed since preview');
     assert.equal((await invoke('get_pending_files_cmd')).some(([, name]) => name === 'gotowe-faktura B.mzt'), false);
   });
+  if (stable && originalLogs.length === 0) {
+    await caseOf('History refreshes after Restore All and Clear History without losing the applied filter', async () => {
+      const logs = await invoke('get_logs_cmd', { limit: -1 });
+      assert.ok(logs.every(log => log.source_path.startsWith(run)), 'Expected only test-owned history');
+      await button('History').click();
+      const filename = page.getByLabel('Filename', { exact: true });
+      await filename.fill('faktura B.mzt'); await button('Filter history').click();
+      const row = page.locator('label').filter({ hasText: 'faktura B.mzt' });
+      const checkbox = row.getByRole('checkbox');
+      await until(() => checkbox.isEnabled(), 'Expected a restorable history row');
+      await filename.fill('unapplied search');
+      await button('Revert All').click(); await button('Restore all actions').click();
+      await row.getByText(/· Restored$/).waitFor();
+      assert.equal(await checkbox.isDisabled(), true);
+      assert.equal(await readFile(b, 'utf8'), 'changed since preview');
+      assert.equal(await filename.inputValue(), 'unapplied search');
+      await button('Clear History').click(); await button('Clear history').click();
+      await page.getByText('No history matches these filters.', { exact: true }).waitFor();
+      assert.equal(await row.count(), 0);
+    });
+  }
   let onlyNewId; const second = join(run, 'tylko nowe'); await mkdir(second); const old = join(second, 'stary.mzt'); await writeFile(old, 'old fixture');
   await caseOf('Only-new baseline configured through the folder form', async () => {
     await button('Watched Folders').click(); await page.getByPlaceholder('C:/Users/.../Downloads').fill(second);
