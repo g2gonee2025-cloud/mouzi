@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import i18n, { initI18n } from "../i18n";
 
 const locales = import.meta.glob("../i18n/locales/*.json", { eager: true, import: "default" });
 const keys = [
@@ -22,6 +23,21 @@ function translation(locale: unknown, key: string): unknown {
 }
 
 describe("preferences and inventory translations", () => {
+  it("loads only the requested locale and keeps the newest language choice", async () => {
+    expect(await initI18n("en")).toBe("en");
+    expect(i18n.hasResourceBundle("de", "translation")).toBe(false);
+    expect(i18n.hasResourceBundle("ja", "translation")).toBe(false);
+
+    const older = initI18n("ja");
+    expect(await initI18n("de")).toBe("de");
+    await older;
+
+    expect(i18n.resolvedLanguage).toBe("de");
+    expect(i18n.t("common.cancel")).toBe("Abbrechen");
+    expect(i18n.hasResourceBundle("en", "translation")).toBe(true);
+    expect(i18n.hasResourceBundle("fr", "translation")).toBe(false);
+  });
+
   it("provides every new UI key in all eleven shipped locales", () => {
     expect(Object.keys(locales)).toHaveLength(11);
     expect(locales).toHaveProperty(["../i18n/locales/zh-CN.json"]);
