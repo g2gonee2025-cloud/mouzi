@@ -1,5 +1,6 @@
 use crate::safe_fs::{self, AncestorGuard};
 use flate2::read::GzDecoder;
+use serde::Serialize;
 use std::fs::{self, File, FileTimes, OpenOptions};
 use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
@@ -44,7 +45,36 @@ pub fn cancel_import() -> Result<(), String> {
     Ok(())
 }
 
-struct Budget<'a> { limits: Limits, started: Instant, cancelled: &'a AtomicBool, bytes: u64, files: usize, last_progress: Instant, progress: &'a mut dyn FnMut(u64, usize) }
+#[derive(Default)]
+struct ExtractionReceipt {
+    extracted: Vec<ExtractedEntry>,
+    incomplete: Option<IncompleteEntry>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExtractedEntry {
+    name: String,
+    bytes: u64,
+    is_file: bool,
+}
+
+struct IncompleteEntry {
+    name: String,
+    archive_path: String,
+    expected_bytes: u64,
+}
+
+struct Budget<'a> {
+    limits: Limits,
+    started: Instant,
+    cancelled: &'a AtomicBool,
+    bytes: u64,
+    receipt: ExtractionReceipt,
+    last_progress: Instant,
+    progress_interval: Duration,
+    progress: &'a mut dyn FnMut(u64, usize),
+}
 struct GuardedReader<'a, R> { inner: R, remaining: u64, started: Instant, duration: Duration, cancelled: &'a AtomicBool }
 impl<R: Read> Read for GuardedReader<'_, R> {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
@@ -71,7 +101,6 @@ impl Budget<'_> {
         Ok(())
     }
     fn copy(&mut self, input: &mut impl Read, output: &mut File, expected: u64) -> Result<(), String> {
-        if expected > self.limits.file_bytes || expected > self.limits.total_bytes.saturating_sub(self.bytes) { return Err("Archive uncompressed size limit exceeded".into()); }
         let mut buffer = [0u8; 64 * 1024];
         let mut copied = 0u64;
         loop {
@@ -82,10 +111,43 @@ impl Budget<'_> {
             self.bytes += count as u64;
             if copied > self.limits.file_bytes || self.bytes > self.limits.total_bytes { return Err("Archive uncompressed size limit exceeded".into()); }
             output.write_all(&buffer[..count]).map_err(|e| e.to_string())?;
-            if self.last_progress.elapsed() >= Duration::from_millis(250) { (self.progress)(self.bytes, self.files); self.last_progress = Instant::now(); }
+            if self.last_progress.elapsed() >= self.progress_interval {
+                (self.progress)(self.bytes, self.receipt.extracted.len());
+                self.last_progress = Instant::now();
+            }
         }
         if copied != expected { return Err("Archive entry size differs from its declared size".into()); }
-        output.sync_all().map_err(|e| e.to_string())
+        Ok(())
+    }
+
+    fn extract_entry(
+        &mut self,
+        input: &mut impl Read,
+        staging: &Path,
+        entry_path: &Path,
+        size: u64,
+        modified: Option<SystemTime>,
+    ) -> Result<(), String> {
+        let file_name = output_name(entry_path)?;
+        if size > self.limits.file_bytes || size > self.limits.total_bytes.saturating_sub(self.bytes) {
+            return Err("Archive uncompressed size limit exceeded".into());
+        }
+        check_disk_space(staging, size)?;
+        let (stage_name, stage, mut output) = create_entry_stage(staging, self.receipt.extracted.len(), file_name)?;
+        self.receipt.incomplete = Some(IncompleteEntry {
+            name: stage_name,
+            archive_path: entry_path.to_string_lossy().into_owned(),
+            expected_bytes: size,
+        });
+
+        self.copy(input, &mut output, size)?;
+        preserve_modified_time(&output, &stage, modified)?;
+        output.sync_all().map_err(|error| error.to_string())?;
+        self.check()?;
+        let name = publish_entry(staging, &stage, &output, entry_path, file_name)?;
+        self.receipt.incomplete = None;
+        self.receipt.extracted.push(ExtractedEntry { name, bytes: size, is_file: true });
+        Ok(())
     }
 }
 
@@ -111,19 +173,21 @@ fn extract_archive_in(
     let retained_error = |error| format!("Import staging retained at {}. {error}", staging_dir.display());
     observe_staging(&staging_dir).map_err(retained_error)?;
     save_manifest(&staging_dir, Some(path), "extracting", &[], None).map_err(retained_error)?;
-    match extract_archive_from(source, format, &staging_dir, LIMITS, cancelled, &mut progress) {
-        Ok(extracted_files) => {
-            save_manifest(&staging_dir, Some(path), "extracted", &[], None).map_err(retained_error)?;
+    let (result, receipt) = extract_archive_from(source, format, &staging_dir, LIMITS, cancelled, &mut progress);
+    match result {
+        Ok(()) => {
+            save_manifest_with_receipt(&staging_dir, Some(path), "extracted", &[], None, Some(&receipt))
+                .map_err(retained_error)?;
             Ok(ArchiveExtraction {
                 staging_dir,
-                extracted_files,
+                extracted_files: receipt.extracted.len(),
                 _staging_guard: staging_guard,
             })
         }
         Err(err) => {
             // Successful entries and partially extracted data may be useful for
             // recovery. Never sweep an import folder after sorting may begin.
-            let manifest = save_manifest(&staging_dir, Some(path), "failed", &[], Some(&err));
+            let manifest = save_manifest_with_receipt(&staging_dir, Some(path), "failed", &[], Some(&err), Some(&receipt));
             Err(format!("{err}. Import data retained at {}{}", staging_dir.display(), manifest.err().map(|e| format!("; {e}")).unwrap_or_default()))
         }
     }
@@ -186,18 +250,26 @@ fn open_archive(path: &Path, limits: Limits) -> Result<(File, AncestorGuard, Arc
 fn extract_archive_to_with_progress(path: &Path, staging_dir: &Path, limits: Limits, cancelled: &AtomicBool, progress: &mut dyn FnMut(u64, usize)) -> Result<usize, String> {
     let (source, _source_guard, format) = open_archive(path, limits)?;
     let _staging_guard = safe_fs::create_guarded_directory(staging_dir)?;
-    extract_archive_from(source, format, staging_dir, limits, cancelled, progress)
+    let (result, receipt) = extract_archive_from(source, format, staging_dir, limits, cancelled, progress);
+    result.map(|()| receipt.extracted.len())
 }
 
-fn extract_archive_from(source: File, format: ArchiveFormat, staging_dir: &Path, limits: Limits, cancelled: &AtomicBool, progress: &mut dyn FnMut(u64, usize)) -> Result<usize, String> {
-    let mut budget = Budget { limits, started: Instant::now(), cancelled, bytes: 0, files: 0, last_progress: Instant::now(), progress };
-    budget.check()?;
-    let result = match format {
-        ArchiveFormat::Zip => extract_zip_to(source, staging_dir, &mut budget),
-        ArchiveFormat::Tgz => extract_tgz_to(source, staging_dir, &mut budget),
+fn extract_archive_from(source: File, format: ArchiveFormat, staging_dir: &Path, limits: Limits, cancelled: &AtomicBool, progress: &mut dyn FnMut(u64, usize)) -> (Result<(), String>, ExtractionReceipt) {
+    let mut budget = Budget {
+        limits, started: Instant::now(), cancelled, bytes: 0, receipt: ExtractionReceipt::default(),
+        last_progress: Instant::now(), progress_interval: Duration::from_millis(250), progress,
     };
-    (budget.progress)(budget.bytes, budget.files);
-    result
+    let result = (|| {
+        budget.check()?;
+        let staging = fs::canonicalize(staging_dir).map_err(|error| error.to_string())?;
+        let result = match format {
+            ArchiveFormat::Zip => extract_zip_to(source, &staging, &mut budget),
+            ArchiveFormat::Tgz => extract_tgz_to(source, &staging, &mut budget),
+        };
+        (budget.progress)(budget.bytes, budget.receipt.extracted.len());
+        result
+    })();
+    (result, budget.receipt)
 }
 
 fn archive_format(path: &Path) -> Result<ArchiveFormat, String> {
@@ -393,7 +465,7 @@ fn preflight_zip(reader: &mut ZipReader<'_>, limits: Limits) -> io::Result<usize
     Ok(count as usize)
 }
 
-fn extract_zip_to(file: File, staging_dir: &Path, budget: &mut Budget<'_>) -> Result<usize, String> {
+fn extract_zip_to(file: File, staging_dir: &Path, budget: &mut Budget<'_>) -> Result<(), String> {
     let mut reader = ZipReader::new(file, budget).map_err(|e| e.to_string())?;
     let count = preflight_zip(&mut reader, budget.limits)
         .map_err(|e| format!("Failed to read zip archive: {e}"))?;
@@ -404,7 +476,6 @@ fn extract_zip_to(file: File, staging_dir: &Path, budget: &mut Budget<'_>) -> Re
     }
     budget.check()?;
 
-    let mut extracted = 0;
     for i in 0..archive.len() {
         budget.check()?;
         let mut entry = archive
@@ -421,22 +492,17 @@ fn extract_zip_to(file: File, staging_dir: &Path, budget: &mut Budget<'_>) -> Re
             .map(Path::to_path_buf)
             .ok_or_else(|| format!("Archive contains an unsafe path: {}", entry.name()))?;
         let size = entry.size();
-        check_disk_space(staging_dir, size)?;
-        let (target, mut output) = create_output(staging_dir, &entry_path)?;
         let date = entry.last_modified();
-        budget.copy(&mut entry, &mut output, size)?;
         let timestamp = chrono::NaiveDate::from_ymd_opt(date.year() as i32, date.month() as u32, date.day() as u32)
             .and_then(|day| day.and_hms_opt(date.hour() as u32, date.minute() as u32, date.second() as u32))
             .map(|date| date.and_utc().timestamp()).filter(|seconds| *seconds >= 0).map(|seconds| UNIX_EPOCH + Duration::from_secs(seconds as u64));
-        preserve_modified_time(&output, &target, timestamp)?;
-        extracted += 1;
-        budget.files = extracted;
+        budget.extract_entry(&mut entry, staging_dir, &entry_path, size, timestamp)?;
     }
 
-    Ok(extracted)
+    Ok(())
 }
 
-fn extract_tgz_to(file: File, staging_dir: &Path, budget: &mut Budget<'_>) -> Result<usize, String> {
+fn extract_tgz_to(file: File, staging_dir: &Path, budget: &mut Budget<'_>) -> Result<(), String> {
     let decoder = GzDecoder::new(file);
     // Header/padding overhead is bounded separately from extracted file bytes.
     let stream_limit = budget.limits.total_bytes.saturating_add((budget.limits.entries as u64).saturating_mul(1024));
@@ -445,7 +511,6 @@ fn extract_tgz_to(file: File, staging_dir: &Path, budget: &mut Budget<'_>) -> Re
         .entries()
         .map_err(|e| format!("Failed to read tar archive: {}", e))?;
 
-    let mut extracted = 0;
     for (index, entry) in entries.enumerate() {
         budget.check()?;
         if index >= budget.limits.entries { return Err("Archive entry count limit exceeded".into()); }
@@ -459,25 +524,19 @@ fn extract_tgz_to(file: File, staging_dir: &Path, budget: &mut Budget<'_>) -> Re
             .path()
             .map_err(|e| format!("Failed to read tar entry path: {}", e))?
             .into_owned();
-        ensure_safe_relative_path(&entry_path)?;
         let size = entry.size();
-        check_disk_space(staging_dir, size)?;
         let modified = entry.header().mtime().ok().and_then(|seconds| UNIX_EPOCH.checked_add(Duration::from_secs(seconds)));
-        let (target, mut output) = create_output(staging_dir, &entry_path)?;
-        budget.copy(&mut entry, &mut output, size)?;
-        preserve_modified_time(&output, &target, modified)?;
-        extracted += 1;
-        budget.files = extracted;
+        budget.extract_entry(&mut entry, staging_dir, &entry_path, size, modified)?;
     }
 
     // TAR ends at its first zero header. Finish gzip under the same budget so
     // flate2 checks the footer even when TAR stops before reaching it.
     io::copy(&mut archive.into_inner(), &mut io::sink())
         .map_err(|e| format!("Failed to finish gzip stream: {e}"))?;
-    Ok(extracted)
+    Ok(())
 }
 
-fn create_output(staging_dir: &Path, entry_path: &Path) -> Result<(PathBuf, File), String> {
+fn output_name(entry_path: &Path) -> Result<&str, String> {
     ensure_safe_relative_path(entry_path)?;
     let file_name = entry_path
         .file_name()
@@ -491,17 +550,47 @@ fn create_output(staging_dir: &Path, entry_path: &Path) -> Result<(PathBuf, File
         ));
     }
 
-    // Windows alternate streams and reserved names are never output targets.
-    if file_name.chars().any(|c| c.is_control() || ":<>|?*\\/".contains(c)) || file_name.ends_with(['.', ' ']) { return Err("Archive contains an unsupported filename".into()); }
+    // Windows device names must be checked even when the staged publish uses a verbatim path.
+    if file_name.chars().any(|c| c.is_control() || ":<>|?*\\/".contains(c))
+        || file_name.ends_with(['.', ' '])
+        || (cfg!(windows) && (file_name.contains('"') || is_windows_device_name(file_name)))
+    {
+        return Err("Archive contains an unsupported filename".into());
+    }
+    Ok(file_name)
+}
+
+fn is_windows_device_name(file_name: &str) -> bool {
+    let stem = file_name.split('.').next().unwrap_or_default().trim_end_matches(' ').to_ascii_uppercase();
+    matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$")
+        || stem.strip_prefix("COM").or_else(|| stem.strip_prefix("LPT"))
+            .is_some_and(|suffix| matches!(suffix, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"))
+}
+
+fn create_entry_stage(staging: &Path, entry_index: usize, target_name: &str) -> Result<(String, PathBuf, File), String> {
+    for attempt in 0..10_000 {
+        let name = format!(".mouzi-archive-entry-{entry_index}-{attempt}.part");
+        if name.eq_ignore_ascii_case(target_name) { continue; }
+        let path = staging.join(&name);
+        match safe_fs::create_guarded_staging_file(&path) {
+            Ok(file) => return Ok((name, path, file)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(format!("Cannot stage {}: {error}", path.display())),
+        }
+    }
+    Err("No free archive staging filename".into())
+}
+
+fn publish_entry(staging: &Path, stage: &Path, output: &File, entry_path: &Path, file_name: &str) -> Result<String, String> {
     let stem = entry_path.file_stem().and_then(|s| s.to_str()).unwrap_or(file_name);
     let extension = entry_path.extension().and_then(|s| s.to_str());
     for index in 0..10_000 {
         let name = if index == 0 { file_name.to_string() } else { match extension { Some(ext) => format!("{stem} ({index}).{ext}"), None => format!("{stem} ({index})") } };
-        let target = staging_dir.join(name);
-        match OpenOptions::new().write(true).create_new(true).open(&target) {
-            Ok(file) => return Ok((target, file)),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(format!("Cannot extract {}: {error}", target.display())),
+        let target = staging.join(&name);
+        match safe_fs::publish_staged_file(output, stage, &target) {
+            Ok(true) => return Ok(name),
+            Ok(false) => continue,
+            Err(error) => return Err(format!("Cannot publish {}: {error}", target.display())),
         }
     }
     Err("Archive filename collision limit exceeded".into())
@@ -555,6 +644,17 @@ fn check_disk_space(path: &Path, bytes: u64) -> Result<(), String> {
 /// The manifest is beside the staging directory so the organizer cannot file
 /// it as imported content. It survives failed/cancelled and successful imports.
 pub fn save_manifest(staging: &Path, source: Option<&Path>, status: &str, results: &[(String, String, String)], message: Option<&str>) -> Result<(), String> {
+    save_manifest_with_receipt(staging, source, status, results, message, None)
+}
+
+fn save_manifest_with_receipt(
+    staging: &Path,
+    source: Option<&Path>,
+    status: &str,
+    results: &[(String, String, String)],
+    message: Option<&str>,
+    extraction: Option<&ExtractionReceipt>,
+) -> Result<(), String> {
     let _staging_guard = safe_fs::guard_directory(staging)?;
     let manifest = staging.with_extension("manifest.json");
     let mut value = match fs::symlink_metadata(&manifest) {
@@ -566,13 +666,34 @@ pub fn save_manifest(staging: &Path, source: Option<&Path>, status: &str, result
             serde_json::json!({"version":1,"createdAt":chrono::Utc::now().to_rfc3339(),"source":source.map(|p|p.to_string_lossy().into_owned()),"staging":staging.to_string_lossy(),"limits":{"entries":LIMITS.entries,"fileBytes":LIMITS.file_bytes,"totalBytes":LIMITS.total_bytes,"zipMetadataBytes":LIMITS.zip_metadata_bytes,"seconds":LIMITS.duration.as_secs()}}),
         Err(error) => return Err(error.to_string()),
     };
+    let incomplete = extraction.and_then(|receipt| receipt.incomplete.as_ref());
+    let mut incomplete_bytes = None;
     let mut remaining = Vec::new();
     for entry in fs::read_dir(staging).map_err(|e| e.to_string())? {
         let entry = entry.map_err(|e| e.to_string())?;
         let metadata = fs::symlink_metadata(entry.path()).map_err(|e| e.to_string())?;
-        remaining.push(serde_json::json!({"name":entry.file_name().to_string_lossy(),"bytes":metadata.len(),"isFile":metadata.is_file()}));
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let mut row = serde_json::json!({"name":name,"bytes":metadata.len(),"isFile":metadata.is_file()});
+        if incomplete.is_some_and(|pending| pending.name == name) {
+            incomplete_bytes = metadata.is_file().then_some(metadata.len());
+            row["incomplete"] = serde_json::json!(true);
+        }
+        remaining.push(row);
     }
-    if status == "extracted" { value["extractedEntries"] = serde_json::json!(remaining.clone()); }
+    if let Some(receipt) = extraction {
+        value["extractedEntries"] = serde_json::json!(receipt.extracted);
+        value["extractedCount"] = serde_json::json!(receipt.extracted.len());
+        let incomplete_entries = incomplete.map(|pending| serde_json::json!({
+            "name": pending.name,
+            "archivePath": pending.archive_path,
+            "bytes": incomplete_bytes,
+            "expectedBytes": pending.expected_bytes,
+        }));
+        value["incompleteEntries"] = serde_json::json!(incomplete_entries.into_iter().collect::<Vec<_>>());
+    } else if status == "extracted" {
+        value["extractedEntries"] = serde_json::json!(remaining);
+    }
     value["remainingEntries"] = serde_json::json!(remaining);
     value["status"] = serde_json::json!(status);
     value["message"] = serde_json::json!(message);
@@ -808,8 +929,9 @@ mod tests {
             started: Instant::now(),
             cancelled: &cancelled,
             bytes: 0,
-            files: 0,
+            receipt: ExtractionReceipt::default(),
             last_progress: Instant::now(),
+            progress_interval: Duration::from_millis(250),
             progress: &mut |_, _| {},
         };
         let (file, guard, _) = open_archive(&source, LIMITS).unwrap();
@@ -997,6 +1119,90 @@ mod tests {
         assert_eq!(progress.last(),Some(&(4,1)));
         let timestamp = fs::metadata(root.join("done/a.txt")).unwrap().modified().unwrap();
         assert!(timestamp > UNIX_EPOCH + Duration::from_secs(300_000_000), "ZIP timestamp was replaced with 1970");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cancellation_preserves_complete_entries_and_labels_partial_bytes() {
+        let root = test_dir("cancel-partial-entry");
+        let complete = b"first payload";
+        let second = vec![b'x'; 192 * 1024];
+        let entries = [("deep/first.txt", complete.as_slice()), ("deep/second.bin", second.as_slice())];
+
+        for format in [ArchiveFormat::Zip, ArchiveFormat::Tgz] {
+            let extension = match format { ArchiveFormat::Zip => "zip", ArchiveFormat::Tgz => "tgz" };
+            let source = root.join(format!("fixture.{extension}"));
+            let staging = root.join(extension);
+            match format {
+                ArchiveFormat::Zip => write_zip(&source, &entries),
+                ArchiveFormat::Tgz => write_tgz(&source, &entries),
+            }
+            let original_archive = fs::read(&source).unwrap();
+            let (file, source_guard, _) = open_archive(&source, LIMITS).unwrap();
+            let staging_guard = safe_fs::create_guarded_directory(&staging).unwrap();
+            save_manifest(&staging, Some(&source), "extracting", &[], None).unwrap();
+            let cancelled = AtomicBool::new(false);
+            let mut progress = |bytes, files| {
+                if files == 1 && bytes > complete.len() as u64 {
+                    cancelled.store(true, Ordering::Relaxed);
+                }
+            };
+            let mut budget = Budget {
+                limits: LIMITS, started: Instant::now(), cancelled: &cancelled, bytes: 0,
+                receipt: ExtractionReceipt::default(), last_progress: Instant::now(),
+                progress_interval: Duration::ZERO, progress: &mut progress,
+            };
+            let canonical_staging = fs::canonicalize(&staging).unwrap();
+            let result = match format {
+                ArchiveFormat::Zip => extract_zip_to(file, &canonical_staging, &mut budget),
+                ArchiveFormat::Tgz => extract_tgz_to(file, &canonical_staging, &mut budget),
+            };
+            let error = result.unwrap_err();
+            assert!(error.contains("cancelled"), "{error}");
+            save_manifest_with_receipt(&staging, Some(&source), "failed", &[], Some(&error), Some(&budget.receipt)).unwrap();
+
+            let receipt: serde_json::Value =
+                serde_json::from_slice(&fs::read(staging.with_extension("manifest.json")).unwrap()).unwrap();
+            assert_eq!(receipt["status"], "failed");
+            assert_eq!(receipt["extractedCount"], 1);
+            assert_eq!(receipt["extractedEntries"].as_array().unwrap().len(), 1);
+            assert_eq!(receipt["extractedEntries"][0]["name"], "first.txt");
+            assert_eq!(receipt["incompleteEntries"].as_array().unwrap().len(), 1);
+            let incomplete = &receipt["incompleteEntries"][0];
+            let partial_name = incomplete["name"].as_str().unwrap();
+            assert!(partial_name.ends_with(".part"));
+            assert_eq!(Path::new(incomplete["archivePath"].as_str().unwrap()).file_name().unwrap(), "second.bin");
+            assert_eq!(incomplete["expectedBytes"], second.len() as u64);
+            let partial_path = staging.join(partial_name);
+            let partial_bytes = fs::read(&partial_path).unwrap();
+            assert!(!partial_bytes.is_empty() && partial_bytes.len() < second.len());
+            assert_eq!(partial_bytes, second[..partial_bytes.len()]);
+            assert_eq!(incomplete["bytes"], partial_bytes.len() as u64);
+            assert!(receipt["remainingEntries"].as_array().unwrap().iter().any(|row| row["name"] == partial_name && row["incomplete"] == true));
+            assert!(crate::rules::should_ignore_file(&partial_path));
+            assert_eq!(fs::read(staging.join("first.txt")).unwrap(), complete);
+            assert!(!staging.join("second.bin").exists());
+            assert_eq!(fs::read(&source).unwrap(), original_archive);
+            drop(staging_guard);
+            drop(source_guard);
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn published_entry_preserves_already_occupied_names_and_picks_a_suffix() {
+        let root = test_dir("archive-occupied-name");
+        let source = root.join("fixture.zip");
+        write_zip(&source, &[("report.txt", b"new contents")]);
+        let staging = root.join("staging");
+        fs::create_dir_all(staging.join("report.txt")).unwrap();
+        fs::write(staging.join("report (1).txt"), b"previous contents").unwrap();
+
+        assert_eq!(extract_archive_to(&source, &staging).unwrap(), 1);
+        assert!(staging.join("report.txt").is_dir());
+        assert_eq!(fs::read(staging.join("report (1).txt")).unwrap(), b"previous contents");
+        assert_eq!(fs::read(staging.join("report (2).txt")).unwrap(), b"new contents");
+        assert!(file_names(&staging).iter().all(|name| !name.ends_with(".part")));
         fs::remove_dir_all(root).unwrap();
     }
 

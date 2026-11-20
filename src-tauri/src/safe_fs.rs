@@ -567,18 +567,30 @@ fn cross_device_error(error: &io::Error) -> bool {
     #[cfg(not(windows))] { error.kind() == io::ErrorKind::CrossesDevices || error.raw_os_error() == Some(18) }
 }
 
-fn rename_no_replace(source: &File, src: &Path, parent: &File, destination: &Path) -> io::Result<()> {
-    #[cfg(windows)] { let _ = (src, parent); windows_fs::rename(source, destination) }
+fn rename_no_replace(source: &File, src: &Path, destination: &Path) -> io::Result<()> {
+    #[cfg(windows)] { let _ = src; windows_fs::rename(source, destination) }
     #[cfg(not(windows))] {
         // Creating a hard link reserves the destination atomically without replacing it.
         // Unix handles cannot prevent external pathname replacements: check again before unlinking.
-        let _ = parent;
         std::fs::hard_link(src, destination)?;
         if file_identity(src).ok() != identity_from_handle(source).ok() {
             let _ = std::fs::remove_file(destination);
             return Err(io::Error::other("Source identity changed before unlink"));
         }
         std::fs::remove_file(src)
+    }
+}
+
+/// Publish a prepared stage without replacing a destination. The caller
+/// holds the output handle and its directory guard through publication.
+pub(crate) fn publish_staged_file(output: &File, stage: &Path, destination: &Path) -> io::Result<bool> {
+    if path_occupied(destination).map_err(io::Error::other)? {
+        return Ok(false);
+    }
+    match rename_no_replace(output, stage, destination) {
+        Ok(()) => Ok(true),
+        Err(error) if collision_error(&error) => Ok(false),
+        Err(error) => Err(error),
     }
 }
 
@@ -602,19 +614,23 @@ pub(crate) fn hash_handle(file: &mut File) -> Result<blake3::Hash, String> {
     Ok(hash.finalize())
 }
 
-fn create_staged_copy(parent: &Path) -> Result<(PathBuf, File), String> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NEXT_STAGE: AtomicU64 = AtomicU64::new(0);
+pub(crate) fn create_guarded_staging_file(path: &Path) -> io::Result<File> {
     let mut output_options = OpenOptions::new();
     output_options.read(true).write(true).create_new(true);
     #[cfg(windows)] {
         use std::os::windows::fs::OpenOptionsExt;
         output_options.access_mode(0x80000000 | 0x40000000 | 0x00010000).share_mode(1); // deny external write/delete
     }
+    output_options.open(path)
+}
+
+fn create_staged_copy(parent: &Path) -> Result<(PathBuf, File), String> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT_STAGE: AtomicU64 = AtomicU64::new(0);
     for _ in 0..1024 {
         let sequence = NEXT_STAGE.fetch_add(1, Ordering::Relaxed);
         let path = parent.join(format!(".mouzi-transfer-{}-{sequence}.part", std::process::id()));
-        match output_options.open(&path) {
+        match create_guarded_staging_file(&path) {
             Ok(file) => return Ok((path, file)),
             Err(error) if collision_error(&error) => continue,
             Err(error) => return Err(format!("Cannot create staging file {}: {error}", path.display())),
@@ -905,7 +921,7 @@ fn move_file_checked_content_inner(
             requested.clone()
         };
         if !force_copy {
-            match rename_no_replace(&source, src, &guards[0], &actual) {
+            match rename_no_replace(&source, src, &actual) {
                 Ok(()) => return Ok(MoveResult { source: canonical_source, renamed: actual != requested, destination: actual, identity }),
                 Err(error) if allow_rename && collision_error(&error) => continue,
                 Err(error) if cross_device_error(&error) => {}
