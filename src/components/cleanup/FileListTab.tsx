@@ -2,16 +2,18 @@ import { useState, useCallback, useId, useMemo, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import { useCleanupStore } from "../../store/useCleanupStore";
 import { formatBytes, formatTimestamp } from "../../utils/format";
-import type { CleanupFile, CleanupRequest } from "../../utils/cleanup";
+import type { CleanupRequest } from "../../utils/cleanup";
 import { Search, Trash2, ExternalLink } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import ResultsPanel from "./ResultsPanel";
 import ConfirmDialog, { type ConfirmDialogProps } from "./ConfirmDialog";
 import { usePreviewOwner } from "./usePreviewOwner";
 
+const BYTES_PER_MIB = 1_048_576;
+
 interface FileListTabProps {
   kind: "large" | "stale";
-  /** Default threshold in bytes (for large) or days (for stale). */
+  /** Default threshold in MiB (for large) or days (for stale). */
   defaultThreshold: number;
   /** Label for the find button. */
   findLabel: string;
@@ -34,15 +36,17 @@ export default function FileListTab({
   const { t } = useTranslation();
   const store = useCleanupStore();
   const thresholdId = useId();
-  const [threshold, setThreshold] = useState(defaultThreshold);
+  const [draftThreshold, setDraftThreshold] = useState<number | null>(null);
   const [checked, setChecked] = useState<Set<string>>(new Set());
   const [showResults, setShowResults] = useState(false);
   const [pending, setPending] = useState<ConfirmDialogProps | null>(null);
   const beginPreview = usePreviewOwner();
   const resultsHeading = useRef<HTMLHeadingElement>(null);
 
-  const data: CleanupFile[] | null =
-    kind === "large" ? store.largeFiles : store.staleFiles;
+  const search = kind === "large" ? store.largeFiles : store.staleFiles;
+  const searchedThreshold = search && ("minBytes" in search ? search.minBytes / BYTES_PER_MIB : search.days);
+  const threshold = draftThreshold ?? searchedThreshold ?? defaultThreshold;
+  const data = search && threshold === searchedThreshold ? search.files : null;
 
   const checkedFiles = useMemo(
     () => (data ?? []).filter((f) => checked.has(f.path)),
@@ -50,9 +54,9 @@ export default function FileListTab({
   );
 
   const handleFind = () => {
+    setDraftThreshold(threshold);
     if (kind === "large") {
-      // threshold is in MB, convert to bytes
-      store.findLargeFiles(threshold * 1_048_576);
+      store.findLargeFiles(threshold * BYTES_PER_MIB);
     } else {
       store.findStaleFiles(threshold);
     }
@@ -79,12 +83,11 @@ export default function FileListTab({
   }, [data, checked]);
 
   const handleConfirm = async (opener: HTMLButtonElement) => {
-    if (checkedFiles.length === 0) return;
-    const actions: CleanupRequest[] = checkedFiles.map(({ path }) => ({
-      kind: kind === "large" ? "trash_large" : "trash_stale",
-      path,
-      ...(kind === "large" ? { minBytes: threshold * 1_048_576 } : { days: threshold }),
-    }));
+    if (!search || checkedFiles.length === 0) return;
+    const actions = checkedFiles.map(({ path }): CleanupRequest => "minBytes" in search
+      ? { kind: "trash_large", path, minBytes: search.minBytes }
+      : { kind: "trash_stale", path, days: search.days },
+    );
     const owner = beginPreview();
     if (!owner) return;
     try {
@@ -150,9 +153,10 @@ export default function FileListTab({
             type="number"
             min={1}
             value={threshold}
-            onChange={(e) =>
-              setThreshold(Math.max(1, Number(e.target.value)))
-            }
+            onChange={(event) => {
+              setDraftThreshold(Math.max(1, Number(event.target.value)));
+              setChecked(new Set());
+            }}
             className="w-20 rounded-md border border-border bg-surface px-2 py-1 text-xs text-text"
           />
           <button
@@ -170,6 +174,10 @@ export default function FileListTab({
         <div className="rounded-lg bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 px-4 py-3 text-xs text-red-700 dark:text-red-400">
           {store.error}
         </div>
+      )}
+
+      {search && !data && (
+        <p className="text-xs text-text-muted">{t("cleanup.notSearched")}</p>
       )}
 
       {data && data.length === 0 && (

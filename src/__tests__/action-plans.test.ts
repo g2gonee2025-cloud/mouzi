@@ -18,7 +18,7 @@ beforeEach(() => {
 });
 
 it("previews cleanup criteria and executes only the reviewed backend token", async () => {
-  useCleanupStore.setState({ largeFiles: [row("a"), row("b")] });
+  useCleanupStore.setState({ largeFiles: { minBytes: 100, files: [row("a"), row("b")] } });
   ipc.invoke.mockResolvedValueOnce(cleanupPlan);
   const reviewed = await useCleanupStore.getState().prepareCleanup(cleanupPlan.actions);
   expect(ipc.invoke).toHaveBeenCalledWith("prepare_cleanup_cmd", { actions: cleanupPlan.actions });
@@ -26,7 +26,7 @@ it("previews cleanup criteria and executes only the reviewed backend token", asy
   ipc.invoke.mockResolvedValueOnce([{ path: "a", status: "ok", message: "Recovery unverified" }, { path: "b", status: "failed", message: "File changed" }]).mockResolvedValueOnce([]);
   await useCleanupStore.getState().executeCleanup(reviewed.planId);
   expect(ipc.invoke).toHaveBeenCalledWith("execute_cleanup_cmd", { planId: "cleanup:reviewed" });
-  expect(useCleanupStore.getState().largeFiles?.map((file) => file.path)).toEqual(["b"]);
+  expect(useCleanupStore.getState().largeFiles).toEqual({ minBytes: 100, files: [row("b")] });
   expect(useCleanupStore.getState().results?.[1].message).toBe("File changed");
   useCleanupStore.getState().invalidateCandidates();
   expect(useCleanupStore.getState().results).toHaveLength(2);
@@ -38,7 +38,7 @@ it("discards a late finder and refuses a preview invalidated during preparation"
   const first = useCleanupStore.getState().findLargeFiles(10);
   await useCleanupStore.getState().findLargeFiles(20);
   older.resolve([row("old")]); await first;
-  expect(useCleanupStore.getState().largeFiles?.[0].path).toBe("current");
+  expect(useCleanupStore.getState().largeFiles).toEqual({ minBytes: 20, files: [row("current")] });
   const pending = deferred<CleanupPlan>(); ipc.invoke.mockReturnValueOnce(pending.promise);
   const preparing = useCleanupStore.getState().prepareCleanup(cleanupPlan.actions);
   const rejection = expect(preparing).rejects.toThrow("candidates changed");

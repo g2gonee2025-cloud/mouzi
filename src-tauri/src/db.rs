@@ -2249,9 +2249,18 @@ pub fn set_cached_hash(path: &str, size: i64, mtime: i64, hash: &str, is_full: b
 // Cleanup query helpers
 // ---------------------------------------------------------------------------
 
-pub fn count_inventory_files() -> SqliteResult<i64> {
+pub(crate) fn has_cleanup_inventory() -> SqliteResult<bool> {
     let conn = sqlite_lock()?;
-    conn.query_row("SELECT COUNT(*) FROM file_inventory", [], |row| row.get(0))
+    // A completed scan may publish zero rows. Older profiles can have
+    // inventory rows without a recorded completion time.
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM file_inventory) OR EXISTS(
+            SELECT 1 FROM inventory_roots r JOIN watched_folders w ON w.path = r.root_path
+            WHERE r.last_scan_at IS NOT NULL AND w.enabled = 1 AND w.mode <> 'paused'
+        )",
+        [],
+        |row| row.get(0),
+    )
 }
 
 /// Return (size, path, mtime) for each size group that has >1 file.

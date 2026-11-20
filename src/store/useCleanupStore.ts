@@ -17,8 +17,8 @@ export interface CleanupLogEntry {
 
 interface CleanupState {
   duplicates: DuplicateGroup[] | null;
-  largeFiles: CleanupFile[] | null;
-  staleFiles: CleanupFile[] | null;
+  largeFiles: { files: CleanupFile[]; minBytes: number } | null;
+  staleFiles: { files: CleanupFile[]; days: number } | null;
   emptyDirs: string[] | null;
   loading: boolean;
   error: string | null;
@@ -47,13 +47,16 @@ const emptyCandidates = { duplicates: null, largeFiles: null, staleFiles: null, 
 export const useCleanupStore = create<CleanupState>((set, get) => {
   const preview = createPreviewSlot();
 
-  async function find(command: string, key: "duplicates" | "largeFiles" | "staleFiles" | "emptyDirs", args?: Record<string, number>) {
+  async function find<Key extends keyof typeof emptyCandidates>(
+    key: Key,
+    request: () => Promise<NonNullable<CleanupState[Key]>>,
+  ) {
     if (get().busy || get().preparedPlan) return;
     const generation = ++candidatesGeneration;
     set({ loading: true, error: null, [key]: null });
     try {
-      const rows = await invoke<DuplicateGroup[] | CleanupFile[] | string[]>(command, args);
-      if (generation === candidatesGeneration) set({ [key]: rows, loading: false });
+      const result = await request();
+      if (generation === candidatesGeneration) set({ [key]: result, loading: false });
     } catch (error) {
       if (generation === candidatesGeneration) set({ error: String(error), loading: false });
     }
@@ -63,10 +66,16 @@ export const useCleanupStore = create<CleanupState>((set, get) => {
     ...emptyCandidates,
     loading: false, error: null, busy: false, preparedPlan: null,
     results: null, history: null, historyLoading: false, historyError: null,
-    findDuplicates: () => find("find_duplicates_cmd", "duplicates"),
-    findLargeFiles: (minBytes) => find("find_large_files_cmd", "largeFiles", { minBytes }),
-    findStaleFiles: (days) => find("find_stale_files_cmd", "staleFiles", { days }),
-    findEmptyDirs: () => find("find_empty_dirs_cmd", "emptyDirs"),
+    findDuplicates: () => find("duplicates", () => invoke<DuplicateGroup[]>("find_duplicates_cmd")),
+    findLargeFiles: (minBytes) => find("largeFiles", async () => ({
+      files: await invoke<CleanupFile[]>("find_large_files_cmd", { minBytes }),
+      minBytes,
+    })),
+    findStaleFiles: (days) => find("staleFiles", async () => ({
+      files: await invoke<CleanupFile[]>("find_stale_files_cmd", { days }),
+      days,
+    })),
+    findEmptyDirs: () => find("emptyDirs", () => invoke<string[]>("find_empty_dirs_cmd")),
     prepareCleanup: async (actions, owner) => {
       if (!actions.length || get().busy || get().preparedPlan) throw new Error("Another cleanup is being reviewed or processed");
       const isCurrent = preview.begin(owner, () => set({ busy: false, preparedPlan: null }));
@@ -99,8 +108,14 @@ export const useCleanupStore = create<CleanupState>((set, get) => {
         set((state) => ({
           results,
           duplicates: state.duplicates?.map((g) => ({ ...g, files: g.files.filter((f) => !removed.has(f.path)) })).filter((g) => g.files.length > 1) ?? null,
-          largeFiles: state.largeFiles?.filter((f) => !removed.has(f.path)) ?? null,
-          staleFiles: state.staleFiles?.filter((f) => !removed.has(f.path)) ?? null,
+          largeFiles: state.largeFiles && {
+            ...state.largeFiles,
+            files: state.largeFiles.files.filter((file) => !removed.has(file.path)),
+          },
+          staleFiles: state.staleFiles && {
+            ...state.staleFiles,
+            files: state.staleFiles.files.filter((file) => !removed.has(file.path)),
+          },
           emptyDirs: state.emptyDirs?.filter((path) => !removed.has(path)) ?? null,
         }));
       } catch (error) {
