@@ -96,6 +96,22 @@ function defaultSchedule(): ScheduleSettings {
   };
 }
 
+function schedulesMatch(saved: ScheduleSettings, draft: ScheduleSettings): boolean {
+  return (Object.keys(saved) as Array<keyof ScheduleSettings>).every((key) => saved[key] === draft[key]);
+}
+
+function activeScheduleDefaults(draft: ScheduleSettings): ScheduleSettings {
+  if (!draft.schedule_enabled) return draft;
+  const times = draft.schedule_times_per_day;
+  return {
+    ...draft,
+    schedule_time_1: draft.schedule_time_1 || "08:00",
+    schedule_time_2: times >= 2 ? draft.schedule_time_2 || "14:00" : draft.schedule_time_2,
+    schedule_time_3: times >= 3 ? draft.schedule_time_3 || "20:00" : draft.schedule_time_3,
+    schedule_time_4: times >= 4 ? draft.schedule_time_4 || "23:00" : draft.schedule_time_4,
+  };
+}
+
 type SchedulerRun = {
   id: number;
   status: "claimed" | "running" | "completed" | "failed" | "interrupted";
@@ -205,13 +221,14 @@ export default function Settings() {
   const [writeError, setWriteError] = useState<string | null>(null);
   const [isSaving, setIsSaving] = useState(false);
   const savingRef = useRef(false);
-  const [scheduleDirty, setScheduleDirty] = useState(false);
   const [aiModel, setAiModel] = useState("");
 
   const [graceDraft, setGraceDraft] = useState<GraceDraft | null>(null);
   const graceInput = useRef<HTMLInputElement>(null);
 
-  const [localSchedule, setLocalSchedule] = useState<ScheduleSettings>(defaultSchedule());
+  const [scheduleDraft, setScheduleDraft] = useState<ScheduleSettings | null>(null);
+  const localSchedule = scheduleDraft ? activeScheduleDefaults(scheduleDraft) : schedule ?? defaultSchedule();
+  const scheduleDirty = !!schedule && !!scheduleDraft && !schedulesMatch(schedule, localSchedule);
   const [ruleToast, setRuleToast] = useState<{ message: string; type: "success" | "error" } | null>(null);
   const [replaceOnImport, setReplaceOnImport] = useState(false);
   const [archiveToast, setArchiveToast] = useState<{
@@ -296,13 +313,6 @@ export default function Settings() {
   };
 
   const savePreferences = (patch: PreferencesPatch) => runWrite(() => saveSettings(patch));
-
-  // Sync local schedule editor with loaded schedule
-  useEffect(() => {
-    if (schedule && !scheduleDirty) {
-      setLocalSchedule(schedule);
-    }
-  }, [schedule, scheduleDirty]);
 
   const handleAddFolder = async () => {
     if (!newFolderPath.trim()) return;
@@ -400,21 +410,16 @@ export default function Settings() {
   };
 
   const handleScheduleChange = (patch: Partial<ScheduleSettings>) => {
-    setScheduleDirty(true);
-    setLocalSchedule((prev) => {
-      const next = { ...prev, ...patch };
-      const times = Math.max(1, Math.min(4, next.schedule_times_per_day || 1));
-      // Ensure required time slots have defaults when increasing count
-      if (times >= 1 && !next.schedule_time_1) next.schedule_time_1 = "08:00";
-      if (times >= 2 && !next.schedule_time_2) next.schedule_time_2 = "14:00";
-      if (times >= 3 && !next.schedule_time_3) next.schedule_time_3 = "20:00";
-      if (times >= 4 && !next.schedule_time_4) next.schedule_time_4 = "23:00";
-      return { ...next, schedule_times_per_day: times };
-    });
+    if (!schedule) return;
+    const next = { ...(scheduleDraft ?? schedule), ...patch };
+    next.schedule_times_per_day = Math.max(1, Math.min(4, next.schedule_times_per_day || 1));
+    setScheduleDraft(schedulesMatch(schedule, activeScheduleDefaults(next)) ? null : next);
   };
 
   const handleSaveSchedule = async () => {
-    if (await runWrite(() => updateSchedule(localSchedule))) setScheduleDirty(false);
+    if (scheduleDirty && (await runWrite(() => updateSchedule(localSchedule)))) {
+      setScheduleDraft(null);
+    }
   };
 
   const handleExportRules = async () => {
@@ -1201,6 +1206,7 @@ export default function Settings() {
                   role="switch"
                   aria-label={t("settings.scheduler.enable")}
                   aria-checked={localSchedule.schedule_enabled}
+                  disabled={!schedule}
                   onClick={() => handleScheduleChange({ schedule_enabled: !localSchedule.schedule_enabled })}
                   className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${localSchedule.schedule_enabled ? "bg-primary" : "bg-surface-dark"
                     }`}
@@ -1219,6 +1225,7 @@ export default function Settings() {
                 <select
                   aria-label={t("settings.scheduler.timesPerDay")}
                   value={localSchedule.schedule_times_per_day}
+                  disabled={!schedule}
                   onChange={(e) =>
                     handleScheduleChange({ schedule_times_per_day: parseInt(e.target.value, 10) })
                   }
@@ -1243,6 +1250,7 @@ export default function Settings() {
                         aria-label={t("settings.scheduler.time", { number: idx + 1 })}
                         type="time"
                         value={(localSchedule[key] as string | null) || ""}
+                        disabled={!schedule}
                         onChange={(e) =>
                           handleScheduleChange({ [key]: e.target.value || null } as Partial<ScheduleSettings>)
                         }
@@ -1254,11 +1262,13 @@ export default function Settings() {
               </div>
 
               <button
+                type="button"
+                disabled={!scheduleDirty}
                 onClick={handleSaveSchedule}
-                className="flex items-center gap-1.5 rounded-md bg-primary px-3 py-2 text-sm font-medium text-on-primary hover:bg-primary-hover"
+                className="flex items-center gap-1.5 rounded-md bg-primary px-3 py-2 text-sm font-medium text-on-primary hover:bg-primary-hover disabled:opacity-50"
               >
                 <Save size={14} />
-                {t("settings.rules.edit")}
+                {t("common.save")}
               </button>
             </div>
 

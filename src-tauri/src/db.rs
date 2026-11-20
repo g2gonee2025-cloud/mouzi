@@ -181,7 +181,7 @@ pub struct PreferencesPatch {
     pub auto_update_enabled: Option<bool>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScheduleSettings {
     pub schedule_enabled: bool,
     pub schedule_times_per_day: i64,

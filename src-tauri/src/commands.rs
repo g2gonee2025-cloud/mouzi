@@ -940,14 +940,17 @@ pub fn refresh_watcher_cmd(app: AppHandle) -> Result<(), String> {
 /// Get the current scheduled-clean settings.
 #[tauri::command]
 pub fn get_schedule_cmd() -> Result<ScheduleSettings, String> {
-    get_settings().map(crate::scheduler::schedule_from_settings).map_err(|e| e.to_string())
+    let settings = get_settings().map_err(|e| e.to_string())?;
+    Ok(crate::scheduler::schedule_from_settings(&settings))
 }
 
 /// Update scheduled-clean settings.
 #[tauri::command(async)]
 pub fn update_schedule_cmd(app: AppHandle, schedule: ScheduleSettings, state: tauri::State<AppState>) -> Result<AppSettings, String> {
-    let committed = state.scheduler.save_schedule(&state.ignored_files, &schedule)?;
-    let _ = app.emit("settings-changed", &committed);
+    let (committed, changed) = state.scheduler.save_schedule(&state.ignored_files, &schedule)?;
+    if changed {
+        let _ = app.emit("settings-changed", &committed);
+    }
     Ok(committed)
 }
 

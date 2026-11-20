@@ -57,12 +57,26 @@ impl Scheduler {
         Self { revision: Arc::new(AtomicU64::new(0)) }
     }
 
-    pub(crate) fn save_schedule(&self, suppression: &SuppressionSet, schedule: &ScheduleSettings) -> Result<AppSettings, String> {
-        validate_schedule_times(schedule)?;
+    pub(crate) fn save_schedule(
+        &self,
+        suppression: &SuppressionSet,
+        schedule: &ScheduleSettings,
+    ) -> Result<(AppSettings, bool), String> {
+        let times = active_times(schedule)?;
         let _operation = suppression.with_operation();
+        let current = get_settings().map_err(|error| error.to_string())?;
+        let previous = schedule_from_settings(&current);
+        if &previous == schedule {
+            return Ok((current, false));
+        }
+
         let committed = update_schedule_settings(schedule).map_err(|error| error.to_string())?;
-        self.revision.fetch_add(1, Ordering::AcqRel);
-        Ok(committed)
+        // A valid save can repair malformed stored settings. In that case we
+        // cannot establish that the previous run used the same times.
+        if active_times(&previous).ok().as_ref() != Some(&times) {
+            self.revision.fetch_add(1, Ordering::AcqRel);
+        }
+        Ok((committed, true))
     }
 
     #[cfg(test)]
@@ -83,14 +97,14 @@ impl Scheduler {
     }
 }
 
-pub(crate) fn schedule_from_settings(settings: AppSettings) -> ScheduleSettings {
+pub(crate) fn schedule_from_settings(settings: &AppSettings) -> ScheduleSettings {
     ScheduleSettings {
         schedule_enabled: settings.schedule_enabled,
         schedule_times_per_day: settings.schedule_times_per_day,
-        schedule_time_1: settings.schedule_time_1,
-        schedule_time_2: settings.schedule_time_2,
-        schedule_time_3: settings.schedule_time_3,
-        schedule_time_4: settings.schedule_time_4,
+        schedule_time_1: settings.schedule_time_1.clone(),
+        schedule_time_2: settings.schedule_time_2.clone(),
+        schedule_time_3: settings.schedule_time_3.clone(),
+        schedule_time_4: settings.schedule_time_4.clone(),
     }
 }
 
@@ -285,7 +299,8 @@ fn check_and_run(app_handle: &AppHandle, suppression: &SuppressionSet, revision:
     // subsequent file operation checks this revision under that gate again.
     let operation = suppression.with_operation();
     let expected_revision = revision.load(Ordering::Acquire);
-    let schedule = get_settings().map(schedule_from_settings).map_err(|e| e.to_string())?;
+    let settings = get_settings().map_err(|e| e.to_string())?;
+    let schedule = schedule_from_settings(&settings);
     let saved_checkpoint = get_schedule_last_check().map_err(|e| e.to_string())?;
     let previous = saved_checkpoint.as_deref().and_then(|value| {
         serde_json::from_str::<ScheduleCheckpoint>(value)
@@ -367,6 +382,33 @@ mod tests {
             schedule_time_3: times.get(2).map(|value| value.to_string()),
             schedule_time_4: times.get(3).map(|value| value.to_string()),
         }
+    }
+
+    #[test]
+    fn disabling_a_malformed_stored_schedule_accepts_valid_replacement_slots() {
+        let _serial = crate::db::serialise_test_db();
+        crate::db::init_test_db();
+        let original = schedule_from_settings(&get_settings().unwrap());
+        let malformed = schedule(&["legacy-invalid"]);
+        let invalid_settings = update_schedule_settings(&malformed).unwrap();
+        let scheduler = Scheduler::new();
+        let suppression = SuppressionSet::new();
+        let invalid_disable = ScheduleSettings { schedule_enabled: false, ..malformed };
+        let rejected = scheduler.save_schedule(&suppression, &invalid_disable);
+        let revision_after_rejection = scheduler.revision();
+        let settings_after_rejection = get_settings().unwrap();
+        let disabled = ScheduleSettings { schedule_time_1: None, ..invalid_disable };
+        let saved = scheduler.save_schedule(&suppression, &disabled);
+        let persisted = get_settings().unwrap();
+        update_schedule_settings(&original).unwrap();
+
+        assert!(rejected.is_err());
+        assert_eq!(revision_after_rejection, 0);
+        assert_eq!(settings_after_rejection.revision, invalid_settings.revision);
+        let (committed, changed) = saved.unwrap();
+        assert!(changed);
+        assert_eq!(schedule_from_settings(&persisted), disabled);
+        assert_eq!(committed.revision, invalid_settings.revision + 1);
     }
 
     fn now(value: &str) -> DateTime<FixedOffset> {

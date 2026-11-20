@@ -1532,7 +1532,7 @@ mod tests {
         let _serial = db::serialise_test_db();
         db::init_test_db();
         const SLOT: &str = "v2|2026-11-20|08:00:00";
-        let original = crate::scheduler::schedule_from_settings(db::get_settings().unwrap());
+        let original = crate::scheduler::schedule_from_settings(&db::get_settings().unwrap());
         let original_checkpoint = db::get_schedule_last_check().unwrap();
         let path = std::env::temp_dir().join(format!(
             "mouzi-schedule-{}-{}", std::process::id(), Utc::now().timestamp_nanos_opt().unwrap()
@@ -1585,7 +1585,7 @@ mod tests {
             schedule_enabled: true, schedule_times_per_day: 2, schedule_time_1: Some("08:00".into()),
             schedule_time_2: Some("14:00".into()), schedule_time_3: None, schedule_time_4: None,
         };
-        let initial_settings = scheduler.save_schedule(&suppression, &schedule).unwrap();
+        let (initial_settings, _) = scheduler.save_schedule(&suppression, &schedule).unwrap();
         let revision = scheduler.revision();
         db::start_schedule_run(run).unwrap();
         let mut selected = Vec::new();
@@ -1604,7 +1604,8 @@ mod tests {
         assert_eq!(selected.len(), 2);
         let expected_revoked = expected_organized == 1;
         assert_eq!((progress.organized, progress.errors, progress.revoked), (expected_organized, 0, expected_revoked));
-        let committed = saved_settings.unwrap();
+        let (committed, changed) = saved_settings.unwrap();
+        assert_eq!(changed, expected_revision_delta != 0);
         assert_eq!(committed.revision, initial_settings.revision + expected_revision_delta);
         let persisted = db::get_settings().unwrap();
         assert_eq!(persisted.revision, committed.revision);
