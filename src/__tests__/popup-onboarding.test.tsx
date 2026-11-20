@@ -13,6 +13,7 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke: fixture.invoke }));
 vi.mock("react", async (importOriginal) => ({
   ...await importOriginal<typeof import("react")>(),
   useEffect: () => {},
+  useRef: (current: unknown) => ({ current }),
   useState: (value: unknown) => {
     const retained = fixture.retained;
     if (!retained) return [value, fixture.setState];

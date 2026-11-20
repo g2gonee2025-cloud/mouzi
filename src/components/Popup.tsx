@@ -1,6 +1,6 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { useAppStore } from "../store/useAppStore";
+import { pendingFilePath, useAppStore } from "../store/useAppStore";
 import ActionRefreshWarnings from "./ActionRefreshWarnings";
 import {
   FolderOpen,
@@ -54,10 +54,13 @@ export default function Popup() {
     folderRead,
     pendingFiles,
     getPendingFiles,
+    selectedPendingPaths,
+    setPendingFileSelected,
+    clearPendingSelection,
   } = useAppStore();
   const [actionError, setActionError] = useState<string | null>(null);
   const [openingFolders, setOpeningFolders] = useState(false);
-  const [selectedFiles, setSelectedFiles] = useState<Set<string>>(new Set());
+  const mounted = useRef(true);
   const [toast, setToast] = useState<{
     file: string;
     rule: string;
@@ -81,6 +84,7 @@ export default function Popup() {
   }, [undoToast]);
 
   useEffect(() => {
+    mounted.current = true;
     loadLogs().catch(console.error);
     loadStats().catch(console.error);
     loadFolders().catch(console.error);
@@ -110,10 +114,12 @@ export default function Popup() {
     }, 3000);
 
     return () => {
+      mounted.current = false;
+      clearPendingSelection();
       unlisten.then((f) => f()).catch(console.error);
       clearInterval(interval);
     };
-  }, [loadLogs, loadStats, loadFolders, getPendingFiles]);
+  }, [loadLogs, loadStats, loadFolders, getPendingFiles, clearPendingSelection]);
 
 
 
@@ -121,7 +127,7 @@ export default function Popup() {
     setActionError(null);
     try {
       await invoke("show_review_cmd", { paths });
-      setSelectedFiles(new Set());
+      if (mounted.current) clearPendingSelection();
     } catch (error) {
       setActionError(String(error));
     }
@@ -139,11 +145,15 @@ export default function Popup() {
     }
   };
 
-  const pendingPaths = pendingFiles.map(([folder, name]) => ({
-    name,
-    path: folder.replace(/[\\/]$/, "") + (folder.includes("\\") ? "\\" : "/") + name,
+  const pendingPaths = pendingFiles.map((file) => ({
+    name: file[1],
+    path: pendingFilePath(file),
   }));
-  const selectedPaths = pendingPaths.filter(({ path }) => selectedFiles.has(path)).map(({ path }) => path);
+  const reviewSelection = () => {
+    const { pendingFiles, selectedPendingPaths } = useAppStore.getState();
+    const paths = pendingFiles.map(pendingFilePath).filter((path) => selectedPendingPaths.has(path));
+    if (paths.length) void openReview(paths);
+  };
 
   const handleOpenDownloads = async () => {
     setActionError(null);
@@ -238,20 +248,13 @@ export default function Popup() {
         {showPendingFiles && <div className="mt-2 space-y-2">
           <div className="max-h-24 space-y-1 overflow-auto text-xs">
             {pendingPaths.map(({ name, path }) => <label key={path} className="flex items-center gap-2" title={path}>
-              <input type="checkbox" checked={selectedFiles.has(path)} onChange={(event) => {
-                const checked = event.target.checked;
-                setSelectedFiles((previous) => {
-                  const next = new Set(previous);
-                  if (checked) next.add(path);
-                  else next.delete(path);
-                  return next;
-                });
-              }} />
+              <input type="checkbox" checked={selectedPendingPaths.has(path)}
+                onChange={(event) => setPendingFileSelected(path, event.target.checked)} />
               <span className="truncate">{name}</span>
             </label>)}
           </div>
-          <button type="button" disabled={!selectedPaths.length} className="text-xs text-primary underline disabled:opacity-50"
-            onClick={() => void openReview(selectedPaths)}>{t("beta.review")} ({selectedPaths.length})</button>
+          <button type="button" disabled={!selectedPendingPaths.size} className="text-xs text-primary underline disabled:opacity-50"
+            onClick={reviewSelection}>{t("beta.review")} ({selectedPendingPaths.size})</button>
         </div>}
 
         <button

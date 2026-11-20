@@ -135,6 +135,11 @@ export interface ArchiveImportState {
 
 type ActionRefreshErrors = Record<'history' | 'historyCounts' | 'stats', string | null>;
 type FolderRead = { status: 'loading' | 'ready' } | { status: 'failed'; error: string };
+type PendingFile = [folder: string, name: string];
+
+export function pendingFilePath([folder, name]: PendingFile): string {
+  return folder.replace(/[\\/]$/, '') + (folder.includes('\\') ? '\\' : '/') + name;
+}
 
 interface AppState {
   rules: Rule[];
@@ -146,7 +151,8 @@ interface AppState {
   stats: { file_type: string; count: number }[];
   settings: AppSettings | null;
   schedule: ScheduleSettings | null;
-  pendingFiles: [string, string][];
+  pendingFiles: PendingFile[];
+  selectedPendingPaths: ReadonlySet<string>;
   isLoading: boolean;
   actionRefreshErrors: ActionRefreshErrors;
   archiveImportState: ArchiveImportState | null;
@@ -178,6 +184,8 @@ interface AppState {
   deleteRule: (id: number) => Promise<void>;
   clearLogs: (throughId: number) => Promise<void>;
   getPendingFiles: () => Promise<void>;
+  setPendingFileSelected: (path: string, checked: boolean) => void;
+  clearPendingSelection: () => void;
   getSchedule: () => Promise<void>;
   updateSchedule: (schedule: ScheduleSettings) => Promise<void>;
   exportRules: () => Promise<boolean>;
@@ -232,6 +240,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   settings: null,
   schedule: null,
   pendingFiles: [],
+  selectedPendingPaths: new Set(),
   isLoading: false,
   actionRefreshErrors: noActionRefreshErrors,
   archiveImportState: null,
@@ -440,12 +449,31 @@ export const useAppStore = create<AppState>((set, get) => ({
   getPendingFiles: async () => {
     const request = ++pendingRequest;
     try {
-      const pendingFiles = await invoke<[string, string][]>('get_pending_files_cmd');
-      if (request === pendingRequest) set({ pendingFiles });
+      const pendingFiles = await invoke<PendingFile[]>('get_pending_files_cmd');
+      if (request === pendingRequest) {
+        // Reconcile every published snapshot, including updates React batches together.
+        set(({ selectedPendingPaths }) => {
+          if (selectedPendingPaths.size === 0) return { pendingFiles };
+          const listed = new Set(pendingFiles.map(pendingFilePath));
+          const retained = new Set([...selectedPendingPaths].filter((path) => listed.has(path)));
+          return { pendingFiles, selectedPendingPaths: retained };
+        });
+      }
     } catch (e) {
       console.error('getPendingFiles failed:', e);
     }
   },
+
+  setPendingFileSelected: (path, checked) => {
+    set(({ pendingFiles, selectedPendingPaths }) => {
+      const selection = new Set(selectedPendingPaths);
+      if (!checked) selection.delete(path);
+      else if (pendingFiles.some((file) => pendingFilePath(file) === path)) selection.add(path);
+      return { selectedPendingPaths: selection };
+    });
+  },
+
+  clearPendingSelection: () => set({ selectedPendingPaths: new Set() }),
 
   getSchedule: async () => {
     await get().loadSettings();
