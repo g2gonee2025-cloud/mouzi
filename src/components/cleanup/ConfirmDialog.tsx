@@ -61,7 +61,7 @@ export interface ConfirmRequest {
    * selected" and disabling the button for an action that is not a no-op.
    */
   countIsExact?: boolean;
-  /** Total bytes at stake. Omit when the backend cannot know it before the run. */
+  /** Total bytes at stake. Omit when no total size is available. */
   bytes?: number;
   notice: ConfirmNotice;
   /** Operation-specific consequence, already translated by the caller. */
@@ -209,24 +209,20 @@ export default function ConfirmDialog({
         </div>
 
         <div id={bodyId} className="space-y-2">
-          {tier !== "simple" && (count > 0 || countIsExact) && (
-            <div className="rounded-md border border-border bg-surface-dark px-3 py-2">
+          <div className={tier === "simple" ? undefined : "rounded-md border border-border bg-surface-dark px-3 py-2"}>
+            {(count > 0 || countIsExact) && (
               <div className="text-xs font-medium text-text tabular-nums">
                 {countIsExact
                   ? t("confirm.impactItems", { count })
                   : t("confirm.impactAtLeast", { count })}
               </div>
-              {bytes !== undefined && (
-                <div className="text-xs text-text-muted tabular-nums">
-                  {t("confirm.impactBytes", { size: formatBytes(bytes) })}
-                </div>
-              )}
+            )}
+            <div className="text-xs text-text-muted tabular-nums">
+              {bytes === undefined
+                ? t("confirm.bytesUnknown")
+                : t("confirm.impactBytes", { size: formatBytes(bytes) })}
             </div>
-          )}
-
-          {bytes === undefined && (
-            <p className="text-xs text-text-muted">{t("confirm.bytesUnknown")}</p>
-          )}
+          </div>
 
           {note && <p className="text-xs text-text-muted whitespace-pre-line">{note}</p>}
 

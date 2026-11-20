@@ -457,7 +457,7 @@
     "more_few": "+{{count}} więcej",
     "more_many": "+{{count}} więcej",
     "impactBytes": "Łączny rozmiar: {{size}}",
-    "bytesUnknown": "Dokładna suma będzie znana dopiero po rozpoczęciu operacji.",
+    "bytesUnknown": "Brak informacji o łącznym rozmiarze.",
     "trashNotice": "Usunięte pliki trafiają do Kosza i można je odzyskać, ale tylko dopóty Kosz może przyjąć ten element. Gdy Kosz jest pełny, element jest za duży albo folder leży na dysku sieciowym, Windows usuwa go trwale, nie informując o tym Mouzi.",
     "moveNotice": "Pliki są przenoszone, a nie usuwane, więc nic nie znika z dysków. Możesz to cofnąć w Historii — dopóki historia nie zostanie wyczyszczona.",
     "permanentNotice": "Nie da się tego cofnąć. Nie ma kopii w Koszu ani sposobu na odzyskanie.",

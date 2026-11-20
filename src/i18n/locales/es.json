@@ -457,7 +457,7 @@
     "more_other": "+{{count}} más",
     "more_many": "+{{count}} más",
     "impactBytes": "Tamaño total: {{size}}",
-    "bytesUnknown": "El total exacto no se conoce hasta que empieza la operación.",
+    "bytesUnknown": "El tamaño total no está disponible.",
     "trashNotice": "Los archivos eliminados van a la Papelera y puedes recuperarlos, pero solo mientras la Papelera pueda aceptar el elemento. Si la Papelera está llena, el elemento es demasiado grande o la carpeta está en una unidad de red, Windows lo elimina de forma permanente sin avisar a Mouzi.",
     "moveNotice": "Los archivos se mueven, no se eliminan, así que nada desaparece de tus discos. Puedes revertirlo desde el Historial, hasta que se borre el historial.",
     "permanentNotice": "Esto no se puede deshacer. No hay copia en la Papelera ni forma de recuperarlo.",

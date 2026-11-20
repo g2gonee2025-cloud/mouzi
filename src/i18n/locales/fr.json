@@ -457,7 +457,7 @@
     "more_other": "+{{count}} de plus",
     "more_many": "+{{count}} de plus",
     "impactBytes": "Taille totale : {{size}}",
-    "bytesUnknown": "Le total exact n'est connu qu'une fois l'opération lancée.",
+    "bytesUnknown": "Taille totale indisponible.",
     "trashNotice": "Les fichiers supprimés vont dans la Corbeille et peuvent être récupérés, mais seulement tant que la Corbeille peut accepter l'élément. Si elle est pleine, si l'élément est trop volumineux ou si le dossier se trouve sur un lecteur réseau, Windows le supprime définitivement, sans en informer Mouzi.",
     "moveNotice": "Les fichiers sont déplacés, pas supprimés : rien ne quitte vos disques. Vous pouvez tout annuler depuis l'historique, tant que celui-ci n'a pas été effacé.",
     "permanentNotice": "Cette action est irréversible. Il n'y a aucune copie dans la Corbeille et aucun moyen de la récupérer.",

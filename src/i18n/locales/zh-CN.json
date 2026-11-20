@@ -448,7 +448,7 @@
     "impactAtLeast": "至少 {{count}} 项",
     "more": "另有 {{count}} 项",
     "impactBytes": "总大小：{{size}}",
-    "bytesUnknown": "操作开始前无法确定准确总数。",
+    "bytesUnknown": "总大小未知。",
     "trashNotice": "删除的文件通常会移入回收站，可以从中恢复。回收站已满、文件过大或位于网络驱动器时，Windows 可能直接永久删除文件，并且不会通知 Mouzi。",
     "moveNotice": "文件会在磁盘上移动，您可以从历史记录中撤销操作。清除历史记录后将无法撤销。",
     "permanentNotice": "此操作无法撤销。回收站中不会保留副本，无法恢复。",

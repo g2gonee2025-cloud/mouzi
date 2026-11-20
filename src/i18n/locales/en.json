@@ -454,7 +454,7 @@
     "more_one": "+{{count}} more",
     "more_other": "+{{count}} more",
     "impactBytes": "Total size: {{size}}",
-    "bytesUnknown": "The exact total is not known until the run starts.",
+    "bytesUnknown": "Total size unavailable.",
     "trashNotice": "Removed files go to the Recycle Bin, so you can put them back - but only while the Recycle Bin can accept the item. If the bin is full, the item is too large, or the folder is on a network drive, Windows deletes it permanently instead, and Mouzi is not told.",
     "moveNotice": "Files are moved, not deleted, so nothing leaves your disks. You can reverse this from History - until the history is cleared.",
     "permanentNotice": "This cannot be undone. There is no Recycle Bin copy and no way to recover it.",

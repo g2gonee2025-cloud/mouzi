@@ -454,7 +454,7 @@
     "more_one": "+{{count}} weitere",
     "more_other": "+{{count}} weitere",
     "impactBytes": "Gesamtgröße: {{size}}",
-    "bytesUnknown": "Die genaue Gesamtgröße ist erst nach dem Start des Laufs bekannt.",
+    "bytesUnknown": "Gesamtgröße nicht verfügbar.",
     "trashNotice": "Entfernte Dateien landen im Papierkorb und lassen sich zurückholen – aber nur, solange der Papierkorb die Datei aufnehmen kann. Ist der Papierkorb voll, ist die Datei zu groß oder liegt der Ordner auf einem Netzwerklaufwerk, löscht Windows sie endgültig, ohne Mouzi darüber zu informieren.",
     "moveNotice": "Dateien werden verschoben, nicht gelöscht, es geht also nichts verloren. Du kannst es im Verlauf rückgängig machen – solange der Verlauf nicht gelöscht wurde.",
     "permanentNotice": "Das lässt sich nicht rückgängig machen. Es gibt keine Kopie im Papierkorb und keine Möglichkeit, die Datei wiederherzustellen.",

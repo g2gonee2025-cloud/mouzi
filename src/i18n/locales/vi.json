@@ -454,7 +454,7 @@
     "impactAtLeast": "Ít nhất {{count}} mục",
     "more": "+{{count}} mục nữa",
     "impactBytes": "Tổng dung lượng: {{size}}",
-    "bytesUnknown": "Tổng chính xác chỉ biết được sau khi bắt đầu chạy.",
+    "bytesUnknown": "Không có thông tin về tổng dung lượng.",
     "trashNotice": "Tệp đã xóa sẽ vào Thùng rác và có thể khôi phục lại, nhưng chỉ khi Thùng rác còn nhận được mục đó. Nếu Thùng rác đầy, mục đó quá lớn, hoặc thư mục nằm trên ổ mạng, Windows sẽ xóa vĩnh viễn mà không báo cho Mouzi.",
     "moveNotice": "Các tệp được di chuyển chứ không bị xóa, nên không có gì mất khỏi ổ đĩa của bạn. Bạn có thể hoàn tác từ Lịch sử, cho tới khi lịch sử bị xóa.",
     "permanentNotice": "Không thể hoàn tác. Không có bản sao trong Thùng rác và cũng không có cách khôi phục.",

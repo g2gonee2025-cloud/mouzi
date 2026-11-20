@@ -457,7 +457,7 @@
     "more_other": "+{{count}} altri",
     "more_many": "+{{count}} altri",
     "impactBytes": "Dimensione totale: {{size}}",
-    "bytesUnknown": "Il totale esatto non è noto finché l'operazione non parte.",
+    "bytesUnknown": "Dimensione totale non disponibile.",
     "trashNotice": "I file rimossi finiscono nel Cestino e puoi recuperarli, ma solo finché il Cestino può accogliere l'elemento. Se il Cestino è pieno, l'elemento è troppo grande o la cartella si trova su un'unità di rete, Windows lo elimina definitivamente senza avvisare Mouzi.",
     "moveNotice": "I file vengono spostati, non eliminati, quindi nulla lascia i tuoi dischi. Puoi annullare dalla Cronologia, finché la cronologia non viene cancellata.",
     "permanentNotice": "Questa azione è irreversibile. Non c'è una copia nel Cestino e nessun modo per recuperarla.",
