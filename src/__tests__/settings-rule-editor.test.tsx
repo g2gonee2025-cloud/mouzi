@@ -37,7 +37,8 @@ vi.mock("../store/useAppStore", async (importOriginal) => {
 
 interface Props {
   children?: ReactNode;
-  value?: string;
+  value?: string | number;
+  disabled?: boolean;
   checked?: boolean;
   label?: string;
   role?: string;
@@ -50,6 +51,7 @@ interface Props {
 }
 type Element = ReactElement<Props>;
 type Match = (element: Element) => boolean;
+
 
 function text(node: ReactNode): string {
   if (Array.isArray(node)) return node.map(text).join("");
@@ -295,4 +297,41 @@ it("does not allow an older list read to restore a previous rule state", async (
   finishOldRead([invoice, receipts]);
   await stale;
   expect(useAppStore.getState().rules.find(({ id }) => id === 1)?.enabled).toBe(false);
+});
+
+it.each(["loading", "failed", "ready"] as const)("keeps an unknown folder ID distinct from global scope when the folder list is %s", async (status) => {
+  const folderId = 37;
+  useAppStore.setState({
+    rules: [{ ...invoice, folder_id: folderId }],
+    folders: [],
+    folderRead: status === "failed" ? { status, error: "Fixture read failed" } : { status },
+  });
+  edit("Invoices");
+
+  const form = editor();
+  const option = requireElement((node) => node.type === "option" && node.props.value === folderId, form);
+  expect(text(option)).toBe(status === "ready" ? "beta.removedRuleFolder" : "beta.ruleFolderById");
+  expect(option.props.disabled).toBe(true);
+  const scope = requireElement((node) => node.type === "select" && node.props.value === folderId, form);
+  expect(text(requireElement((node) => node.type === "option" && node.props.value === 0, scope))).toBe("beta.allWatched");
+  const save = requireElement(button("settings.rules.save"), form);
+  expect(save.props.disabled).toBe(true);
+  await click(save);
+  expect(harness.invoke).not.toHaveBeenCalledWith("update_rule_cmd", expect.anything());
+});
+
+it("displays a live rule's exact folder and permits an explicit scope change", async () => {
+  const folder = { id: 41, path: "C:/Fixture/Receipts", enabled: true, mode: "manual" };
+  const scopedInvoice = { ...invoice, id: 1, folder_id: folder.id };
+  db.set(scopedInvoice.id, scopedInvoice);
+  useAppStore.setState({ rules: [scopedInvoice], folders: [folder], folderRead: { status: "ready" } });
+  expect(text(editor())).toContain(folder.path);
+  edit("Invoices");
+  const select = requireElement((node) => node.type === "select" && node.props.value === folder.id);
+  expect(text(requireElement((node) => node.type === "option" && node.props.value === folder.id, select))).toBe(folder.path);
+  expect(requireElement(button("settings.rules.save")).props.disabled).toBe(false);
+  change(select, { value: "0" });
+  await submit();
+  expect(harness.invoke).toHaveBeenCalledWith("update_rule_cmd", { rule: { ...scopedInvoice, folder_id: 0 } });
+  expect(db.get(scopedInvoice.id)?.folder_id).toBe(0);
 });
