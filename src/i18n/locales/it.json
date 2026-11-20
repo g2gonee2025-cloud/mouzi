@@ -352,6 +352,8 @@
       "history": "Cronologia"
     },
     "noScanData": "Nessun dato di scansione — esegui prima una scansione",
+    "unavailableFolders": "La ricerca ha ignorato queste cartelle non disponibili.",
+    "noMatchesInAvailableFolders": "Nessun risultato nelle cartelle monitorate disponibili.",
     "findDuplicates": "Trova duplicati",
     "findLarge": "Trova file grandi",
     "findStale": "Trova file obsoleti",

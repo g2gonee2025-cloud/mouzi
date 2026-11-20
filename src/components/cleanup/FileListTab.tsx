@@ -8,6 +8,7 @@ import { invoke } from "@tauri-apps/api/core";
 import ResultsPanel from "./ResultsPanel";
 import ConfirmDialog, { type ConfirmDialogProps } from "./ConfirmDialog";
 import { usePreviewOwner } from "./usePreviewOwner";
+import UnavailableCleanupRoots from "./UnavailableCleanupRoots";
 
 const BYTES_PER_MIB = 1_048_576;
 
@@ -47,6 +48,7 @@ export default function FileListTab({
   const searchedThreshold = search && ("minBytes" in search ? search.minBytes / BYTES_PER_MIB : search.days);
   const threshold = draftThreshold ?? searchedThreshold ?? defaultThreshold;
   const data = search && threshold === searchedThreshold ? search.files : null;
+  const unavailableRoots = data && store.unavailableRoots[kind === "large" ? "largeFiles" : "staleFiles"];
 
   const checkedFiles = useMemo(
     () => (data ?? []).filter((f) => checked.has(f.path)),
@@ -180,7 +182,9 @@ export default function FileListTab({
         <p className="text-xs text-text-muted">{t("cleanup.notSearched")}</p>
       )}
 
-      {data && data.length === 0 && (
+      <UnavailableCleanupRoots paths={unavailableRoots ?? undefined} noMatches={data?.length === 0} />
+
+      {data && data.length === 0 && !unavailableRoots?.length && (
         <div className="rounded-lg border border-border bg-surface-dark p-6 text-center text-xs text-text-muted">
           {t(emptyKey)}
         </div>

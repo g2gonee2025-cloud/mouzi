@@ -6,6 +6,7 @@ import { Search, Trash2, FolderX } from "lucide-react";
 import ResultsPanel from "./ResultsPanel";
 import ConfirmDialog, { type ConfirmDialogProps } from "./ConfirmDialog";
 import { usePreviewOwner } from "./usePreviewOwner";
+import UnavailableCleanupRoots from "./UnavailableCleanupRoots";
 
 export default function EmptyDirsTab() {
   const { t } = useTranslation();
@@ -76,6 +77,7 @@ export default function EmptyDirsTab() {
   };
 
   const data = store.emptyDirs ?? [];
+  const unavailableRoots = store.emptyDirs && store.unavailableRoots.emptyDirs;
 
   if (showResults && store.results) {
     return (
@@ -108,7 +110,9 @@ export default function EmptyDirsTab() {
         </div>
       )}
 
-      {data.length === 0 && (
+      <UnavailableCleanupRoots paths={unavailableRoots ?? undefined} noMatches={data.length === 0} />
+
+      {store.emptyDirs && data.length === 0 && !unavailableRoots?.length && (
         <div className="rounded-lg border border-border bg-surface-dark p-6 text-center text-xs text-text-muted">
           {t("cleanup.noEmptyDirs")}
         </div>

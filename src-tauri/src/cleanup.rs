@@ -77,6 +77,35 @@ pub struct CleanupPlanPreview {
 
 pub use db::LargestFile as CleanupFile;
 
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+pub enum FinderResult<T> {
+    Complete(Vec<T>),
+    Partial {
+        candidates: Vec<T>,
+        #[serde(rename = "unavailableRoots")]
+        unavailable_roots: Vec<String>,
+    },
+}
+
+impl<T> FinderResult<T> {
+    fn from_scope(candidates: Vec<T>, scope: &safe_fs::RootScope) -> Self {
+        let unavailable_roots = scope.unavailable_active_roots();
+        if unavailable_roots.is_empty() {
+            Self::Complete(candidates)
+        } else {
+            Self::Partial { candidates, unavailable_roots }
+        }
+    }
+
+    #[cfg(test)]
+    fn candidates(&self) -> &[T] {
+        match self {
+            Self::Complete(candidates) | Self::Partial { candidates, .. } => candidates,
+        }
+    }
+}
+
 pub fn has_inventory() -> bool {
     db::has_cleanup_inventory().unwrap_or(false)
 }
@@ -194,7 +223,7 @@ fn duplicate_candidates(scope: &safe_fs::RootScope) -> Result<Vec<(String, FileF
     Ok(files)
 }
 
-pub fn find_duplicates() -> Result<Vec<DuplicateGroup>, String> {
+pub fn find_duplicates() -> Result<FinderResult<DuplicateGroup>, String> {
     let scope = current_scope()?;
     let mut grouped: HashMap<(u64, String), Vec<DuplicateFile>> = HashMap::new();
     for (path, current) in duplicate_candidates(&scope)? {
@@ -213,7 +242,7 @@ pub fn find_duplicates() -> Result<Vec<DuplicateGroup>, String> {
         let reclaim = |group: &DuplicateGroup| group.files[0].size.saturating_mul(group.files.len() as i64 - 1);
         reclaim(right).cmp(&reclaim(left)).then(left.hash.cmp(&right.hash))
     });
-    Ok(groups)
+    Ok(FinderResult::from_scope(groups, &scope))
 }
 
 fn current_inventory_files(scope: &safe_fs::RootScope) -> Result<Vec<CleanupFile>, String> {
@@ -233,12 +262,13 @@ fn current_inventory_files(scope: &safe_fs::RootScope) -> Result<Vec<CleanupFile
     Ok(files)
 }
 
-pub fn find_large_files(min_bytes: i64) -> Result<Vec<CleanupFile>, String> {
+pub fn find_large_files(min_bytes: i64) -> Result<FinderResult<CleanupFile>, String> {
     if min_bytes < 1 { return Err("The minimum file size must be positive".into()); }
-    let mut files = current_inventory_files(&current_scope()?)?;
+    let scope = current_scope()?;
+    let mut files = current_inventory_files(&scope)?;
     files.retain(|file| file.size >= min_bytes);
     files.sort_by(|left, right| right.size.cmp(&left.size).then(left.path.cmp(&right.path)));
-    Ok(files)
+    Ok(FinderResult::from_scope(files, &scope))
 }
 
 fn stale_cutoff(days: i64, now: SystemTime) -> Result<i64, String> {
@@ -247,12 +277,13 @@ fn stale_cutoff(days: i64, now: SystemTime) -> Result<i64, String> {
     Ok(modified_epoch(now).saturating_sub(seconds))
 }
 
-pub fn find_stale_files(days: i64) -> Result<Vec<CleanupFile>, String> {
+pub fn find_stale_files(days: i64) -> Result<FinderResult<CleanupFile>, String> {
     let cutoff = stale_cutoff(days, SystemTime::now())?;
-    let mut files = current_inventory_files(&current_scope()?)?;
+    let scope = current_scope()?;
+    let mut files = current_inventory_files(&scope)?;
     files.retain(|file| file.mtime < cutoff);
     files.sort_by(|left, right| left.mtime.cmp(&right.mtime).then(left.path.cmp(&right.path)));
-    Ok(files)
+    Ok(FinderResult::from_scope(files, &scope))
 }
 
 fn empty_leaves(scope: &safe_fs::RootScope, directory: &Path, result: &mut Vec<String>) {
@@ -272,7 +303,7 @@ fn empty_leaves(scope: &safe_fs::RootScope, directory: &Path, result: &mut Vec<S
 }
 
 /// Uses eligible registered roots directly, including an entirely empty scan.
-pub fn find_empty_dirs() -> Result<Vec<String>, String> {
+pub fn find_empty_dirs() -> Result<FinderResult<String>, String> {
     let scope = current_scope()?;
     let mut result = Vec::new();
     for root in scope.active_roots() {
@@ -280,7 +311,7 @@ pub fn find_empty_dirs() -> Result<Vec<String>, String> {
     }
     result.sort();
     result.dedup();
-    Ok(result)
+    Ok(FinderResult::from_scope(result, &scope))
 }
 
 #[derive(Debug, Clone)]
@@ -763,8 +794,48 @@ mod tests {
         db::remove_watched_folder(offline_id).unwrap();
 
         assert!(unavailable.unwrap_err().contains("watched folders are unavailable"));
-        assert!(paused.unwrap().is_empty());
-        assert_eq!(mixed.unwrap().len(), 1);
+        assert!(paused.unwrap().candidates().is_empty());
+        assert_eq!(mixed.unwrap().candidates().len(), 1);
+    }
+
+    #[test]
+    fn cleanup_commands_report_their_mixed_scope_for_empty_and_partial_matches() {
+        let _guard = db::serialise_test_db();
+        init();
+        let tree = TestTree::new();
+        let online_id = db::add_watched_folder(&tree.0.to_string_lossy(), db::FOLDER_MODE_MANUAL).unwrap();
+        let a = tree.file("a.txt", b"same");
+        let b = tree.file("b.txt", b"same");
+        let offline = tree.0.join("offline");
+        let paused = tree.0.join("paused");
+        let empty = tree.0.join("empty");
+        fs::create_dir(&offline).unwrap();
+        fs::create_dir(&empty).unwrap();
+        let offline_id = db::add_watched_folder(&offline.to_string_lossy(), db::FOLDER_MODE_MANUAL).unwrap();
+        let paused_id = db::add_watched_folder(&paused.to_string_lossy(), db::FOLDER_MODE_PAUSED).unwrap();
+        let offline_match = tree.file("offline/other.txt", b"same");
+        tree.inventory(&[&a, &b, &offline_match]);
+        fs::rename(&offline, tree.0.join("retained")).unwrap();
+
+        let duplicates = serde_json::to_value(crate::commands::find_duplicates_cmd().unwrap()).unwrap();
+        let large = serde_json::to_value(crate::commands::find_large_files_cmd(1).unwrap()).unwrap();
+        let stale = serde_json::to_value(crate::commands::find_stale_files_cmd(1000).unwrap()).unwrap();
+        let directories = serde_json::to_value(crate::commands::find_empty_dirs_cmd().unwrap()).unwrap();
+        db::remove_watched_folder(offline_id).unwrap();
+        db::remove_watched_folder(paused_id).unwrap();
+        let complete = serde_json::to_value(crate::commands::find_large_files_cmd(1).unwrap()).unwrap();
+        db::remove_watched_folder(online_id).unwrap();
+
+        for result in [&duplicates, &large, &stale, &directories] {
+            assert_eq!(result["unavailableRoots"], serde_json::json!([offline.to_string_lossy()]));
+        }
+        let groups = duplicates["candidates"].as_array().unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0]["files"].as_array().unwrap().len(), 2);
+        assert_eq!(large["candidates"].as_array().unwrap().len(), 2);
+        assert_eq!(stale["candidates"], serde_json::json!([]));
+        assert_eq!(directories["candidates"], serde_json::json!([empty.to_string_lossy()]));
+        assert_eq!(complete.as_array().unwrap().len(), 2, "complete IPC results retain the array shape");
     }
 
     #[test]
@@ -778,9 +849,10 @@ mod tests {
         tree.inventory(&[&a, &b]);
         let metadata = fs::metadata(&a).unwrap();
         db::set_cached_hash(&a, 4, modified_epoch(metadata.modified().unwrap()), &blake3::hash(b"BBBB").to_hex().to_string(), true).unwrap();
-        assert!(find_duplicates().unwrap().is_empty(), "a cached digest cannot turn different live contents into duplicates");
+        assert!(find_duplicates().unwrap().candidates().is_empty(), "a cached digest cannot turn different live contents into duplicates");
         fs::write(&a, b"BBBB").unwrap();
-        let groups = find_duplicates().unwrap();
+        let result = find_duplicates().unwrap();
+        let groups = result.candidates();
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].files.len(), 2);
     }
@@ -797,7 +869,7 @@ mod tests {
         let other = tree.file("b.txt", b"same");
         let linked = linked.to_string_lossy().into_owned();
         tree.inventory(&[&original, &linked, &other]);
-        assert!(find_duplicates().unwrap().is_empty());
+        assert!(find_duplicates().unwrap().candidates().is_empty());
         assert!(prepare_cleanup(&[duplicate(&linked, &original)]).is_err());
     }
 
@@ -813,11 +885,13 @@ mod tests {
         fs::OpenOptions::new().write(true).open(&old).unwrap().set_times(fs::FileTimes::new().set_modified(old_time)).unwrap();
         tree.inventory(&[&old, &fresh]);
         fs::write(&fresh, vec![b'x'; 200]).unwrap();
-        let large = find_large_files(100).unwrap();
+        let large_result = find_large_files(100).unwrap();
+        let large = large_result.candidates();
         assert_eq!(large.len(), 1);
         assert_eq!(large[0].path, fresh);
         assert_eq!(large[0].size, 200, "inventory size is not live evidence");
-        let stale = find_stale_files(1).unwrap();
+        let stale_result = find_stale_files(1).unwrap();
+        let stale = stale_result.candidates();
         assert_eq!(stale.len(), 1);
         assert_eq!(stale[0].path, old);
     }
@@ -848,9 +922,9 @@ mod tests {
         assert!(before_scan.2.is_err());
         assert_eq!(summaries[0].status, "complete");
         assert_eq!(summaries[0].files, 0);
-        assert!(after_scan.0.unwrap().is_empty());
-        assert!(after_scan.1.unwrap().is_empty());
-        assert!(after_scan.2.unwrap().is_empty());
+        assert!(after_scan.0.unwrap().candidates().is_empty());
+        assert!(after_scan.1.unwrap().candidates().is_empty());
+        assert!(after_scan.2.unwrap().candidates().is_empty());
     }
 
     #[test]
@@ -860,10 +934,11 @@ mod tests {
         let tree = TestTree::new();
         tree.register();
         assert!(!has_inventory());
-        assert!(find_empty_dirs().unwrap().is_empty(), "registered root itself is protected");
+        assert!(find_empty_dirs().unwrap().candidates().is_empty(), "registered root itself is protected");
         fs::create_dir_all(tree.0.join("a").join("deep")).unwrap();
         fs::create_dir(tree.0.join("b")).unwrap();
-        let leaves = find_empty_dirs().unwrap();
+        let result = find_empty_dirs().unwrap();
+        let leaves = result.candidates();
         assert_eq!(leaves.len(), 2);
         assert!(leaves.iter().any(|path| Path::new(path) == tree.0.join("a").join("deep")));
         assert!(leaves.iter().any(|path| Path::new(path) == tree.0.join("b")));
@@ -913,7 +988,7 @@ mod tests {
         db::add_watched_folder(&nested.to_string_lossy(), "paused").unwrap();
         let path = tree.file("nested/a.txt", b"same");
         tree.inventory(&[&path]);
-        assert!(find_large_files(1).unwrap().is_empty());
+        assert!(find_large_files(1).unwrap().candidates().is_empty());
         assert!(prepare_cleanup(&[large(&path)]).is_err());
         assert!(prepare_cleanup(&[directory(&nested.to_string_lossy())]).is_err());
     }

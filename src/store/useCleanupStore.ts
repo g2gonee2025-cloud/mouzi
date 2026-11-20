@@ -20,6 +20,7 @@ interface CleanupState {
   largeFiles: { files: CleanupFile[]; minBytes: number } | null;
   staleFiles: { files: CleanupFile[]; days: number } | null;
   emptyDirs: string[] | null;
+  unavailableRoots: Partial<Record<FinderKey, string[]>>;
   loading: boolean;
   error: string | null;
   busy: boolean;
@@ -43,20 +44,38 @@ interface CleanupState {
 let candidatesGeneration = 0;
 let historyGeneration = 0;
 const emptyCandidates = { duplicates: null, largeFiles: null, staleFiles: null, emptyDirs: null };
+type FinderKey = keyof typeof emptyCandidates;
+type FinderResult<Candidates> = { candidates: Candidates; unavailableRoots: string[] };
+
+async function requestCandidates<Item>(command: string, args?: Record<string, number>): Promise<FinderResult<Item[]>> {
+  const result = await invoke<Item[] | FinderResult<Item[]>>(command, args);
+  return Array.isArray(result) ? { candidates: result, unavailableRoots: [] } : result;
+}
 
 export const useCleanupStore = create<CleanupState>((set, get) => {
   const preview = createPreviewSlot();
 
-  async function find<Key extends keyof typeof emptyCandidates>(
+  async function find<Key extends FinderKey>(
     key: Key,
-    request: () => Promise<NonNullable<CleanupState[Key]>>,
+    request: () => Promise<FinderResult<NonNullable<CleanupState[Key]>>>,
   ) {
     if (get().busy || get().preparedPlan) return;
     const generation = ++candidatesGeneration;
-    set({ loading: true, error: null, [key]: null });
+    set((state) => ({
+      loading: true,
+      error: null,
+      [key]: null,
+      unavailableRoots: { ...state.unavailableRoots, [key]: [] },
+    }));
     try {
-      const result = await request();
-      if (generation === candidatesGeneration) set({ [key]: result, loading: false });
+      const { candidates, unavailableRoots } = await request();
+      if (generation === candidatesGeneration) {
+        set((state) => ({
+          [key]: candidates,
+          loading: false,
+          unavailableRoots: { ...state.unavailableRoots, [key]: unavailableRoots },
+        }));
+      }
     } catch (error) {
       if (generation === candidatesGeneration) set({ error: String(error), loading: false });
     }
@@ -64,18 +83,19 @@ export const useCleanupStore = create<CleanupState>((set, get) => {
 
   return {
     ...emptyCandidates,
+    unavailableRoots: {},
     loading: false, error: null, busy: false, preparedPlan: null,
     results: null, history: null, historyLoading: false, historyError: null,
-    findDuplicates: () => find("duplicates", () => invoke<DuplicateGroup[]>("find_duplicates_cmd")),
-    findLargeFiles: (minBytes) => find("largeFiles", async () => ({
-      files: await invoke<CleanupFile[]>("find_large_files_cmd", { minBytes }),
-      minBytes,
-    })),
-    findStaleFiles: (days) => find("staleFiles", async () => ({
-      files: await invoke<CleanupFile[]>("find_stale_files_cmd", { days }),
-      days,
-    })),
-    findEmptyDirs: () => find("emptyDirs", () => invoke<string[]>("find_empty_dirs_cmd")),
+    findDuplicates: () => find("duplicates", () => requestCandidates<DuplicateGroup>("find_duplicates_cmd")),
+    findLargeFiles: (minBytes) => find("largeFiles", async () => {
+      const { candidates: files, unavailableRoots } = await requestCandidates<CleanupFile>("find_large_files_cmd", { minBytes });
+      return { candidates: { files, minBytes }, unavailableRoots };
+    }),
+    findStaleFiles: (days) => find("staleFiles", async () => {
+      const { candidates: files, unavailableRoots } = await requestCandidates<CleanupFile>("find_stale_files_cmd", { days });
+      return { candidates: { files, days }, unavailableRoots };
+    }),
+    findEmptyDirs: () => find("emptyDirs", () => requestCandidates<string>("find_empty_dirs_cmd")),
     prepareCleanup: async (actions, owner) => {
       if (!actions.length || get().busy || get().preparedPlan) throw new Error("Another cleanup is being reviewed or processed");
       const isCurrent = preview.begin(owner, () => set({ busy: false, preparedPlan: null }));
@@ -131,10 +151,10 @@ export const useCleanupStore = create<CleanupState>((set, get) => {
       ++historyGeneration;
       // Completion can arrive before the command result. Keep these candidates
       // until per-file outcomes identify failed items that can be retried.
-      if (get().busy) set({ loading: false, history: null, historyLoading: false });
+      if (get().busy) set({ unavailableRoots: {}, loading: false, history: null, historyLoading: false });
       else {
         preview.clear();
-        set({ ...emptyCandidates, preparedPlan: null, loading: false, history: null, historyLoading: false });
+        set({ ...emptyCandidates, unavailableRoots: {}, preparedPlan: null, loading: false, history: null, historyLoading: false });
       }
     },
     loadHistory: async () => {

@@ -352,6 +352,8 @@
       "history": "Historial"
     },
     "noScanData": "Sin datos de escaneo — ejecuta un escaneo primero",
+    "unavailableFolders": "La búsqueda omitió estas carpetas que no están disponibles.",
+    "noMatchesInAvailableFolders": "No hay resultados en las carpetas supervisadas disponibles.",
     "findDuplicates": "Buscar duplicados",
     "findLarge": "Buscar archivos grandes",
     "findStale": "Buscar archivos obsoletos",

@@ -17,6 +17,7 @@ import { Search, Trash2, Check } from "lucide-react";
 import ResultsPanel from "./ResultsPanel";
 import ConfirmDialog, { type ConfirmDialogProps } from "./ConfirmDialog";
 import { usePreviewOwner } from "./usePreviewOwner";
+import UnavailableCleanupRoots from "./UnavailableCleanupRoots";
 
 export default function DuplicatesTab() {
   const { t } = useTranslation();
@@ -32,6 +33,7 @@ export default function DuplicatesTab() {
     [store.duplicates],
   );
   const reclaimable = useMemo(() => reclaimableBytes(groups), [groups]);
+  const unavailableRoots = store.duplicates && store.unavailableRoots.duplicates;
 
   // The button count and the card badges are both derived from this, so what
   // the user is told they are about to delete is what actually gets sent.
@@ -111,7 +113,9 @@ export default function DuplicatesTab() {
         </div>
       )}
 
-      {store.duplicates && groups.length === 0 && (
+      <UnavailableCleanupRoots paths={unavailableRoots ?? undefined} noMatches={groups.length === 0} />
+
+      {store.duplicates && groups.length === 0 && !unavailableRoots?.length && (
         <div className="rounded-lg border border-border bg-surface-dark p-6 text-center text-xs text-text-muted">
           {t("cleanup.noDuplicates")}
         </div>

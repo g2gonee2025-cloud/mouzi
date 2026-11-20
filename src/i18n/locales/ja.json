@@ -352,6 +352,8 @@
       "history": "履歴"
     },
     "noScanData": "スキャンデータがありません — 先にスキャンを実行してください",
+    "unavailableFolders": "利用できないため、次のフォルダーは検索対象から除外されました。",
+    "noMatchesInAvailableFolders": "利用可能な監視フォルダーに該当項目はありません。",
     "findDuplicates": "重複を検索",
     "findLarge": "大きなファイルを検索",
     "findStale": "古いファイルを検索",

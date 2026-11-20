@@ -13,7 +13,7 @@ function deferred<T>() { let resolve!: (value: T) => void; const promise = new P
 
 beforeEach(() => {
   ipc.invoke.mockReset();
-  useCleanupStore.setState({ duplicates: null, largeFiles: null, staleFiles: null, emptyDirs: null, loading: false, busy: false, preparedPlan: null, results: null, error: null, history: null, historyLoading: false, historyError: null });
+  useCleanupStore.setState({ duplicates: null, largeFiles: null, staleFiles: null, emptyDirs: null, unavailableRoots: {}, loading: false, busy: false, preparedPlan: null, results: null, error: null, history: null, historyLoading: false, historyError: null });
   useSuggestionsStore.setState({ suggestions: [], loading: false, busy: false, error: null, preparedPlans: null, results: null });
 });
 
@@ -33,18 +33,51 @@ it("previews cleanup criteria and executes only the reviewed backend token", asy
 });
 
 it("discards a late finder and refuses a preview invalidated during preparation", async () => {
-  const older = deferred<ReturnType<typeof row>[]>();
-  ipc.invoke.mockReturnValueOnce(older.promise).mockResolvedValueOnce([row("current")]);
+  const older = deferred<{ candidates: ReturnType<typeof row>[]; unavailableRoots: string[] }>();
+  ipc.invoke.mockReturnValueOnce(older.promise).mockResolvedValueOnce({ candidates: [row("current")], unavailableRoots: ["W:/current"] });
   const first = useCleanupStore.getState().findLargeFiles(10);
   await useCleanupStore.getState().findLargeFiles(20);
-  older.resolve([row("old")]); await first;
+  older.resolve({ candidates: [row("old")], unavailableRoots: ["Z:/old"] }); await first;
   expect(useCleanupStore.getState().largeFiles).toEqual({ minBytes: 20, files: [row("current")] });
+  expect(useCleanupStore.getState().unavailableRoots.largeFiles).toEqual(["W:/current"]);
   const pending = deferred<CleanupPlan>(); ipc.invoke.mockReturnValueOnce(pending.promise);
   const preparing = useCleanupStore.getState().prepareCleanup(cleanupPlan.actions);
   const rejection = expect(preparing).rejects.toThrow("candidates changed");
   useCleanupStore.getState().invalidateCandidates(); pending.resolve(cleanupPlan);
   await rejection;
   expect(useCleanupStore.getState().preparedPlan).toBeNull();
+  expect(useCleanupStore.getState().unavailableRoots).toEqual({});
+});
+
+it("keeps omissions with each cleanup finder and clears them on a fresh search or scope invalidation", async () => {
+  const store = useCleanupStore.getState();
+  ipc.invoke.mockResolvedValueOnce({ candidates: [], unavailableRoots: ["D:/duplicates"] });
+  await store.findDuplicates();
+  ipc.invoke.mockResolvedValueOnce({ candidates: ["C:/empty"], unavailableRoots: ["E:/empty"] });
+  await store.findEmptyDirs();
+  expect(useCleanupStore.getState().unavailableRoots).toMatchObject({
+    duplicates: ["D:/duplicates"],
+    emptyDirs: ["E:/empty"],
+  });
+  expect(useCleanupStore.getState().emptyDirs).toEqual(["C:/empty"]);
+
+  const rerun = deferred<never[]>();
+  ipc.invoke.mockReturnValueOnce(rerun.promise);
+  const complete = store.findDuplicates();
+  expect(useCleanupStore.getState().unavailableRoots.duplicates).toEqual([]);
+  rerun.resolve([]);
+  await complete;
+  expect(useCleanupStore.getState().duplicates).toEqual([]);
+  expect(useCleanupStore.getState().unavailableRoots.emptyDirs).toEqual(["E:/empty"]);
+
+  const late = deferred<{ candidates: string[]; unavailableRoots: string[] }>();
+  ipc.invoke.mockReturnValueOnce(late.promise);
+  const waiting = store.findEmptyDirs();
+  store.invalidateCandidates();
+  late.resolve({ candidates: [], unavailableRoots: ["F:/stale"] });
+  await waiting;
+  expect(useCleanupStore.getState().unavailableRoots).toEqual({});
+  expect(useCleanupStore.getState().emptyDirs).toBeNull();
 });
 
 it("releases an abandoned cleanup review without letting its response replace a newer review", async () => {

@@ -352,6 +352,8 @@
       "history": "Historia"
     },
     "noScanData": "Brak danych skanowania — najpierw uruchom skanowanie",
+    "unavailableFolders": "Podczas wyszukiwania pominięto te niedostępne foldery.",
+    "noMatchesInAvailableFolders": "Brak wyników w dostępnych obserwowanych folderach.",
     "findDuplicates": "Znajdź duplikaty",
     "findLarge": "Znajdź duże pliki",
     "findStale": "Znajdź nieaktualne pliki",

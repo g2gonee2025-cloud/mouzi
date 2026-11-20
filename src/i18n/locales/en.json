@@ -352,6 +352,8 @@
       "history": "History"
     },
     "noScanData": "No scan data — run a scan first",
+    "unavailableFolders": "The search skipped these unavailable folders.",
+    "noMatchesInAvailableFolders": "No matches in the available watched folders.",
     "findDuplicates": "Find Duplicates",
     "findLarge": "Find Large Files",
     "findStale": "Find Stale Files",

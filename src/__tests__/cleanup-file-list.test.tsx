@@ -1,6 +1,8 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { beforeEach, expect, it, vi } from "vitest";
 import FileListTab from "../components/cleanup/FileListTab";
+import DuplicatesTab from "../components/cleanup/DuplicatesTab";
+import EmptyDirsTab from "../components/cleanup/EmptyDirsTab";
 import { useCleanupStore } from "../store/useCleanupStore";
 
 const ipc = vi.hoisted(() => ({ invoke: vi.fn() }));
@@ -47,4 +49,43 @@ it("restores the searched age even when no stale files matched", async () => {
   const html = renderFileList("stale", 365);
   expect(html).toMatch(/<input[^>]*type="number"[^>]*value="45"/);
   expect(html).toContain("empty");
+});
+
+it("qualifies empty results when a watched folder is unavailable", async () => {
+  ipc.invoke.mockResolvedValueOnce({ candidates: [], unavailableRoots: ["D:/Disconnected"] });
+  await useCleanupStore.getState().findStaleFiles(45);
+
+  const html = renderFileList("stale", 365);
+  expect(html).toContain("cleanup.noMatchesInAvailableFolders");
+  expect(html).toContain("cleanup.unavailableFolders");
+  expect(html).toContain("D:/Disconnected");
+  expect(html).not.toContain(">empty<");
+});
+
+it("shows partial candidate results without carrying an omission into a different finder", async () => {
+  const group = { hash: "fixture-hash", files: [
+    { path: "C:/Watched/keeper.txt", size: 5000, mtime: 1 },
+    { path: "C:/Watched/copy.txt", size: 5000, mtime: 1 },
+  ] };
+  ipc.invoke.mockResolvedValueOnce({ candidates: [group], unavailableRoots: ["D:/Disconnected"] });
+  await useCleanupStore.getState().findDuplicates();
+  ipc.invoke.mockResolvedValueOnce(["C:/Watched/empty"]);
+  await useCleanupStore.getState().findEmptyDirs();
+
+  const duplicates = renderToStaticMarkup(<DuplicatesTab />);
+  expect(duplicates).toContain("D:/Disconnected");
+  expect(duplicates).toContain("copy.txt");
+  expect(duplicates).not.toContain("cleanup.noMatchesInAvailableFolders");
+  const directories = renderToStaticMarkup(<EmptyDirsTab />);
+  expect(directories).toContain("C:/Watched/empty");
+  expect(directories).not.toContain("D:/Disconnected");
+});
+
+it("shows no empty-directory success state when the finder could not run", async () => {
+  ipc.invoke.mockRejectedValueOnce("The enabled watched folders are unavailable.");
+  await useCleanupStore.getState().findEmptyDirs();
+
+  const html = renderToStaticMarkup(<EmptyDirsTab />);
+  expect(html).toContain("The enabled watched folders are unavailable.");
+  expect(html).not.toContain("cleanup.noEmptyDirs");
 });

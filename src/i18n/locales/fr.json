@@ -352,6 +352,8 @@
       "history": "Historique"
     },
     "noScanData": "Aucune donnée d'analyse — lancez une analyse d'abord",
+    "unavailableFolders": "Ces dossiers indisponibles ont été ignorés lors de la recherche.",
+    "noMatchesInAvailableFolders": "Aucun résultat dans les dossiers surveillés disponibles.",
     "findDuplicates": "Trouver les doublons",
     "findLarge": "Trouver les gros fichiers",
     "findStale": "Trouver les fichiers obsolètes",

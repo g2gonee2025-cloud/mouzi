@@ -352,6 +352,8 @@
       "history": "历史记录"
     },
     "noScanData": "暂无扫描数据，请先扫描",
+    "unavailableFolders": "搜索已跳过以下无法访问的文件夹。",
+    "noMatchesInAvailableFolders": "可用的监控文件夹中没有匹配项。",
     "findDuplicates": "查找重复文件",
     "findLarge": "查找大文件",
     "findStale": "查找久未修改的文件",

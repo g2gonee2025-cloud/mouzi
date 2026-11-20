@@ -358,6 +358,8 @@
       "history": "Lịch sử"
     },
     "noScanData": "Không có dữ liệu quét — hãy chạy quét trước",
+    "unavailableFolders": "Tìm kiếm đã bỏ qua các thư mục không thể truy cập sau đây.",
+    "noMatchesInAvailableFolders": "Không có kết quả trong các thư mục theo dõi có thể truy cập.",
     "findDuplicates": "Tìm tệp trùng lặp",
     "findLarge": "Tìm tệp lớn",
     "findStale": "Tìm tệp cũ",
