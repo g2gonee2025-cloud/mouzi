@@ -108,6 +108,14 @@ export interface UndoAllResult {
   results: UndoResult[];
 }
 
+interface ArchiveImportResult {
+  extractedCount: number | null;
+  sortedCount: number;
+  stagingPath: string;
+  results: [file: string, rule: string, destination: string][];
+  issue: string | null;
+}
+
 type ActionRefreshErrors = Record<'history' | 'historyCounts' | 'stats', string | null>;
 
 interface AppState {
@@ -147,6 +155,7 @@ interface AppState {
   updateSchedule: (schedule: ScheduleSettings) => Promise<void>;
   exportRules: () => Promise<boolean>;
   importRules: (replace: boolean) => Promise<number | null>;
+  importArchive: (path: string) => Promise<ArchiveImportResult>;
 }
 
 function scheduleFrom(settings: AppSettings): ScheduleSettings {
@@ -393,5 +402,11 @@ export const useAppStore = create<AppState>((set, get) => ({
     const count = await invoke<number | null>('import_rules_cmd', { replace });
     if (count !== null) await get().loadRules();
     return count;
+  },
+
+  importArchive: async (path) => {
+    const result = await invoke<ArchiveImportResult>('import_archive_cmd', { path });
+    if (result.extractedCount !== null) void get().refreshActionViews();
+    return result;
   },
 }));

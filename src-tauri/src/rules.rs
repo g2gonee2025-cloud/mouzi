@@ -1149,12 +1149,21 @@ mod tests {
                 }
                 Ok(outcome)
             });
-            let error = crate::commands::finish_archive_sort(intent, &staging, 2, sorting).unwrap_err();
+            let summary = crate::commands::finish_archive_sort(intent, &staging, 2, sorting);
+            let error = summary.issue.as_deref().expect("partial import issue");
             assert!(error.contains(match stop {
                 "entry" => "forced directory entry failure",
                 "cancel" => "Import cancelled",
                 _ => "forced history warning",
             }), "{error}");
+            assert_eq!(summary.staging_path, expected_staging);
+            assert_eq!(summary.extracted_count, Some(2));
+            assert_eq!(summary.sorted_count, 1);
+            assert_eq!(summary.results, vec![(
+                "first.archivepartialx".to_owned(),
+                "Archive fixture".to_owned(),
+                destination.to_string_lossy().into_owned(),
+            )]);
             assert_eq!(intent_state(), ("partial".to_owned(), expected_staging));
 
             let receipt: serde_json::Value = serde_json::from_slice(

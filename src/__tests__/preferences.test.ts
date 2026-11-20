@@ -167,6 +167,30 @@ describe("authoritative clean scope and history", () => {
     expect(useAppStore.getState().actionRefreshErrors).toEqual({ history: null, historyCounts: null, stats: null });
   });
 
+  it.each([null, "Import cancelled after organizing 1 files"])(
+    "returns archive receipts immediately when history refresh fails (issue: %s)",
+    async (issue) => {
+      const history = deferred<never>();
+      const result = {
+        extractedCount: 2, sortedCount: 1, stagingPath: "C:/archive-imports/fixture",
+        results: [["first.txt", "Documents", "C:/filed/first.txt"]], issue,
+      };
+      ipc.invoke.mockImplementation(async (command: string) => {
+        if (command === "import_archive_cmd") return result;
+        if (command === "get_logs_cmd") return history.promise;
+        if (command === "get_stats_cmd") return [];
+        throw new Error(`Unexpected IPC command ${command}`);
+      });
+
+      await expect(useAppStore.getState().importArchive("C:/fixture.zip")).resolves.toEqual(result);
+      expect(ipc.invoke).toHaveBeenCalledWith("import_archive_cmd", { path: "C:/fixture.zip" });
+
+      history.reject(new Error("History unavailable"));
+      await vi.waitFor(() => expect(useAppStore.getState().actionRefreshErrors.history)
+        .toBe("Error: History unavailable"));
+    },
+  );
+
   it("ignores a late action refresh failure after a newer ordinary read succeeds", async () => {
     const oldHistory = deferred<never>();
     const started = deferred<void>();

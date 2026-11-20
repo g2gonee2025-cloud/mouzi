@@ -39,11 +39,6 @@ import {
 
 type Tab = "folders" | "rules" | "review" | "history" | "ignore" | "general" | "about";
 type GraceUnit = "seconds" | "minutes" | "hours";
-type ArchiveImportResult = {
-  extractedCount: number;
-  sortedCount: number;
-  stagingPath: string;
-};
 
 const GRACE_STEPS = [
   0, 30, 60, 300, 900, 1800, 3600, 7200, 21600, 43200, 86400, 172800, 604800,
@@ -197,6 +192,7 @@ export default function Settings() {
     updateSchedule,
     exportRules,
     importRules,
+    importArchive,
   } = useAppStore();
 
   const [tab, setTab] = useState<Tab>("folders");
@@ -510,15 +506,13 @@ export default function Settings() {
       setArchiveProgress(null);
       setArchiveToast({ message: t("settings.archive.importing"), type: "info" });
 
-      const summary = await invoke<ArchiveImportResult>("import_archive_cmd", { path });
-      await loadLogs();
+      const { sortedCount, extractedCount, stagingPath, issue } = await importArchive(path);
       setArchiveToast({
-        message: t("settings.archive.importSuccess", {
-          count: summary.sortedCount,
-          extracted: summary.extractedCount,
-        }),
-        type: "success",
-        stagingPath: summary.stagingPath,
+        message: issue === null
+          ? t("settings.archive.importSuccess", { count: sortedCount, extracted: extractedCount })
+          : t("settings.archive.importError", { error: issue }),
+        type: issue === null ? "success" : "error",
+        stagingPath,
       });
     } catch (e) {
       console.error("Import archive failed:", e);

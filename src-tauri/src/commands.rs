@@ -686,13 +686,16 @@ pub fn clean_now_cmd(app: AppHandle, state: tauri::State<AppState>) -> Result<Ve
     results
 }
 
+/// Once an import has a staging folder, its receipt remains available even
+/// when extraction stops or sorting is only partially successful.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ArchiveImportSummary {
-    pub extracted_count: usize,
+    pub extracted_count: Option<usize>,
     pub sorted_count: usize,
     pub staging_path: String,
     pub results: Vec<(String, String, String)>,
+    pub issue: Option<String>,
 }
 
 #[tauri::command(async)]
@@ -716,14 +719,27 @@ pub fn import_archive_cmd(app: AppHandle, path: String, state: tauri::State<AppS
         Ok(extraction) => extraction,
         Err(error) => {
             let journal = finalize_operation_intent(intent, "failed", observed_staging.as_deref(), Some(&error));
-            return Err(match journal { Ok(()) => error, Err(e) => format!("{error}; import journal finalization failed: {e}") });
+            let issue = match journal {
+                Ok(()) => error,
+                Err(e) => format!("{error}; import journal finalization failed: {e}"),
+            };
+            return match observed_staging {
+                Some(staging_path) => Ok(ArchiveImportSummary {
+                    extracted_count: None,
+                    sorted_count: 0,
+                    staging_path,
+                    results: Vec::new(),
+                    issue: Some(issue),
+                }),
+                None => Err(issue),
+            };
         }
     };
     let staging = &extraction.staging_dir;
     let sorting = crate::rules::manual_scan_folder_cancelable(staging, &state.ignored_files, &job.cancelled);
     let result = finish_archive_sort(intent, staging, extraction.extracted_files, sorting);
     let _ = app.emit("mutation-completed", ());
-    result
+    Ok(result)
 }
 
 pub(crate) fn finish_archive_sort(
@@ -731,7 +747,7 @@ pub(crate) fn finish_archive_sort(
     staging: &Path,
     extracted_count: usize,
     sorting: Result<crate::rules::SortedFiles, crate::rules::FolderScanError>,
-) -> Result<ArchiveImportSummary, String> {
+) -> ArchiveImportSummary {
     let staging_path = staging.to_string_lossy().into_owned();
     let (status, results, mut errors) = match sorting {
         Ok(results) => ("completed", results, Vec::new()),
@@ -745,18 +761,21 @@ pub(crate) fn finish_archive_sort(
     if let Err(error) = finalize_operation_intent(intent, status, Some(&staging_path), journal_message.as_deref()) {
         errors.push(format!("Import journal finalization failed: {error}"));
     }
-    if !errors.is_empty() {
+    let issue = if errors.is_empty() {
+        None
+    } else {
         if status == "completed" {
             errors.insert(0, format!("Organized {} of {extracted_count} extracted files", results.len()));
         }
-        return Err(format!("{}. Import data retained at {staging_path}", errors.join("; ")));
-    }
-    Ok(ArchiveImportSummary {
-        extracted_count,
+        Some(format!("{}. Import data retained at {staging_path}", errors.join("; ")))
+    };
+    ArchiveImportSummary {
+        extracted_count: Some(extracted_count),
         sorted_count: results.len(),
         staging_path,
         results,
-    })
+        issue,
+    }
 }
 
 #[tauri::command]
