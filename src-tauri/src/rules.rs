@@ -895,13 +895,15 @@ fn scan_folder_entries(
             Ok(ProcessOutcome::Retained { message }) | Err(message) => errors.push(format!("{file_name}: {message}")),
         }
     }
+    let count = results.len();
+    let noun = if count == 1 { "file" } else { "files" };
     if cancellation.is_some_and(|cancel| cancel.stopped.get()) {
-        errors.insert(0, format!("Import cancelled after organizing {} files", results.len()));
+        errors.insert(0, format!("Import cancelled after organizing {count} {noun}"));
         return Err(FolderScanError { results, message: errors.join("; ") });
     }
     if errors.is_empty() { Ok(results) }
     else {
-        let message = format!("Organized {} files; {}", results.len(), errors.join("; "));
+        let message = format!("Organized {count} {noun}. {}", errors.join("; "));
         Err(FolderScanError { results, message })
     }
 }
@@ -1255,7 +1257,7 @@ mod tests {
             let error = summary.issue.as_deref().unwrap_or_else(|| panic!("{stop}: expected partial import issue; moved {}", summary.sorted_count));
             assert!(error.contains(match stop {
                 "entry" => "forced directory entry failure",
-                "cancel" | "cancel-wait" => "Import cancelled after organizing 1 files",
+                "cancel" | "cancel-wait" => "Import cancelled after organizing 1 file.",
                 _ => "forced history warning",
             }), "{error}");
             assert_eq!(summary.staging_path, expected_staging);
