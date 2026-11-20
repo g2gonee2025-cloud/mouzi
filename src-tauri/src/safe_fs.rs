@@ -149,19 +149,41 @@ pub fn identity_from_handle(file: &File) -> Result<FileIdentity, String> {
     #[cfg(not(any(windows, unix)))] { let _ = file; Err("Physical file identity is unsupported on this platform".into()) }
 }
 
+fn open_identity_target(path: &Path) -> io::Result<File> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        OpenOptions::new().read(true).share_mode(1 | 2 | 4).custom_flags(0x02000000 | 0x00200000).open(path)
+    }
+    #[cfg(not(windows))]
+    { File::open(path) }
+}
+
 pub fn file_identity(path: &Path) -> Result<FileIdentity, String> {
     let metadata = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
     if is_link(&metadata) { return Err("Links are not eligible filesystem targets".into()); }
-    #[cfg(windows)]
-    let file = {
-        use std::os::windows::fs::OpenOptionsExt;
-        OpenOptions::new().read(true).share_mode(1 | 2 | 4).custom_flags(0x02000000 | 0x00200000).open(path)
-    };
-    #[cfg(not(windows))]
-    let file = File::open(path);
-    let file = file.map_err(|e| e.to_string())?;
+    let file = open_identity_target(path).map_err(|e| e.to_string())?;
     if is_link(&file.metadata().map_err(|e| e.to_string())?) { return Err("Target changed to a link".into()); }
     identity_from_handle(&file)
+}
+
+/// Read metadata and identity from the same regular file on a guarded walk.
+pub(crate) fn inventory_file_snapshot(path: &Path) -> Result<Option<(Metadata, FileIdentity)>, String> {
+    let read_file = || -> io::Result<Option<(File, Metadata)>> {
+        let metadata = std::fs::symlink_metadata(path)?;
+        if !metadata.is_file() || is_link(&metadata) {
+            return Ok(None);
+        }
+        let file = open_identity_target(path)?;
+        let metadata = file.metadata()?;
+        Ok((metadata.is_file() && !is_link(&metadata)).then_some((file, metadata)))
+    };
+    match read_file() {
+        Ok(Some((file, metadata))) => Ok(Some((metadata, identity_from_handle(&file)?))),
+        Ok(None) => Ok(None),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("Could not read {}: {error}", path.display())),
+    }
 }
 
 pub(crate) fn link_count(file: &File) -> Result<u64, String> {

@@ -4,7 +4,7 @@
 //! `scan_roots` from a spawned std::thread and forwards progress events.
 
 use crate::db::{self, InventoryRow, ScanToken, SnapshotInventoryRow, INVENTORY_BATCH_SIZE};
-use crate::ignore::{is_ignored, load_mouziignore};
+use crate::ignore::{is_ignored_entry, load_mouziignore};
 use serde::Serialize;
 use std::fs;
 use std::path::{Path,PathBuf};
@@ -91,15 +91,18 @@ struct RootWalk<'a> {
 }
 
 impl<'a> RootWalk<'a> {
-    fn push_file(&mut self, path: &Path, meta: &fs::Metadata) -> Result<(),String> {
+    fn push_file(&mut self, path: &Path) -> Result<(), String> {
+        let Some((meta, identity)) = crate::safe_fs::inventory_file_snapshot(path)? else {
+            return Ok(());
+        };
         self.processed += 1;
         self.bytes += meta.len();
         self.batch.push(SnapshotInventoryRow{row:InventoryRow {
             path: path.to_string_lossy().into_owned(),
             size: meta.len() as i64,
-            mtime: to_epoch_secs(meta),
+            mtime: to_epoch_secs(&meta),
             category: categorize(&path.to_string_lossy()).to_string(),
-        },identity:crate::safe_fs::file_identity(path)?.key(),mtime_ns:db::metadata_mtime_ns(meta)});
+        },identity:identity.key(),mtime_ns:db::metadata_mtime_ns(&meta)});
         if self.batch.len() >= INVENTORY_BATCH_SIZE {
             self.flush_batch()?;
         }
@@ -130,12 +133,16 @@ impl<'a> RootWalk<'a> {
         let entries=fs::read_dir(dir).map_err(|error|format!("Could not read {}: {error}",dir.display()))?;
         for entry in entries {
             let entry=entry.map_err(|error|format!("Could not read an entry in {}: {error}",dir.display()))?;
-            let file_type=entry.file_type().map_err(|error|format!("Could not inspect {}: {error}",entry.path().display()))?;
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(format!("Could not inspect {}: {error}", entry.path().display())),
+            };
             if is_symlink(&file_type) {
                 continue;
             }
             let name = entry.file_name();
-            if is_ignored(&name.to_string_lossy(), self.patterns) {
+            if is_ignored_entry(&name.to_string_lossy(), file_type.is_dir(), self.patterns) {
                 continue;
             }
             if file_type.is_dir() {
@@ -144,8 +151,7 @@ impl<'a> RootWalk<'a> {
                 if self.child_roots.iter().any(|root|crate::safe_fs::directory_contains(&entry.path(),root).unwrap_or(false)) {continue;}
                 self.walk_dir(&entry.path(), depth + 1)?;
             } else if file_type.is_file() {
-                let meta=entry.metadata().map_err(|error|format!("Could not read metadata for {}: {error}",entry.path().display()))?;
-                self.push_file(&entry.path(), &meta)?;
+                self.push_file(&entry.path())?;
             }
         }
         Ok(())
@@ -373,6 +379,86 @@ mod tests {
         let snapshot=db::get_dashboard_snapshot().unwrap();
         let stat=snapshot.watched_roots.iter().find(|stat|stat.path==root).unwrap();
         assert_eq!(stat.files,0);assert_eq!(stat.status,"complete");assert!(!stat.stale);assert!(stat.last_scan_at.is_some());
+    }
+
+    #[test]
+    fn directory_ignore_keeps_a_regular_file_with_the_same_name() {
+        let _guard = db::serialise_test_db();
+        let fixture = ScanFixture::new("directory-ignore");
+        let root = fixture.root.to_string_lossy().into_owned();
+        fs::write(fixture.root.join("notes"), "keep this file").unwrap();
+        fs::create_dir_all(fixture.root.join("nested/notes")).unwrap();
+        fs::write(fixture.root.join("nested/notes/private.txt"), "skip this directory").unwrap();
+        fs::write(fixture.root.join(".mouziignore"), "notes/\n").unwrap();
+
+        let summary = &scan_roots(std::slice::from_ref(&root), |_| {})[0];
+        assert_eq!(summary.status, "complete", "{:?}", summary.error);
+        let rows = db::get_inventory_files("size", None, Some(&root), None, 10).unwrap();
+        assert!(rows.iter().any(|row| Path::new(&row.path).ends_with("notes")));
+        assert!(!rows.iter().any(|row| row.path.ends_with("private.txt")));
+    }
+
+    #[test]
+    fn disappearing_file_does_not_break_the_inventory_batch() {
+        let _guard = db::serialise_test_db();
+        let fixture = ScanFixture::new("vanishing-file");
+        let root = fixture.root.to_string_lossy().into_owned();
+        let token = db::begin_inventory_scan(&root).unwrap();
+        let gone = fixture.root.join("gone.txt");
+        let kept = fixture.root.join("kept.txt");
+        fs::write(&gone, "previous").unwrap();
+        fs::write(&kept, "current").unwrap();
+        assert!(fs::symlink_metadata(&gone).unwrap().is_file());
+        fs::remove_file(&gone).unwrap();
+        let mut walk = RootWalk { root: &root, patterns: &[], processed: 0, bytes: 0,
+            batch: Vec::new(), token: &token, child_roots: &[], progress: &mut |_| {} };
+        walk.push_file(&gone).unwrap();
+        walk.push_file(&kept).unwrap();
+        assert_eq!(walk.processed, 1);
+        assert_eq!(walk.bytes, 7);
+        walk.flush_batch().unwrap();
+        db::publish_inventory_scan(&token).unwrap();
+        let rows = db::get_inventory_files("size", None, Some(&root), None, 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].path.ends_with("kept.txt"));
+    }
+
+    #[test]
+    fn pausing_another_folder_does_not_abort_the_current_scan() {
+        let _guard = db::serialise_test_db();
+        let current = ScanFixture::new("independent-scan");
+        let other = ScanFixture::new("independent-other");
+        let root = current.root.to_string_lossy().into_owned();
+        fs::write(current.root.join("kept.txt"), "current").unwrap();
+
+        let summaries = scan_roots(std::slice::from_ref(&root), |event| {
+            if matches!(event, ScanEvent::Progress(progress) if progress.processed == 0) {
+                db::update_folder_mode(other.folder_id, db::FOLDER_MODE_PAUSED).unwrap();
+            }
+        });
+        assert_eq!(summaries[0].status, "complete", "{:?}", summaries[0].error);
+        assert_eq!(summaries[0].files, 1);
+    }
+
+    #[test]
+    fn pausing_then_resuming_the_scanned_root_invalidates_its_snapshot() {
+        let _guard = db::serialise_test_db();
+        let fixture = ScanFixture::new("pause-resume");
+        let root = fixture.root.to_string_lossy().into_owned();
+        fs::write(fixture.root.join("previous.txt"), "previous").unwrap();
+        assert_eq!(scan_roots(std::slice::from_ref(&root), |_| {})[0].status, "complete");
+        fs::write(fixture.root.join("new.txt"), "new").unwrap();
+
+        let summaries = scan_roots(std::slice::from_ref(&root), |event| {
+            if matches!(event, ScanEvent::Progress(progress) if progress.processed == 0) {
+                db::update_folder_mode(fixture.folder_id, db::FOLDER_MODE_PAUSED).unwrap();
+                db::update_folder_mode(fixture.folder_id, db::FOLDER_MODE_MANUAL).unwrap();
+            }
+        });
+        assert_eq!(summaries[0].status, "failed");
+        let rows = db::get_inventory_files("size", None, Some(&root), None, 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].path.ends_with("previous.txt"));
     }
 
     #[test]

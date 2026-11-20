@@ -835,7 +835,22 @@ pub(crate) fn forget_removed_baseline(id: i64, path: &Path, registered_root: &Pa
 pub fn update_folder_mode(id: i64, mode: &str) -> SqliteResult<()> {
     let mut conn=sqlite_lock()?;let tx=conn.transaction()?;
     let changed=tx.execute("UPDATE watched_folders SET mode=?1 WHERE id=?2 AND mode<>?1", params![mode, id])?;
-    if changed>0 {tx.execute("UPDATE inventory_state SET revision=revision+1,mutation_revision=mutation_revision+1 WHERE id=1", [])?;}
+    if changed > 0 {
+        // Registered descendants own their trees in every mode. Only the
+        // changed folder's current scan must stop, even if it is resumed later.
+        let interrupted = tx.execute(
+            "UPDATE inventory_roots SET status='failed',stale=1,error='Folder mode changed during scan. Scan again.'
+             WHERE root_path=(SELECT path FROM watched_folders WHERE id=?1) AND status='scanning'",
+            [id],
+        )?;
+        if interrupted > 0 {
+            tx.execute(
+                "DELETE FROM inventory_scan_stage WHERE root_path=(SELECT path FROM watched_folders WHERE id=?1)",
+                [id],
+            )?;
+        }
+        tx.execute("UPDATE inventory_state SET revision=revision+1 WHERE id=1", [])?;
+    }
     tx.commit()
 }
 

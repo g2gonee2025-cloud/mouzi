@@ -146,6 +146,10 @@ pub fn save_mouziignore(folder_path: &str, patterns: &[String]) -> Result<(), St
 /// Supports: literal match, `*` wildcard (any number of `*`), and `folder/` directory suffix.
 /// On Windows, matching is case-insensitive for both literals and wildcards.
 pub fn is_ignored(name: &str, patterns: &[String]) -> bool {
+    is_ignored_entry(name, false, patterns)
+}
+
+pub(crate) fn is_ignored_entry(name: &str, is_directory: bool, patterns: &[String]) -> bool {
     #[cfg(windows)]
     let name = name.to_lowercase();
 
@@ -156,9 +160,8 @@ pub fn is_ignored(name: &str, patterns: &[String]) -> bool {
         let pat = original_pat.as_str();
 
         // Directory pattern: ends with /
-        if pat.ends_with('/') {
-            let dir_pat = &pat[..pat.len() - 1];
-            if name.eq_ignore_ascii_case(dir_pat) {
+        if let Some(dir_pat) = pat.strip_suffix('/') {
+            if is_directory && name.eq_ignore_ascii_case(dir_pat) {
                 return true;
             }
             continue;
