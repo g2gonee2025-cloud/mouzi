@@ -99,17 +99,16 @@ pub fn run() {
             Some(vec!["--autostart"]),
         ))
         .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
-            let app = app.clone();
-            // An Explorer request can recreate a closed workspace from this native event.
-            tauri::async_runtime::spawn_blocking(move || {
-                if integration::handle_folder_args(&app, &args) {
-                    return;
-                }
-                if let Some(window) = app.get_webview_window("app").or_else(|| app.get_webview_window("popup")) {
-                    let _ = window.show();
-                    let _ = window.set_focus();
-                }
-            });
+            if integration::handle_folder_args(app, &args) {
+                return;
+            }
+            if let Some(window) = app.get_webview_window("app") {
+                let _ = window.show();
+                let _ = window.set_focus();
+            } else if let Some(window) = app.get_webview_window("popup") {
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
         }))
         .manage(AppState {
             watcher: Arc::new(Mutex::new(FolderWatcher::new(ignored_files.clone()))),
