@@ -1,15 +1,27 @@
 import { beforeEach, expect, it, vi } from "vitest";
-import { isValidElement, type ReactNode } from "react";
+import { isValidElement, type ReactElement, type ReactNode } from "react";
 import Popup from "../components/Popup";
 import { useAppStore, type WatchedFolder } from "../store/useAppStore";
 import en from "../i18n/locales/en.json";
 
-const fixture = vi.hoisted(() => ({ invoke: vi.fn(), setState: vi.fn() }));
+const fixture = vi.hoisted(() => ({
+  invoke: vi.fn(),
+  setState: vi.fn(),
+  retained: null as { index: number; values: unknown[] } | null,
+}));
 vi.mock("@tauri-apps/api/core", () => ({ invoke: fixture.invoke }));
 vi.mock("react", async (importOriginal) => ({
   ...await importOriginal<typeof import("react")>(),
   useEffect: () => {},
-  useState: (value: unknown) => [value, fixture.setState],
+  useState: (value: unknown) => {
+    const retained = fixture.retained;
+    if (!retained) return [value, fixture.setState];
+    const index = retained.index++;
+    if (!(index in retained.values)) retained.values[index] = value;
+    return [retained.values[index], (next: unknown) => {
+      retained.values[index] = typeof next === "function" ? next(retained.values[index]) : next;
+    }];
+  },
 }));
 vi.mock("../store/useAppStore", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../store/useAppStore")>();
@@ -29,6 +41,9 @@ vi.mock("react-i18next", () => ({
 interface ElementProps {
   children?: ReactNode;
   onClick?: () => Promise<void> | void;
+  onChange?: (event: { target: { checked: boolean } }) => void;
+  checked?: boolean;
+  disabled?: boolean;
 }
 
 function label(node: ReactNode): string {
@@ -38,10 +53,14 @@ function label(node: ReactNode): string {
 }
 
 function findAction(node: ReactNode, name: string): ElementProps["onClick"] {
-  if (Array.isArray(node)) return node.map((child) => findAction(child, name)).find(Boolean);
+  return findElement(node, (element) => element.type === "button" && label(element) === name)?.props.onClick;
+}
+
+function findElement(node: ReactNode, match: (element: ReactElement<ElementProps>) => boolean): ReactElement<ElementProps> | undefined {
+  if (Array.isArray(node)) return node.map((child) => findElement(child, match)).find(Boolean);
   if (!isValidElement<ElementProps>(node)) return;
-  if (node.type === "button" && label(node) === name) return node.props.onClick;
-  return findAction(node.props.children, name);
+  if (match(node)) return node;
+  return findElement(node.props.children, match);
 }
 
 const invoices: WatchedFolder = { id: 1, path: "C:/Fixture/Invoices", mode: "manual", enabled: true };
@@ -50,6 +69,7 @@ const downloads = "C:/Fixture/Downloads";
 beforeEach(() => {
   fixture.invoke.mockReset();
   fixture.setState.mockClear();
+  fixture.retained = null;
   useAppStore.setState(useAppStore.getInitialState(), true);
 });
 
@@ -58,6 +78,68 @@ async function loadFolderList(folders: WatchedFolder[]) {
   await useAppStore.getState().loadFolders();
   fixture.invoke.mockClear();
 }
+
+function renderRetainedPopup() {
+  fixture.retained ??= { index: 0, values: [] };
+  fixture.retained.index = 0;
+  return Popup();
+}
+
+function pendingCheckbox(popup: ReactNode, filename: string) {
+  const row = findElement(popup, (element) => element.type === "label" && label(element) === filename);
+  const box = findElement(row, (element) => element.type === "input");
+  if (!box) throw new Error(`Pending checkbox is missing for ${filename}`);
+  return box.props;
+}
+
+async function publishPendingFiles(...names: string[]) {
+  fixture.invoke.mockResolvedValueOnce(names.map((name) => [invoices.path, name]));
+  await useAppStore.getState().getPendingFiles();
+}
+
+it("forgets a selected pending path after an empty snapshot even if it returns before rendering", async () => {
+  await loadFolderList([invoices]);
+  await publishPendingFiles("arrival.txt");
+  pendingCheckbox(renderRetainedPopup(), "arrival.txt").onChange?.({ target: { checked: true } });
+  expect(pendingCheckbox(renderRetainedPopup(), "arrival.txt").checked).toBe(true);
+
+  await publishPendingFiles();
+  await publishPendingFiles("arrival.txt", "chosen.txt");
+  const returned = renderRetainedPopup();
+  expect(pendingCheckbox(returned, "arrival.txt").checked).toBe(false);
+  pendingCheckbox(returned, "chosen.txt").onChange?.({ target: { checked: true } });
+
+  fixture.invoke.mockClear().mockResolvedValueOnce(undefined);
+  const review = findElement(renderRetainedPopup(), (element) => element.type === "button" && label(element).startsWith("Review queue ("));
+  expect(review?.props.disabled).toBe(false);
+  await review?.props.onClick?.();
+  expect(fixture.invoke.mock.calls).toEqual([["show_review_cmd", { paths: [`${invoices.path}/chosen.txt`] }]]);
+});
+
+it("keeps only continuously present selections across reorder, a new arrival, and a failed read", async () => {
+  await loadFolderList([invoices]);
+  await publishPendingFiles("removed.txt", "retained.txt");
+  const original = renderRetainedPopup();
+  for (const name of ["removed.txt", "retained.txt"]) {
+    pendingCheckbox(original, name).onChange?.({ target: { checked: true } });
+  }
+  const reporter = vi.spyOn(console, "error").mockImplementation(() => {});
+  try {
+    fixture.invoke.mockRejectedValueOnce(new Error("Pending files unavailable"));
+    await expect(useAppStore.getState().getPendingFiles()).resolves.toBeUndefined();
+  } finally {
+    reporter.mockRestore();
+  }
+  expect(pendingCheckbox(renderRetainedPopup(), "retained.txt").checked).toBe(true);
+  expect(pendingCheckbox(renderRetainedPopup(), "removed.txt").checked).toBe(true);
+
+  await publishPendingFiles("retained.txt", "new.txt");
+  await publishPendingFiles("new.txt", "removed.txt", "retained.txt");
+  const refreshed = renderRetainedPopup();
+  expect(pendingCheckbox(refreshed, "retained.txt").checked).toBe(true);
+  expect(pendingCheckbox(refreshed, "new.txt").checked).toBe(false);
+  expect(pendingCheckbox(refreshed, "removed.txt").checked).toBe(false);
+});
 
 it("takes a confirmed zero-folder popup directly to Watched Folders", async () => {
   await loadFolderList([]);
