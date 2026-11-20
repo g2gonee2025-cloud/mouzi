@@ -108,6 +108,7 @@ const EMPTY_INSIGHTS: DashboardInsights = {
 interface DashboardState {
   stats: DashboardStats | null;
   statsReadRevision: number;
+  statsSnapshotRevision: number;
   weeklyStats: WeeklyStat[];
   isScanning: boolean;
   scanProgress: ScanProgress | null;
@@ -148,6 +149,7 @@ let scanStateRevision = 0;
 export const useDashboardStore = create<DashboardState>((set, get) => ({
   stats: null,
   statsReadRevision: 0,
+  statsSnapshotRevision: 0,
   weeklyStats: [],
   isScanning: false,
   scanProgress: null,
@@ -170,6 +172,7 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
         set((state) => ({
           stats,
           statsReadRevision: request,
+          statsSnapshotRevision: request,
           isLoading: false,
           scanReason: state.scanReason === "no_roots" ? null : state.scanReason,
         }));

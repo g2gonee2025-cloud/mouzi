@@ -92,6 +92,7 @@ export default function StorageTreemap({
                     {item.lastScanAt !== null && (
                       <span className="block">{t("dashboard.rootLastScan", { date: formatTimestamp(item.lastScanAt) })}</span>
                     )}
+                    {item.error && <span className="block text-red-700 dark:text-red-400 break-words">{item.error}</span>}
                   </div>
                 </button>
                 <button

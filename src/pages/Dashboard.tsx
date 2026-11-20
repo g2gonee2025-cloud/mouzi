@@ -35,6 +35,7 @@ export default function Dashboard({ view, setView }: DashboardProps) {
   const {
     stats: cachedStats,
     statsReadRevision,
+    statsSnapshotRevision,
     weeklyStats,
     isLoading,
     isScanning,
@@ -55,10 +56,10 @@ export default function Dashboard({ view, setView }: DashboardProps) {
   const [scanListenersReady, setScanListenersReady] = useState(false);
   const [scanListenerError, setScanListenerError] = useState<string | null>(null);
   const [scanListenerAttempt, setScanListenerAttempt] = useState(0);
-  const [entry] = useState({ statsReadRevision, lastFinishedRunId });
-  const hasReadStats = statsReadRevision !== entry.statsReadRevision;
-  const stats = hasReadStats ? cachedStats : null;
-  const error = hasReadStats ? cachedError : null;
+  // On re-entry, wait for a successful read before showing a previous route's inventory.
+  const [entry] = useState({ statsReadRevision, statsSnapshotRevision, lastFinishedRunId });
+  const stats = statsSnapshotRevision !== entry.statsSnapshotRevision ? cachedStats : null;
+  const error = statsReadRevision !== entry.statsReadRevision ? cachedError : null;
 
   useEffect(() => {
     const controller = new AbortController();

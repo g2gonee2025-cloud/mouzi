@@ -104,7 +104,12 @@ function renderDashboard(
   mock.state.length = 0;
   useDashboardStore.setState({ stats: null, ...previousRun });
   mountedDashboard(view);
-  useDashboardStore.setState({ stats: dashboardStats(watchedRoots, scanEligibleRoots, largestFiles), statsReadRevision: useDashboardStore.getState().statsReadRevision + 1 });
+  const revision = useDashboardStore.getState().statsReadRevision + 1;
+  useDashboardStore.setState({
+    stats: dashboardStats(watchedRoots, scanEligibleRoots, largestFiles),
+    statsReadRevision: revision,
+    statsSnapshotRevision: revision,
+  });
   return mountedDashboard(view).html;
 }
 
@@ -148,7 +153,7 @@ describe("dashboard entry points", () => {
     expect(warning).toContain(firstFailure.error);
     expect(html.indexOf(failed.error)).toBeLessThan(html.indexOf('role="search"'));
     expect(html).toContain(retained.path);
-    expect(html.match(/Folder is unavailable/g)).toHaveLength(1);
+    expect(html.split('role="search"')[0].match(/Folder is unavailable/g)).toHaveLength(1);
     expect(renderDashboard([root])).not.toContain("dashboard.scanFailedRoots");
   });
 
@@ -159,7 +164,7 @@ describe("dashboard entry points", () => {
     expect(html).not.toContain("Expired worker error");
   });
 
-  it("rechecks cached inventory on entry, preserves a live worker error, and clears a root warning after recovery", async () => {
+  it("keeps cached inventory hidden on a failed entry read, then keeps verified rows through a live scan and recovery", async () => {
     vi.stubGlobal("window", new EventTarget());
     const listeners = new Map<string, (event: { payload: unknown }) => void>();
     mock.listen.mockImplementation(async (name: string, onEvent: (event: { payload: unknown }) => void) => {
@@ -174,8 +179,8 @@ describe("dashboard entry points", () => {
     const cached = dashboardStats([{ ...root, files: 1, bytes: 100 }], 1, [retained]);
     const failed = dashboardStats([{ ...cached.watchedRoots[0], status: "failed", stale: true, error: "Folder unreachable" }], 1, [retained]);
     const recovered = dashboardStats([root]);
-    let finishRead!: (stats: DashboardStats) => void;
-    let read = new Promise<DashboardStats>((resolve) => { finishRead = resolve; });
+    let failRead!: (error: Error) => void;
+    let read = new Promise<DashboardStats>((_resolve, reject) => { failRead = reject; });
     mock.invoke.mockImplementation(async (name: string) => {
       if (name === "get_dashboard_stats_cmd") return read;
       if (name === "get_stats_cmd") return [];
@@ -189,9 +194,22 @@ describe("dashboard entry points", () => {
     const cleanups = initial.effects.map((effect) => effect());
     try {
       await settle();
-      finishRead(failed);
+      failRead(new Error("Could not read dashboard"));
       await settle();
+      const unavailable = mountedDashboard().html;
+      expect(unavailable).toContain("Could not read dashboard");
+      expect(unavailable).toContain("common.retry");
+      expect(unavailable).not.toContain(retained.path);
+      expect(unavailable).not.toContain("dashboard.scanFailedRoots");
+
+      read = Promise.resolve(failed);
+      await useDashboardStore.getState().refresh();
       expect(mountedDashboard().html).toContain("Folder unreachable");
+      expect(mountedDashboard().html).toContain(retained.path);
+
+      read = Promise.reject(new Error("Temporary refresh error"));
+      await useDashboardStore.getState().refresh();
+      expect(mountedDashboard().html).toContain("Temporary refresh error");
       expect(mountedDashboard().html).toContain(retained.path);
 
       const runId = "19000000000000000002";
@@ -199,7 +217,7 @@ describe("dashboard entry points", () => {
       publish("scan-finished", { runId, status: "failed", errors: ["Folder unreachable", "Worker stopped unexpectedly"] });
       const live = mountedDashboard().html;
       expect(live).toContain("Worker stopped unexpectedly");
-      expect(live.match(/Folder unreachable/g)).toHaveLength(1);
+      expect(live.split('role="search"')[0].match(/Folder unreachable/g)).toHaveLength(1);
 
       const nextRunId = "19000000000000000003";
       publish("scan-complete", { runId: nextRunId, root: root.path, status: "complete", error: null });
@@ -316,10 +334,11 @@ describe("configured root presentation", () => {
   });
 
   it("marks a failed empty snapshot stale only if a prior scan completed", () => {
-    const failed = { ...root, status: "failed" as const, stale: true };
+    const failed = { ...root, status: "failed" as const, stale: true, error: "Access denied" };
     const html = renderToStaticMarkup(<StorageTreemap data={[failed]} totalBytes={0} />);
     expect(html).toContain("dashboard.rootStale");
     expect(html).toContain("dashboard.rootFailed");
+    expect(html).toContain("Access denied");
     expect(renderToStaticMarkup(<StorageTreemap data={[{ ...failed, lastScanAt: null }]} totalBytes={0} />))
       .not.toContain("dashboard.rootStale");
   });
