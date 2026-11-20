@@ -42,13 +42,15 @@ export default function FileListTab({
   const [showResults, setShowResults] = useState(false);
   const [pending, setPending] = useState<ConfirmDialogProps | null>(null);
   const beginPreview = usePreviewOwner();
+  const findButton = useRef<HTMLButtonElement>(null);
   const resultsHeading = useRef<HTMLHeadingElement>(null);
 
-  const search = kind === "large" ? store.largeFiles : store.staleFiles;
+  const finderKey = kind === "large" ? "largeFiles" : "staleFiles";
+  const search = store[finderKey];
   const searchedThreshold = search && ("minBytes" in search ? search.minBytes / BYTES_PER_MIB : search.days);
   const threshold = draftThreshold ?? searchedThreshold ?? defaultThreshold;
   const data = search && threshold === searchedThreshold ? search.files : null;
-  const unavailableRoots = data && store.unavailableRoots[kind === "large" ? "largeFiles" : "staleFiles"];
+  const unavailableRoots = data && store.unavailableRoots[finderKey];
 
   const checkedFiles = useMemo(
     () => (data ?? []).filter((f) => checked.has(f.path)),
@@ -85,7 +87,7 @@ export default function FileListTab({
   }, [data, checked]);
 
   const handleConfirm = async (opener: HTMLButtonElement) => {
-    if (!search || checkedFiles.length === 0) return;
+    if (!search || checkedFiles.length === 0 || useCleanupStore.getState()[finderKey] !== search) return;
     const actions = checkedFiles.map(({ path }): CleanupRequest => "minBytes" in search
       ? { kind: "trash_large", path, minBytes: search.minBytes }
       : { kind: "trash_stale", path, days: search.days },
@@ -102,7 +104,7 @@ export default function FileListTab({
         notice: "trash",
         preview: plan.actions.map((f) => f.path),
         opener,
-        focusFallback: () => resultsHeading.current,
+        focusFallback: () => resultsHeading.current ?? findButton.current,
         onConfirm: async () => { await store.executeCleanup(plan.planId); setShowResults(true); },
         onClose: () => { owner.abort(); setPending(null); },
       });
@@ -162,6 +164,7 @@ export default function FileListTab({
             className="w-20 rounded-md border border-border bg-surface px-2 py-1 text-xs text-text"
           />
           <button
+            ref={findButton}
             onClick={handleFind}
           disabled={store.loading || store.busy || !!store.preparedPlan}
             className="flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-on-primary hover:bg-primary-hover disabled:opacity-50 transition-colors"
@@ -178,7 +181,7 @@ export default function FileListTab({
         </div>
       )}
 
-      {search && !data && (
+      {!store.loading && search && !data && (
         <p className="text-xs text-text-muted">{t("cleanup.notSearched")}</p>
       )}
 

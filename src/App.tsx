@@ -4,7 +4,7 @@ import { DEFAULT_DASHBOARD_VIEW } from "./utils/dashboard";
 import { useTranslation } from "react-i18next";
 import { initI18n, SupportedLang } from "./i18n";
 import { useAppStore, type AppSettings } from "./store/useAppStore";
-import { useDashboardStore } from "./store/useDashboardStore";
+import { useDashboardStore, type ScanComplete } from "./store/useDashboardStore";
 import { useCleanupStore } from "./store/useCleanupStore";
 import { useSuggestionsStore } from "./store/useSuggestionsStore";
 import Popup from "./components/Popup";
@@ -107,6 +107,9 @@ function App() {
       void refreshVisibleSuggestions().catch(console.error);
     };
     listen("file-organized", refreshActivity).then(keepListener).catch(console.error);
+    listen<ScanComplete>("scan-complete", ({ payload }) => {
+      if (!disposed && payload?.status === "complete") useCleanupStore.getState().invalidateFileCandidates();
+    }).then(keepListener).catch(console.error);
     listen("mutation-completed", () => {
       refreshActivity();
       invalidateInventory();

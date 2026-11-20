@@ -19,8 +19,8 @@ export interface CleanupLogEntry {
 interface CleanupState {
   inventoryReady: boolean | null;
   duplicates: DuplicateGroup[] | null;
-  largeFiles: { files: CleanupFile[]; minBytes: number } | null;
-  staleFiles: { files: CleanupFile[]; days: number } | null;
+  largeFiles: { files: CleanupFile[] | null; minBytes: number } | null;
+  staleFiles: { files: CleanupFile[] | null; days: number } | null;
   emptyDirs: string[] | null;
   unavailableRoots: Partial<Record<FinderKey, string[]>>;
   loading: boolean;
@@ -38,6 +38,7 @@ interface CleanupState {
   prepareCleanup: (actions: CleanupRequest[], owner?: AbortSignal) => Promise<CleanupPlan>;
   executeCleanup: (planId: string) => Promise<void>;
   invalidateCandidates: () => void;
+  invalidateFileCandidates: () => void;
   observeInventoryReadiness: () => () => void;
   loadHistory: () => Promise<void>;
   clearResults: () => void;
@@ -58,22 +59,27 @@ async function requestCandidates<Item>(command: string, args?: Record<string, nu
 
 export const useCleanupStore = create<CleanupState>((set, get) => {
   const preview = createPreviewSlot();
+  let activeFinder: { key: FinderKey; generation: number } | null = null;
 
   async function find<Key extends FinderKey>(
     key: Key,
     request: () => Promise<FinderResult<NonNullable<CleanupState[Key]>>>,
+    waiting?: NonNullable<CleanupState[Key]>,
   ) {
     if (get().busy || get().preparedPlan) return;
-    const generation = ++candidatesGeneration;
+    const finder = { key, generation: ++candidatesGeneration };
+    activeFinder = finder;
+    const isCurrent = () => activeFinder === finder && finder.generation === candidatesGeneration;
     set((state) => ({
       loading: true,
       error: null,
-      [key]: null,
+      [key]: waiting ?? null,
       unavailableRoots: { ...state.unavailableRoots, [key]: [] },
     }));
     try {
       const { candidates, unavailableRoots } = await request();
-      if (generation === candidatesGeneration) {
+      if (isCurrent()) {
+        activeFinder = null;
         set((state) => ({
           [key]: candidates,
           loading: false,
@@ -81,7 +87,10 @@ export const useCleanupStore = create<CleanupState>((set, get) => {
         }));
       }
     } catch (error) {
-      if (generation === candidatesGeneration) set({ error: String(error), loading: false });
+      if (isCurrent()) {
+        activeFinder = null;
+        set({ error: String(error), loading: false });
+      }
     }
   }
 
@@ -95,16 +104,17 @@ export const useCleanupStore = create<CleanupState>((set, get) => {
     findLargeFiles: (minBytes) => find("largeFiles", async () => {
       const { candidates: files, unavailableRoots } = await requestCandidates<CleanupFile>("find_large_files_cmd", { minBytes });
       return { candidates: { files, minBytes }, unavailableRoots };
-    }),
+    }, { minBytes, files: null }),
     findStaleFiles: (days) => find("staleFiles", async () => {
       const { candidates: files, unavailableRoots } = await requestCandidates<CleanupFile>("find_stale_files_cmd", { days });
       return { candidates: { files, days }, unavailableRoots };
-    }),
+    }, { days, files: null }),
     findEmptyDirs: () => find("emptyDirs", () => requestCandidates<string>("find_empty_dirs_cmd")),
     prepareCleanup: async (actions, owner) => {
       if (!actions.length || get().busy || get().preparedPlan) throw new Error("Another cleanup is being reviewed or processed");
       const isCurrent = preview.begin(owner, () => set({ busy: false, preparedPlan: null }));
       const generation = ++candidatesGeneration;
+      activeFinder = null;
       const snapshot = actions.map((action) => ({ ...action }));
       set({ busy: true, loading: false, error: null });
       try {
@@ -135,11 +145,11 @@ export const useCleanupStore = create<CleanupState>((set, get) => {
           duplicates: state.duplicates?.map((g) => ({ ...g, files: g.files.filter((f) => !removed.has(f.path)) })).filter((g) => g.files.length > 1) ?? null,
           largeFiles: state.largeFiles && {
             ...state.largeFiles,
-            files: state.largeFiles.files.filter((file) => !removed.has(file.path)),
+            files: state.largeFiles.files?.filter((file) => !removed.has(file.path)) ?? null,
           },
           staleFiles: state.staleFiles && {
             ...state.staleFiles,
-            files: state.staleFiles.files.filter((file) => !removed.has(file.path)),
+            files: state.staleFiles.files?.filter((file) => !removed.has(file.path)) ?? null,
           },
           emptyDirs: state.emptyDirs?.filter((path) => !removed.has(path)) ?? null,
         }));
@@ -154,6 +164,7 @@ export const useCleanupStore = create<CleanupState>((set, get) => {
     invalidateCandidates: () => {
       ++candidatesGeneration;
       ++historyGeneration;
+      activeFinder = null;
       // Completion can arrive before the command result. Keep the candidates
       // and their coverage together until per-file outcomes identify retryable items.
       if (get().busy) set({ loading: false, history: null, historyLoading: false });
@@ -161,6 +172,25 @@ export const useCleanupStore = create<CleanupState>((set, get) => {
         preview.clear();
         set({ ...emptyCandidates, unavailableRoots: {}, preparedPlan: null, loading: false, history: null, historyLoading: false });
       }
+    },
+    invalidateFileCandidates: () => {
+      // Scan publication replaces inventory rows. Live directory queries and
+      // exact backend review plans have their own lifetimes.
+      const stoppedFileFinder = activeFinder !== null && activeFinder.key !== "emptyDirs";
+      if (stoppedFileFinder) activeFinder = null;
+      set((state) => {
+        const { duplicates, largeFiles, staleFiles, unavailableRoots } = state;
+        const { emptyDirs, ...fileCoverage } = unavailableRoots;
+        if (!stoppedFileFinder && duplicates === null && !largeFiles?.files && !staleFiles?.files
+            && Object.keys(fileCoverage).length === 0) return state;
+        return {
+          duplicates: null,
+          largeFiles: largeFiles && { minBytes: largeFiles.minBytes, files: null },
+          staleFiles: staleFiles && { days: staleFiles.days, files: null },
+          unavailableRoots: emptyDirs === undefined ? {} : { emptyDirs },
+          ...(stoppedFileFinder ? { loading: false } : {}),
+        };
+      });
     },
     observeInventoryReadiness: () => {
       let stopped = false;

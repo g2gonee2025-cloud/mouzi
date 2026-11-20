@@ -26,6 +26,7 @@ export default function DuplicatesTab() {
   const [showResults, setShowResults] = useState(false);
   const [pending, setPending] = useState<ConfirmDialogProps | null>(null);
   const beginPreview = usePreviewOwner();
+  const findButton = useRef<HTMLButtonElement>(null);
   const resultsHeading = useRef<HTMLHeadingElement>(null);
 
   const groups = useMemo(
@@ -44,14 +45,17 @@ export default function DuplicatesTab() {
 
   // Summed off `actions`, never off `reclaimableBytes(groups)`: if the two ever
   // disagreed the dialog would quote one number and the backend act on another.
-  const handleFind = () => store.findDuplicates();
+  const handleFind = () => {
+    if (useCleanupStore.getState().duplicates === null) setSelected({});
+    return store.findDuplicates();
+  };
 
   const handleKeep = (hash: string, path: string) => {
     setSelected((prev) => ({ ...prev, [hash]: path }));
   };
 
   const handleConfirm = async (opener: HTMLButtonElement) => {
-    if (actions.length === 0) return;
+    if (actions.length === 0 || useCleanupStore.getState().duplicates !== store.duplicates) return;
     const owner = beginPreview();
     if (!owner) return;
     try {
@@ -64,7 +68,7 @@ export default function DuplicatesTab() {
         notice: "trash",
         preview: plan.actions.map((a) => a.path),
         opener,
-        focusFallback: () => resultsHeading.current,
+        focusFallback: () => resultsHeading.current ?? findButton.current,
         onConfirm: async () => { await store.executeCleanup(plan.planId); setShowResults(true); },
         onClose: () => { owner.abort(); setPending(null); },
       });
@@ -77,7 +81,7 @@ export default function DuplicatesTab() {
   const handleResultsDone = () => {
     setShowResults(false);
     store.clearResults();
-    store.findDuplicates();
+    void handleFind();
   };
 
   if (showResults && store.results) {
@@ -96,6 +100,7 @@ export default function DuplicatesTab() {
       <div className="flex items-center justify-between">
         <p className="text-xs text-text-muted">{t("cleanup.duplicatesHint")}</p>
         <button
+          ref={findButton}
           onClick={handleFind}
           disabled={store.loading || store.busy || !!store.preparedPlan}
           className="flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-on-primary hover:bg-primary-hover disabled:opacity-50 transition-colors"
