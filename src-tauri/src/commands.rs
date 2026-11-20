@@ -763,9 +763,7 @@ fn run_archive_import(
     };
     let staging = &extraction.staging_dir;
     job.sorting();
-    let sorting = crate::rules::manual_scan_folder_cancelable(
-        staging, suppression, &job.cancelled, extraction.staging_guard(),
-    );
+    let sorting = crate::rules::manual_scan_folder_cancelable(staging, suppression, &job.cancelled);
     let result = finish_archive_sort(intent, staging, extraction.extracted_files, sorting);
     let _ = app.emit("mutation-completed", ());
     Ok(result)

@@ -530,12 +530,11 @@ impl FolderAuthority<'_> {
 struct ArchiveSortCancellation<'a> {
     requested: &'a AtomicBool,
     stopped: Cell<bool>,
-    staging_guard: &'a AncestorGuard,
 }
 
 impl<'a> ArchiveSortCancellation<'a> {
-    fn new(requested: &'a AtomicBool, staging_guard: &'a AncestorGuard) -> Self {
-        Self { requested, stopped: Cell::new(false), staging_guard }
+    fn new(requested: &'a AtomicBool) -> Self {
+        Self { requested, stopped: Cell::new(false) }
     }
 
     fn stop_requested(&self) -> bool {
@@ -616,19 +615,12 @@ fn process_file(
             (root, Some(watched.guard_physical()?))
         }
         FolderAuthority::WatchedManual(watched) => (root, Some(watched.guard_current(&folders)?)),
-        FolderAuthority::ArchiveStaging(Some(_)) => (root, None),
-        FolderAuthority::ArchiveStaging(None) => {
+        _ => {
             crate::safe_fs::validate_root(root)?;
             (root, None)
         }
     };
-    let contained = match authority {
-        FolderAuthority::ArchiveStaging(Some(archive)) => {
-            crate::safe_fs::archive_entry_is_contained(root, path, archive.staging_guard)?
-        }
-        _ => path.parent().is_some_and(|parent| crate::safe_fs::directory_contains(parent, root).unwrap_or(false)),
-    };
-    if !contained {
+    if !path.parent().is_some_and(|parent| crate::safe_fs::directory_contains(parent, root).unwrap_or(false)) {
         return Err(format!("File is outside organizer root: {}", path.display()));
     }
     let use_folder_protection = authority.uses_folder_protection();
@@ -775,10 +767,10 @@ pub(crate) struct FolderScanError {
     pub message: String,
 }
 
-pub(crate) fn manual_scan_folder_cancelable(
-    root: &Path, suppression: &SuppressionSet, cancelled: &AtomicBool, staging_guard: &AncestorGuard,
-) -> Result<SortedFiles, FolderScanError> {
-    let cancellation = ArchiveSortCancellation::new(cancelled, staging_guard);
+pub(crate) fn manual_scan_folder_cancelable(root: &Path, suppression: &SuppressionSet, cancelled: &std::sync::atomic::AtomicBool)
+    -> Result<SortedFiles, FolderScanError>
+{
+    let cancellation = ArchiveSortCancellation::new(cancelled);
     scan_folder(root, suppression, FolderAuthority::ArchiveStaging(Some(&cancellation)))
 }
 
@@ -1056,8 +1048,7 @@ mod tests {
         fs::create_dir(&staging).unwrap();
         fs::write(staging.join("archive.authorityx"), b"archive").unwrap();
         let cancelled = std::sync::atomic::AtomicBool::new(false);
-        let staging_guard = crate::safe_fs::guard_directory(&staging).unwrap();
-        assert_eq!(manual_scan_folder_cancelable(&staging, &suppression, &cancelled, &staging_guard).unwrap().len(), 1);
+        assert_eq!(manual_scan_folder_cancelable(&staging, &suppression, &cancelled).unwrap().len(), 1);
         assert_eq!(fs::read(staging.join("Filed/archive.authorityx")).unwrap(), b"archive");
 
         crate::db::update_folder_mode(folder_id, crate::db::FOLDER_MODE_MANUAL).unwrap();
@@ -1131,8 +1122,7 @@ mod tests {
             fs::write(&control, policy).unwrap();
             fs::write(staging.join(FILE_NAME), b"archive payload").unwrap();
 
-            let staging_guard = crate::safe_fs::guard_directory(&staging).unwrap();
-            assert_eq!(manual_scan_folder_cancelable(&staging, &suppression, &cancelled, &staging_guard).unwrap().len(), 1);
+            assert_eq!(manual_scan_folder_cancelable(&staging, &suppression, &cancelled).unwrap().len(), 1);
             assert_eq!(fs::read(staging.join("Filed").join(FILE_NAME)).unwrap(), b"archive payload");
             assert_eq!(fs::read(control).unwrap(), policy);
         }
@@ -1217,8 +1207,7 @@ mod tests {
             assert_eq!(intent_state(), ("pending".to_owned(), expected_staging.clone()));
 
             let cancelled = AtomicBool::new(false);
-            let staging_guard = crate::safe_fs::guard_directory(&staging).unwrap();
-            let cancellation = ArchiveSortCancellation::new(&cancelled, &staging_guard);
+            let cancellation = ArchiveSortCancellation::new(&cancelled);
             let authority = FolderAuthority::ArchiveStaging(Some(&cancellation));
             let suppression = SuppressionSet::new();
             let entries = [
