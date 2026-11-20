@@ -11,8 +11,8 @@ import ConfirmDialog, { type ConfirmRequest } from "./cleanup/ConfirmDialog";
 const emptyFilters = { query: "", rule: "", extension: "", from: "", to: "", run_id: "" };
 
 function endOfLocalMinute(value: string): string {
-  const start = new Date(value);
-  const lastSecond = new Date(start.getTime() + 59_000);
+  const lastSecond = new Date(value);
+  lastSecond.setUTCSeconds(59, 0);
   // History's inclusive bound can retain nanoseconds beyond Date's precision.
   return lastSecond.toISOString().replace(".000Z", ".999999999Z");
 }

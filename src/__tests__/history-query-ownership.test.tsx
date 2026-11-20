@@ -140,6 +140,7 @@ async function mount() {
 it.each([
   { name: "one local minute", from: "2026-11-21T10:15", to: "2026-11-21T10:15" },
   { name: "an end-only range at local midnight", from: "", to: "2026-11-21T23:59" },
+  { name: "an end value carrying seconds", from: "", to: "2026-11-21T10:15:29.123" },
   { name: "a start-only range", from: "2026-11-22T00:00", to: "" },
 ])("sends precise History bounds for $name", async ({ from, to }) => {
   mock.invoke.mockResolvedValue([]);
@@ -152,7 +153,7 @@ it.each([
     filter: {
       query: "", rule: "", extension: "", run_id: "",
       from: from ? new Date(from).toISOString() : "",
-      to: to ? new Date(to + ":59").toISOString().slice(0, -5) + ".999999999Z" : "",
+      to: to ? new Date(to.slice(0, 16) + ":59").toISOString().slice(0, -5) + ".999999999Z" : "",
     },
   });
 
