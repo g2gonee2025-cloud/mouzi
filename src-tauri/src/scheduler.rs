@@ -128,7 +128,7 @@ pub fn validate_schedule_times(schedule: &ScheduleSettings) -> Result<(), String
             continue;
         };
         let time = parse_time(value)?;
-        if index < count {
+        if schedule.schedule_enabled && index < count {
             if active_times.contains(&time) {
                 return Err("Active schedule times must be distinct".to_string());
             }
@@ -465,7 +465,10 @@ mod tests {
         for invalid in ["24:00", "12:60", "23:59:60", "8:00", "08:3", "08:00 PM", ""] {
             assert!(validate_schedule_times(&schedule(&[invalid])).is_err(), "{invalid}");
         }
-        assert!(validate_schedule_times(&schedule(&["08:00", "08:00:00"])).is_err());
+        let mut duplicates = schedule(&["08:00", "08:00:00"]);
+        assert!(validate_schedule_times(&duplicates).is_err());
+        duplicates.schedule_enabled = false;
+        assert!(validate_schedule_times(&duplicates).is_ok(), "stored duplicate times must allow Disable");
         let mut missing = schedule(&["08:00"]);
         missing.schedule_times_per_day = 2;
         assert!(validate_schedule_times(&missing).is_err());
