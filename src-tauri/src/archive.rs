@@ -909,16 +909,21 @@ fn recovery_remaining_entries(staging: &Path, partial_names: &HashSet<String>)
     Ok((remaining, false))
 }
 
-fn reconcile_pending_manifest(base: &Path, source: &str, staging: &Path) -> Result<bool, String> {
+struct RecoveredImport {
+    status: String,
+    message: Option<String>,
+}
+
+fn reconcile_pending_manifest(base: &Path, source: &str, staging: &Path) -> Result<Option<RecoveredImport>, String> {
     // Only a direct child registered by this profile is eligible. The
     // manifest and journal names are computed here, never followed from JSON.
     if staging.parent() != Some(base) || !staging.file_name().is_some_and(|name| name.to_string_lossy().starts_with("import-")) {
-        return Ok(false);
+        return Ok(None);
     }
     let _staging_guard = safe_fs::guard_directory(staging)?;
     let manifest_path = staging.with_extension("manifest.json");
     if safe_fs::source_absence(&manifest_path) == safe_fs::SourceAbsence::Absent {
-        return Ok(false);
+        return Ok(None);
     }
     let mut manifest = {
         let (file, _guard) = safe_fs::open_guarded_regular_file(&manifest_path)?;
@@ -933,7 +938,7 @@ fn reconcile_pending_manifest(base: &Path, source: &str, staging: &Path) -> Resu
         || journal_name.is_none()
         || manifest["entryJournal"].as_str() != journal_name
     {
-        return Ok(false);
+        return Ok(None);
     }
     match manifest["status"].as_str() {
         Some("extracting") => {
@@ -947,15 +952,24 @@ fn reconcile_pending_manifest(base: &Path, source: &str, staging: &Path) -> Resu
             manifest["remainingEntries"] = serde_json::json!(remaining);
             manifest["recoveryEvidenceTruncated"] = serde_json::json!(truncated);
         }
-        Some("interrupted") => return Ok(true),
-        _ => return Ok(false),
+        Some(status @ ("completed" | "partial" | "failed" | "interrupted")) => {
+            // The manifest can reach its final state before SQLite records it.
+            return Ok(Some(RecoveredImport {
+                status: status.to_string(),
+                message: manifest["message"].as_str().map(str::to_owned),
+            }));
+        }
+        _ => return Ok(None),
     }
     manifest["status"] = serde_json::json!("interrupted");
     manifest["message"] = serde_json::json!(ARCHIVE_INTERRUPTED_MESSAGE);
     manifest["updatedAt"] = serde_json::json!(chrono::Utc::now().to_rfc3339());
     let bytes = serde_json::to_vec_pretty(&manifest).map_err(|error| error.to_string())?;
     replace_manifest(&manifest_path, &bytes).map_err(|error| error.to_string())?;
-    Ok(true)
+    Ok(Some(RecoveredImport {
+        status: "interrupted".into(),
+        message: Some(ARCHIVE_INTERRUPTED_MESSAGE.into()),
+    }))
 }
 
 const ARCHIVE_INTERRUPTED_MESSAGE: &str = "Archive import was interrupted when Mouzi closed. Review the retained files and recovery records.";
@@ -971,14 +985,14 @@ pub(crate) fn recover_pending_imports(data_dir: &Path) {
     if let Err(error) = std::thread::Builder::new().name("mouzi-archive-recovery".into()).spawn(move || {
         for (id, source, staging) in pending {
             match reconcile_pending_manifest(&base, &source, Path::new(&staging)) {
-                Ok(true) => {
+                Ok(Some(recovered)) => {
                     if let Err(error) = crate::db::finalize_operation_intent(
-                        id, "interrupted", Some(&staging), Some(ARCHIVE_INTERRUPTED_MESSAGE),
+                        id, &recovered.status, Some(&staging), recovered.message.as_deref(),
                     ) {
-                        log::warn!("Cannot record interrupted archive import {id}: {error}");
+                        log::warn!("Cannot finish recovered archive import {id}: {error}");
                     }
                 }
-                Ok(false) => {}
+                Ok(None) => {}
                 Err(error) => log::warn!("Cannot reconcile archive import {id}: {error}"),
             }
         }
@@ -1515,7 +1529,8 @@ mod tests {
         fs::write(staging.join(".mouzi-archive-entry-3-0.part"), b"unrecorded").unwrap();
 
         let source_text = source.to_str().unwrap();
-        assert!(reconcile_pending_manifest(&base, source_text, &staging).unwrap());
+        let recovered = reconcile_pending_manifest(&base, source_text, &staging).unwrap().unwrap();
+        assert_eq!(recovered.status, "interrupted");
         let observed = fs::read(&manifest_path).unwrap();
         let manifest: serde_json::Value = serde_json::from_slice(&observed).unwrap();
         assert_eq!(manifest["status"], "interrupted");
@@ -1535,7 +1550,8 @@ mod tests {
         assert_eq!(fs::read(staging.join("changed.txt")).unwrap(), b"external");
         assert_eq!(fs::read(staging.join(partial_name)).unwrap(), b"partial");
         assert_eq!(fs::read(&source).unwrap(), b"fixture archive");
-        assert!(reconcile_pending_manifest(&base, source_text, &staging).unwrap());
+        let recovered = reconcile_pending_manifest(&base, source_text, &staging).unwrap().unwrap();
+        assert_eq!(recovered.status, "interrupted");
         assert_eq!(fs::read(&manifest_path).unwrap(), observed);
         fs::remove_dir_all(root).unwrap();
     }
@@ -1550,13 +1566,17 @@ mod tests {
         let source_text = source.to_str().unwrap();
         save_manifest(&staging, Some(&source), "extracting", &[], None).unwrap();
         let original = fs::read(&manifest).unwrap();
-        assert!(!reconcile_pending_manifest(&root, source_text, &staging).unwrap());
+        assert!(reconcile_pending_manifest(&root, source_text, &staging).unwrap().is_none());
         assert_eq!(fs::read(&manifest).unwrap(), original);
         let journal = staging.with_extension("entries.jsonl");
-        save_manifest_with_receipt(&staging, Some(&source), "failed", &[], Some("fixture failure"), None, journal.file_name().unwrap().to_str()).unwrap();
-        let terminal = fs::read(&manifest).unwrap();
-        assert!(!reconcile_pending_manifest(&root, source_text, &staging).unwrap());
-        assert_eq!(fs::read(&manifest).unwrap(), terminal);
+        for (status, message) in [("completed", None), ("partial", Some("fixture sorting failure")), ("failed", Some("fixture extraction failure"))] {
+            save_manifest_with_receipt(&staging, Some(&source), status, &[], message, None, journal.file_name().unwrap().to_str()).unwrap();
+            let terminal = fs::read(&manifest).unwrap();
+            let recovered = reconcile_pending_manifest(&root, source_text, &staging).unwrap().unwrap();
+            assert_eq!(recovered.status, status);
+            assert_eq!(recovered.message.as_deref(), message);
+            assert_eq!(fs::read(&manifest).unwrap(), terminal);
+        }
         fs::remove_dir_all(root).unwrap();
     }
 
