@@ -17,6 +17,7 @@ const PAGE_SIZE: i64 = 128;
 const REQUEST_BUDGET: Duration = Duration::from_secs(6);
 const MODEL_TIMEOUT: Duration = Duration::from_secs(2);
 const MODEL_AVAILABILITY_TTL: Duration = Duration::from_secs(30);
+const MODEL_FAILURE_TTL: Duration = Duration::from_secs(30);
 const MODEL_ATTEMPTS: usize = 5;
 const MAX_RESPONSE_BYTES: u64 = 256 * 1024;
 const MAX_CACHE_ENTRIES: usize = 500;
@@ -209,6 +210,7 @@ pub trait AiProvider: Send + Sync {
         (self.classify_with_budget(filename, budget).ok().flatten(), None)
     }
     fn confirmed_missing_model(&self) -> bool { false }
+    fn confirmed_unreachable(&self) -> bool { false }
     fn cached(&self, _filename: &str) -> bool { false }
     fn candidate_cursor(&self) -> Option<String> { None }
     fn advance_candidate_cursor(&self, _path: &str) {}
@@ -240,6 +242,7 @@ struct TransportResponse { status: u16, body: String }
 #[derive(Clone, Debug)]
 enum ProviderFailure {
     Unreachable(String),
+    Response(String),
     Other(String),
 }
 
@@ -249,7 +252,7 @@ impl From<String> for ProviderFailure {
 
 impl ProviderFailure {
     fn into_message(self) -> String {
-        match self { Self::Unreachable(message) | Self::Other(message) => message }
+        match self { Self::Unreachable(message) | Self::Response(message) | Self::Other(message) => message }
     }
 }
 
@@ -271,22 +274,28 @@ impl LocalTransport for LoopbackTransport {
             match error {
                 ureq::Error::Transport(transport) if transport.kind() == ureq::ErrorKind::ConnectionFailed =>
                     ProviderFailure::Unreachable(message),
+                ureq::Error::Status(..) => ProviderFailure::Response(message),
                 _ => ProviderFailure::Other(message),
             }
         })?;
         let status = response.status();
-        if status != 200 { return Err(format!("Local model returned HTTP {status}; expected 200").into()); }
+        if status != 200 { return Err(ProviderFailure::Response(format!("Local model returned HTTP {status}; expected 200"))); }
         let mut bytes = Vec::new();
         response.into_reader().take(MAX_RESPONSE_BYTES + 1).read_to_end(&mut bytes)
-            .map_err(|e| format!("Local model response read failed: {e}"))?;
-        if bytes.len() as u64 > MAX_RESPONSE_BYTES { return Err("Local model response is too large".to_string().into()); }
-        let body = String::from_utf8(bytes).map_err(|_| "Local model response is not UTF-8".to_string())?;
+            .map_err(|e| ProviderFailure::Response(format!("Local model response read failed: {e}")))?;
+        if bytes.len() as u64 > MAX_RESPONSE_BYTES {
+            return Err(ProviderFailure::Response("Local model response is too large".into()));
+        }
+        let body = String::from_utf8(bytes).map_err(|_| ProviderFailure::Response("Local model response is not UTF-8".into()))?;
         Ok(TransportResponse { status, body })
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ModelAvailability { Available, Missing, Unknown }
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Reachability { Reached, Unreachable }
 
 #[derive(Clone)]
 enum ModelClassification {
@@ -299,6 +308,7 @@ type CachedPrediction = (Instant, ClassificationResult);
 #[derive(Default)]
 struct ModelCache {
     availability: Option<(Instant, Result<ModelAvailability, ProviderFailure>)>,
+    reachability: Option<(Instant, Reachability)>,
     predictions: HashMap<String, CachedPrediction>,
     candidate_cursor: Option<String>,
 }
@@ -308,7 +318,7 @@ fn prediction_ttl(result: &ClassificationResult) -> Duration {
     match result {
         Ok(ModelClassification::Prediction(Some(_))) => Duration::from_secs(300),
         Ok(_) => Duration::from_secs(60),
-        Err(_) => Duration::from_secs(30),
+        Err(_) => MODEL_FAILURE_TTL,
     }
 }
 
@@ -334,7 +344,19 @@ impl<'a> OllamaProvider<'a> {
             if remaining.is_zero() {
                 return Err("Local model request budget expired".to_string().into());
             }
-            self.transport.request(endpoint, body, remaining)
+            let result = self.transport.request(endpoint, body, remaining);
+            let reachability = match &result {
+                Ok(_) | Err(ProviderFailure::Response(_)) => Some(Reachability::Reached),
+                Err(ProviderFailure::Unreachable(_)) => Some(Reachability::Unreachable),
+                Err(ProviderFailure::Other(_)) => None,
+            };
+            // Only real transport observations can supersede connection evidence.
+            if let Some(reachability) = reachability {
+                if let Ok(mut cache) = self.cache.lock() {
+                    cache.reachability = Some((Instant::now(), reachability));
+                }
+            }
+            result
         })
     }
 
@@ -446,12 +468,17 @@ impl AiProvider for OllamaProvider<'_> {
             Ok(ModelClassification::Prediction(prediction)) => (prediction, None),
             Ok(ModelClassification::ModelMissing) => (None, Some(LocalAiStatus::ModelMissing)),
             Err(ProviderFailure::Unreachable(_)) => (None, Some(LocalAiStatus::Unreachable)),
-            Err(ProviderFailure::Other(_)) => (None, None),
+            Err(ProviderFailure::Response(_) | ProviderFailure::Other(_)) => (None, None),
         }
     }
     fn confirmed_missing_model(&self) -> bool {
         self.cache.lock().is_ok_and(|cache| cache.availability.as_ref().is_some_and(|(at, result)| {
             at.elapsed() < MODEL_AVAILABILITY_TTL && matches!(result, Ok(ModelAvailability::Missing))
+        }))
+    }
+    fn confirmed_unreachable(&self) -> bool {
+        self.cache.lock().is_ok_and(|cache| cache.reachability.is_some_and(|(at, result)| {
+            at.elapsed() < MODEL_FAILURE_TTL && result == Reachability::Unreachable
         }))
     }
     fn cached(&self, filename: &str) -> bool {
@@ -597,7 +624,7 @@ fn collect_suggestions(
     let local_ai_status = if observed_missing && provider.confirmed_missing_model() {
         Some(LocalAiStatus::ModelMissing)
     } else {
-        observed_unreachable.then_some(LocalAiStatus::Unreachable)
+        (observed_unreachable && provider.confirmed_unreachable()).then_some(LocalAiStatus::Unreachable)
     };
     Ok(SuggestionsWithStatus { suggestions, local_ai_status })
 }
@@ -742,6 +769,36 @@ mod tests {
         let targets: Vec<_> = transport.calls.lock().unwrap().iter().map(|call| call.0).collect();
         assert_eq!(targets, [Endpoint::Tags, Endpoint::Tags, Endpoint::Generate]);
         assert_eq!(collect_fixture(&provider, &["one.xyz"]).local_ai_status, None);
+    }
+
+    #[test]
+    fn latest_live_connection_controls_the_unreachable_warning() {
+        let gate = SuggestionGate::new();
+        let session = advance(&gate);
+        let reply_ok = || response(r#"{"response":"{\"category\":\"Images\"}"}"#);
+        let refused = || Err(ProviderFailure::Unreachable("socket refused".into()));
+        for (first, second, expected, prediction_count) in [
+            (refused(), reply_ok(), None, 1),
+            (reply_ok(), refused(), Some(LocalAiStatus::Unreachable), 1),
+            (refused(), Err(ProviderFailure::Response("HTTP 503".into())), None, 0),
+            (refused(), Err(ProviderFailure::Other("request budget expired".into())), Some(LocalAiStatus::Unreachable), 0),
+        ] {
+            let (provider, transport) = fake_provider(vec![
+                response(r#"{"models":[{"model":"test"}]}"#), first, second,
+            ], session);
+            for _ in 0..2 {
+                let result = collect_fixture(&provider, &["one.xyz", "two.xyz"]);
+                assert_eq!(result.suggestions.len(), prediction_count);
+                assert!(result.suggestions.iter().all(|item| item.source == PredictionSource::Ollama));
+                assert_eq!(result.local_ai_status, expected);
+            }
+            if expected == Some(LocalAiStatus::Unreachable) {
+                provider.cache.lock().unwrap().reachability.as_mut().unwrap().0 = Instant::now() - MODEL_FAILURE_TTL;
+                assert_eq!(collect_fixture(&provider, &["one.xyz", "two.xyz"]).local_ai_status, None);
+            }
+            let targets: Vec<_> = transport.calls.lock().unwrap().iter().map(|call| call.0).collect();
+            assert_eq!(targets, [Endpoint::Tags, Endpoint::Generate, Endpoint::Generate]);
+        }
     }
 
     #[test]
