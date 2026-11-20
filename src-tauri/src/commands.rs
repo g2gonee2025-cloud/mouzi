@@ -723,18 +723,37 @@ pub struct ArchiveImportSummary {
     pub issue: Option<String>,
 }
 
+const ARCHIVE_IMPORT_STATE_CHANGED: &str = "archive-import-state-changed";
+
 #[tauri::command(async)]
 pub fn import_archive_cmd(app: AppHandle, path: String, state: tauri::State<AppState>) -> Result<ArchiveImportSummary, String> {
-    let job = crate::archive::ImportJob::start()?;
-    let intent = begin_operation_intent("archive_import", &path, None).map_err(|e| format!("Import was not started: cannot persist intent: {e}"))?;
+    let publish = |snapshot: &crate::archive::ArchiveImportSnapshot| {
+        let _ = app.emit(ARCHIVE_IMPORT_STATE_CHANGED, snapshot);
+    };
+    let job = crate::archive::IMPORT.start(&publish)?;
+    let result = run_archive_import(&app, &path, &state.ignored_files, &job);
+    job.finish(result.as_ref().map(|summary| crate::archive::ArchiveImportReceipt {
+        extracted_count: summary.extracted_count,
+        sorted_count: summary.sorted_count,
+        staging_path: summary.staging_path.clone(),
+        issue: summary.issue.as_deref().map(crate::archive::compact_import_issue),
+    }).map_err(String::as_str));
+    result
+}
+
+fn run_archive_import(
+    app: &AppHandle, path: &str, suppression: &SuppressionSet, job: &crate::archive::ImportJob<'_>,
+) -> Result<ArchiveImportSummary, String> {
+    let intent = begin_operation_intent("archive_import", path, None).map_err(|e| format!("Import was not started: cannot persist intent: {e}"))?;
     let extraction = match crate::archive::extract_archive(
-        Path::new(&path),
+        Path::new(path),
         &job.cancelled,
         |staging| {
             observe_pending_archive_staging(intent, &staging.to_string_lossy())
                 .map_err(|error| format!("Cannot record import staging before extraction: {error}"))
         },
         |bytes, files| {
+            job.progress(bytes, files);
             let _ = app.emit("archive-import-progress", serde_json::json!({"bytes":bytes,"files":files}));
         },
     ) {
@@ -742,7 +761,8 @@ pub fn import_archive_cmd(app: AppHandle, path: String, state: tauri::State<AppS
         Err(error) => return finish_archive_extraction_failure(intent, error),
     };
     let staging = &extraction.staging_dir;
-    let sorting = crate::rules::manual_scan_folder_cancelable(staging, &state.ignored_files, &job.cancelled);
+    job.sorting();
+    let sorting = crate::rules::manual_scan_folder_cancelable(staging, suppression, &job.cancelled);
     let result = finish_archive_sort(intent, staging, extraction.extracted_files, sorting);
     let _ = app.emit("mutation-completed", ());
     Ok(result)
@@ -809,7 +829,17 @@ pub(crate) fn finish_archive_sort(
 }
 
 #[tauri::command]
-pub fn cancel_archive_import_cmd() -> Result<(), String> { crate::archive::cancel_import() }
+pub fn get_archive_import_state_cmd() -> Result<crate::archive::ArchiveImportSnapshot, String> {
+    crate::archive::IMPORT.snapshot()
+}
+
+#[tauri::command]
+pub fn cancel_archive_import_cmd(app: AppHandle, job_id: Option<u64>) -> Result<(), String> {
+    if let Some(snapshot) = crate::archive::IMPORT.cancel(job_id)? {
+        let _ = app.emit(ARCHIVE_IMPORT_STATE_CHANGED, &snapshot);
+    }
+    Ok(())
+}
 
 #[tauri::command]
 pub fn open_folder_cmd(path: String) -> Result<(), String> {

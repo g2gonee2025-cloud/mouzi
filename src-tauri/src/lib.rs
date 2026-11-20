@@ -231,6 +231,7 @@ pub fn run() {
             scan_folder_cmd,
             clean_now_cmd,
             import_archive_cmd,
+            get_archive_import_state_cmd,
             cancel_archive_import_cmd,
             open_folder_cmd,
             get_downloads_folder,

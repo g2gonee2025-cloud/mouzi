@@ -55,22 +55,177 @@ enum ArchiveFormat {
 #[derive(Clone, Copy)]
 struct Limits { entries: usize, file_bytes: u64, total_bytes: u64, archive_bytes: u64, zip_metadata_bytes: u64, duration: Duration }
 const LIMITS: Limits = Limits { entries: 20_000, file_bytes: 256 * 1024 * 1024, total_bytes: 2 * 1024 * 1024 * 1024, archive_bytes: 1024 * 1024 * 1024, zip_metadata_bytes: 32 * 1024 * 1024, duration: Duration::from_secs(120) };
-static IMPORT: Mutex<Option<Arc<AtomicBool>>> = Mutex::new(None);
+pub(crate) static IMPORT: ImportLifecycle = ImportLifecycle::new();
 
-pub struct ImportJob { pub cancelled: Arc<AtomicBool> }
-impl ImportJob {
-    pub fn start() -> Result<Self, String> {
-        let mut active = IMPORT.lock().map_err(|_| "Archive job lock failed")?;
-        if active.is_some() { return Err("An archive import is already running".into()); }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+enum ImportStatus { Idle, Running, Completed, Failed }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+enum ImportPhase { Extracting, Sorting }
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ArchiveImportReceipt {
+    pub extracted_count: Option<usize>,
+    pub sorted_count: usize,
+    pub staging_path: String,
+    pub issue: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArchiveImportSnapshot {
+    revision: u64,
+    job_id: Option<u64>,
+    status: ImportStatus,
+    phase: Option<ImportPhase>,
+    bytes: u64,
+    files: usize,
+    cancel_requested: bool,
+    result: Option<ArchiveImportReceipt>,
+    error: Option<String>,
+}
+
+impl ArchiveImportSnapshot {
+    const IDLE: Self = Self {
+        revision: 0,
+        job_id: None,
+        status: ImportStatus::Idle,
+        phase: None,
+        bytes: 0,
+        files: 0,
+        cancel_requested: false,
+        result: None,
+        error: None,
+    };
+}
+
+struct ImportState {
+    snapshot: ArchiveImportSnapshot,
+    cancellation: Option<Arc<AtomicBool>>,
+}
+
+pub(crate) struct ImportLifecycle(Mutex<ImportState>);
+
+impl ImportLifecycle {
+    const fn new() -> Self {
+        Self(Mutex::new(ImportState { snapshot: ArchiveImportSnapshot::IDLE, cancellation: None }))
+    }
+
+    pub(crate) fn snapshot(&self) -> Result<ArchiveImportSnapshot, String> {
+        self.0.lock().map(|state| state.snapshot.clone()).map_err(|_| "Archive job lock failed".into())
+    }
+
+    pub(crate) fn start<'a>(&'a self, publish: &'a dyn Fn(&ArchiveImportSnapshot)) -> Result<ImportJob<'a>, String> {
         let cancelled = Arc::new(AtomicBool::new(false));
-        *active = Some(cancelled.clone());
-        Ok(Self { cancelled })
+        let snapshot = {
+            let mut state = self.0.lock().map_err(|_| "Archive job lock failed")?;
+            if state.cancellation.is_some() { return Err("An archive import is already running".into()); }
+            let id = state.snapshot.revision + 1;
+            state.snapshot = ArchiveImportSnapshot {
+                revision: id,
+                job_id: Some(id),
+                status: ImportStatus::Running,
+                phase: Some(ImportPhase::Extracting),
+                ..ArchiveImportSnapshot::IDLE
+            };
+            state.cancellation = Some(cancelled.clone());
+            state.snapshot.clone()
+        };
+        let job = ImportJob { lifecycle: self, id: snapshot.revision, cancelled, publish };
+        publish(&snapshot);
+        Ok(job)
+    }
+
+    pub(crate) fn cancel(&self, job_id: Option<u64>) -> Result<Option<ArchiveImportSnapshot>, String> {
+        self.change_active(job_id, |state| {
+            if state.snapshot.cancel_requested { return false; }
+            let Some(cancelled) = &state.cancellation else { return false; };
+            cancelled.store(true, Ordering::Relaxed);
+            state.snapshot.cancel_requested = true;
+            true
+        })
+    }
+
+    fn change_active(
+        &self, job_id: Option<u64>, change: impl FnOnce(&mut ImportState) -> bool,
+    ) -> Result<Option<ArchiveImportSnapshot>, String> {
+        let mut state = self.0.lock().map_err(|_| "Archive job lock failed")?;
+        if state.cancellation.is_none() || job_id.is_some_and(|id| state.snapshot.job_id != Some(id)) || !change(&mut state) {
+            return Ok(None);
+        }
+        state.snapshot.revision += 1;
+        Ok(Some(state.snapshot.clone()))
     }
 }
-impl Drop for ImportJob { fn drop(&mut self) { if let Ok(mut active) = IMPORT.lock() { *active = None; } } }
-pub fn cancel_import() -> Result<(), String> {
-    if let Some(cancelled) = IMPORT.lock().map_err(|_| "Archive job lock failed")?.as_ref() { cancelled.store(true, Ordering::Relaxed); }
-    Ok(())
+
+pub(crate) struct ImportJob<'a> {
+    lifecycle: &'a ImportLifecycle,
+    id: u64,
+    pub cancelled: Arc<AtomicBool>,
+    publish: &'a dyn Fn(&ArchiveImportSnapshot),
+}
+
+impl ImportJob<'_> {
+    pub(crate) fn progress(&self, bytes: u64, files: usize) {
+        self.change(|state| {
+            if (state.snapshot.bytes, state.snapshot.files) == (bytes, files) { return false; }
+            state.snapshot.bytes = bytes;
+            state.snapshot.files = files;
+            true
+        });
+    }
+
+    pub(crate) fn sorting(&self) {
+        self.change(|state| {
+            state.snapshot.phase = Some(ImportPhase::Sorting);
+            true
+        });
+    }
+
+    pub(crate) fn finish(&self, outcome: Result<ArchiveImportReceipt, &str>) {
+        self.change(|state| {
+            state.cancellation = None;
+            state.snapshot.phase = None;
+            match outcome {
+                Ok(receipt) => {
+                    if let Some(count) = receipt.extracted_count {
+                        state.snapshot.files = count;
+                    }
+                    state.snapshot.status = ImportStatus::Completed;
+                    state.snapshot.result = Some(receipt);
+                }
+                Err(error) => {
+                    state.snapshot.status = ImportStatus::Failed;
+                    state.snapshot.error = Some(compact_import_issue(error));
+                }
+            }
+            true
+        });
+    }
+
+    fn change(&self, change: impl FnOnce(&mut ImportState) -> bool) {
+        if let Ok(Some(snapshot)) = self.lifecycle.change_active(Some(self.id), change) {
+            (self.publish)(&snapshot);
+        }
+    }
+}
+
+impl Drop for ImportJob<'_> {
+    fn drop(&mut self) {
+        self.finish(Err("Archive import stopped before reporting its result"));
+    }
+}
+
+pub(crate) fn compact_import_issue(issue: &str) -> String {
+    let mut chars = issue.chars();
+    let mut result: String = chars.by_ref().take(512).collect();
+    if chars.next().is_some() {
+        result.push('…');
+    }
+    result
 }
 
 #[derive(Default)]
@@ -1085,11 +1240,94 @@ pub(crate) fn recover_pending_imports(data_dir: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
     use std::io::Write;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use zip::write::FileOptions;
 
     static TEST_DIR_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn archive_import_state_preserves_progress_and_partial_receipt_across_reads() {
+        let lifecycle = ImportLifecycle::new();
+        let events = RefCell::new(Vec::new());
+        let publish = |snapshot: &ArchiveImportSnapshot| events.borrow_mut().push(snapshot.clone());
+        assert_eq!(lifecycle.snapshot().unwrap(), ArchiveImportSnapshot::IDLE);
+        let job = lifecycle.start(&publish).unwrap();
+        let started = lifecycle.snapshot().unwrap();
+        assert_eq!((started.status, started.phase), (ImportStatus::Running, Some(ImportPhase::Extracting)));
+        assert!(lifecycle.start(&publish).is_err());
+        assert_eq!(lifecycle.snapshot().unwrap(), started);
+
+        job.progress(4096, 1);
+        let progress = lifecycle.snapshot().unwrap();
+        assert_eq!((progress.job_id, progress.bytes, progress.files), (started.job_id, 4096, 1));
+        assert!(progress.revision > started.revision);
+        job.sorting();
+        assert_eq!(lifecycle.snapshot().unwrap().phase, Some(ImportPhase::Sorting));
+        let cancel = lifecycle.cancel(started.job_id).unwrap().unwrap();
+        publish(&cancel);
+        assert!(cancel.cancel_requested && job.cancelled.load(Ordering::Relaxed));
+        assert!(lifecycle.cancel(started.job_id).unwrap().is_none());
+
+        let receipt = ArchiveImportReceipt {
+            extracted_count: Some(2),
+            sorted_count: 1,
+            staging_path: "C:/Mouzi/staging/fixture".into(),
+            issue: Some("Archive import cancelled".into()),
+        };
+        job.finish(Ok(receipt));
+        let completed = lifecycle.snapshot().unwrap();
+        assert_eq!(serde_json::to_value(&completed).unwrap(), serde_json::json!({
+            "revision": 5,
+            "jobId": started.job_id,
+            "status": "completed",
+            "phase": null,
+            "bytes": 4096,
+            "files": 2,
+            "cancelRequested": true,
+            "result": {
+                "extractedCount": 2,
+                "sortedCount": 1,
+                "stagingPath": "C:/Mouzi/staging/fixture",
+                "issue": "Archive import cancelled",
+            },
+            "error": null,
+        }));
+        drop(job);
+        assert_eq!(lifecycle.snapshot().unwrap(), completed);
+        assert_eq!(events.into_inner().last(), Some(&completed));
+    }
+
+    #[test]
+    fn archive_import_state_ignores_old_jobs_and_retains_failure_after_drop() {
+        let lifecycle = ImportLifecycle::new();
+        let publish = |_: &ArchiveImportSnapshot| {};
+        let old_job = lifecycle.start(&publish).unwrap();
+        let old_id = lifecycle.snapshot().unwrap().job_id;
+        old_job.finish(Err("Archive fixture not found"));
+        let first_failure = lifecycle.snapshot().unwrap();
+        assert_eq!(first_failure.status, ImportStatus::Failed);
+        assert_eq!(first_failure.error.as_deref(), Some("Archive fixture not found"));
+
+        let current_job = lifecycle.start(&publish).unwrap();
+        let started = lifecycle.snapshot().unwrap();
+        assert!(started.revision > first_failure.revision);
+        assert_ne!(started.job_id, old_id);
+        assert!(lifecycle.cancel(old_id).unwrap().is_none());
+        old_job.progress(10, 1);
+        drop(old_job);
+        assert!(lifecycle.start(&publish).is_err());
+        assert!(!current_job.cancelled.load(Ordering::Relaxed));
+        assert_eq!(lifecycle.snapshot().unwrap(), started);
+
+        assert!(lifecycle.cancel(None).unwrap().unwrap().cancel_requested);
+        drop(current_job);
+        let abandoned = lifecycle.snapshot().unwrap();
+        assert_eq!((abandoned.job_id, abandoned.status, abandoned.phase), (started.job_id, ImportStatus::Failed, None));
+        assert_eq!(abandoned.error.as_deref(), Some("Archive import stopped before reporting its result"));
+        assert!(lifecycle.start(&publish).is_ok());
+    }
 
     fn test_dir(prefix: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
