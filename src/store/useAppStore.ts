@@ -149,7 +149,7 @@ interface AppState {
   addRule: (rule: Rule) => Promise<void>;
   updateRule: (rule: Rule) => Promise<void>;
   deleteRule: (id: number) => Promise<void>;
-  clearLogs: () => Promise<void>;
+  clearLogs: (throughId: number) => Promise<void>;
   getPendingFiles: () => Promise<void>;
   getSchedule: () => Promise<void>;
   updateSchedule: (schedule: ScheduleSettings) => Promise<void>;
@@ -369,12 +369,9 @@ export const useAppStore = create<AppState>((set, get) => ({
     await get().loadRules();
   },
 
-  clearLogs: async () => {
-    await invoke('clear_logs_cmd');
-    ++logsRequest;
-    ++countsRequest;
-    ++statsRequest;
-    set({ logs: [], stats: [], historyCounts: { total: 0, undoable: 0 }, actionRefreshErrors: noActionRefreshErrors });
+  clearLogs: async (throughId) => {
+    await invoke('clear_logs_cmd', { throughId });
+    await get().refreshActionViews();
   },
 
   getPendingFiles: async () => {

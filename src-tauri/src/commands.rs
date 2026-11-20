@@ -664,10 +664,15 @@ pub fn update_settings_cmd(app: AppHandle, settings: PreferencesPatch) -> Result
 }
 
 #[tauri::command(async)]
-pub fn clear_logs_cmd(app: AppHandle, state: tauri::State<AppState>) -> Result<(), String> {
+pub fn preview_clear_logs_cmd() -> Result<HistoryClearPreview, String> {
+    preview_clear_logs().map_err(|error| error.to_string())
+}
+
+#[tauri::command(async)]
+pub fn clear_logs_cmd(app: AppHandle, state: tauri::State<AppState>, through_id: i64) -> Result<(), String> {
     {
         let _operation = state.ignored_files.with_operation();
-        clear_logs().map_err(|e| e.to_string())?;
+        clear_logs_through(through_id)?;
     }
     let _ = app.emit("mutation-completed", ());
     Ok(())
@@ -2451,6 +2456,40 @@ mod undo_tests {
         }).unwrap_err();
         assert!(stale.contains("reviewed history changed"));
         assert_eq!(std::fs::read(late_dest).unwrap(), b"payload");
+    }
+
+    #[test]
+    fn clear_reviewed_history_preserves_new_entries_and_pending_undo() {
+        let fixture = UndoFixture::new("clear_reviewed");
+        let time = "2026-01-01T00:00:00Z";
+        let empty = preview_clear_logs_cmd().unwrap();
+        assert_eq!((empty.total, empty.through_id), (0, 0));
+        let (source, dest) = stage(fixture.root(), "reviewed.undocheck");
+        let reviewed = insert_log(time, &source, Some(&dest));
+        clear_logs_through(empty.through_id).unwrap();
+        let preview = preview_clear_logs_cmd().unwrap();
+        assert_eq!((preview.total, preview.through_id), (1, reviewed));
+
+        let (late_source, late_dest) = stage(fixture.root(), "late.undocheck");
+        let late = insert_log("2025-12-31T23:59:00Z", &late_source, Some(&late_dest));
+        let (pending_source, pending_dest) = stage(fixture.root(), "pending.undocheck");
+        let pending = insert_log(time, &pending_source, Some(&pending_dest));
+        let identity = crate::safe_fs::file_identity(Path::new(&pending_dest)).unwrap().key();
+        let intent = begin_undo_intent(pending, &pending_dest, &pending_source, &identity).unwrap();
+
+        clear_logs_through(preview.through_id).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"payload");
+        assert!(!Path::new(&source).exists());
+        let rows: Vec<_> = get_organization_logs().unwrap().into_iter().map(|row| row.action.id.unwrap()).collect();
+        assert_eq!(rows, [pending, late]);
+        assert_eq!(history_counts().unwrap().undoable, 2);
+
+        let error = clear_logs_through(preview_clear_logs_cmd().unwrap().through_id).unwrap_err();
+        assert!(error.contains("interrupted restore"));
+        assert_eq!(preview_clear_logs_cmd().unwrap().total, 2);
+        assert_eq!(pending_undos().unwrap()[0].id, intent);
+        assert_eq!(undo_action_with(late, &ignored_files()).unwrap().status, "ok");
+        assert_eq!(std::fs::read(late_source).unwrap(), b"payload");
     }
 
     #[test]

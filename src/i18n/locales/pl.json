@@ -473,10 +473,10 @@
       "acceptAllRules_one": "Zostanie utworzona i włączona {{count}} nowa reguła",
       "acceptAllRules_few": "Zostaną utworzone i włączone {{count}} nowe reguły",
       "acceptAllRules_many": "Zostanie utworzonych i włączonych {{count}} nowych reguł",
-      "clearHistory": "Zostanie usunięty {{count}} wpis historii, a wraz z nim każda możliwość cofnięcia",
-      "clearHistory_one": "Zostanie usunięty {{count}} wpis historii, a wraz z nim każda możliwość cofnięcia",
-      "clearHistory_few": "Zostaną usunięte {{count}} wpisy historii, a wraz z nimi każda możliwość cofnięcia",
-      "clearHistory_many": "Zostanie usuniętych {{count}} wpisów historii, a wraz z nimi każda możliwość cofnięcia"
+      "clearHistory": "Zostanie usunięty {{count}} wpis historii. Nie będzie można cofnąć tych operacji. Pliki pozostaną na swoim miejscu.",
+      "clearHistory_one": "Zostanie usunięty {{count}} wpis historii. Nie będzie można cofnąć tych operacji. Pliki pozostaną na swoim miejscu.",
+      "clearHistory_few": "Zostaną usunięte {{count}} wpisy historii. Nie będzie można cofnąć tych operacji. Pliki pozostaną na swoim miejscu.",
+      "clearHistory_many": "Zostanie usuniętych {{count}} wpisów historii. Nie będzie można cofnąć tych operacji. Pliki pozostaną na swoim miejscu."
     }
   },
   "undo": {

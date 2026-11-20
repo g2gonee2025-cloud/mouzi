@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawn, execFileSync } from 'node:child_process';
 import { mkdir, writeFile, readFile, access, realpath } from 'node:fs/promises';
-import { resolve, join, basename } from 'node:path';
+import { resolve, join, basename, isAbsolute, relative, sep } from 'node:path';
 import { createHash } from 'node:crypto';
 const { chromium } = await import(process.env.MOUZI_PLAYWRIGHT_MODULE || 'playwright');
 const pl = JSON.parse(await readFile(new URL('../src/i18n/locales/pl.json', import.meta.url), 'utf8'));
@@ -90,7 +90,7 @@ try {
     ciPolicyInstalled = true;
   }
   await start();
-  originalSettings = await invoke('get_settings_cmd'); originalLogs = await invoke('get_logs_cmd', { limit: -1 });
+  originalSettings = await invoke('get_settings_cmd'); originalLogs = await invoke('get_logs_cmd', { limit: 1 });
   originalRules = await invoke('get_rules_cmd'); originalFolders = await invoke('get_folders_cmd');
   await invoke('update_settings_cmd', { settings: { ...originalSettings, language: 'en' } });
   await page.reload(); await button('About').waitFor();
@@ -252,8 +252,21 @@ finally {
     for (const id of ownedRules) { try { await invoke('delete_rule_cmd', { id }); report.cleanup.push(`Removed test rule ${id}`); } catch (e) { report.cleanup.push(String(e)); } }
     if (originalSettings) { try { await invoke('update_settings_cmd', { settings: originalSettings }); report.cleanup.push('Original settings restored'); } catch(e) { report.cleanup.push(String(e)); } }
     if (originalLogs?.length === 0) {
-      const logs = await invoke('get_logs_cmd', { limit: -1 });
-      if (logs.every(log => log.source_path.startsWith(run))) { await invoke('clear_logs_cmd'); report.cleanup.push('Removed test-only history'); }
+      try {
+        const { total, throughId } = await invoke('preview_clear_logs_cmd');
+        const history = await invoke('history_cmd', { filter: {} });
+        const reviewed = history.filter(log => log.id > 0 && log.id <= throughId);
+        if (total > 0 && reviewed.length === total && reviewed.every(log => {
+          const source = log.source_path.startsWith('\\\\?\\') ? log.source_path.slice(4) : log.source_path;
+          const fromRun = relative(run, source);
+          return fromRun && fromRun !== '..' && !fromRun.startsWith('..' + sep) && !isAbsolute(fromRun);
+        })) {
+          await invoke('clear_logs_cmd', { throughId });
+          report.cleanup.push('Removed reviewed test-only history');
+        }
+      } catch (error) {
+        report.cleanup.push(String(error));
+      }
     }
     if (originalSettings) {
       report.profileRestored = JSON.stringify(await invoke('get_settings_cmd')) === JSON.stringify(originalSettings)

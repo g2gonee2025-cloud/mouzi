@@ -225,6 +225,7 @@ pub fn run() {
             enable_autostart_cmd,
             disable_autostart_cmd,
             is_autostart_enabled_cmd,
+            preview_clear_logs_cmd,
             clear_logs_cmd,
             scan_folder_cmd,
             clean_now_cmd,

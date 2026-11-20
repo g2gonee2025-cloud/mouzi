@@ -469,9 +469,9 @@
       "acceptAllRules": "{{count}} new rule will be created and switched on",
       "acceptAllRules_one": "{{count}} new rule will be created and switched on",
       "acceptAllRules_other": "{{count}} new rules will be created and switched on",
-      "clearHistory": "{{count}} history entry will be erased, and every Undo goes with it",
-      "clearHistory_one": "{{count}} history entry will be erased, and every Undo goes with it",
-      "clearHistory_other": "{{count}} history entries will be erased, and every Undo goes with it"
+      "clearHistory": "{{count}} history entry will be erased. Undo will no longer be available for these entries. Files stay where they are.",
+      "clearHistory_one": "{{count}} history entry will be erased. Undo will no longer be available for these entries. Files stay where they are.",
+      "clearHistory_other": "{{count}} history entries will be erased. Undo will no longer be available for these entries. Files stay where they are."
     }
   },
   "undo": {

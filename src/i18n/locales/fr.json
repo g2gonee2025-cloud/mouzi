@@ -473,10 +473,10 @@
       "acceptAllRules_one": "{{count}} nouvelle règle sera créée et activée",
       "acceptAllRules_other": "{{count}} nouvelles règles seront créées et activées",
       "acceptAllRules_many": "{{count}} nouvelles règles seront créées et activées",
-      "clearHistory": "{{count}} entrée d'historique sera effacée, et toute possibilité d'annulation disparaît avec",
-      "clearHistory_one": "{{count}} entrée d'historique sera effacée, et toute possibilité d'annulation disparaît avec",
-      "clearHistory_other": "{{count}} entrées d'historique seront effacées, et toute possibilité d'annulation disparaît avec",
-      "clearHistory_many": "{{count}} entrées d'historique seront effacées, et toute possibilité d'annulation disparaît avec"
+      "clearHistory": "{{count}} entrée d’historique sera effacée. Ces actions ne pourront plus être annulées. Les fichiers restent à leur place.",
+      "clearHistory_one": "{{count}} entrée d’historique sera effacée. Ces actions ne pourront plus être annulées. Les fichiers restent à leur place.",
+      "clearHistory_other": "{{count}} entrées d’historique seront effacées. Ces actions ne pourront plus être annulées. Les fichiers restent à leur place.",
+      "clearHistory_many": "{{count}} entrées d’historique seront effacées. Ces actions ne pourront plus être annulées. Les fichiers restent à leur place."
     }
   },
   "undo": {

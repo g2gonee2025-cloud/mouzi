@@ -473,10 +473,10 @@
       "acceptAllRules_one": "Se creará y activará {{count}} regla nueva",
       "acceptAllRules_other": "Se crearán y activarán {{count}} reglas nuevas",
       "acceptAllRules_many": "Se crearán y activarán {{count}} reglas nuevas",
-      "clearHistory": "Se borrará {{count}} entrada del historial y se perderá toda opción de deshacer",
-      "clearHistory_one": "Se borrará {{count}} entrada del historial y se perderá toda opción de deshacer",
-      "clearHistory_other": "Se borrarán {{count}} entradas del historial y se perderá toda opción de deshacer",
-      "clearHistory_many": "Se borrarán {{count}} entradas del historial y se perderá toda opción de deshacer"
+      "clearHistory": "Se borrará {{count}} entrada del historial. Ya no se podrán deshacer esas acciones. Los archivos permanecen en su sitio.",
+      "clearHistory_one": "Se borrará {{count}} entrada del historial. Ya no se podrán deshacer esas acciones. Los archivos permanecen en su sitio.",
+      "clearHistory_other": "Se borrarán {{count}} entradas del historial. Ya no se podrán deshacer esas acciones. Los archivos permanecen en su sitio.",
+      "clearHistory_many": "Se borrarán {{count}} entradas del historial. Ya no se podrán deshacer esas acciones. Los archivos permanecen en su sitio."
     }
   },
   "undo": {

@@ -469,9 +469,9 @@
       "acceptAllRules": "{{count}} neue Regel wird erstellt und eingeschaltet",
       "acceptAllRules_one": "{{count}} neue Regel wird erstellt und eingeschaltet",
       "acceptAllRules_other": "{{count}} neue Regeln werden erstellt und eingeschaltet",
-      "clearHistory": "{{count}} Verlaufseintrag wird gelöscht, und jede Möglichkeit zum Rückgängigmachen geht mit verloren",
-      "clearHistory_one": "{{count}} Verlaufseintrag wird gelöscht, und jede Möglichkeit zum Rückgängigmachen geht mit verloren",
-      "clearHistory_other": "{{count}} Verlaufseinträge werden gelöscht, und jede Möglichkeit zum Rückgängigmachen geht mit verloren"
+      "clearHistory": "{{count}} Verlaufseintrag wird gelöscht. Die zugehörigen Aktionen können nicht mehr rückgängig gemacht werden. Die Dateien bleiben an ihrem Ort.",
+      "clearHistory_one": "{{count}} Verlaufseintrag wird gelöscht. Die zugehörigen Aktionen können nicht mehr rückgängig gemacht werden. Die Dateien bleiben an ihrem Ort.",
+      "clearHistory_other": "{{count}} Verlaufseinträge werden gelöscht. Die zugehörigen Aktionen können nicht mehr rückgängig gemacht werden. Die Dateien bleiben an ihrem Ort."
     }
   },
   "undo": {

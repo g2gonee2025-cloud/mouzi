@@ -189,7 +189,6 @@ export default function Settings() {
     rules,
     folders,
     historyCounts,
-    loadHistoryCounts,
     loadRules,
     loadFolders,
     loadLogs,
@@ -402,27 +401,22 @@ export default function Settings() {
     }
   };
 
-  // `clear_logs_cmd` is an unconditional DELETE FROM action_logs, so this takes
-  // the undo trail with it - every Undo button in the app reads from the same
-  // table. Undoing history and deleting it are not the same verb.
   const askClearLogs = async (opener: HTMLButtonElement) => {
-    let total: number;
     try {
-      total = (await loadHistoryCounts()).total;
+      const { total, throughId } = await invoke<{ total: number; throughId: number }>("preview_clear_logs_cmd");
+      if (total === 0) return;
+      setPending({
+        title: t("confirm.op.clearHistory"),
+        count: total,
+        notice: "permanent",
+        note: t("confirm.note.clearHistory", { count: total }),
+        opener,
+        focusFallback: () => sectionHeading.current,
+        onConfirm: () => clearLogs(throughId),
+      });
     } catch (e) {
       setWriteError(String(e));
-      return;
     }
-    if (total === 0) return;
-    setPending({
-      title: t("confirm.op.clearHistory"),
-      count: total,
-      notice: "permanent",
-      note: t("confirm.note.clearHistory", { count: total }),
-      opener,
-      focusFallback: () => sectionHeading.current,
-      onConfirm: () => clearLogs(),
-    });
   };
 
   const handleChangeLanguage = async (lang: string) => {

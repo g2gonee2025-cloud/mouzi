@@ -461,7 +461,7 @@
       "deleteRule": "后续文件将不再按此规则整理。",
       "undoAll": "已撤销的记录会被跳过。",
       "acceptAllRules": "将创建并启用 {{count}} 条新规则",
-      "clearHistory": "将清除 {{count}} 条历史记录，并且无法再撤销这些操作"
+      "clearHistory": "将清除 {{count}} 条历史记录。这些操作将无法撤销。文件仍保留在原处。"
     }
   },
   "undo": {

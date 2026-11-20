@@ -1425,10 +1425,37 @@ fn scheduler_recovery_preserves_claims_and_distinguishes_confirmed_from_uncertai
     assert!(claim_schedule_occurrences_on(&mut conn, &slots, "replay").unwrap().is_none());
 }
 
-pub fn clear_logs() -> SqliteResult<()> {
-    let conn = sqlite_lock()?;
-    conn.execute("DELETE FROM action_logs", [])?;
-    Ok(())
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryClearPreview {
+    pub total: i64,
+    pub through_id: i64,
+}
+
+pub fn preview_clear_logs() -> SqliteResult<HistoryClearPreview> {
+    sqlite_lock()?.query_row(
+        "SELECT COUNT(*), COALESCE(MAX(id), 0) FROM action_logs",
+        [],
+        |row| Ok(HistoryClearPreview { total: row.get(0)?, through_id: row.get(1)? }),
+    )
+}
+
+pub fn clear_logs_through(through_id: i64) -> Result<(), String> {
+    let mut conn = lock_db()?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|error| error.to_string())?;
+    let pending_undo: bool = tx.query_row(
+        "SELECT EXISTS (SELECT 1 FROM operation_intents i JOIN action_logs l ON l.id=i.undo_action_log_id
+         WHERE i.action='undo' AND i.status='pending' AND l.id<=?1)",
+        [through_id],
+        |row| row.get(0),
+    ).map_err(|error| error.to_string())?;
+    if pending_undo {
+        return Err("History includes an interrupted restore that still needs its original record.".into());
+    }
+    // The primary key is AUTOINCREMENT, so newer entries always fall above the reviewed ID.
+    tx.execute("DELETE FROM action_logs WHERE id<=?1", [through_id]).map_err(|error| error.to_string())?;
+    tx.commit().map_err(|error| error.to_string())
 }
 
 // ---------------------------------------------------------------------------

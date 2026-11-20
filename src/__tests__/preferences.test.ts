@@ -118,6 +118,24 @@ describe("authoritative clean scope and history", () => {
     expect(ipc.invoke).toHaveBeenCalledWith("undo_all_cmd", { reviewedIds: [42, 17] });
   });
 
+  it("keeps later activity and its Undo after clearing the reviewed history", async () => {
+    const late = { id: 43, source_path: "late.txt" };
+    ipc.invoke.mockImplementation(async (command: string, args) => {
+      if (command === "clear_logs_cmd") return expect(args).toEqual({ throughId: 42 });
+      if (command === "get_logs_cmd") return [late];
+      if (command === "get_history_counts_cmd") return { total: 1, undoable: 1 };
+      if (command === "get_stats_cmd") return [["txt", 1]];
+      throw new Error(`Unexpected IPC command ${command}`);
+    });
+
+    await useAppStore.getState().clearLogs(42);
+
+    const { logs, historyCounts, stats } = useAppStore.getState();
+    expect(logs).toEqual([late]);
+    expect(historyCounts).toEqual({ total: 1, undoable: 1 });
+    expect(stats).toEqual([{ file_type: "txt", count: 1 }]);
+  });
+
   it.each([
     {
       command: "clean_now_cmd",

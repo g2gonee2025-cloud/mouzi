@@ -467,7 +467,7 @@
       "deleteRule": "Từ nay quy tắc này sẽ không còn sắp xếp tệp mới.",
       "undoAll": "Các mục đã hoàn tác trước đó sẽ được bỏ qua.",
       "acceptAllRules": "Sẽ tạo và bật {{count}} quy tắc mới",
-      "clearHistory": "{{count}} mục lịch sử sẽ bị xóa, và mọi khả năng hoàn tác cũng mất theo"
+      "clearHistory": "{{count}} mục lịch sử sẽ bị xóa. Các thao tác này sẽ không thể hoàn tác. Tệp vẫn ở nguyên vị trí."
     }
   },
   "undo": {
