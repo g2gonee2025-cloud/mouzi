@@ -404,6 +404,7 @@
     "historyLoading": "Ładowanie historii porządkowania…",
     "historyError": "Nie udało się załadować historii porządkowania.",
     "notSearched": "Uruchom wyszukiwanie, aby przejrzeć kandydatów.",
+    "reviewChanged": "Podgląd czyszczenia się zmienił. Wyszukaj ponownie, aby przejrzeć aktualne elementy.",
     "historyUnknown": "Nieznany wynik"
   },
   "suggestions": {

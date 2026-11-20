@@ -410,6 +410,7 @@
     "historyLoading": "Đang tải lịch sử dọn dẹp…",
     "historyError": "Không thể tải lịch sử dọn dẹp.",
     "notSearched": "Chạy tìm kiếm để xem các mục đề xuất.",
+    "reviewChanged": "Nội dung xem trước khi dọn dẹp đã thay đổi. Hãy tìm lại để xem xét các mục hiện tại.",
     "historyUnknown": "Kết quả không xác định"
   },
   "suggestions": {

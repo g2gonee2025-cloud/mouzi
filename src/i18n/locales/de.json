@@ -404,6 +404,7 @@
     "historyLoading": "Bereinigungsverlauf wird geladen…",
     "historyError": "Bereinigungsverlauf konnte nicht geladen werden.",
     "notSearched": "Starte eine Suche, um Kandidaten zu prüfen.",
+    "reviewChanged": "Diese Bereinigungsvorschau hat sich geändert. Suche erneut, um die aktuellen Elemente zu prüfen.",
     "historyUnknown": "Unbekanntes Ergebnis"
   },
   "suggestions": {

@@ -15,8 +15,8 @@ import {
 } from "../../utils/cleanup";
 import { Search, Trash2, Check } from "lucide-react";
 import ResultsPanel from "./ResultsPanel";
-import ConfirmDialog, { type ConfirmDialogProps } from "./ConfirmDialog";
-import { usePreviewOwner } from "./usePreviewOwner";
+import ConfirmDialog from "./ConfirmDialog";
+import { useCleanupConfirmation } from "./useCleanupConfirmation";
 import UnavailableCleanupRoots from "./UnavailableCleanupRoots";
 
 export default function DuplicatesTab() {
@@ -24,8 +24,7 @@ export default function DuplicatesTab() {
   const store = useCleanupStore();
   const [selected, setSelected] = useState<Record<string, string>>({});
   const [showResults, setShowResults] = useState(false);
-  const [pending, setPending] = useState<ConfirmDialogProps | null>(null);
-  const beginPreview = usePreviewOwner();
+  const { pending, reviewNeedsSearch, clearReviewNotice, openReview } = useCleanupConfirmation(() => setShowResults(true));
   const findButton = useRef<HTMLButtonElement>(null);
   const resultsHeading = useRef<HTMLHeadingElement>(null);
 
@@ -46,6 +45,7 @@ export default function DuplicatesTab() {
   // Summed off `actions`, never off `reclaimableBytes(groups)`: if the two ever
   // disagreed the dialog would quote one number and the backend act on another.
   const handleFind = () => {
+    clearReviewNotice();
     if (useCleanupStore.getState().duplicates === null) setSelected({});
     return store.findDuplicates();
   };
@@ -56,25 +56,12 @@ export default function DuplicatesTab() {
 
   const handleConfirm = async (opener: HTMLButtonElement) => {
     if (actions.length === 0 || useCleanupStore.getState().duplicates !== store.duplicates) return;
-    const owner = beginPreview();
-    if (!owner) return;
-    try {
-      const plan = await store.prepareCleanup(actions, owner.signal);
-      if (owner.signal.aborted) return;
-      setPending({
-        title: t("confirm.op.trashDuplicates"),
-        count: plan.actions.length,
-        bytes: plan.totalBytes,
-        notice: "trash",
-        preview: plan.actions.map((a) => a.path),
-        opener,
-        focusFallback: () => resultsHeading.current ?? findButton.current,
-        onConfirm: async () => { await store.executeCleanup(plan.planId); setShowResults(true); },
-        onClose: () => { owner.abort(); setPending(null); },
-      });
-    } catch {
-      owner.abort();
-    }
+    await openReview(actions, {
+      title: t("confirm.op.trashDuplicates"),
+      notice: "trash",
+      opener,
+      focusFallback: () => resultsHeading.current ?? findButton.current,
+    });
   };
 
   // When results come back, refresh the list
@@ -112,6 +99,7 @@ export default function DuplicatesTab() {
         </button>
       </div>
 
+      {reviewNeedsSearch && <p role="status" className="text-xs text-text-muted">{t("cleanup.reviewChanged")}</p>}
       {store.error && (
         <div className="rounded-lg bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 px-4 py-3 text-xs text-red-700 dark:text-red-400">
           {store.error}

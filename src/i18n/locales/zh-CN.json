@@ -404,6 +404,7 @@
     "historyLoading": "正在加载清理历史…",
     "historyError": "无法加载清理历史。",
     "notSearched": "请先搜索，再查看候选项。",
+    "reviewChanged": "此次清理预览已更改。请重新搜索并查看当前项目。",
     "historyUnknown": "结果未知"
   },
   "suggestions": {

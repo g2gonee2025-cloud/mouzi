@@ -404,6 +404,7 @@
     "historyLoading": "Loading cleanup history…",
     "historyError": "Could not load cleanup history.",
     "notSearched": "Run a search to review candidates.",
+    "reviewChanged": "This cleanup review changed. Search again to review the current items.",
     "historyUnknown": "Unknown outcome"
   },
   "suggestions": {

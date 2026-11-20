@@ -404,6 +404,7 @@
     "historyLoading": "Cargando el historial de limpieza…",
     "historyError": "No se pudo cargar el historial de limpieza.",
     "notSearched": "Ejecuta una búsqueda para revisar los candidatos.",
+    "reviewChanged": "Esta revisión de limpieza ha cambiado. Vuelve a buscar para revisar los elementos actuales.",
     "historyUnknown": "Resultado desconocido"
   },
   "suggestions": {

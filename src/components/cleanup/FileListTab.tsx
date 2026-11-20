@@ -6,8 +6,8 @@ import type { CleanupRequest } from "../../utils/cleanup";
 import { Search, Trash2, ExternalLink } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import ResultsPanel from "./ResultsPanel";
-import ConfirmDialog, { type ConfirmDialogProps } from "./ConfirmDialog";
-import { usePreviewOwner } from "./usePreviewOwner";
+import ConfirmDialog from "./ConfirmDialog";
+import { useCleanupConfirmation } from "./useCleanupConfirmation";
 import UnavailableCleanupRoots from "./UnavailableCleanupRoots";
 
 const BYTES_PER_MIB = 1_048_576;
@@ -40,8 +40,7 @@ export default function FileListTab({
   const [draftThreshold, setDraftThreshold] = useState<number | null>(null);
   const [checked, setChecked] = useState<Set<string>>(new Set());
   const [showResults, setShowResults] = useState(false);
-  const [pending, setPending] = useState<ConfirmDialogProps | null>(null);
-  const beginPreview = usePreviewOwner();
+  const { pending, reviewNeedsSearch, clearReviewNotice, openReview } = useCleanupConfirmation(() => setShowResults(true));
   const findButton = useRef<HTMLButtonElement>(null);
   const resultsHeading = useRef<HTMLHeadingElement>(null);
 
@@ -58,6 +57,7 @@ export default function FileListTab({
   );
 
   const handleFind = () => {
+    clearReviewNotice();
     setDraftThreshold(threshold);
     if (kind === "large") {
       store.findLargeFiles(threshold * BYTES_PER_MIB);
@@ -92,25 +92,12 @@ export default function FileListTab({
       ? { kind: "trash_large", path, minBytes: search.minBytes }
       : { kind: "trash_stale", path, days: search.days },
     );
-    const owner = beginPreview();
-    if (!owner) return;
-    try {
-      const plan = await store.prepareCleanup(actions, owner.signal);
-      if (owner.signal.aborted) return;
-      setPending({
-        title: t(operationKey),
-        count: plan.actions.length,
-        bytes: plan.totalBytes,
-        notice: "trash",
-        preview: plan.actions.map((f) => f.path),
-        opener,
-        focusFallback: () => resultsHeading.current ?? findButton.current,
-        onConfirm: async () => { await store.executeCleanup(plan.planId); setShowResults(true); },
-        onClose: () => { owner.abort(); setPending(null); },
-      });
-    } catch {
-      owner.abort();
-    }
+    await openReview(actions, {
+      title: t(operationKey),
+      notice: "trash",
+      opener,
+      focusFallback: () => resultsHeading.current ?? findButton.current,
+    });
   };
 
   const handleResultsDone = () => {
@@ -181,7 +168,8 @@ export default function FileListTab({
         </div>
       )}
 
-      {!store.loading && search && !data && (
+      {reviewNeedsSearch && <p role="status" className="text-xs text-text-muted">{t("cleanup.reviewChanged")}</p>}
+      {!reviewNeedsSearch && !store.loading && search && !data && (
         <p className="text-xs text-text-muted">{t("cleanup.notSearched")}</p>
       )}
 

@@ -4,8 +4,8 @@ import { useCleanupStore } from "../../store/useCleanupStore";
 import type { CleanupRequest } from "../../utils/cleanup";
 import { Search, Trash2, FolderX } from "lucide-react";
 import ResultsPanel from "./ResultsPanel";
-import ConfirmDialog, { type ConfirmDialogProps } from "./ConfirmDialog";
-import { usePreviewOwner } from "./usePreviewOwner";
+import ConfirmDialog from "./ConfirmDialog";
+import { useCleanupConfirmation } from "./useCleanupConfirmation";
 import UnavailableCleanupRoots from "./UnavailableCleanupRoots";
 
 export default function EmptyDirsTab() {
@@ -13,11 +13,12 @@ export default function EmptyDirsTab() {
   const store = useCleanupStore();
   const [checked, setChecked] = useState<Set<string>>(new Set());
   const [showResults, setShowResults] = useState(false);
-  const [pending, setPending] = useState<ConfirmDialogProps | null>(null);
-  const beginPreview = usePreviewOwner();
+  const { pending, reviewNeedsSearch, clearReviewNotice, openReview } = useCleanupConfirmation(() => setShowResults(true));
+  const findButton = useRef<HTMLButtonElement>(null);
   const resultsHeading = useRef<HTMLHeadingElement>(null);
 
   const handleFind = () => {
+    clearReviewNotice();
     store.findEmptyDirs();
     setChecked(new Set());
     setShowResults(false);
@@ -48,26 +49,12 @@ export default function EmptyDirsTab() {
       kind: "remove_empty_dir",
       path,
     }));
-    const owner = beginPreview();
-    if (!owner) return;
-    try {
-      const plan = await store.prepareCleanup(actions, owner.signal);
-      if (owner.signal.aborted) return;
-      setPending({
-        title: t("confirm.op.removeEmptyDirs"),
-        count: plan.actions.length,
-        // `remove_empty_dir` is a bare `fs::remove_dir`, not a trash: there is no
-        // byte figure to quote and no Recycle Bin copy to fall back on.
-        notice: "permanent",
-        preview: plan.actions.map((action) => action.path),
-        opener,
-        focusFallback: () => resultsHeading.current,
-        onConfirm: async () => { await store.executeCleanup(plan.planId); setShowResults(true); },
-        onClose: () => { owner.abort(); setPending(null); },
-      });
-    } catch {
-      owner.abort();
-    }
+    await openReview(actions, {
+      title: t("confirm.op.removeEmptyDirs"),
+      notice: "permanent",
+      opener,
+      focusFallback: () => resultsHeading.current ?? findButton.current,
+    });
   };
 
   const handleResultsDone = () => {
@@ -95,6 +82,7 @@ export default function EmptyDirsTab() {
       <div className="flex items-center justify-between">
         <p className="text-xs text-text-muted">{t("cleanup.emptyDirsHint")}</p>
         <button
+          ref={findButton}
           onClick={handleFind}
           disabled={store.loading || store.busy || !!store.preparedPlan}
           className="flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-on-primary hover:bg-primary-hover disabled:opacity-50 transition-colors"
@@ -104,6 +92,7 @@ export default function EmptyDirsTab() {
         </button>
       </div>
 
+      {reviewNeedsSearch && <p role="status" className="text-xs text-text-muted">{t("cleanup.reviewChanged")}</p>}
       {store.error && (
         <div className="rounded-lg bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 px-4 py-3 text-xs text-red-700 dark:text-red-400">
           {store.error}

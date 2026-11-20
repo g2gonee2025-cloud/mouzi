@@ -404,6 +404,7 @@
     "historyLoading": "Caricamento della cronologia di pulizia…",
     "historyError": "Impossibile caricare la cronologia di pulizia.",
     "notSearched": "Avvia una ricerca per esaminare i candidati.",
+    "reviewChanged": "L’anteprima della pulizia è cambiata. Ripeti la ricerca per esaminare gli elementi attuali.",
     "historyUnknown": "Esito sconosciuto"
   },
   "suggestions": {

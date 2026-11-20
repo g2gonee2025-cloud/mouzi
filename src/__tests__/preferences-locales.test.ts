@@ -10,7 +10,7 @@ const keys = [
   "settings.history.showing", "dashboard.loadingFiles", "dashboard.rootPending", "dashboard.rootStale",
   "dashboard.rootFailed", "dashboard.rootLastScan", "dashboard.scanFailed",
   "settings.ignore.extensionTip", "settings.ignore.folderTip", "settings.ignore.officeTip", "settings.ignore.exactTip",
-  "cleanup.historyLoading", "cleanup.historyError", "cleanup.notSearched", "cleanup.historyUnknown",
+  "cleanup.historyLoading", "cleanup.historyError", "cleanup.notSearched", "cleanup.reviewChanged", "cleanup.historyUnknown",
   "beta.allWatched", "beta.recoveryUnavailable",
   ...["resetDismissed", "rulePreview", "ruleScope", "rulePriority", "ruleExtension", "ruleDestination", "ruleAlreadyCovered", "ruleConflict", "ruleNotApplicable", "partial", "preparing", "ruleCount", "planChanged"].map((name) => `suggestions.${name}`),
   ...["Documents", "Images", "Videos", "Audio", "Archives", "Code", "Other"].map((name) => `categories.${name}`),
