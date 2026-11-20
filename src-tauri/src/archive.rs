@@ -237,7 +237,8 @@ struct ExtractionReceipt {
 
 struct PublishedArchiveNames {
     names: HashSet<String>,
-    next_owned_suffix: HashMap<String, usize>,
+    ascii_folded_names: HashSet<String>,
+    next_owned_suffix: HashMap<(String, bool), usize>,
     foreign_probe_limit: usize,
 }
 
@@ -245,6 +246,7 @@ impl Default for PublishedArchiveNames {
     fn default() -> Self {
         Self {
             names: HashSet::new(),
+            ascii_folded_names: HashSet::new(),
             next_owned_suffix: HashMap::new(),
             foreign_probe_limit: 10_000,
         }
@@ -291,6 +293,7 @@ struct Budget<'a> {
     cancelled: &'a AtomicBool,
     bytes: u64,
     receipt: ExtractionReceipt,
+    staging_guard: &'a AncestorGuard,
     journal: Option<&'a mut EntryJournal>,
     last_progress: Instant,
     progress_interval: Duration,
@@ -374,7 +377,7 @@ impl Budget<'_> {
         let journal = &mut self.journal;
         let (cancelled, started, duration) = (self.cancelled, self.started, self.limits.duration);
         let name = publish_entry(
-            staging, &stage, &output, file_name, &mut self.receipt.published_names,
+            staging, self.staging_guard, &stage, &output, file_name, &mut self.receipt.published_names,
             || check_extraction_active(cancelled, started, duration),
             |destination| {
                 if let Some(journal) = journal {
@@ -426,7 +429,9 @@ fn extract_archive_in(
         .to_string_lossy();
     save_manifest_with_receipt(&staging_dir, Some(path), "extracting", &[], None, None, Some(&journal_name))
         .map_err(setup_error)?;
-    let (result, receipt) = extract_archive_from(source, format, &staging_dir, LIMITS, cancelled, &mut progress, Some(&mut journal));
+    let (result, receipt) = extract_archive_from(
+        source, format, &staging_dir, &staging_guard, LIMITS, cancelled, &mut progress, Some(&mut journal),
+    );
     let extracted_files = receipt.extracted.len();
     match result {
         Ok(()) => {
@@ -510,17 +515,19 @@ fn open_archive(path: &Path, limits: Limits) -> Result<(File, AncestorGuard, Arc
 #[cfg(test)]
 fn extract_archive_to_with_progress(path: &Path, staging_dir: &Path, limits: Limits, cancelled: &AtomicBool, progress: &mut dyn FnMut(u64, usize)) -> Result<usize, String> {
     let (source, _source_guard, format) = open_archive(path, limits)?;
-    let _staging_guard = safe_fs::create_guarded_directory(staging_dir)?;
-    let (result, receipt) = extract_archive_from(source, format, staging_dir, limits, cancelled, progress, None);
+    let staging_guard = safe_fs::create_guarded_directory(staging_dir)?;
+    let (result, receipt) = extract_archive_from(
+        source, format, staging_dir, &staging_guard, limits, cancelled, progress, None,
+    );
     result.map(|()| receipt.extracted.len())
 }
 
 fn extract_archive_from<'a>(
-    source: File, format: ArchiveFormat, staging_dir: &Path, limits: Limits,
+    source: File, format: ArchiveFormat, staging_dir: &Path, staging_guard: &'a AncestorGuard, limits: Limits,
     cancelled: &'a AtomicBool, progress: &'a mut dyn FnMut(u64, usize), journal: Option<&'a mut EntryJournal>,
 ) -> (Result<(), String>, ExtractionReceipt) {
     let mut budget = Budget {
-        limits, started: Instant::now(), cancelled, bytes: 0, receipt: ExtractionReceipt::default(), journal,
+        limits, started: Instant::now(), cancelled, bytes: 0, receipt: ExtractionReceipt::default(), staging_guard, journal,
         last_progress: Instant::now(), progress_interval: Duration::from_millis(250), progress,
     };
     let result = (|| {
@@ -846,7 +853,7 @@ fn create_entry_stage(staging: &Path, entry_index: usize, target_name: &str) -> 
 }
 
 fn publish_entry(
-    staging: &Path, stage: &Path, output: &File, file_name: &str,
+    staging: &Path, staging_guard: &AncestorGuard, stage: &Path, output: &File, file_name: &str,
     published_names: &mut PublishedArchiveNames,
     mut check_active: impl FnMut() -> Result<(), String>,
     mut record_destination: impl FnMut(&str) -> Result<(), String>,
@@ -854,17 +861,29 @@ fn publish_entry(
     let leaf = Path::new(file_name);
     let stem = leaf.file_stem().and_then(|s| s.to_str()).unwrap_or(file_name);
     let extension = leaf.extension().and_then(|s| s.to_str());
+    // Query the pinned directory while it contains this entry's staged file.
+    // A confirmed case-insensitive directory can reuse ASCII alias ownership.
+    let ascii_case_aliases = staging_guard.has_ascii_case_aliases();
+    let cursor_key = (
+        if ascii_case_aliases { file_name.to_ascii_lowercase() } else { file_name.to_owned() },
+        ascii_case_aliases,
+    );
     // Remember only the contiguous prefix of names this import already
     // published. A foreign file can disappear, so its slot remains eligible
     // and receives a fresh filesystem check on the next entry.
-    let mut next_owned = published_names.next_owned_suffix.get(file_name).copied().unwrap_or(0);
+    let mut next_owned = published_names.next_owned_suffix.get(&cursor_key).copied().unwrap_or(0);
     // The import can publish up to LIMITS.entries files with the same basename.
     // Bound filesystem probes separately when other occupants block publication.
     let mut probes_remaining = published_names.foreign_probe_limit;
     for index in next_owned.. {
         check_active()?;
         let name = if index == 0 { file_name.to_string() } else { match extension { Some(ext) => format!("{stem} ({index}).{ext}"), None => format!("{stem} ({index})") } };
-        if published_names.names.contains(&name) {
+        let already_owned = if ascii_case_aliases {
+            published_names.ascii_folded_names.contains(&name.to_ascii_lowercase())
+        } else {
+            published_names.names.contains(&name)
+        };
+        if already_owned {
             if next_owned == index { next_owned += 1; }
             continue;
         }
@@ -877,9 +896,10 @@ fn publish_entry(
         match safe_fs::publish_staged_file(output, stage, &target) {
             Ok(true) => {
                 published_names.names.insert(name.clone());
+                published_names.ascii_folded_names.insert(name.to_ascii_lowercase());
                 if next_owned == index { next_owned += 1; }
                 if index > 0 && next_owned > 0 {
-                    published_names.next_owned_suffix.insert(file_name.to_owned(), next_owned);
+                    published_names.next_owned_suffix.insert(cursor_key, next_owned);
                 }
                 return Ok(name);
             }
@@ -1657,12 +1677,14 @@ mod tests {
         let source = root.join("fixture.zip");
         write_zip(&source, &[("entry.txt", b"data")]);
         let cancelled = AtomicBool::new(false);
+        let staging_guard = safe_fs::guard_directory(&root).unwrap();
         let budget = Budget {
             limits: LIMITS,
             started: Instant::now(),
             cancelled: &cancelled,
             bytes: 0,
             receipt: ExtractionReceipt::default(),
+            staging_guard: &staging_guard,
             journal: None,
             last_progress: Instant::now(),
             progress_interval: Duration::from_millis(250),
@@ -1675,6 +1697,7 @@ mod tests {
         let error = ZipArchive::new(reader).err().expect("cancelled ZIP constructor");
         assert!(error.to_string().contains("cancelled"), "{error}");
         drop(guard);
+        drop(staging_guard);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1883,7 +1906,7 @@ mod tests {
             };
             let mut budget = Budget {
                 limits: LIMITS, started: Instant::now(), cancelled: &cancelled, bytes: 0,
-                receipt: ExtractionReceipt::default(), journal: None, last_progress: Instant::now(),
+                receipt: ExtractionReceipt::default(), staging_guard: &staging_guard, journal: None, last_progress: Instant::now(),
                 progress_interval: Duration::ZERO, progress: &mut progress,
             };
             let canonical_staging = fs::canonicalize(&staging).unwrap();
@@ -1949,26 +1972,32 @@ mod tests {
         for index in 1..last_index {
             published.names.insert(format!("index ({index}).txt"));
         }
-        published.next_owned_suffix.insert("index.txt".into(), last_index);
+        published.ascii_folded_names = published.names.clone();
+        published.next_owned_suffix.insert(("index.txt".into(), false), last_index);
+        published.next_owned_suffix.insert(("index.txt".into(), true), last_index);
 
         let root = test_dir("archive-last-owned-suffix");
         let staging = fs::canonicalize(&root).unwrap();
+        let staging_guard = safe_fs::guard_directory(&staging).unwrap();
         let (_, stage, mut output) = create_entry_stage(&staging, last_index, "index.txt").unwrap();
         output.write_all(b"last entry").unwrap();
         let mut ready = Vec::new();
-        let result = publish_entry(&staging, &stage, &output, "index.txt", &mut published,
+        let result = publish_entry(&staging, &staging_guard, &stage, &output, "index.txt", &mut published,
             || Ok(()), |name| { ready.push(name.to_owned()); Ok(()) });
         drop(output);
         let name = format!("index ({last_index}).txt");
         let contents = fs::read(staging.join(&name)).ok();
+        drop(staging_guard);
         fs::remove_dir_all(root).unwrap();
         assert_eq!(result.unwrap(), name);
         assert_eq!(ready, [name]);
         assert_eq!(contents.as_deref(), Some(b"last entry".as_slice()));
     }
 
+    #[cfg(windows)]
     fn assert_mixed_case_publication(root: PathBuf, require_case_sensitive: bool) {
         let staging = fs::canonicalize(&root).unwrap();
+        let staging_guard = safe_fs::guard_directory(&staging).unwrap();
         let mut published = PublishedArchiveNames {
             foreign_probe_limit: 3,
             ..PublishedArchiveNames::default()
@@ -1977,7 +2006,7 @@ mod tests {
         let mut publish = |index, name, bytes: &[u8]| {
             let (_, stage, mut output) = create_entry_stage(&staging, index, name).unwrap();
             output.write_all(bytes).unwrap();
-            publish_entry(&staging, &stage, &output, name, &mut published, || Ok(()), |name| {
+            publish_entry(&staging, &staging_guard, &stage, &output, name, &mut published, || Ok(()), |name| {
                 ready.push(name.to_owned());
                 Ok(())
             })
@@ -2000,6 +2029,7 @@ mod tests {
         fs::remove_file(&foreign).unwrap();
         let freed_slot = publish(5, "report.txt", b"import in vacated slot");
         let freed_bytes = fs::read(&foreign).ok();
+        drop(staging_guard);
         fs::remove_dir_all(root).unwrap();
 
         assert!(!require_case_sensitive || !aliases, "fixture must distinguish ASCII case");
@@ -2014,6 +2044,7 @@ mod tests {
         assert_eq!(ready, ["index.txt", "index (1).txt", "index (2).txt", expected, "report (1).txt", "report.txt"]);
     }
 
+    #[cfg(windows)]
     #[test]
     fn mixed_case_publications_do_not_spend_foreign_probe_budget() {
         assert_mixed_case_publication(test_dir("archive-case-publication"), false);
@@ -2037,13 +2068,14 @@ mod tests {
     fn cancel_during_filename_search_preserves_existing_and_staged_files() {
         let root = test_dir("archive-cancel-filename-search");
         let staging = fs::canonicalize(&root).unwrap();
+        let staging_guard = safe_fs::guard_directory(&staging).unwrap();
         fs::write(staging.join("report.txt"), b"existing").unwrap();
         let (_, stage, mut output) = create_entry_stage(&staging, 0, "report.txt").unwrap();
         output.write_all(b"staged").unwrap();
         let mut checks = 0;
         let mut ready = Vec::new();
         let result = publish_entry(
-            &staging, &stage, &output, "report.txt",
+            &staging, &staging_guard, &stage, &output, "report.txt",
             &mut PublishedArchiveNames::default(),
             || {
                 checks += 1;
@@ -2057,6 +2089,7 @@ mod tests {
         assert_eq!(fs::read(staging.join("report.txt")).unwrap(), b"existing");
         assert_eq!(fs::read(stage).unwrap(), b"staged");
         assert!(!staging.join("report (1).txt").exists());
+        drop(staging_guard);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -2064,13 +2097,14 @@ mod tests {
     fn publication_rechecks_foreign_names_and_never_reuses_its_own_names() {
         let root = test_dir("archive-name-ownership");
         let staging = fs::canonicalize(&root).unwrap();
+        let staging_guard = safe_fs::guard_directory(&staging).unwrap();
         let external_directory = staging.join("report (1).txt");
         fs::create_dir(&external_directory).unwrap();
         let mut publications = PublishedArchiveNames::default();
         let mut publish = |index, bytes: &[u8], record: &mut dyn FnMut(&str) -> Result<(), String>| {
             let (_, stage, mut output) = create_entry_stage(&staging, index, "report.txt").unwrap();
             output.write_all(bytes).unwrap();
-            publish_entry(&staging, &stage, &output, "report.txt", &mut publications, || Ok(()), record).unwrap()
+            publish_entry(&staging, &staging_guard, &stage, &output, "report.txt", &mut publications, || Ok(()), record).unwrap()
         };
         assert_eq!(publish(0, b"first", &mut |_| Ok(())), "report.txt");
         let mut proposed = Vec::new();
@@ -2088,6 +2122,7 @@ mod tests {
         assert_eq!(fs::read(staging.join("report (1).txt")).unwrap(), b"third");
         assert_eq!(fs::read(staging.join("report (2).txt")).unwrap(), b"concurrent file");
         assert_eq!(fs::read(staging.join("report (3).txt")).unwrap(), b"second");
+        drop(staging_guard);
         fs::remove_dir_all(root).unwrap();
     }
 

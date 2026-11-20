@@ -79,6 +79,20 @@ mod windows_fs {
         Ok(FileIdentity { volume: info.volume, file_id: info.id })
     }
 
+    pub(super) fn has_ascii_case_aliases(directory: &File) -> bool {
+        const FILE_CASE_SENSITIVE_INFO: i32 = 23;
+        let mut flags = u32::MAX;
+        let ok = unsafe {
+            GetFileInformationByHandleEx(
+                directory.as_raw_handle(),
+                FILE_CASE_SENSITIVE_INFO,
+                (&mut flags as *mut u32).cast(),
+                std::mem::size_of::<u32>() as u32,
+            )
+        };
+        ok != 0 && flags == 0
+    }
+
     pub(super) fn links(file: &File) -> io::Result<u64> {
         let mut info: ByHandleInfo = unsafe { std::mem::zeroed() };
         if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 { return Err(io::Error::last_os_error()); }
@@ -382,6 +396,20 @@ pub fn eligible_scope(folders: &[crate::db::WatchedFolder]) -> Result<RootScope,
 
 #[derive(Debug)]
 pub struct AncestorGuard { _files: Vec<File> }
+
+impl AncestorGuard {
+    pub(crate) fn has_ascii_case_aliases(&self) -> bool {
+        #[cfg(windows)]
+        {
+            // pin_ancestry orders the guarded directory before its parents.
+            self._files.first().is_some_and(windows_fs::has_ascii_case_aliases)
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct ValidatedFile {
