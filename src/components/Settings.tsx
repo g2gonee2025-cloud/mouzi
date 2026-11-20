@@ -186,6 +186,7 @@ export default function Settings() {
   const { t } = useTranslation();
   const {
     rules,
+    ruleRefreshError,
     folders,
     folderRead,
     historyCounts,
@@ -347,6 +348,15 @@ export default function Settings() {
     if (await runWrite(() => rule.id ? updateRule(rule) : addRule(rule))) setEditingRule(null);
   };
 
+  const toggleRule = async (rule: Rule) => {
+    const { id } = rule;
+    if (id === undefined) return;
+    const enabled = !rule.enabled;
+    if (await runWrite(() => updateRule({ ...rule, enabled }))) {
+      setEditingRule((draft) => draft?.id === id ? { ...draft, enabled } : draft);
+    }
+  };
+
   const askRemoveFolder = (folder: WatchedFolder, opener: HTMLButtonElement) => {
     if (folder.id === undefined) return;
     setPending({
@@ -361,7 +371,8 @@ export default function Settings() {
   };
 
   const askDeleteRule = (rule: Rule, opener: HTMLButtonElement) => {
-    if (rule.id === undefined) return;
+    const { id } = rule;
+    if (id === undefined) return;
     setPending({
       title: t("confirm.op.deleteRule"),
       count: 1,
@@ -369,7 +380,10 @@ export default function Settings() {
       note: t("confirm.note.deleteRule"),
       opener,
       focusFallback: () => sectionHeading.current,
-      onConfirm: () => deleteRule(rule.id!),
+      onConfirm: async () => {
+        await deleteRule(id);
+        setEditingRule((draft) => draft?.id === id ? null : draft);
+      },
     });
   };
 
@@ -446,6 +460,10 @@ export default function Settings() {
     try {
       const count = await importRules(replaceOnImport);
       if (count === null) return;
+      if (replaceOnImport) {
+        const remaining = useAppStore.getState().rules;
+        setEditingRule((draft) => draft?.id !== undefined && !remaining.some((rule) => rule.id === draft.id) ? null : draft);
+      }
       setRuleToast({
         message: t("settings.rules.importSuccess", { count }),
         type: "success",
@@ -649,6 +667,15 @@ export default function Settings() {
               </button>
             </div>
 
+            {ruleRefreshError && (
+              <div className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs text-amber-800 dark:border-amber-900 dark:bg-amber-900/20 dark:text-amber-200">
+                <p role="alert">{t("settings.rules.refreshAfterWriteError", { error: ruleRefreshError })}</p>
+                <button type="button" className="mt-1 underline" onClick={() => loadRules(true).catch(() => {})}>
+                  {t("common.retry")}
+                </button>
+              </div>
+            )}
+
             {/* Export / Import */}
             <div className="rounded-lg border border-border bg-surface-dark p-4 space-y-3">
               <div className="flex flex-wrap items-center gap-2">
@@ -810,7 +837,7 @@ export default function Settings() {
                     className="flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-on-primary hover:bg-primary-hover disabled:opacity-50"
                   >
                     <Save size={14} />
-                    {t("settings.rules.edit")}
+                    {t("settings.rules.save")}
                   </button>
                   <button
                     onClick={() => setEditingRule(null)}
@@ -849,7 +876,7 @@ export default function Settings() {
                       role="switch"
                       aria-checked={r.enabled}
                       aria-label={`${r.name}: ${r.enabled ? t("settings.rules.enabled") : t("common.off")}`}
-                      onClick={() => { void runWrite(() => updateRule({ ...r, enabled: !r.enabled })); }}
+                      onClick={() => void toggleRule(r)}
                       className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2 ${r.enabled ? "bg-primary" : "bg-border"
                         }`}
                     >

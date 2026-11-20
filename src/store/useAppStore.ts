@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
+import { normalizeExtensions } from '../utils/ruleInput';
 
 export interface Rule {
   id?: number;
@@ -137,6 +138,7 @@ type FolderRead = { status: 'loading' | 'ready' } | { status: 'failed'; error: s
 
 interface AppState {
   rules: Rule[];
+  ruleRefreshError: string | null;
   folders: WatchedFolder[];
   folderRead: FolderRead;
   logs: ActionLog[];
@@ -159,7 +161,7 @@ interface AppState {
   applySettings: (settings: AppSettings) => void;
   saveSettings: (settings: PreferencesPatch) => Promise<void>;
   setAutostart: (enabled: boolean) => Promise<void>;
-  loadRules: () => Promise<void>;
+  loadRules: (reportRefreshError?: boolean) => Promise<void>;
   loadFolders: () => Promise<void>;
   loadLogs: (reportActionWarning?: boolean) => Promise<void>;
   loadHistoryCounts: (reportActionWarning?: boolean) => Promise<HistoryCounts>;
@@ -198,6 +200,7 @@ function scheduleFrom(settings: AppSettings): ScheduleSettings {
   };
 }
 
+let rulesRequest = 0;
 let foldersRequest = 0;
 let logsRequest = 0;
 let countsRequest = 0;
@@ -212,8 +215,15 @@ function withActionRefreshError(state: AppState, key: keyof ActionRefreshErrors,
     : { ...state.actionRefreshErrors, [key]: value };
 }
 
+function withSavedRule(rules: Rule[], rule: Rule): Rule[] {
+  const saved = { ...rule, extensions: normalizeExtensions(rule.extensions) };
+  return [...rules.filter((current) => current.id !== saved.id), saved]
+    .sort((first, second) => first.priority - second.priority || (first.id ?? 0) - (second.id ?? 0));
+}
+
 export const useAppStore = create<AppState>((set, get) => ({
   rules: [],
+  ruleRefreshError: null,
   folders: [],
   folderRead: { status: 'loading' },
   logs: [],
@@ -272,9 +282,15 @@ export const useAppStore = create<AppState>((set, get) => ({
     await get().saveSettings({ autostart: enabled });
   },
 
-  loadRules: async () => {
-    const rules = await invoke<Rule[]>('get_rules_cmd');
-    set({ rules });
+  loadRules: async (reportRefreshError = false) => {
+    const request = ++rulesRequest;
+    try {
+      const rules = await invoke<Rule[]>('get_rules_cmd');
+      if (request === rulesRequest) set({ rules, ruleRefreshError: null });
+    } catch (error) {
+      if (reportRefreshError && request === rulesRequest) set({ ruleRefreshError: String(error) });
+      throw error;
+    }
   },
 
   loadFolders: async () => {
@@ -399,18 +415,21 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   addRule: async (rule) => {
-    await invoke('add_rule_cmd', { rule });
-    await get().loadRules();
+    const id = await invoke<number>('add_rule_cmd', { rule });
+    set((state) => ({ rules: withSavedRule(state.rules, { ...rule, id }) }));
+    await get().loadRules(true).catch(() => {});
   },
 
   updateRule: async (rule) => {
     await invoke('update_rule_cmd', { rule });
-    await get().loadRules();
+    set((state) => ({ rules: withSavedRule(state.rules, rule) }));
+    await get().loadRules(true).catch(() => {});
   },
 
   deleteRule: async (id) => {
     await invoke('delete_rule_cmd', { id });
-    await get().loadRules();
+    set((state) => ({ rules: state.rules.filter((rule) => rule.id !== id) }));
+    await get().loadRules(true).catch(() => {});
   },
 
   clearLogs: async (throughId) => {
@@ -441,7 +460,10 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   importRules: async (replace) => {
     const count = await invoke<number | null>('import_rules_cmd', { replace });
-    if (count !== null) await get().loadRules();
+    if (count !== null) {
+      if (replace) set({ rules: [] });
+      await get().loadRules(true).catch(() => {});
+    }
     return count;
   },
 

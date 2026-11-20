@@ -76,6 +76,7 @@
       "exportSuccess": "Wyeksportowano reguły",
       "importSuccess": "Zaimportowano {{count}} reguł",
       "importError": "Nie udało się zaimportować reguł",
+      "refreshAfterWriteError": "Zapisano zmiany reguł. Nie udało się odświeżyć listy reguł. {{error}}",
       "exportError": "Nie udało się wyeksportować reguł",
       "replaceOnImport": "Zastąp istniejące reguły (w przeciwnym razie dopisz)",
       "pickDestination": "Wybierz folder docelowy",

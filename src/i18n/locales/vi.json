@@ -82,6 +82,7 @@
       "exportSuccess": "Đã xuất các quy tắc",
       "importSuccess": "Đã nhập {{count}} quy tắc",
       "importError": "Lỗi khi nhập quy tắc",
+      "refreshAfterWriteError": "Các thay đổi về quy tắc đã được lưu. Không thể làm mới danh sách quy tắc. {{error}}",
       "exportError": "Lỗi khi xuất quy tắc",
       "replaceOnImport": "Thay thế các quy tắc hiện có (nếu không sẽ thêm nối tiếp)",
       "pickDestination": "Chọn thư mục đích",

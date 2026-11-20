@@ -76,6 +76,7 @@
       "exportSuccess": "Regole esportate",
       "importSuccess": "Importate {{count}} regole",
       "importError": "Impossibile importare le regole",
+      "refreshAfterWriteError": "Le modifiche alle regole sono state salvate. L’aggiornamento dell’elenco non è riuscito. {{error}}",
       "exportError": "Impossibile esportare le regole",
       "replaceOnImport": "Sostituisci le regole esistenti (altrimenti aggiungi)",
       "pickDestination": "Scegli cartella di destinazione",

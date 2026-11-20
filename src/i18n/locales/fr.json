@@ -76,6 +76,7 @@
       "exportSuccess": "Règles exportées",
       "importSuccess": "{{count}} règles importées",
       "importError": "Échec de l'importation des règles",
+      "refreshAfterWriteError": "Les modifications des règles ont été enregistrées. L’actualisation de la liste a échoué. {{error}}",
       "exportError": "Échec de l'exportation des règles",
       "replaceOnImport": "Remplacer les règles existantes (sinon ajouter)",
       "pickDestination": "Choisir le dossier de destination",

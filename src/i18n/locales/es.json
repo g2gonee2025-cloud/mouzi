@@ -60,6 +60,7 @@
       "exportSuccess": "Reglas exportadas",
       "importSuccess": "{{count}} reglas importadas",
       "importError": "Error al importar reglas",
+      "refreshAfterWriteError": "Se guardaron los cambios en las reglas. No se pudo actualizar la lista. {{error}}",
       "exportError": "Error al exportar reglas",
       "replaceOnImport": "Reemplazar reglas existentes (de lo contrario agregar)",
       "pickDestination": "Elegir carpeta de destino",

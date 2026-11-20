@@ -76,6 +76,7 @@
       "exportSuccess": "规则已导出",
       "importSuccess": "已导入 {{count}} 条规则",
       "importError": "导入规则失败",
+      "refreshAfterWriteError": "规则更改已保存。刷新规则列表失败。{{error}}",
       "exportError": "导出规则失败",
       "replaceOnImport": "替换现有规则（否则追加）",
       "pickDestination": "选择目标文件夹",

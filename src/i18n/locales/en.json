@@ -76,6 +76,7 @@
       "exportSuccess": "Rules exported",
       "importSuccess": "Imported {{count}} rules",
       "importError": "Failed to import rules",
+      "refreshAfterWriteError": "Rule changes were saved. Refreshing the rule list failed. {{error}}",
       "exportError": "Failed to export rules",
       "replaceOnImport": "Replace existing rules (otherwise append)",
       "pickDestination": "Choose destination folder",

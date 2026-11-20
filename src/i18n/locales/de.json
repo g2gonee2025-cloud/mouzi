@@ -76,6 +76,7 @@
       "exportSuccess": "Regeln exportiert",
       "importSuccess": "{{count}} Regeln importiert",
       "importError": "Regeln konnten nicht importiert werden",
+      "refreshAfterWriteError": "Die Regeländerungen wurden gespeichert. Die Regelliste konnte nicht aktualisiert werden. {{error}}",
       "exportError": "Regeln konnten nicht exportiert werden",
       "replaceOnImport": "Bestehende Regeln ersetzen (ansonsten anhängen)",
       "pickDestination": "Zielordner auswählen",
