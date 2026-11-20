@@ -2475,6 +2475,45 @@ mod undo_tests {
     }
 
     #[test]
+    fn undo_saved_eligibility_agrees_with_bulk_review_and_history_counts() {
+        let fixture = UndoFixture::new("saved_eligibility");
+        let time = "2026-01-01T00:00:00Z";
+        let (source, destination) = stage(fixture.root(), "verified.undocheck");
+        let verified = insert_log(time, &source, Some(&destination));
+        let (missing_source, missing_destination) = stage(fixture.root(), "missing.undocheck");
+        let missing_verified = insert_log(time, &missing_source, Some(&missing_destination));
+        std::fs::rename(&missing_destination, fixture.root().join("held.undocheck")).unwrap();
+        let identity = crate::safe_fs::file_identity(Path::new(&destination)).unwrap().key();
+        let note = |name: &str, dest, identity| {
+            insert_log_with_identity(time, &fixture.root().join(name).to_string_lossy(), dest, identity)
+        };
+        let legacy = note("legacy.undocheck", Some(&destination), None);
+        note("null-destination.undocheck", None, Some(&identity));
+        note("empty-destination.undocheck", Some(""), Some(&identity));
+        let deleted = note("deleted.undocheck", Some(&destination), Some(&identity));
+        let undone = note("restored.undocheck", Some(&destination), Some(&identity));
+        {
+            let conn = lock_db().unwrap();
+            conn.execute("UPDATE action_logs SET action='delete' WHERE id=?1", [deleted]).unwrap();
+            conn.execute("UPDATE action_logs SET undone=1 WHERE id=?1", [undone]).unwrap();
+        }
+
+        let counts = get_history_counts_cmd().unwrap();
+        assert_eq!(counts.total, 7);
+        let reviewed: Vec<_> = preview_undo_all_cmd().unwrap().into_iter().map(|row| row.id).collect();
+        assert_eq!(reviewed, [missing_verified, verified]);
+        assert_eq!(counts.undoable, 2);
+        assert!(undo_all_with(&ignored_files(), &[legacy], |_| panic!("legacy row must not cancel queued work")).is_err());
+
+        let conn = lock_db().unwrap();
+        conn.execute("UPDATE action_logs SET undone=1 WHERE id IN (?1,?2)", [missing_verified, verified]).unwrap();
+        drop(conn);
+        assert_eq!(get_history_counts_cmd().unwrap().undoable, 0);
+        assert!(preview_undo_all_cmd().unwrap().is_empty());
+        assert_eq!(get_history_counts_cmd().unwrap().total, 7);
+    }
+
+    #[test]
     fn undo_lookup_error_keeps_history_retryable() {
         let fixture = UndoFixture::new("lookup_error");
         let source = fixture.root().join("source.undocheck");

@@ -88,11 +88,13 @@ function renderRetainedPopup() {
   return Popup();
 }
 
-function renderRecentActivity(destination: string | null) {
-  useAppStore.setState({ logs: [{
+function renderRecentActivity(destination: string | null, undoVerified = true, action = "move", undone = false) {
+  const log = {
     id: 1, timestamp: "2026-11-20", source_path: "C:/Fixture/arrival.txt",
-    destination_path: destination, action: "move", file_name: "arrival.txt", file_type: "text", undone: false,
-  }] });
+    destination_path: destination, action, file_name: "arrival.txt", file_type: "text", undone,
+    undo_verified: undoVerified,
+  };
+  useAppStore.setState({ logs: [log] });
   return renderRetainedPopup();
 }
 
@@ -126,10 +128,31 @@ it("shows a failed activity-folder open until the next successful open", async (
   }
 });
 
-it("keeps Undo available for recent activity without a destination", () => {
-  const popup = renderRecentActivity(null);
+it.each([null, ""])("withholds Undo for a verified row with no recorded destination (%s)", (destination) => {
+  const popup = renderRecentActivity(destination);
   expect(recentButton(popup, en.cleanup.openFolder)).toBeUndefined();
-  expect(recentButton(popup, en.popup.undo)).toBeDefined();
+  expect(recentButton(popup, en.popup.undo)).toBeUndefined();
+});
+
+it("keeps the recorded folder but withholds Undo for an unverified legacy move", () => {
+  const popup = renderRecentActivity("C:/Fixture/arrival.txt", false);
+  expect(recentButton(popup, en.cleanup.openFolder)).toBeDefined();
+  expect(recentButton(popup, en.popup.undo)).toBeUndefined();
+});
+
+it("withholds Undo for a legacy removal or a completed restore", () => {
+  expect(recentButton(renderRecentActivity("C:/Fixture/arrival.txt", true, "delete"), en.popup.undo)).toBeUndefined();
+  expect(recentButton(renderRecentActivity("C:/Fixture/arrival.txt", true, "move", true), en.popup.undo)).toBeUndefined();
+});
+
+it.each(["move", "rename", "accept"])("sends Undo for a verified saved %s", async (action) => {
+  const popup = renderRecentActivity("C:/Fixture/arrival.txt", true, action);
+  const undo = recentButton(popup, en.popup.undo);
+  expect(undo).toBeDefined();
+  fixture.invoke.mockResolvedValueOnce({ status: "ok", restoredTo: "C:/Fixture/arrival.txt", message: null })
+    .mockResolvedValue([]);
+  await undo?.props.onClick?.();
+  expect(fixture.invoke).toHaveBeenNthCalledWith(1, "undo_action_cmd", { id: 1 });
 });
 
 function pendingCheckbox(popup: ReactNode, filename: string) {
