@@ -3,6 +3,7 @@ import { useTranslation } from "react-i18next";
 import i18n from "../../i18n";
 import { useCleanupStore } from "../../store/useCleanupStore";
 import { cleanupStatusMark, cleanupStatusLabel } from "../../utils/cleanup";
+import { parentDir } from "../../utils/paths";
 import { ExternalLink } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 
@@ -17,8 +18,7 @@ export default function HistoryPanel() {
 
   const handleOpen = async (path: string) => {
     try {
-      const parent = path.replace(/[\\/][^\\/]+$/, "");
-      await invoke("open_folder_cmd", { path: parent });
+      await invoke("open_folder_cmd", { path: parentDir(path) });
     } catch (error) {
       setOpenError(String(error));
     }

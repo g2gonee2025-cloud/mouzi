@@ -21,7 +21,14 @@ describe("fileName / parentDir", () => {
   it("keeps the separator on a drive root so Explorer opens the root", () => {
     expect(parentDir("C:\\photo.jpg")).toBe("C:\\");
     expect(parentDir("D:/photo.jpg")).toBe("D:/");
+    expect(parentDir("\\\\?\\C:\\photo.jpg")).toBe("\\\\?\\C:\\");
     expect(parentDir("C:\\Users\\me\\photo.jpg")).toBe("C:\\Users\\me");
+    expect(parentDir("\\\\?\\C:\\Filed\\photo.jpg")).toBe("\\\\?\\C:\\Filed");
+  });
+
+  it("keeps UNC parents intact", () => {
+    expect(parentDir("\\\\server\\share\\photo.jpg")).toBe("\\\\server\\share");
+    expect(parentDir("\\\\?\\UNC\\server\\share\\filed\\photo.jpg")).toBe("\\\\?\\UNC\\server\\share\\filed");
   });
 
   it("resolves a posix root parent", () => {

@@ -13,9 +13,8 @@ export function parentDir(path: string): string {
   if (i < 0) return path;
   if (i === 0) return path.slice(0, 1);
   const parent = path.slice(0, i);
-  // "C:\photo.jpg" would otherwise yield "C:", which Explorer resolves to the
-  // current directory on that drive rather than the drive root.
-  return /^[A-Za-z]:$/.test(parent) ? parent + path[i] : parent;
+  // Ordinary and verbatim Windows drive roots require their final separator.
+  return /^(?:\\\\\?\\)?[A-Za-z]:$/.test(parent) ? parent + path[i] : parent;
 }
 
 export function parseHash(hash = typeof window !== "undefined" ? window.location.hash : ""): {
