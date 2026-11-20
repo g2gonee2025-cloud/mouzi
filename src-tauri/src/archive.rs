@@ -1,7 +1,7 @@
 use crate::safe_fs::{self, AncestorGuard};
 use flate2::read::GzDecoder;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, FileTimes, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
@@ -50,6 +50,13 @@ pub fn cancel_import() -> Result<(), String> {
 struct ExtractionReceipt {
     extracted: Vec<ExtractedEntry>,
     incomplete: Option<IncompleteEntry>,
+    published_names: PublishedArchiveNames,
+}
+
+#[derive(Default)]
+struct PublishedArchiveNames {
+    names: HashSet<String>,
+    next_owned_suffix: HashMap<String, usize>,
 }
 
 #[derive(Serialize)]
@@ -118,9 +125,7 @@ impl<R: Read> Read for GuardedReader<'_, R> {
 }
 impl Budget<'_> {
     fn check(&self) -> Result<(), String> {
-        if self.cancelled.load(Ordering::Relaxed) { return Err("Archive import cancelled".into()); }
-        if self.started.elapsed() >= self.limits.duration { return Err("Archive import time limit exceeded".into()); }
-        Ok(())
+        check_extraction_active(self.cancelled, self.started, self.limits.duration)
     }
     fn copy(&mut self, input: &mut impl Read, output: &mut File, expected: u64) -> Result<(), String> {
         let mut buffer = [0u8; 64 * 1024];
@@ -174,16 +179,27 @@ impl Budget<'_> {
         preserve_modified_time(&output, &stage, modified)?;
         output.sync_all().map_err(|error| error.to_string())?;
         self.check()?;
-        let name = publish_entry(staging, &stage, &output, entry_path, file_name, |destination| {
-            if let Some(journal) = &mut self.journal {
-                journal.append(&EntryEvent::Ready { name: stage_name.clone(), destination: destination.into() })?;
-            }
-            self.check()
-        })?;
+        let journal = &mut self.journal;
+        let (cancelled, started, duration) = (self.cancelled, self.started, self.limits.duration);
+        let name = publish_entry(
+            staging, &stage, &output, entry_path, file_name, &mut self.receipt.published_names,
+            |destination| {
+                if let Some(journal) = journal {
+                    journal.append(&EntryEvent::Ready { name: stage_name.clone(), destination: destination.into() })?;
+                }
+                check_extraction_active(cancelled, started, duration)
+            },
+        )?;
         self.receipt.incomplete = None;
         self.receipt.extracted.push(ExtractedEntry { name, bytes: size, is_file: true });
         Ok(())
     }
+}
+
+fn check_extraction_active(cancelled: &AtomicBool, started: Instant, duration: Duration) -> Result<(), String> {
+    if cancelled.load(Ordering::Relaxed) { return Err("Archive import cancelled".into()); }
+    if started.elapsed() >= duration { return Err("Archive import time limit exceeded".into()); }
+    Ok(())
 }
 
 pub fn extract_archive(
@@ -626,17 +642,33 @@ fn create_entry_stage(staging: &Path, entry_index: usize, target_name: &str) -> 
 
 fn publish_entry(
     staging: &Path, stage: &Path, output: &File, entry_path: &Path, file_name: &str,
+    published_names: &mut PublishedArchiveNames,
     mut record_destination: impl FnMut(&str) -> Result<(), String>,
 ) -> Result<String, String> {
     let stem = entry_path.file_stem().and_then(|s| s.to_str()).unwrap_or(file_name);
     let extension = entry_path.extension().and_then(|s| s.to_str());
-    for index in 0..10_000 {
+    // Remember only the contiguous prefix of names this import already
+    // published. A foreign file can disappear, so its slot remains eligible
+    // and receives a fresh filesystem check on the next entry.
+    let mut next_owned = published_names.next_owned_suffix.get(file_name).copied().unwrap_or(0);
+    for index in next_owned..10_000 {
         let name = if index == 0 { file_name.to_string() } else { match extension { Some(ext) => format!("{stem} ({index}).{ext}"), None => format!("{stem} ({index})") } };
+        if published_names.names.contains(&name) {
+            if next_owned == index { next_owned += 1; }
+            continue;
+        }
         let target = staging.join(&name);
         if safe_fs::path_occupied(&target)? { continue; }
         record_destination(&name)?;
         match safe_fs::publish_staged_file(output, stage, &target) {
-            Ok(true) => return Ok(name),
+            Ok(true) => {
+                published_names.names.insert(name.clone());
+                if next_owned == index { next_owned += 1; }
+                if index > 0 && next_owned > 0 {
+                    published_names.next_owned_suffix.insert(file_name.to_owned(), next_owned);
+                }
+                return Ok(name);
+            }
             Ok(false) => continue,
             Err(error) => return Err(format!("Cannot publish {}: {error}", target.display())),
         }
@@ -1481,6 +1513,38 @@ mod tests {
         assert_eq!(fs::read(staging.join("report (1).txt")).unwrap(), b"previous contents");
         assert_eq!(fs::read(staging.join("report (2).txt")).unwrap(), b"new contents");
         assert!(file_names(&staging).iter().all(|name| !name.ends_with(".part")));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn publication_rechecks_foreign_names_and_never_reuses_its_own_names() {
+        let root = test_dir("archive-name-ownership");
+        let staging = fs::canonicalize(&root).unwrap();
+        let external_directory = staging.join("report (1).txt");
+        fs::create_dir(&external_directory).unwrap();
+        let mut publications = PublishedArchiveNames::default();
+        let source = Path::new("report.txt");
+        let mut publish = |index, bytes: &[u8], record: &mut dyn FnMut(&str) -> Result<(), String>| {
+            let (_, stage, mut output) = create_entry_stage(&staging, index, "report.txt").unwrap();
+            output.write_all(bytes).unwrap();
+            publish_entry(&staging, &stage, &output, source, "report.txt", &mut publications, record).unwrap()
+        };
+        assert_eq!(publish(0, b"first", &mut |_| Ok(())), "report.txt");
+        let mut proposed = Vec::new();
+        assert_eq!(publish(1, b"second", &mut |name| {
+            proposed.push(name.to_owned());
+            if name == "report (2).txt" {
+                fs::write(staging.join(name), b"concurrent file").unwrap();
+            }
+            Ok(())
+        }), "report (3).txt");
+        assert_eq!(proposed, ["report (2).txt", "report (3).txt"]);
+        fs::remove_dir(&external_directory).unwrap();
+        fs::remove_file(staging.join("report.txt")).unwrap();
+        assert_eq!(publish(2, b"third", &mut |_| Ok(())), "report (1).txt");
+        assert_eq!(fs::read(staging.join("report (1).txt")).unwrap(), b"third");
+        assert_eq!(fs::read(staging.join("report (2).txt")).unwrap(), b"concurrent file");
+        assert_eq!(fs::read(staging.join("report (3).txt")).unwrap(), b"second");
         fs::remove_dir_all(root).unwrap();
     }
 
