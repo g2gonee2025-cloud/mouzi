@@ -262,6 +262,7 @@ pub fn run() {
             prepare_cleanup_cmd,
             execute_cleanup_cmd,
             get_suggestions_cmd,
+            get_suggestions_with_status_cmd,
             begin_suggestion_preparation_cmd,
             prepare_suggestions_cmd,
             cancel_suggestion_preparation_cmd,

@@ -1665,6 +1665,11 @@ pub fn get_suggestions_cmd(limit: i64) -> Result<Vec<crate::classify::Suggestion
     crate::classify::get_suggestions(limit)
 }
 
+#[tauri::command(async)]
+pub fn get_suggestions_with_status_cmd(limit: i64) -> Result<crate::classify::SuggestionsWithStatus, String> {
+    crate::classify::get_suggestions_with_status(limit.clamp(1, 200) as usize)
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AcceptOutcome {
