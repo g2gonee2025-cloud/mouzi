@@ -409,6 +409,31 @@ it("shows an execution rejection in its own finder after navigation", async () =
   expect(sent()).toHaveLength(1);
 });
 
+it("acknowledges a receipt without interrupting another find already in progress", async () => {
+  const review = await open("large");
+  mock.invoke.mockResolvedValueOnce([{ path: report.path, status: "skipped", message: "Retained fixture" }]);
+  await review.onConfirm?.();
+  review.onClose?.();
+
+  let finish!: (paths: string[]) => void;
+  mock.invoke.mockReturnValueOnce(new Promise<string[]>((resolve) => { finish = resolve; }));
+  const searching = useCleanupStore.getState().findEmptyDirs();
+  receipt("large")!.onDone?.();
+  expect(receipt("large")).toBeUndefined();
+  expect(find(render("large"), button("cleanup.confirm"))?.props.disabled).not.toBe(false);
+  const largeSearches = () => mock.invoke.mock.calls.filter(([command]) => command === "find_large_files_cmd");
+  expect.soft(largeSearches()).toHaveLength(0);
+  finish([empty]);
+  await searching;
+  expect(useCleanupStore.getState().emptyDirs).toEqual([empty]);
+
+  mock.invoke.mockResolvedValueOnce([report]);
+  find(render("large"), button("Find files"))!.props.onClick!({ currentTarget: opener });
+  await settle();
+  expect(largeSearches()).toEqual([["find_large_files_cmd", { minBytes: 100 * 1_048_576 }]]);
+  expect(sent()).toHaveLength(1);
+});
+
 type FileTab = "large" | "stale";
 const mib = 1_048_576;
 const findCommand = {
