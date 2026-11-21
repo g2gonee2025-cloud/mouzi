@@ -12,7 +12,11 @@ const harness = vi.hoisted(() => ({
 }));
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: harness.invoke }));
-vi.mock("react-i18next", () => ({ useTranslation: () => ({ t: (key: string) => key }) }));
+vi.mock("react-i18next", () => ({
+  useTranslation: () => ({
+    t: (key: string, options?: { count?: number }) => options?.count === undefined ? key : `${key}:${options.count}`,
+  }),
+}));
 vi.mock("../components/BetaControls", () => ({
   buttonClass: "",
   primaryClass: "",
@@ -54,9 +58,13 @@ type ControlProps = {
   children?: ReactNode;
   type?: string;
   checked?: boolean;
+  disabled?: boolean;
+  count?: number;
+  preview?: unknown[];
   onClick?: (event?: { currentTarget: object }) => void;
   onChange?: () => void;
   onConfirm?: () => Promise<void>;
+  onClose?: () => void;
 };
 
 function render() {
@@ -172,6 +180,40 @@ it("keeps first and pristine refresh defaults, excluding warning rows", async ()
   button("beta.refresh").onClick?.();
   await settled();
   expect(chosen()).toEqual([true, true, false]);
+});
+
+it("keeps one current count and review action together before a long list", async () => {
+  const entries = Array.from({ length: 180 }, (_, index) => row("long", `file-${index + 1}`));
+  await initial("long", entries);
+  expect(chosen()).toHaveLength(180);
+
+  button("beta.clearSelection").onClick?.();
+  expect(button("beta.apply").disabled).toBe(true);
+  checks()[3].onChange?.();
+  checks()[176].onChange?.();
+  expect(button("beta.apply").disabled).toBe(false);
+
+  const controls = render();
+  const applyActions = controls.filter(node => node.type === "button" && node.props.children === "beta.apply");
+  const counts = controls.filter(node => node.props.children === "beta.selected:2");
+  expect(applyActions).toHaveLength(1);
+  expect(counts).toHaveLength(1);
+  const selectionGroup = controls.find(node => {
+    const children: ReactNode[] = [];
+    Children.forEach(node.props.children, child => { children.push(child); });
+    return children.includes(applyActions[0]) && children.includes(counts[0]);
+  });
+  expect(selectionGroup).toBeDefined();
+  const firstCheckbox = controls.findIndex(node => node.type === "input" && node.props.type === "checkbox");
+  expect(controls.indexOf(applyActions[0])).toBeLessThan(firstCheckbox);
+
+  button("beta.apply").onClick?.({ currentTarget: {} });
+  const confirmation = render().find(node => node.type === ConfirmDialog)?.props;
+  expect(confirmation?.count).toBe(2);
+  expect(confirmation?.preview).toEqual([entries[3], entries[176]].map(({ source, destination }) => ({ source, destination })));
+  confirmation?.onClose?.();
+  expect(chosen().filter(Boolean)).toHaveLength(2);
+  expect(harness.invoke).not.toHaveBeenCalledWith("apply_preview_cmd", expect.anything());
 });
 
 it("carries only checked unchanged ordinary rows, using IDs from the refreshed plan", async () => {
