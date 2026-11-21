@@ -23,7 +23,7 @@ Add a folder in Settings. New folders are added in Manual mode. Choose the behav
 
 Clean Now opens the review queue for enabled, nonpaused folders. Review the exact paths and select which moves or renames to approve. The **Only new files** setting takes a baseline of files currently in the watched folder. Suspicious names require explicit selection even in Silent mode. An empty configuration performs no organization. Volume roots, dot traversal, links and linked ancestors are rejected as watched roots. Physical aliases refer to the same folder. Conflicting legacy aliases and invalid configured roots are blocked rather than silently removed or remoded.
 
-Once you confirm a review, you can switch to Dashboard or another Settings tab. Return to **Review queue** to see its progress or results, including any renamed destination. Choose **Refresh preview** when you’re ready to review the next request.
+Once you confirm a review, you can switch to Dashboard or another Settings tab. Return to **Review queue** to see its progress or results, including any renamed destination. If a second request arrived while the first was running, choose **Refresh preview** after reading the result to open that request.
 
 Mouzi remembers the physical identity of each newly registered watched folder. When the folder goes offline, the watcher retries and resumes when the same folder returns. Settings shows a problem if a different folder occupies its path. To use the replacement, remove the old registration and add the new folder. For an older registration without a saved identity, startup binds to the folder then present at the saved path. If that path is offline, reconnect the intended folder and restart Mouzi or add the folder again in Settings.
 
