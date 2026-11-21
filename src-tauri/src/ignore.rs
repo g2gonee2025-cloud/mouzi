@@ -241,26 +241,17 @@ pub(crate) fn is_ignored_entry(name: &str, is_directory: bool, patterns: &[Strin
 
     for original_pat in patterns {
         #[cfg(windows)]
-        let pat = original_pat.to_lowercase();
-        #[cfg(not(windows))]
-        let pat = original_pat.as_str();
-
-        // Directory pattern: ends with /
-        if let Some(dir_pat) = pat.strip_suffix('/') {
-            if is_directory && name.eq_ignore_ascii_case(dir_pat) {
-                return true;
-            }
-            continue;
-        }
-        // Wildcard pattern: contains *
+        let original_pat = original_pat.to_lowercase();
+        let pat = match original_pat.strip_suffix('/') {
+            Some(directory) if is_directory => directory,
+            Some(_) => continue,
+            None => original_pat.as_str(),
+        };
         if pat.contains('*') {
-            if glob_match(&name, &pat) {
+            if glob_match(&name, pat) {
                 return true;
             }
-            continue;
-        }
-        // Literal match
-        if name.eq_ignore_ascii_case(&pat) {
+        } else if name.eq_ignore_ascii_case(pat) {
             return true;
         }
     }
@@ -420,6 +411,17 @@ mod tests {
         assert!(is_ignored("README", &["readme".to_string()]));
         assert!(!is_ignored("foo.tmp", &["*.txt".to_string()]));
         assert!(!is_ignored("FOO.TMP", &["*.txt".to_string()]));
+    }
+
+    #[test]
+    fn directory_wildcards_match_only_directory_names() {
+        let patterns = parse_patterns("Camera-*/\nTrip\\#*raw*/ # original photos\n");
+        for name in ["Camera-", "Camera-2024", "Trip#raw", "Trip#2-raw-export"] {
+            assert!(is_ignored_entry(name, true, &patterns), "{name}");
+            assert!(!is_ignored_entry(name, false, &patterns), "{name}");
+        }
+        assert!(!is_ignored_entry("MyCamera-2024", true, &patterns));
+        assert_eq!(is_ignored_entry("CAMERA-2024", true, &patterns), cfg!(windows));
     }
 
     #[test]

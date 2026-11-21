@@ -412,20 +412,25 @@ mod tests {
     }
 
     #[test]
-    fn directory_ignore_keeps_a_regular_file_with_the_same_name() {
+    fn directory_only_ignores_skip_matching_subtrees_and_keep_matching_files() {
         let _guard = db::serialise_test_db();
         let fixture = ScanFixture::new("directory-ignore");
         let root = fixture.root.to_string_lossy().into_owned();
         fs::write(fixture.root.join("notes"), "keep this file").unwrap();
         fs::create_dir_all(fixture.root.join("nested/notes")).unwrap();
         fs::write(fixture.root.join("nested/notes/private.txt"), "skip this directory").unwrap();
-        fs::write(fixture.root.join(".mouziignore"), "notes/\n").unwrap();
+        fs::write(fixture.root.join("nested/keep.txt"), "keep this sibling").unwrap();
 
-        let summary = &scan_roots(std::slice::from_ref(&root), |_| {})[0];
-        assert_eq!(summary.status, "complete", "{:?}", summary.error);
-        let rows = db::get_inventory_files("size", None, Some(&root), None, 10).unwrap();
-        assert!(rows.iter().any(|row| Path::new(&row.path).ends_with("notes")));
-        assert!(!rows.iter().any(|row| row.path.ends_with("private.txt")));
+        for (pattern, keep_file) in [("notes/", true), ("not*s/", true), ("not*s", false)] {
+            fs::write(fixture.root.join(".mouziignore"), pattern).unwrap();
+            let summary = &scan_roots(std::slice::from_ref(&root), |_| {})[0];
+            assert_eq!(summary.status, "complete", "{:?}", summary.error);
+            let rows = db::get_inventory_files("size", None, Some(&root), None, 10).unwrap();
+            let contains = |name: &str| rows.iter().any(|row| Path::new(&row.path).ends_with(name));
+            assert_eq!(contains("notes"), keep_file, "{pattern}");
+            assert!(!contains("private.txt"), "{pattern}");
+            assert!(contains("keep.txt"), "{pattern}");
+        }
     }
 
     #[test]
