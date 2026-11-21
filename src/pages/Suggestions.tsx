@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { navigateHash } from "../utils/paths";
-import { useSuggestionsStore, distinctSuggestionRules, isMovedWithWarning, type Suggestion } from "../store/useSuggestionsStore";
+import { useSuggestionsStore, distinctSuggestionRules, isMovedWithWarning, type AcceptOutcome, type Suggestion } from "../store/useSuggestionsStore";
 import {
   Sparkles,
   ChevronLeft,
@@ -49,6 +49,11 @@ function sourceLabel(source: string, t: (key: string) => string): string {
   }
 }
 
+interface PendingSuggestionReview {
+  dialog: ConfirmDialogProps;
+  previousResults: AcceptOutcome[] | null;
+}
+
 export default function Suggestions() {
   const { t } = useTranslation();
   const {
@@ -73,11 +78,15 @@ export default function Suggestions() {
   const canAct = lookup.status === "ready" && !busy && !preparedPlans;
 
   const [createRule, setCreateRule] = useState(createRuleDefault);
-  const [pending, setPending] = useState<ConfirmDialogProps | null>(null);
+  const [pending, setPending] = useState<PendingSuggestionReview | null>(null);
   const [preparing, setPreparing] = useState<AbortController | null>(null);
   const beginPreview = usePreviewOwner();
   const pageHeading = useRef<HTMLHeadingElement>(null);
   const resultsHeading = useRef<HTMLHeadingElement>(null);
+  // A native modal makes the rest of the page inert. Let it close before
+  // adding new outcomes to the already-mounted live region outside it.
+  const visibleResults = pending ? pending.previousResults : results;
+  const hasResults = !!visibleResults?.length;
 
   useEffect(() => {
     loadSuggestions();
@@ -109,16 +118,19 @@ export default function Suggestions() {
         return `${operation}: .${rule.extension ?? "—"} → ${t(`categories.${rule.destination}`, { defaultValue: rule.destination })}. ${rule.scope}. ${rule.message ?? ""}`;
       });
       setPending({
-        title: captured.length === 1 ? t("suggestions.accept") : t("confirm.op.acceptAll"),
-        count: plans.length,
-        bytes: plans.reduce((total, plan) => total + plan.size, 0),
-        notice: "move",
-        note: ruleNotes.length ? [t("suggestions.ruleCount", { count: rules.filter((r) => r.disposition === "create").length }), ...ruleNotes].join("\n") : undefined,
-        preview: plans.map((plan) => `${plan.path} → ${plan.destination}`),
-        opener,
-        focusFallback: () => resultsHeading.current ?? pageHeading.current,
-        onConfirm: () => acceptAll(plans),
-        onClose: () => { owner.abort(); setPending(null); },
+        previousResults: useSuggestionsStore.getState().results,
+        dialog: {
+          title: captured.length === 1 ? t("suggestions.accept") : t("confirm.op.acceptAll"),
+          count: plans.length,
+          bytes: plans.reduce((total, plan) => total + plan.size, 0),
+          notice: "move",
+          note: ruleNotes.length ? [t("suggestions.ruleCount", { count: rules.filter((r) => r.disposition === "create").length }), ...ruleNotes].join("\n") : undefined,
+          preview: plans.map((plan) => `${plan.path} → ${plan.destination}`),
+          opener,
+          focusFallback: () => resultsHeading.current ?? pageHeading.current,
+          onConfirm: () => acceptAll(plans),
+          onClose: () => { owner.abort(); setPending(null); },
+        },
       });
     } catch {
       owner.abort();
@@ -203,9 +215,8 @@ export default function Suggestions() {
           </div>
         )}
 
-        {/* Results banner */}
-        {results && results.length > 0 && (
-          <div className="rounded-lg border border-border bg-surface-dark p-4 space-y-2">
+        <div className={hasResults ? "rounded-lg border border-border bg-surface-dark p-4 space-y-2" : "sr-only"}>
+          {hasResults && (
             <div className="flex items-center justify-between">
               <h2 ref={resultsHeading} tabIndex={-1} className="text-sm font-semibold">
                 {t("suggestions.resultsTitle")}
@@ -217,31 +228,39 @@ export default function Suggestions() {
                 {t("suggestions.backToList")}
               </button>
             </div>
-            <div className="space-y-1 max-h-40 overflow-auto">
-              {results.map((r, i) => {
-                const labels = {
-                  ok: r.dest === r.path ? "suggestions.alreadyFiled" : "suggestions.accepted",
-                  missing: "suggestions.missing",
-                  failed: "suggestions.failed",
-                  partial: isMovedWithWarning(r) ? "suggestions.movedWithWarning" : "suggestions.moveNeedsReview",
-                };
-                const color = r.status === "ok" ? "text-green-600 dark:text-green-400"
-                  : r.status === "failed" ? "text-red-600 dark:text-red-400"
-                  : "text-yellow-600 dark:text-yellow-400";
-                return (
-                  <div key={i} className="border-b border-border py-1 last:border-0 text-xs">
-                    <p className="break-all">{r.path}</p>
-                    {r.dest && r.dest !== r.path && (
-                      <p className="text-text-muted break-all">→ {r.dest}</p>
-                    )}
-                    <p className={`font-medium ${color}`}>{t(labels[r.status])}</p>
-                    {r.message && <p className="text-text-muted break-words">{r.message}</p>}
-                  </div>
-                );
-              })}
-            </div>
+          )}
+          <div
+            role="log"
+            aria-label={t("suggestions.resultsTitle")}
+            aria-live="polite"
+            aria-atomic="false"
+            aria-relevant="additions"
+            tabIndex={hasResults ? 0 : undefined}
+            className="space-y-1 max-h-40 overflow-auto"
+          >
+            {visibleResults?.map((r, i) => {
+              const labels = {
+                ok: r.dest === r.path ? "suggestions.alreadyFiled" : "suggestions.accepted",
+                missing: "suggestions.missing",
+                failed: "suggestions.failed",
+                partial: isMovedWithWarning(r) ? "suggestions.movedWithWarning" : "suggestions.moveNeedsReview",
+              };
+              const color = r.status === "ok" ? "text-green-600 dark:text-green-400"
+                : r.status === "failed" ? "text-red-600 dark:text-red-400"
+                : "text-yellow-600 dark:text-yellow-400";
+              return (
+                <div key={i} className="border-b border-border py-1 last:border-0 text-xs">
+                  <p className="break-all">{r.path}</p>
+                  {r.dest && r.dest !== r.path && (
+                    <p className="text-text-muted break-all">→ {r.dest}</p>
+                  )}
+                  <p className={`font-medium ${color}`}>{t(labels[r.status])}</p>
+                  {r.message && <p className="text-text-muted break-words">{r.message}</p>}
+                </div>
+              );
+            })}
           </div>
-        )}
+        </div>
 
         {/* Loading state */}
         {(lookup.status === "idle" || loading) && (
@@ -253,7 +272,7 @@ export default function Suggestions() {
         )}
 
         {/* Empty state */}
-        {lookup.status === "ready" && suggestions.length === 0 && !results && (
+        {lookup.status === "ready" && suggestions.length === 0 && !hasResults && (
           <div className="flex flex-col items-center justify-center h-48 text-center">
             <Sparkles size={32} className="text-text-muted mb-2" />
             <p className="text-sm text-text-muted">{t("suggestions.empty")}</p>
@@ -369,7 +388,7 @@ export default function Suggestions() {
         )}
       </div>
 
-      {pending && <ConfirmDialog {...pending} />}
+      {pending && <ConfirmDialog {...pending.dialog} />}
     </div>
   );
 }

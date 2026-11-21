@@ -1,9 +1,10 @@
 import { isValidElement, type ReactElement, type ReactNode } from "react";
 import { beforeEach, expect, it, vi } from "vitest";
 import Suggestions from "../pages/Suggestions";
+import ConfirmDialog, { type ConfirmDialogProps } from "../components/cleanup/ConfirmDialog";
 import { useSuggestionsStore } from "../store/useSuggestionsStore";
 
-const ipc = vi.hoisted(() => ({ invoke: vi.fn() }));
+const ipc = vi.hoisted(() => ({ invoke: vi.fn(), stateSlots: null as unknown[] | null, cursor: 0 }));
 vi.mock("@tauri-apps/api/core", () => ipc);
 vi.mock("react-i18next", () => ({ useTranslation: () => ({ t: (key: string) => key }) }));
 vi.mock("react", async (importOriginal) => ({
@@ -11,7 +12,15 @@ vi.mock("react", async (importOriginal) => ({
   useEffect: () => {},
   useLayoutEffect: () => {},
   useRef: (current: unknown) => ({ current }),
-  useState: (value: unknown) => [value, vi.fn()],
+  useState: (value: unknown) => {
+    const slots = ipc.stateSlots;
+    if (!slots) return [value, vi.fn()];
+    const slot = ipc.cursor++;
+    if (!(slot in slots)) slots[slot] = value;
+    return [slots[slot], (next: unknown) => {
+      slots[slot] = typeof next === "function" ? next(slots[slot]) : next;
+    }];
+  },
 }));
 vi.mock("../store/useSuggestionsStore", async (importOriginal) => {
   const { useSuggestionsStore: store, ...exports } = await importOriginal<typeof import("../store/useSuggestionsStore")>();
@@ -35,10 +44,14 @@ const receipt = {
   version: { identity: "file-C", size: "8", mtimeNs: "3000" },
 };
 
-interface Props {
+interface Props extends Partial<ConfirmDialogProps> {
   children?: ReactNode;
   role?: string;
+  tabIndex?: number;
   "aria-label"?: string;
+  "aria-live"?: string;
+  "aria-atomic"?: string;
+  "aria-relevant"?: string;
   onClick?: (event?: { currentTarget: HTMLButtonElement }) => Promise<void> | void;
 }
 function text(node: ReactNode): string {
@@ -65,8 +78,52 @@ function showVerified(...suggestions: typeof invoice[]) {
 }
 
 beforeEach(() => {
+  ipc.stateSlots = null;
   ipc.invoke.mockReset();
   useSuggestionsStore.setState(useSuggestionsStore.getInitialState(), true);
+});
+
+it("uses the same polite receipt region and adds failures after confirmation closes", async () => {
+  ipc.stateSlots = [];
+  showVerified(invoice);
+  const render = () => {
+    ipc.cursor = 0;
+    return Suggestions();
+  };
+  const log = (tree: ReactNode) => find(tree, (item) => item.props.role === "log");
+  const semantics = {
+    "aria-label": "suggestions.resultsTitle",
+    "aria-live": "polite",
+    "aria-atomic": "false",
+    "aria-relevant": "additions",
+  };
+  const initial = render();
+  expect.soft(log(initial)?.props).toMatchObject(semantics);
+  expect(log(initial)?.props.tabIndex).toBeUndefined();
+
+  ipc.invoke.mockResolvedValueOnce("fixture-preparation").mockResolvedValueOnce([{
+    planId: "fixture-plan", path: invoice.path, destination: "C:/Filed/invoice.unrecognized",
+    category: invoice.suggestedCategory, size: 14, rule: null,
+  }]);
+  find(initial, (item) => item.props["aria-label"] === "suggestions.accept")!.props.onClick!({
+    currentTarget: {} as HTMLButtonElement,
+  });
+  await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  const originalDialog = find(render(), (item) => item.type === ConfirmDialog)!.props;
+  const reason = "Move refused before publication";
+  ipc.invoke.mockRejectedValueOnce(reason);
+  await originalDialog.onConfirm!();
+  expect(useSuggestionsStore.getState().results?.[0].message).toBe(reason);
+  expect.soft(text(log(render()))).not.toContain(reason);
+  originalDialog.onClose!();
+
+  const after = render();
+  expect.soft(log(after)?.props).toMatchObject({ ...semantics, tabIndex: 0 });
+  expect.soft(text(log(after))).toContain("suggestions.failed");
+  expect.soft(text(log(after))).toContain(reason);
+  expect(text(after).split(reason)).toHaveLength(2);
+  expect(find(after, (item) => item.props["aria-label"] === "suggestions.accept")).toBeDefined();
+  expect(find(after, (item) => item.type === "h2" && text(item) === "suggestions.resultsTitle")?.props.tabIndex).toBe(-1);
 });
 
 it("submits the listed version for normal single dismissal and removes its row", async () => {
