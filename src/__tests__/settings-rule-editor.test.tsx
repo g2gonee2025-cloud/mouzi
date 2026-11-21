@@ -1,8 +1,11 @@
 import { Children, isValidElement, type ReactElement, type ReactNode } from "react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import Settings from "../components/Settings";
-import { RuleConditions } from "../components/BetaControls";
+import { Results, RuleConditions, type OperationResult } from "../components/BetaControls";
+import ReviewQueue from "../components/ReviewQueue";
+import ConfirmDialog from "../components/cleanup/ConfirmDialog";
 import { defaultRuleOptions, useAppStore, type AppSettings, type Rule, type ScheduleSettings, type UndoResult, type WatchedFolder } from "../store/useAppStore";
+import { useReviewQueueStore } from "../store/useReviewQueueStore";
 
 const harness = vi.hoisted(() => ({
   invoke: vi.fn(),
@@ -79,6 +82,12 @@ vi.mock("../store/useAppStore", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../store/useAppStore")>();
   const store = actual.useAppStore;
   return { ...actual, useAppStore: Object.assign(store.getState, store) };
+});
+vi.mock("../store/useReviewQueueStore", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../store/useReviewQueueStore")>();
+  const store = actual.useReviewQueueStore;
+  const snapshot = (select: (state: ReturnType<typeof store.getState>) => unknown) => select(store.getState());
+  return { ...actual, useReviewQueueStore: Object.assign(snapshot, store) };
 });
 
 interface Props {
@@ -1320,6 +1329,118 @@ function renderWithEffects(render: () => ReactNode) {
     effects.forEach((run) => run());
   }
 }
+
+function reviewSettingsReply(command: string) {
+  switch (command) {
+    case "get_settings_cmd": return scheduleFixture;
+    case "get_rules_cmd":
+    case "get_folders_cmd":
+    case "get_logs_cmd":
+    case "get_stats_cmd":
+    case "get_pending_files_cmd": return [];
+    case "get_watcher_issues_cmd": return {};
+    case "explorer_integration_status_cmd": return [false, false];
+    default: return null;
+  }
+}
+
+it("reveals a routed review across a Settings mount and keeps the ordinary sidebar queue broad", async () => {
+  const scoped = ["C:/Fixture/selected.txt"];
+  let initialPaths: string[] | null = scoped;
+  useReviewQueueStore.setState(useReviewQueueStore.getInitialState());
+  harness.invoke.mockImplementation(async (command: string) => {
+    if (command === "take_review_request_cmd") {
+      const paths = initialPaths;
+      initialPaths = null;
+      return paths;
+    }
+    if (command === "preview_cmd") return { id: "fixture-preview", entries: [] };
+    return reviewSettingsReply(command);
+  });
+
+  // The native reader from a prior Settings mount has already taken the request.
+  await useReviewQueueStore.getState().readReviewRequest();
+  const settings = () => renderWithEffects(editor);
+  const review = () => find(settings(), (node) => node.type === ReviewQueue);
+  settings();
+  await settle();
+  expect(review(), "the retained request should open the review tab").toBeDefined();
+  renderEffectfulChild(review()!);
+  await settle();
+  expect(harness.invoke).toHaveBeenLastCalledWith("preview_cmd", { paths: scoped });
+
+  click(requireElement(({ props }) => props.label === "settings.folders.title", settings()));
+  expect(review()).toBeUndefined();
+  click(requireElement(({ props }) => props.label === "beta.review", settings()));
+  renderEffectfulChild(review()!);
+  await settle();
+  expect(harness.invoke).toHaveBeenLastCalledWith("preview_cmd", { paths: null });
+});
+
+it("keeps an incoming scope behind an approved receipt and later reopens the full sidebar queue", async () => {
+  const firstScope = ["C:/Fixture/first.txt"];
+  const nextScope = ["C:/Fixture/next.txt"];
+  let requested: string[] | null = firstScope;
+  let resolveApply!: (rows: OperationResult[]) => void;
+  const applying = new Promise<OperationResult[]>(resolve => { resolveApply = resolve; });
+  const destination = "C:/Fixture/Filed/first.txt";
+  const confirmedRow = {
+    id: "chosen", selectionKey: firstScope[0], source: firstScope[0], destination,
+    rule: "Fixture route", action: "move", size: 1, warning: false, error: null,
+  };
+  useReviewQueueStore.setState(useReviewQueueStore.getInitialState());
+  harness.invoke.mockImplementation(async (command: string, args?: { paths: string[] | null }) => {
+    if (command === "take_review_request_cmd") {
+      const paths = requested;
+      requested = null;
+      return paths;
+    }
+    if (command === "preview_cmd") return { id: "current-plan", entries: args?.paths === firstScope ? [confirmedRow] : [] };
+    if (command === "apply_preview_cmd") return applying;
+    return reviewSettingsReply(command);
+  });
+  const settings = () => renderWithEffects(editor);
+  const sidebar = (label: string) => click(requireElement(({ props }) => props.label === label, settings()));
+  const review = () => renderEffectfulChild(requireElement(node => node.type === ReviewQueue, settings()));
+  const requestedPreviews = () => harness.invoke.mock.calls.filter(([command]) => command === "preview_cmd");
+
+  settings();
+  await settle();
+  review();
+  await settle();
+  expect(requestedPreviews()).toEqual([["preview_cmd", { paths: firstScope }]]);
+
+  click(requireElement(button("beta.apply"), review()));
+  const confirmation = requireElement(node => node.type === ConfirmDialog, review());
+  const submitted = confirmation.props.onConfirm!();
+  expect(harness.invoke).toHaveBeenCalledWith("apply_preview_cmd", { id: "current-plan", selected: ["chosen"] });
+  sidebar("settings.folders.title");
+  requested = nextScope;
+  const onReview = harness.listen.mock.calls.find(([event]) => event === "open-review")?.[1];
+  expect(onReview).toBeTypeOf("function");
+  onReview();
+  await settle();
+  expect(text(review())).toContain("confirm.working");
+  expect(requireElement(button("beta.refresh"), review()).props.disabled).toBe(true);
+
+  sidebar("settings.folders.title");
+  const receipt = { id: "chosen", source: firstScope[0], actualDestination: destination, success: true, error: null };
+  resolveApply([receipt]);
+  await submitted;
+  confirmation.props.onClose!();
+  sidebar("beta.review");
+  const result = requireElement(node => node.type === Results, review());
+  expect(result.props).toMatchObject({ results: [receipt] });
+  expect(requestedPreviews()).toHaveLength(1);
+
+  await click(requireElement(button("beta.refresh"), review()));
+  expect(requestedPreviews()).toEqual([["preview_cmd", { paths: firstScope }], ["preview_cmd", { paths: nextScope }]]);
+  sidebar("settings.folders.title");
+  sidebar("beta.review");
+  review();
+  await settle();
+  expect(requestedPreviews().at(-1)).toEqual(["preview_cmd", { paths: null }]);
+});
 
 function visitSettingsTab(label: string) {
   click(requireElement(({ props }) => props.label === label));
