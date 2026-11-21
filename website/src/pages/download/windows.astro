@@ -16,7 +16,7 @@ import { softwareApplicationLd, breadcrumbLd } from '../../lib/seo';
     <SectionHeading
       kicker={`Version ${site.version} · Windows 10 & 11 · x64`}
       title="Mouzi for Windows"
-      lead="Three builds, one app. The installer suits most people; the MSI is for deployment tools; the portable build runs from anywhere without touching the registry."
+      lead="Choose the installer for everyday use, MSI for managed deployments, or the portable EXE to run directly from a folder or USB drive."
     />
     <div class="mt-10">
       <DownloadCards platform="windows" />
@@ -41,9 +41,10 @@ import { softwareApplicationLd, breadcrumbLd } from '../../lib/seo';
 
       <h2>Portable build</h2>
       <p>
-        The portable executable stores configuration next to itself, so rules travel with the file. It suits USB
-        drives, locked-down machines and quick testing. There is no uninstaller because there is nothing to uninstall:
-        delete the file and it is gone.
+        Run the portable EXE directly from the folder or USB drive you choose. Your rules, settings and history use
+        the same Windows profile as the installed builds. The database is at <code>%APPDATA%\mouzi\mouzi\data\mouzi.db</code>.
+        If <strong>Start with system</strong> is enabled, turn it off in Settings before deleting the EXE.
+        Your data stays in the profile.
       </p>
 
       <h2>System requirements</h2>

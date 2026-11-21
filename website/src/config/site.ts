@@ -129,7 +129,7 @@ export const site = {
         size: '18.5 MB',
         arch: 'x64',
         sha256: 'a37214a2c210fbcb96b0beed60243dfb46abc9f9859bbc451e567191b3ba2e58',
-        note: 'No installation. Run from any folder or USB drive.',
+        note: 'Run the EXE directly, including from a USB drive. Data is saved in your Windows profile.',
       },
     ] satisfies DownloadArtifact[],
     linux: [
