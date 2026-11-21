@@ -3090,6 +3090,73 @@ mod undo_tests {
     /// Pins the frontend contract: one result per input row, in the order the
     /// batch query returned them, with the four status values unchanged.
     #[test]
+    fn undo_queue_keeps_reused_manual_arrivals_and_cancels_actual_restores() {
+        let fixture = UndoFixture::new("queue_occupants");
+        let ignored = ignored_files();
+        let root = fixture.root();
+        let (occupied, old_occupied) = stage(root, "occupied.undocheck");
+        let occupied_id = insert_log("2026-01-01T00:00:00Z", &occupied, Some(&old_occupied));
+        let (missing, old_missing) = stage(root, "missing.undocheck");
+        let missing_id = insert_log("2026-01-01T00:00:01Z", &missing, Some(&old_missing));
+        std::fs::rename(&old_missing, root.join("held-missing.bin")).unwrap();
+        let (replaced, old_replaced) = stage(root, "replaced.undocheck");
+        let replaced_id = insert_log("2026-01-01T00:00:02Z", &replaced, Some(&old_replaced));
+        std::fs::rename(&old_replaced, root.join("held-replaced.bin")).unwrap();
+        std::fs::write(&old_replaced, b"unrelated at recorded destination").unwrap();
+        let (free, old_free) = stage(root, "free.undocheck");
+        let free_id = insert_log("2026-01-01T00:00:03Z", &free, Some(&old_free));
+
+        let watched_dir = Path::new(&occupied).parent().unwrap();
+        let folder = crate::db::register_watched_folder(
+            watched_dir.to_str().unwrap(), crate::db::FOLDER_MODE_MANUAL, false,
+        ).unwrap();
+        struct RemoveFolder(i64);
+        impl Drop for RemoveFolder {
+            fn drop(&mut self) { let _ = crate::db::remove_watched_folder(self.0); }
+        }
+        let _registration = RemoveFolder(folder);
+        let sibling = watched_dir.join("sibling.undocheck");
+        for path in [&occupied, &missing, &replaced] {
+            std::fs::write(path, b"new arrival").unwrap();
+        }
+        std::fs::write(&sibling, b"unaffected").unwrap();
+        let timer_tickets = [&occupied, &missing, &replaced, &old_replaced]
+            .map(|path| ignored.ticket(Path::new(path)));
+        let free_ticket = ignored.ticket(Path::new(&free));
+        let mut watcher = crate::watcher::FolderWatcher::new(ignored.clone());
+        watcher.reconcile_baseline(folder).unwrap();
+        let names = || {
+            let mut names = watcher.get_pending_files().unwrap().into_iter().map(|(_, name)| name).collect::<Vec<_>>();
+            names.sort();
+            names
+        };
+        let expected = ["missing.undocheck", "occupied.undocheck", "replaced.undocheck", "sibling.undocheck"];
+        assert_eq!(names(), expected);
+
+        let cancellation = watcher.queue_cancellation();
+        let outcome = undo_all_with(&ignored, &[occupied_id, missing_id, replaced_id, free_id], cancellation.prepare()).unwrap();
+        assert_eq!(outcome.results.iter().map(|row| row.status.as_str()).collect::<Vec<_>>(),
+            ["ok", "failed", "missing", "collision"]);
+        assert_eq!(names(), expected);
+        assert!(timer_tickets.iter().all(|ticket| ticket.is_current()));
+        assert!(!free_ticket.is_current());
+        for path in [&occupied, &missing, &replaced, &old_replaced] {
+            assert!(!ignored.is_suppressed(Path::new(path), Instant::now()), "{path}");
+        }
+        assert_eq!(std::fs::read(&occupied).unwrap(), b"new arrival");
+        assert_eq!(std::fs::read(&missing).unwrap(), b"new arrival");
+        assert_eq!(std::fs::read(&replaced).unwrap(), b"new arrival");
+        assert_eq!(std::fs::read(&old_replaced).unwrap(), b"unrelated at recorded destination");
+        assert_eq!(std::fs::read(&sibling).unwrap(), b"unaffected");
+        let restored = outcome.results[3].restored_to.as_deref().unwrap();
+        assert!(restored.ends_with("occupied_0.undocheck"));
+        assert_eq!(std::fs::read(restored).unwrap(), b"payload");
+        assert_eq!(std::fs::read(&free).unwrap(), b"payload");
+        assert!(ignored.is_suppressed(Path::new(restored), Instant::now()));
+        assert!(ignored.is_suppressed(Path::new(&free), Instant::now()));
+    }
+
+    #[test]
     fn undo_all_reports_one_result_per_row_in_input_order() {
         let fixture = UndoFixture::new("statuses");
         let root = fixture.root();
