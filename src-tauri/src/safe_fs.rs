@@ -360,8 +360,60 @@ fn inspect_watched_root(path: &Path) -> Result<(PathBuf, FileIdentity), Director
     Ok((canonical, identity))
 }
 
-pub(crate) fn guard_watched_root(path: &Path) -> Result<(PathBuf, FileIdentity, AncestorGuard), String> {
-    pin_watched_root(path).map_err(|error| error.to_string())
+pub(crate) struct WatchedRootGuardError {
+    pub message: String,
+    pub boundary: Option<UnavailableRootBoundary>,
+}
+
+pub(crate) struct UnavailableRootBoundary {
+    parent: PathBuf,
+    name: std::ffi::OsString,
+    ascii_case_aliases: bool,
+}
+
+impl UnavailableRootBoundary {
+    pub(crate) fn contains_file(&self, path: &Path) -> bool {
+        let Ok(relative) = path.strip_prefix(&self.parent) else { return false; };
+        let mut parts = relative.components();
+        let Some(Component::Normal(name)) = parts.next() else { return false; };
+        parts.next().is_some() && (name == self.name.as_os_str()
+            || (self.ascii_case_aliases && name.as_encoded_bytes().eq_ignore_ascii_case(self.name.as_encoded_bytes())))
+    }
+}
+
+pub(crate) fn guard_watched_root(path: &Path) -> Result<(PathBuf, FileIdentity, AncestorGuard), WatchedRootGuardError> {
+    pin_watched_root(path).map_err(|error| {
+        let message = error.to_string();
+        let boundary = if path.is_absolute() && !has_dot_component(path) && ordinary_registration(path) {
+            // An ancestor walk visits directories outside-in. Its first
+            // failed component already identifies the unresolved branch.
+            let unavailable = match error {
+                DirectoryPinError::Inspect(unavailable, _) => unavailable,
+                DirectoryPinError::Unsafe(_) => path,
+            };
+            unavailable_root_boundary(unavailable)
+        } else {
+            None
+        };
+        WatchedRootGuardError { message, boundary }
+    })
+}
+
+fn unavailable_root_boundary(unavailable: &Path) -> Option<UnavailableRootBoundary> {
+    for branch in unavailable.ancestors() {
+        let parent = branch.parent()?;
+        let name = branch.file_name()?;
+        let Ok(guard) = guard_directory(parent) else { continue; };
+        let canonical = std::fs::canonicalize(parent).ok()?;
+        let identity = identity_from_handle(guard._files.first()?).ok()?;
+        if file_identity(&canonical).ok()? != identity { return None; }
+        return Some(UnavailableRootBoundary {
+            parent: canonical,
+            name: name.to_os_string(),
+            ascii_case_aliases: guard.has_ascii_case_aliases(),
+        });
+    }
+    None
 }
 
 fn pin_watched_root(path: &Path) -> Result<(PathBuf, FileIdentity, AncestorGuard), DirectoryPinError<'_>> {

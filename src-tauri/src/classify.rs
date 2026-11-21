@@ -567,6 +567,7 @@ pub struct SuggestionPolicyIssue {
 struct SuggestionPolicies {
     roots: HashMap<i64, (String, PathBuf)>,
     by_path: HashMap<PathBuf, Option<IgnorePatterns>>,
+    unavailable: Vec<safe_fs::UnavailableRootBoundary>,
     issues: Vec<SuggestionPolicyIssue>,
 }
 
@@ -597,10 +598,12 @@ impl SuggestionPolicies {
                         .and_modify(|stored| *stored = None)
                         .or_insert(patterns);
                 }
-                Err(message) if folder.active => {
-                    policies.issues.push(SuggestionPolicyIssue { root: folder.path, message });
+                Err(error) => {
+                    policies.unavailable.extend(error.boundary);
+                    if folder.active {
+                        policies.issues.push(SuggestionPolicyIssue { root: folder.path, message: error.message });
+                    }
                 }
-                Err(_) => {}
             }
         }
         Ok(policies)
@@ -619,6 +622,9 @@ impl SuggestionPolicies {
     }
 
     fn allows_path(&self, path: &Path, root: &Path, relative: &Path) -> bool {
+        if self.unavailable.iter().any(|boundary| boundary.contains_file(path)) {
+            return false;
+        }
         let owner = path.ancestors().skip(1).find_map(|parent| self.by_path.get_key_value(parent));
         matches!(owner, Some((owner, Some(patterns))) if owner == root && !patterns.ignores_inventory_path(relative))
     }
