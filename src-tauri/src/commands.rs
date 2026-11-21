@@ -3834,6 +3834,124 @@ mod accept_tests {
             .pop().ok_or("No suggestion was prepared".into())
     }
 
+    fn save_suggestion_exclusions(fixture: &AcceptFixture, current: &[String], next: &[String]) {
+        let outcome = save_registered_ignore(&fixture.root().to_string_lossy(), next, Some(current)).unwrap();
+        assert!(matches!(outcome, Some(IgnoreSaveOutcome::Saved { patterns }) if patterns == next));
+    }
+
+    fn assert_excluded_suggestion_untouched(path: &Path, destination: &Path, identity: &crate::safe_fs::FileIdentity) {
+        assert_eq!(std::fs::read(path).unwrap(), b"payload");
+        assert_eq!(&crate::safe_fs::file_identity(path).unwrap(), identity);
+        assert!(!destination.exists());
+        let records: (i64, i64) = lock_db().unwrap().query_row(
+            "SELECT (SELECT count(*) FROM action_logs WHERE source_path=?1),
+                    (SELECT count(*) FROM operation_intents WHERE source_path=?1)",
+            [path.to_string_lossy().as_ref()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(records, (0, 0));
+    }
+
+    #[test]
+    fn suggestion_live_exclusion_refuses_fresh_review_without_rescan() {
+        let fixture = AcceptFixture::new("suggestion_ignore_before_review");
+        let excluded = fixture.put("invoice-receipt.xyz");
+        let healthy = fixture.put("budget-report.xyz");
+        index_fixture(&fixture);
+        let identity = crate::safe_fs::file_identity(&excluded).unwrap();
+        let patterns = ["invoice-receipt.xyz".into()];
+        save_suggestion_exclusions(&fixture, &[], &patterns);
+
+        let blocked = prepare_suggestions(vec![suggestion_request(&excluded, "Documents")], false);
+        if let Ok(plans) = &blocked {
+            discard_suggestion_plans_cmd(plans.iter().map(|plan| plan.plan_id.clone()).collect()).unwrap();
+        }
+        assert_excluded_suggestion_untouched(&excluded, &fixture.root().join("Documents/invoice-receipt.xyz"), &identity);
+        assert!(blocked.is_err_and(|error| error.contains(".mouziignore") && error.contains("invoice-receipt.xyz")));
+
+        let unaffected = prepare_suggestions(vec![suggestion_request(&healthy, "Documents")], false).unwrap();
+        let outcome = accept_reviewed_suggestion(&unaffected[0].plan_id, &ignored_files()).unwrap();
+        assert_eq!(outcome.dest.as_deref(), Some(unaffected[0].destination.as_str()));
+        assert_eq!(std::fs::read(&unaffected[0].destination).unwrap(), b"payload");
+        assert!(!healthy.exists());
+
+        save_suggestion_exclusions(&fixture, &patterns, &[]);
+        let allowed = prepare_suggestions(vec![suggestion_request(&excluded, "Documents")], false).unwrap();
+        let outcome = accept_reviewed_suggestion(&allowed[0].plan_id, &ignored_files()).unwrap();
+        assert_eq!(outcome.dest.as_deref(), Some(allowed[0].destination.as_str()));
+        assert_eq!(crate::safe_fs::file_identity(Path::new(&allowed[0].destination)).unwrap(), identity);
+    }
+
+    #[test]
+    fn suggestion_live_exclusion_added_after_preview_blocks_nested_file_only() {
+        let fixture = AcceptFixture::new("suggestion_ignore_after_preview");
+        let excluded = fixture.put("Camera-2024/Photos/invoice-receipt.xyz");
+        let healthy = fixture.put("Camera-report.xyz");
+        index_fixture(&fixture);
+        let identity = crate::safe_fs::file_identity(&excluded).unwrap();
+        let plans = prepare_suggestions(vec![
+            suggestion_request(&excluded, "Documents"), suggestion_request(&healthy, "Documents"),
+        ], false).unwrap();
+        let patterns = ["Camera-*/".into()];
+        save_suggestion_exclusions(&fixture, &[], &patterns);
+
+        let suppression = ignored_files();
+        let blocked = accept_reviewed_suggestion(&plans[0].plan_id, &suppression);
+        let allowed = accept_reviewed_suggestion(&plans[1].plan_id, &suppression).unwrap();
+        assert_eq!(allowed.dest.as_deref(), Some(plans[1].destination.as_str()));
+        assert_eq!(std::fs::read(&plans[1].destination).unwrap(), b"payload");
+        assert!(blocked.is_err_and(|error| error.contains(".mouziignore") && error.contains("invoice-receipt.xyz")));
+        assert_excluded_suggestion_untouched(&excluded, Path::new(&plans[0].destination), &identity);
+
+        save_suggestion_exclusions(&fixture, &patterns, &[]);
+        let retry = prepare_suggestions(vec![suggestion_request(&excluded, "Documents")], false).unwrap();
+        let outcome = accept_reviewed_suggestion(&retry[0].plan_id, &suppression).unwrap();
+        assert_eq!(outcome.dest.as_deref(), Some(retry[0].destination.as_str()));
+        assert_eq!(crate::safe_fs::file_identity(Path::new(&retry[0].destination)).unwrap(), identity);
+    }
+
+    #[test]
+    fn suggestion_live_exclusion_saved_during_hashing_prevents_plan_publication() {
+        let fixture = AcceptFixture::new("suggestion_ignore_during_preparation");
+        let source = inventory_fixture(&fixture);
+        let identity = crate::safe_fs::file_identity(&source).unwrap();
+        let suppression = ignored_files();
+        let preparation = RunningSuggestionPreparation::start(reserve_suggestion_preparation().unwrap()).unwrap();
+        let mut saved = false;
+        let result = prepare_suggestion_review(
+            vec![suggestion_request(&source, "Documents")], false, &preparation, &suppression, || {
+                if !saved {
+                    let _operation = suppression.with_operation();
+                    save_suggestion_exclusions(&fixture, &[], &["report.xyz".into()]);
+                    saved = true;
+                }
+                preparation.check()
+            },
+        );
+        cancel_suggestion_preparation(&preparation.id).unwrap();
+        assert!(saved);
+        assert_excluded_suggestion_untouched(&source, &fixture.root().join("Documents/report.xyz"), &identity);
+        assert!(result.is_err_and(|error| error.contains(".mouziignore")));
+    }
+
+    #[test]
+    fn suggestion_live_exclusion_reports_unreadable_policy_on_review_and_confirm() {
+        let fixture = AcceptFixture::new("suggestion_ignore_unreadable");
+        let source = inventory_fixture(&fixture);
+        let identity = crate::safe_fs::file_identity(&source).unwrap();
+        let plan = prepare_suggestions(vec![suggestion_request(&source, "Documents")], false).unwrap().remove(0);
+        std::fs::write(fixture.root().join(".mouziignore"), [0xff, 0xfe]).unwrap();
+        let blocked_preview = prepare_suggestions(vec![suggestion_request(&source, "Documents")], false);
+        if let Ok(plans) = &blocked_preview {
+            discard_suggestion_plans_cmd(plans.iter().map(|plan| plan.plan_id.clone()).collect()).unwrap();
+        }
+        let blocked_confirmation = accept_reviewed_suggestion(&plan.plan_id, &ignored_files());
+        let unreadable = |error: String| error.contains("Unable to read ignore protection file") && error.contains(".mouziignore");
+        assert!(blocked_preview.is_err_and(unreadable));
+        assert!(blocked_confirmation.is_err_and(unreadable));
+        assert_excluded_suggestion_untouched(&source, Path::new(&plan.destination), &identity);
+    }
+
     #[test]
     fn suggestion_batch_reviews_and_moves_same_named_sources_to_distinct_paths() {
         let fixture = AcceptFixture::new("review_batch_collision");
