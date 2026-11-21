@@ -10,7 +10,7 @@ New profiles start without watched folders, scheduled cleaning or local AI. Defa
 
 **Start with System** in General Settings shows Mouzi’s Windows startup registration. If you turn Mouzi off in Windows Startup Apps, it stays off when you reopen Mouzi. To enable it again, use the switch in General Settings or Windows Startup Apps.
 
-Choose **Add a watched folder** in the tray popup to open Watched Folders in Settings. Once you add a folder, the popup offers **Organize Now** to review proposed changes.
+Choose **Add a watched folder** in the tray popup to open Watched Folders in Settings. Once you add a folder, the popup offers **Organize Now** to review proposed changes. **Close** hides the popup and leaves Mouzi running. To exit, right-click the tray icon and choose **Quit**.
 
 Add a folder in Settings. New folders are added in Manual mode. Choose the behavior deliberately:
 
@@ -26,6 +26,8 @@ Clean Now opens the review queue for enabled, nonpaused folders. Review the exac
 Mouzi remembers the physical identity of each newly registered watched folder. When the folder goes offline, the watcher retries and resumes when the same folder returns. Settings shows a problem if a different folder occupies its path. To use the replacement, remove the old registration and add the new folder. For an older registration without a saved identity, startup binds to the folder then present at the saved path. If that path is offline, reconnect the intended folder and restart Mouzi or add the folder again in Settings.
 
 Rules can apply to all watched folders or to one folder. Conditions include extension, filename pattern, size, and modification date. Rules can move, rename, or ignore files. Existing delete rules are visible in review with a recovery error. Relative destinations resolve under the watched root, and collision suffixes preserve existing files.
+
+The rule editor shows the destination it will save. For a rule that applies to all watched folders, picking a subfolder such as `Inbox\Filed` stores `Filed` under each source folder. Picking a watched folder itself keeps its full path. For a rule limited to one folder, picking a destination outside it also keeps the full path.
 
 Automatic and scheduled organization respect the grace period (300 seconds by default) and a minimum two-second settling interval. Explicit manual cleaning/import sorting bypasses the age grace period. Transient locks are retried with bounded backoff; exhausted retries require a later event or explicit action. Already filed outputs and queued work invalidated by Undo are skipped.
 
