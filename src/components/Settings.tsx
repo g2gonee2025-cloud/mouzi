@@ -370,9 +370,11 @@ export default function Settings() {
 
   useEffect(() => {
     let disposed = false;
-    const stops = [useReviewQueueStore.subscribe((next, previous) => {
-      if (!disposed && next.requestedPaths !== previous.requestedPaths) setTab("review");
-    })];
+    const revealRequestedReview = () => {
+      if (!disposed && useReviewQueueStore.getState().takeReviewNavigation()) setTab("review");
+    };
+    const stops = [useReviewQueueStore.subscribe(revealRequestedReview)];
+    revealRequestedReview();
     const openReview = () => useReviewQueueStore.getState().readReviewRequest();
     const openFolderRequest = async () => {
       const path = await invoke<string | null>("take_add_folder_request_cmd");
@@ -666,7 +668,7 @@ export default function Settings() {
           />
           <SidebarButton
             active={tab === "review"}
-            onClick={() => setTab("review")}
+            onClick={() => { useReviewQueueStore.getState().requestFullQueue(); setTab("review"); }}
             icon={<Inbox size={16} />}
             label={t("beta.review")}
           />

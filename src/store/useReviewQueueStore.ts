@@ -10,8 +10,11 @@ type ApplyReceipt =
 
 interface ReviewQueueState {
   requestedPaths: string[] | null;
+  hasUnopenedRequest: boolean;
   applyReceipt: ApplyReceipt | null;
   readReviewRequest: () => Promise<void>;
+  takeReviewNavigation: () => boolean;
+  requestFullQueue: () => void;
   applyReviewedPlan: (id: string, selected: string[]) => Promise<void>;
   dismissReceipt: () => void;
 }
@@ -23,15 +26,28 @@ let lastRequestRead = Promise.resolve();
 // ReviewQueue owns only its unconfirmed preview and selection.
 export const useReviewQueueStore = create<ReviewQueueState>((set, get) => ({
   requestedPaths: null,
+  hasUnopenedRequest: false,
   applyReceipt: null,
 
   readReviewRequest: () => {
     const read = lastRequestRead.then(async () => {
       const paths = await invoke<string[] | null>("take_review_request_cmd");
-      if (Array.isArray(paths)) set({ requestedPaths: paths });
+      if (Array.isArray(paths)) set({ requestedPaths: paths, hasUnopenedRequest: true });
     });
     lastRequestRead = read.catch(() => {});
     return read;
+  },
+
+  // A native read can finish between Settings mounts.
+  takeReviewNavigation: () => {
+    if (!get().hasUnopenedRequest) return false;
+    set({ hasUnopenedRequest: false });
+    return true;
+  },
+
+  requestFullQueue: () => {
+    const { applyReceipt, hasUnopenedRequest, requestedPaths } = get();
+    if (!applyReceipt && !hasUnopenedRequest && requestedPaths !== null) set({ requestedPaths: null });
   },
 
   applyReviewedPlan: async (id, selected) => {

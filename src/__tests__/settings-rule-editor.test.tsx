@@ -1439,7 +1439,7 @@ it("keeps an incoming scope behind an approved receipt and later reopens the ful
   sidebar("beta.review");
   review();
   await settle();
-  expect(requestedPreviews().at(-1)).toEqual(["preview_cmd", { paths: null }]);
+  expect(requestedPreviews().slice(-1)[0]).toEqual(["preview_cmd", { paths: null }]);
 });
 
 function visitSettingsTab(label: string) {
