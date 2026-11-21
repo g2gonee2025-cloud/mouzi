@@ -187,7 +187,22 @@
       "once": "Once per day",
       "twice": "Twice per day",
       "thrice": "3 times per day",
-      "fourTimes": "4 times per day"
+      "fourTimes": "4 times per day",
+      "recentRuns": "Recent scheduled runs",
+      "status": {
+        "claimed": "Claimed",
+        "running": "Running",
+        "completed": "Completed",
+        "failed": "Failed",
+        "interrupted": "Interrupted"
+      },
+      "scheduledTimes": "Scheduled times: {{occurrences, number}}",
+      "runCounts": "Organized {{organized, number}} · Errors {{errors, number}} · Deferred {{deferred, number}}",
+      "pendingRecovery": "Move records needing review: {{count, number}}",
+      "settingsChanged": "Schedule settings changed during the run.",
+      "appClosed": "The app closed before this run finished.",
+      "readError": "Could not load scheduled runs: {{error}}",
+      "resultUnsaved": "The latest result could not be saved."
     }
   },
   "notifications": {

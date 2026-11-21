@@ -187,7 +187,22 @@
       "once": "Una volta al giorno",
       "twice": "Due volte al giorno",
       "thrice": "3 volte al giorno",
-      "fourTimes": "4 volte al giorno"
+      "fourTimes": "4 volte al giorno",
+      "recentRuns": "Ultime esecuzioni pianificate",
+      "status": {
+        "claimed": "In attesa",
+        "running": "In corso",
+        "completed": "Completata",
+        "failed": "Non riuscita",
+        "interrupted": "Interrotta"
+      },
+      "scheduledTimes": "Orari previsti coperti: {{occurrences, number}}",
+      "runCounts": "Organizzati: {{organized, number}} · Errori: {{errors, number}} · Rinviati: {{deferred, number}}",
+      "pendingRecovery": "Spostamenti da verificare: {{count, number}}",
+      "settingsChanged": "Le impostazioni di pianificazione sono cambiate durante l’esecuzione.",
+      "appClosed": "L’app si è chiusa prima della fine dell’esecuzione.",
+      "readError": "Impossibile caricare le esecuzioni pianificate: {{error}}",
+      "resultUnsaved": "Impossibile salvare l’ultimo risultato."
     }
   },
   "notifications": {

@@ -187,7 +187,22 @@
       "once": "1日1回",
       "twice": "1日2回",
       "thrice": "1日3回",
-      "fourTimes": "1日4回"
+      "fourTimes": "1日4回",
+      "recentRuns": "最近の定期整理",
+      "status": {
+        "claimed": "開始待ち",
+        "running": "実行中",
+        "completed": "完了",
+        "failed": "失敗",
+        "interrupted": "中断"
+      },
+      "scheduledTimes": "対象の予定時刻：{{occurrences, number}} 件",
+      "runCounts": "整理済み：{{organized, number}} · エラー：{{errors, number}} · 保留：{{deferred, number}}",
+      "pendingRecovery": "確認が必要な移動記録：{{count, number}} 件",
+      "settingsChanged": "実行中にスケジュールの設定が変わりました。",
+      "appClosed": "処理が完了する前にアプリが終了しました。",
+      "readError": "定期整理の履歴を読み込めませんでした：{{error}}",
+      "resultUnsaved": "最新の結果を保存できませんでした。"
     }
   },
   "notifications": {

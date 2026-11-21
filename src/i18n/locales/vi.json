@@ -193,7 +193,22 @@
       "once": "Một lần mỗi ngày",
       "twice": "Hai lần mỗi ngày",
       "thrice": "3 lần mỗi ngày",
-      "fourTimes": "4 lần mỗi ngày"
+      "fourTimes": "4 lần mỗi ngày",
+      "recentRuns": "Các lần chạy theo lịch gần đây",
+      "status": {
+        "claimed": "Chờ bắt đầu",
+        "running": "Đang chạy",
+        "completed": "Hoàn tất",
+        "failed": "Thất bại",
+        "interrupted": "Bị gián đoạn"
+      },
+      "scheduledTimes": "Bao gồm {{occurrences, number}} mốc thời gian đã lên lịch",
+      "runCounts": "Đã sắp xếp: {{organized, number}} · Lỗi: {{errors, number}} · Đã hoãn: {{deferred, number}}",
+      "pendingRecovery": "Bản ghi di chuyển cần kiểm tra: {{count, number}}",
+      "settingsChanged": "Cài đặt lịch đã thay đổi trong khi chạy.",
+      "appClosed": "Ứng dụng đã đóng trước khi chạy xong.",
+      "readError": "Không thể tải các lần chạy theo lịch: {{error}}",
+      "resultUnsaved": "Không thể lưu kết quả mới nhất."
     }
   },
   "notifications": {

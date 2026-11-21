@@ -187,7 +187,22 @@
       "once": "每天一次",
       "twice": "每天两次",
       "thrice": "每天 3 次",
-      "fourTimes": "每天 4 次"
+      "fourTimes": "每天 4 次",
+      "recentRuns": "最近的定时运行记录",
+      "status": {
+        "claimed": "等待开始",
+        "running": "正在运行",
+        "completed": "已完成",
+        "failed": "失败",
+        "interrupted": "已中断"
+      },
+      "scheduledTimes": "覆盖 {{occurrences, number}} 个计划时间点",
+      "runCounts": "已整理：{{organized, number}} · 错误：{{errors, number}} · 已推迟：{{deferred, number}}",
+      "pendingRecovery": "待核查的移动记录：{{count, number}} 条",
+      "settingsChanged": "运行期间定时任务设置发生了更改。",
+      "appClosed": "这次运行结束前，应用已关闭。",
+      "readError": "无法加载定时运行记录：{{error}}",
+      "resultUnsaved": "无法保存最新结果。"
     }
   },
   "notifications": {

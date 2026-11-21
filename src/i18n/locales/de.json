@@ -187,7 +187,24 @@
       "once": "Einmal pro Tag",
       "twice": "Zweimal pro Tag",
       "thrice": "3 Mal pro Tag",
-      "fourTimes": "4 Mal pro Tag"
+      "fourTimes": "4 Mal pro Tag",
+      "recentRuns": "Letzte geplante Durchläufe",
+      "status": {
+        "claimed": "Wartet auf Start",
+        "running": "Läuft",
+        "completed": "Abgeschlossen",
+        "failed": "Fehlgeschlagen",
+        "interrupted": "Unterbrochen"
+      },
+      "scheduledTimes": "Geplante Zeitpunkte: {{occurrences, number}}",
+      "scheduledTimes_one": "{{occurrences, number}} geplanter Zeitpunkt",
+      "scheduledTimes_other": "{{occurrences, number}} geplante Zeitpunkte",
+      "runCounts": "Organisiert: {{organized, number}} · Fehler: {{errors, number}} · Zurückgestellt: {{deferred, number}}",
+      "pendingRecovery": "Zu prüfende Verschiebevorgänge: {{count, number}}",
+      "settingsChanged": "Die Zeitplaneinstellungen wurden während des Durchlaufs geändert.",
+      "appClosed": "Die App wurde geschlossen, bevor der Durchlauf abgeschlossen war.",
+      "readError": "Geplante Durchläufe konnten nicht geladen werden: {{error}}",
+      "resultUnsaved": "Das letzte Ergebnis konnte nicht gespeichert werden."
     }
   },
   "notifications": {

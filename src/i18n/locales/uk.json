@@ -187,7 +187,22 @@
       "once": "Раз на день",
       "twice": "Двічі на день",
       "thrice": "Тричі на день",
-      "fourTimes": "4 рази на день"
+      "fourTimes": "4 рази на день",
+      "recentRuns": "Останні запуски за розкладом",
+      "status": {
+        "claimed": "Очікує запуску",
+        "running": "Виконується",
+        "completed": "Завершено",
+        "failed": "Помилка",
+        "interrupted": "Перервано"
+      },
+      "scheduledTimes": "Запланованих запусків охоплено: {{occurrences, number}}",
+      "runCounts": "Упорядковано: {{organized, number}} · Помилки: {{errors, number}} · Відкладено: {{deferred, number}}",
+      "pendingRecovery": "Переміщення, які потребують перевірки: {{count, number}}",
+      "settingsChanged": "Налаштування розкладу змінилися під час виконання.",
+      "appClosed": "Застосунок закрився до завершення виконання.",
+      "readError": "Не вдалося завантажити запуски за розкладом: {{error}}",
+      "resultUnsaved": "Не вдалося зберегти останній результат."
     }
   },
   "notifications": {

@@ -187,7 +187,22 @@
       "once": "Raz dziennie",
       "twice": "Dwa razy dziennie",
       "thrice": "3 razy dziennie",
-      "fourTimes": "4 razy dziennie"
+      "fourTimes": "4 razy dziennie",
+      "recentRuns": "Ostatnie uruchomienia według harmonogramu",
+      "status": {
+        "claimed": "Oczekuje na uruchomienie",
+        "running": "W toku",
+        "completed": "Zakończono",
+        "failed": "Niepowodzenie",
+        "interrupted": "Przerwano"
+      },
+      "scheduledTimes": "Zaplanowane terminy: {{occurrences, number}}",
+      "runCounts": "Uporządkowano: {{organized, number}} · Błędy: {{errors, number}} · Odłożono: {{deferred, number}}",
+      "pendingRecovery": "Przeniesienia do sprawdzenia: {{count, number}}",
+      "settingsChanged": "Ustawienia harmonogramu zmieniły się w trakcie porządkowania.",
+      "appClosed": "Aplikacja została zamknięta przed zakończeniem porządkowania.",
+      "readError": "Nie udało się wczytać uruchomień według harmonogramu: {{error}}",
+      "resultUnsaved": "Nie udało się zapisać ostatniego wyniku."
     }
   },
   "notifications": {

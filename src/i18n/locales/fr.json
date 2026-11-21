@@ -187,7 +187,22 @@
       "once": "Une fois par jour",
       "twice": "Deux fois par jour",
       "thrice": "3 fois par jour",
-      "fourTimes": "4 fois par jour"
+      "fourTimes": "4 fois par jour",
+      "recentRuns": "Dernières exécutions planifiées",
+      "status": {
+        "claimed": "En attente",
+        "running": "En cours",
+        "completed": "Terminée",
+        "failed": "Échec",
+        "interrupted": "Interrompue"
+      },
+      "scheduledTimes": "Horaires prévus couverts : {{occurrences, number}}",
+      "runCounts": "Fichiers organisés : {{organized, number}} · Erreurs : {{errors, number}} · Reports : {{deferred, number}}",
+      "pendingRecovery": "Déplacements à vérifier : {{count, number}}",
+      "settingsChanged": "La planification a changé pendant l’exécution.",
+      "appClosed": "L’application s’est fermée avant la fin de l’exécution.",
+      "readError": "Impossible de charger les exécutions planifiées : {{error}}",
+      "resultUnsaved": "Impossible d’enregistrer le dernier résultat."
     }
   },
   "notifications": {

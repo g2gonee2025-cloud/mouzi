@@ -170,7 +170,22 @@
       "once": "Una vez al día",
       "twice": "Dos veces al día",
       "thrice": "3 veces al día",
-      "fourTimes": "4 veces al día"
+      "fourTimes": "4 veces al día",
+      "recentRuns": "Ejecuciones programadas recientes",
+      "status": {
+        "claimed": "En espera",
+        "running": "En curso",
+        "completed": "Completada",
+        "failed": "Fallida",
+        "interrupted": "Interrumpida"
+      },
+      "scheduledTimes": "Horarios programados cubiertos: {{occurrences, number}}",
+      "runCounts": "Organizados: {{organized, number}} · Errores: {{errors, number}} · Aplazados: {{deferred, number}}",
+      "pendingRecovery": "Registros de movimientos por revisar: {{count, number}}",
+      "settingsChanged": "La configuración del horario cambió durante la ejecución.",
+      "appClosed": "La aplicación se cerró antes de que terminara la ejecución.",
+      "readError": "No se pudieron cargar las ejecuciones programadas: {{error}}",
+      "resultUnsaved": "No se pudo guardar el último resultado."
     },
     "archive": {
       "title": "Importar archivo",

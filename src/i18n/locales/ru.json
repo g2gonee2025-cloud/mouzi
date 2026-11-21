@@ -187,7 +187,22 @@
       "once": "Раз в день",
       "twice": "Два раза в день",
       "thrice": "3 раза в день",
-      "fourTimes": "4 раза в день"
+      "fourTimes": "4 раза в день",
+      "recentRuns": "Последние запуски по расписанию",
+      "status": {
+        "claimed": "Ожидает запуска",
+        "running": "Выполняется",
+        "completed": "Завершён",
+        "failed": "Ошибка",
+        "interrupted": "Прерван"
+      },
+      "scheduledTimes": "Запланированных запусков охвачено: {{occurrences, number}}",
+      "runCounts": "Упорядочено: {{organized, number}} · Ошибки: {{errors, number}} · Отложено: {{deferred, number}}",
+      "pendingRecovery": "Перемещения, требующие проверки: {{count, number}}",
+      "settingsChanged": "Настройки расписания изменились во время запуска.",
+      "appClosed": "Приложение закрылось до завершения запуска.",
+      "readError": "Не удалось загрузить запуски по расписанию: {{error}}",
+      "resultUnsaved": "Не удалось сохранить последний результат."
     }
   },
   "notifications": {
