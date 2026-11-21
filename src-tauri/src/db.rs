@@ -88,7 +88,7 @@ pub struct Rule {
     pub options: RuleOptions,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WatchedFolder {
     pub id: Option<i64>,
     pub path: String,

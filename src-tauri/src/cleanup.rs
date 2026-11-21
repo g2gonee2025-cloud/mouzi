@@ -123,9 +123,12 @@ struct RootConfig {
     mode: String,
 }
 
+fn watched_folders() -> Result<Vec<db::WatchedFolder>, String> {
+    db::get_watched_folders().map_err(|error| format!("Cannot read watched folders: {error}"))
+}
+
 fn root_configuration() -> Result<Vec<RootConfig>, String> {
-    let mut configuration: Vec<_> = db::get_watched_folders()
-        .map_err(|error| format!("Cannot read watched folders: {error}"))?
+    let mut configuration: Vec<_> = watched_folders()?
         .into_iter()
         .map(|folder| RootConfig {
             id: folder.id,
@@ -139,13 +142,31 @@ fn root_configuration() -> Result<Vec<RootConfig>, String> {
 }
 
 fn current_scope() -> Result<safe_fs::RootScope, String> {
-    let scope = safe_fs::eligible_scope(
-        &db::get_watched_folders().map_err(|error| format!("Cannot read watched folders: {error}"))?,
-    )?;
+    let scope = safe_fs::eligible_scope(&watched_folders()?)?;
+    require_available_scope(&scope)?;
+    Ok(scope)
+}
+
+fn require_available_scope(scope: &safe_fs::RootScope) -> Result<(), String> {
     if scope.active_roots().is_empty() && !scope.unavailable_active_roots().is_empty() {
         return Err("The enabled watched folders are unavailable. Reconnect a folder to find cleanup candidates.".into());
     }
-    Ok(scope)
+    Ok(())
+}
+
+#[derive(PartialEq, Eq)]
+struct RootCoverage {
+    registrations: Vec<db::WatchedFolder>,
+    scope: safe_fs::RootScope,
+}
+
+impl RootCoverage {
+    fn read() -> Result<Self, String> {
+        let mut registrations = watched_folders()?;
+        registrations.sort_by_key(|folder| folder.id);
+        let scope = safe_fs::eligible_scope(&registrations)?;
+        Ok(Self { registrations, scope })
+    }
 }
 
 fn modified_epoch(modified: SystemTime) -> i64 {
@@ -220,9 +241,16 @@ fn duplicate_candidates(scope: &safe_fs::RootScope) -> Result<Vec<(String, FileF
 }
 
 pub fn find_duplicates() -> Result<FinderResult<DuplicateGroup>, String> {
-    let scope = current_scope()?;
+    find_duplicates_with(duplicate_candidates)
+}
+
+fn find_duplicates_with(
+    discover: impl FnOnce(&safe_fs::RootScope) -> Result<Vec<(String, FileFingerprint)>, String>,
+) -> Result<FinderResult<DuplicateGroup>, String> {
+    let coverage = RootCoverage::read()?;
+    require_available_scope(&coverage.scope)?;
     let mut grouped: HashMap<(u64, String), Vec<DuplicateFile>> = HashMap::new();
-    for (path, current) in duplicate_candidates(&scope)? {
+    for (path, current) in discover(&coverage.scope)? {
         grouped.entry((current.size, current.hash)).or_default().push(DuplicateFile {
             path,
             size: current.size as i64,
@@ -238,7 +266,15 @@ pub fn find_duplicates() -> Result<FinderResult<DuplicateGroup>, String> {
         let reclaim = |group: &DuplicateGroup| group.files[0].size.saturating_mul(group.files.len() as i64 - 1);
         reclaim(right).cmp(&reclaim(left)).then(left.hash.cmp(&right.hash))
     });
-    Ok(FinderResult::from_scope(groups, &scope))
+    // Per-file validation can omit candidates when a watched folder changes.
+    // Verify the coverage before publishing either a complete or partial result.
+    let current = RootCoverage::read().map_err(|error| {
+        format!("Could not verify watched folders after finding duplicates: {error}. Run Find Duplicates again.")
+    })?;
+    if current != coverage {
+        return Err("Watched folders changed while finding duplicates. Run Find Duplicates again.".into());
+    }
+    Ok(FinderResult::from_scope(groups, &current.scope))
 }
 
 fn current_inventory_files(scope: &safe_fs::RootScope) -> Result<Vec<CleanupFile>, String> {
@@ -872,6 +908,122 @@ mod tests {
         assert_eq!(stale["candidates"], serde_json::json!([]));
         assert_eq!(directories["candidates"], serde_json::json!([empty.to_string_lossy()]));
         assert_eq!(complete.as_array().unwrap().len(), 2, "complete IPC results retain the array shape");
+    }
+
+    #[test]
+    fn duplicate_finder_requests_retry_when_a_root_goes_offline_or_is_replaced() {
+        let _guard = db::serialise_test_db();
+        for replace in [false, true] {
+            init();
+            let tree = TestTree::new();
+            tree.register();
+            let a = tree.file("a.txt", b"duplicate");
+            let b = tree.file("b.txt", b"duplicate");
+            tree.inventory(&[&a, &b]);
+            let nested = tree.0.join("nested");
+            fs::create_dir(&nested).unwrap();
+            db::add_watched_folder(&nested.to_string_lossy(), db::FOLDER_MODE_MANUAL).unwrap();
+
+            let result = find_duplicates_with(|scope| {
+                fs::rename(&nested, tree.0.join("original")).unwrap();
+                if replace {
+                    fs::create_dir(&nested).unwrap();
+                }
+                duplicate_candidates(scope)
+            });
+
+            assert_eq!(
+                result.unwrap_err(),
+                "Watched folders changed while finding duplicates. Run Find Duplicates again."
+            );
+            let refreshed = find_duplicates().unwrap();
+            assert_eq!(refreshed.candidates()[0].files.len(), 2);
+            match refreshed {
+                FinderResult::Complete(_) => assert!(replace),
+                FinderResult::Partial { unavailable_roots, .. } => {
+                    assert!(!replace);
+                    assert_eq!(unavailable_roots, [nested.to_string_lossy().into_owned()]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn duplicate_finder_preserves_stable_partial_results_but_retries_when_nested_root_returns() {
+        let _guard = db::serialise_test_db();
+        for mode in [db::FOLDER_MODE_MANUAL, db::FOLDER_MODE_PAUSED] {
+            init();
+            let tree = TestTree::new();
+            tree.register();
+            let a = tree.file("a.txt", b"duplicate");
+            let b = tree.file("b.txt", b"duplicate");
+            tree.inventory(&[&a, &b]);
+            let nested = tree.0.join("nested");
+            let disconnected = tree.0.join("disconnected");
+            fs::create_dir(&nested).unwrap();
+            db::add_watched_folder(&nested.to_string_lossy(), mode).unwrap();
+            fs::rename(&nested, &disconnected).unwrap();
+
+            let starting = find_duplicates().unwrap();
+            assert_eq!(starting.candidates()[0].files.len(), 2);
+            match starting {
+                FinderResult::Complete(_) => assert_eq!(mode, db::FOLDER_MODE_PAUSED),
+                FinderResult::Partial { unavailable_roots, .. } => {
+                    assert_eq!(mode, db::FOLDER_MODE_MANUAL);
+                    assert_eq!(unavailable_roots, [nested.to_string_lossy().into_owned()]);
+                }
+            }
+            let result = find_duplicates_with(|scope| {
+                fs::rename(&disconnected, &nested).unwrap();
+                duplicate_candidates(scope)
+            });
+            assert_eq!(
+                result.unwrap_err(),
+                "Watched folders changed while finding duplicates. Run Find Duplicates again."
+            );
+            assert!(matches!(find_duplicates().unwrap(), FinderResult::Complete(groups) if groups.len() == 1));
+        }
+    }
+
+    #[test]
+    fn duplicate_finder_retries_instead_of_publishing_results_for_a_newly_paused_root() {
+        let _guard = db::serialise_test_db();
+        init();
+        let tree = TestTree::new();
+        let id = db::add_watched_folder(&tree.0.to_string_lossy(), db::FOLDER_MODE_MANUAL).unwrap();
+        let a = tree.file("a.txt", b"duplicate");
+        let b = tree.file("b.txt", b"duplicate");
+        tree.inventory(&[&a, &b]);
+
+        let result = find_duplicates_with(|scope| {
+            let candidates = duplicate_candidates(scope)?;
+            assert_eq!(candidates.len(), 2);
+            db::update_folder_mode(id, db::FOLDER_MODE_PAUSED).unwrap();
+            Ok(candidates)
+        });
+        assert_eq!(
+            result.unwrap_err(),
+            "Watched folders changed while finding duplicates. Run Find Duplicates again."
+        );
+        assert!(matches!(find_duplicates().unwrap(), FinderResult::Complete(groups) if groups.is_empty()));
+    }
+
+    #[test]
+    fn duplicate_finder_keeps_healthy_results_when_an_individual_file_disappears() {
+        let _guard = db::serialise_test_db();
+        init();
+        let tree = TestTree::new();
+        tree.register();
+        let a = tree.file("a.txt", b"duplicate");
+        let b = tree.file("b.txt", b"duplicate");
+        let omitted = tree.file("omitted.txt", b"duplicate");
+        tree.inventory(&[&a, &b, &omitted]);
+        let result = find_duplicates_with(|scope| {
+            fs::rename(omitted, tree.0.join("moved.txt")).unwrap();
+            duplicate_candidates(scope)
+        }).unwrap();
+        assert!(matches!(result, FinderResult::Complete(groups) if groups.len() == 1
+            && groups[0].files.iter().map(|file| &file.path).eq([&a, &b])));
     }
 
     #[test]
