@@ -3804,7 +3804,7 @@ mod accept_tests {
 
     fn index_fixture(fixture: &AcceptFixture) {
         lock_db().unwrap().execute_batch("DELETE FROM watched_folders; DELETE FROM file_inventory; DELETE FROM inventory_fingerprints; DELETE FROM accepted_suggestion_feedback;").unwrap();
-        add_watched_folder(&fixture.root().to_string_lossy(), FOLDER_MODE_MANUAL).unwrap();
+        register_watched_folder(&fixture.root().to_string_lossy(), FOLDER_MODE_MANUAL, false).unwrap();
         let summary = crate::scan::scan_roots(&[fixture.root().to_string_lossy().into_owned()], |_| {});
         assert_eq!(summary[0].status,"complete");
     }
