@@ -16,7 +16,6 @@ use std::sync::Mutex as PlanMutex;
 #[cfg(test)]
 use std::sync::{Mutex, MutexGuard};
 use tauri::{AppHandle, Emitter, Manager};
-use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_notification::NotificationExt;
 
@@ -708,6 +707,7 @@ const MAX_GRACE_PERIOD_SECONDS: i64 = 7 * 24 * 60 * 60;
 
 #[tauri::command(async)]
 pub fn update_settings_cmd(app: AppHandle, settings: PreferencesPatch) -> Result<AppSettings, String> {
+    if settings.autostart.is_some() { return Err("Change startup through Start with System.".into()); }
     if settings.theme.as_deref().is_some_and(|theme| !matches!(theme, "light" | "dark" | "system")) { return Err("Choose a supported theme".into()); }
     if settings.language.as_deref().is_some_and(|language| !matches!(language, "en" | "de" | "es" | "fr" | "it" | "ja" | "pl" | "ru" | "uk" | "vi" | "zh-CN")) { return Err("Choose a supported language".into()); }
     if settings.grace_period_seconds.is_some_and(|seconds| !(0..=MAX_GRACE_PERIOD_SECONDS).contains(&seconds)) {
@@ -996,21 +996,34 @@ pub fn show_notification(app: AppHandle, title: String, body: String) {
     let _ = app.notification().builder().title(title).body(body).show();
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn enable_autostart_cmd(app: AppHandle) -> Result<(), String> {
-    if cfg!(debug_assertions) { return Err("Autostart is unavailable in the isolated development profile".into()); }
-    app.autolaunch().enable().map_err(|e| e.to_string())
+    set_startup_enabled_cmd(app, true).map(|_| ())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn disable_autostart_cmd(app: AppHandle) -> Result<(), String> {
-    if cfg!(debug_assertions) { return Err("Autostart is unavailable in the isolated development profile".into()); }
-    app.autolaunch().disable().map_err(|e| e.to_string())
+    set_startup_enabled_cmd(app, false).map(|_| ())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn is_autostart_enabled_cmd(app: AppHandle) -> Result<bool, String> {
-    app.autolaunch().is_enabled().map_err(|e| e.to_string())
+    match crate::startup::status(&app)? {
+        crate::startup::StartupStatus::Unavailable => Err("Autostart is unavailable in the isolated development profile".into()),
+        status => Ok(status == crate::startup::StartupStatus::Enabled),
+    }
+}
+
+#[tauri::command(async)]
+pub fn get_startup_status_cmd(app: AppHandle) -> Result<crate::startup::StartupStatus, String> {
+    crate::startup::status(&app)
+}
+
+#[tauri::command(async)]
+pub fn set_startup_enabled_cmd(app: AppHandle, enabled: bool) -> Result<crate::startup::StartupStatus, String> {
+    let result = crate::startup::set_enabled(&app, enabled);
+    let _ = app.emit("startup-status-changed", ());
+    result
 }
 
 fn with_registered_ignore_root<T>(

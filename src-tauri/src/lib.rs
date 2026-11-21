@@ -12,6 +12,7 @@ pub mod rules;
 pub mod safe_fs;
 pub mod scan;
 pub mod scheduler;
+pub mod startup;
 pub mod suppress;
 pub mod tray;
 pub mod watcher;
@@ -22,7 +23,6 @@ use directories::ProjectDirs;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use tauri::Manager;
-use tauri_plugin_autostart::ManagerExt;
 use suppress::SuppressionSet;
 use watcher::FolderWatcher;
 #[cfg(target_os = "macos")]
@@ -170,18 +170,6 @@ pub fn run() {
                 }
             }
 
-            // Sync autostart with user settings
-            if !cfg!(debug_assertions) {
-              if let Ok(settings) = db::get_settings() {
-                let auto_manager = app.autolaunch();
-                if settings.autostart {
-                    let _ = auto_manager.enable();
-                } else {
-                    let _ = auto_manager.disable();
-                }
-              }
-            }
-
             // Start folder watcher
             let state = app.state::<AppState>();
             {
@@ -231,6 +219,8 @@ pub fn run() {
             enable_autostart_cmd,
             disable_autostart_cmd,
             is_autostart_enabled_cmd,
+            get_startup_status_cmd,
+            set_startup_enabled_cmd,
             preview_clear_logs_cmd,
             clear_logs_cmd,
             scan_folder_cmd,
