@@ -507,7 +507,8 @@
     "planChanged": "The file or settings changed. Review a new plan.",
     "alreadyFiled": "Already filed; category saved",
     "localAiModelMissing": "Ollama is missing the selected model. Install it or choose an installed model under Settings → General. If a refresh still shows this message, refresh again in a minute.",
-    "localAiUnreachable": "Ollama is unreachable. Start Ollama and refresh. If the message persists, refresh again in a minute."
+    "localAiUnreachable": "Ollama is unreachable. Start Ollama and refresh. If the message persists, refresh again in a minute.",
+    "localAiGenerationFailed": "Ollama could not finish a request with the selected model. Check that the model works in Ollama or choose another in Settings → General. After fixing the issue, wait a minute and refresh Suggestions."
   },
   "confirm": {
     "impactItems": "{{count}} item",

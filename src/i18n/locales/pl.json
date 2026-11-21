@@ -509,7 +509,8 @@
     "planChanged": "Plik lub ustawienia uległy zmianie. Przejrzyj nowy plan.",
     "alreadyFiled": "Już uporządkowano; zapisano kategorię",
     "localAiModelMissing": "W Ollama brakuje wybranego modelu. Zainstaluj go lub wybierz zainstalowany model w sekcji Ustawienia → Ogólne. Jeśli po odświeżeniu komunikat nadal się wyświetla, odśwież sugestie ponownie za minutę.",
-    "localAiUnreachable": "Nie można połączyć się z Ollama. Uruchom Ollama i odśwież sugestie. Jeśli komunikat nadal się wyświetla, odśwież je ponownie za minutę."
+    "localAiUnreachable": "Nie można połączyć się z Ollama. Uruchom Ollama i odśwież sugestie. Jeśli komunikat nadal się wyświetla, odśwież je ponownie za minutę.",
+    "localAiGenerationFailed": "Nie udało się dokończyć żądania w Ollama przy użyciu wybranego modelu. Sprawdź, czy model działa w Ollama, lub wybierz inny w sekcji Ustawienia → Ogólne. Po rozwiązaniu problemu odczekaj minutę i odśwież sugestie."
   },
   "confirm": {
     "impactItems": "{{count}} element",

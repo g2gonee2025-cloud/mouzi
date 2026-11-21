@@ -509,7 +509,8 @@
     "planChanged": "Il file o le impostazioni sono cambiati. Esamina un nuovo piano.",
     "alreadyFiled": "Già archiviato; categoria salvata",
     "localAiModelMissing": "Il modello selezionato manca in Ollama. Installalo o scegli un modello installato in Impostazioni → Generale. Se il messaggio rimane dopo l’aggiornamento, aggiorna di nuovo i suggerimenti tra un minuto.",
-    "localAiUnreachable": "Ollama non è raggiungibile. Avvia Ollama e aggiorna i suggerimenti. Se il messaggio rimane, riprova tra un minuto."
+    "localAiUnreachable": "Ollama non è raggiungibile. Avvia Ollama e aggiorna i suggerimenti. Se il messaggio rimane, riprova tra un minuto.",
+    "localAiGenerationFailed": "Ollama non è riuscito a completare una richiesta con il modello selezionato. Verifica che il modello funzioni in Ollama o scegline un altro in Impostazioni → Generale. Dopo aver risolto il problema, aspetta un minuto e aggiorna i suggerimenti."
   },
   "confirm": {
     "impactItems": "{{count}} elemento",
