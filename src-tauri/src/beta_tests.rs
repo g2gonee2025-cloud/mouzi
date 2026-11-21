@@ -393,15 +393,18 @@ fn unreadable_review_exclusions_leave_healthy_roots_and_explicit_scope_intact() 
 
     let exercise = |paths, shown: &[&Path], blocked: &[&Path]| {
         let preview = op::preview(paths, &fixture.suppression).unwrap();
-        let mut actual = preview.entries.iter().map(|entry| Path::new(&entry.source)).collect::<Vec<_>>();
+        let canonical = |path: &Path| fs::canonicalize(path).unwrap();
+        let mut actual = preview.entries.iter().map(|entry| canonical(Path::new(&entry.source))).collect::<Vec<_>>();
+        let mut expected = shown.iter().map(|path| canonical(path)).collect::<Vec<_>>();
         actual.sort();
-        assert_eq!(actual, shown);
+        expected.sort();
+        assert_eq!(actual, expected);
         assert!(preview.entries.iter().all(|entry| entry.error.is_none()));
         let json = serde_json::to_value(&preview).unwrap();
         let rows = json.get("blockedRoots").and_then(serde_json::Value::as_array).map(Vec::as_slice).unwrap_or_default();
         assert_eq!(rows.len(), blocked.len());
         for root in blocked {
-            let row = rows.iter().find(|row| row["root"].as_str().is_some_and(|path| Path::new(path) == *root)).unwrap();
+            let row = rows.iter().find(|row| row["root"].as_str().is_some_and(|path| canonical(Path::new(path)) == canonical(root))).unwrap();
             let detail = row["error"].as_str().unwrap();
             assert!(detail.contains(".mouziignore"));
             assert!(detail.contains("Unable to read"));
@@ -441,6 +444,19 @@ fn unreadable_review_exclusions_leave_healthy_roots_and_explicit_scope_intact() 
 }
 
 #[test]
+fn unreadable_review_exclusions_do_not_create_a_warning_for_an_empty_candidate_scope() {
+    let fixture = Fixture::new();
+    let policy = fixture.root.join(".mouziignore");
+    fs::write(&policy, [0xff]).unwrap();
+
+    let preview = fixture.preview(&[&policy]);
+    assert!(preview.entries.is_empty());
+    let json = serde_json::to_value(&preview).unwrap();
+    assert!(json.get("blockedRoots").is_none());
+    op::discard(&preview.id);
+}
+
+#[test]
 fn unreadable_nested_review_exclusions_block_the_whole_owning_root_without_reserving_a_name() {
     let mut fixture = Fixture::new();
     let healthy_dir = fixture.root.join("zz-healthy");
@@ -468,7 +484,7 @@ fn unreadable_nested_review_exclusions_block_the_whole_owning_root_without_reser
     assert_eq!(Path::new(destination).file_name(), healthy.file_name());
     let json = serde_json::to_value(&preview).unwrap();
     assert_eq!(json["blockedRoots"].as_array().unwrap().len(), 1);
-    assert_eq!(Path::new(json["blockedRoots"][0]["root"].as_str().unwrap()), &fixture.root);
+    assert_eq!(fs::canonicalize(json["blockedRoots"][0]["root"].as_str().unwrap()).unwrap(), fs::canonicalize(&fixture.root).unwrap());
     assert!(json["blockedRoots"][0]["error"].as_str().unwrap().contains("zz-exclusions"));
     op::discard(&preview.id);
     assert!(!shared_destination.exists());
