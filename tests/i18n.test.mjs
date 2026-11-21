@@ -19,13 +19,18 @@ function strings(object, prefix = '') {
 const tokens = value => [...value.matchAll(/\{\{[^{}]+\}\}|\{[^{}]+\}/g)].map(match => match[0]).sort();
 const reference = strings(locales.en);
 const pluralSuffix = /_(zero|one|two|few|many|other)$/;
-const pluralGroups = new Set(Object.keys(reference).filter(key => pluralSuffix.test(key))
+const referencePlurals = new Set(Object.keys(reference).filter(key => pluralSuffix.test(key))
   .map(key => key.replace(pluralSuffix, '')));
-function messageKey(key) {
+// Keep requiring this family even if every localized variant is removed.
+const requiredLocalPlurals = { de: ['settings.scheduler.scheduledTimes'] };
+function messageKey(key, pluralGroups) {
   const base = key.replace(pluralSuffix, '');
   return pluralGroups.has(base) ? base : key;
 }
-const messageKeys = entries => [...new Set(Object.keys(entries).map(messageKey))].sort();
+const messageKeys = (entries, pluralGroups) => [...new Set(
+  Object.keys(entries).map(key => messageKey(key, pluralGroups)),
+)].sort();
+const referenceKeys = messageKeys(reference, referencePlurals);
 
 // These are the words the person approving the selection should see.
 const selectionCaptions = {
@@ -57,16 +62,25 @@ const selectionCaptions = {
   'zh-CN': [[1, '执行 1 项操作', '恢复 1 个文件'], [2, '执行 2 项操作', '恢复 2 个文件']],
 };
 
-function integerPluralExamples(language) {
-  const rules = new Intl.PluralRules(language);
+function integerPluralExamples(rules) {
   const examples = new Map();
   // The UI passes integer file, rule, and history counts. A million also
   // exercises the additional category used by several Romance languages.
-  for (const count of [...Array.from({ length: 200 }, (_, n) => n), 1_000_000]) {
+  for (const count of [...Array.from({ length: 200 }, (_, n) => n + 1), 0, 1_000_000]) {
     const category = rules.select(count);
     if (!examples.has(category)) examples.set(category, count);
   }
   return examples;
+}
+
+function interpolationSample(value, count, numbers) {
+  const fields = { count };
+  const rendered = value.replace(/\{\{\s*([^,{}]+?)\s*(?:,\s*([^{}]+?)\s*)?\}\}/g, (_, field, format) => {
+    fields[field] ??= 1_234 + Object.keys(fields).length;
+    assert.ok(format === undefined || format === 'number', `Unsupported test format: ${format}`);
+    return format === 'number' ? numbers.format(fields[field]) : String(fields[field]);
+  });
+  return { fields, rendered };
 }
 
 for (const [language, locale] of Object.entries(locales)) {
@@ -81,29 +95,47 @@ for (const [language, locale] of Object.entries(locales)) {
   test(`${language}: all UI keys and placeholders are present without fallback (#67)`, async () => {
     assert.ok(locale.beta, 'Missing organization translations');
     const translated = strings(locale);
-    assert.deepEqual(messageKeys(translated), messageKeys(reference));
+    const pluralGroups = new Set([...referencePlurals, ...(requiredLocalPlurals[language] ?? [])]);
+    for (const key of Object.keys(translated)) {
+      const base = key.replace(pluralSuffix, '');
+      if (base !== key && Object.hasOwn(reference, base)) pluralGroups.add(base);
+    }
+    assert.deepEqual(messageKeys(translated, pluralGroups), referenceKeys);
     for (const [key, value] of Object.entries(translated)) {
-      const base = messageKey(key);
-      const source = reference[key] ?? reference[`${base}_other`];
+      const base = messageKey(key, pluralGroups);
+      const source = reference[key] ?? reference[`${base}_other`] ?? reference[base];
       assert.ok(value.trim(), `${language}: empty ${key}`);
       assert.deepEqual(tokens(value), tokens(source), `${language}: placeholders in ${key}`);
     }
     // Disable fallback so a missing runtime lookup cannot silently use English.
     const instance = i18next.createInstance();
     await instance.init({ lng: language, fallbackLng: false, resources: { [language]: { translation: locale } } });
-    const examples = integerPluralExamples(language);
-    for (const key of messageKeys(reference)) {
+    const rules = new Intl.PluralRules(language);
+    const numbers = new Intl.NumberFormat(language);
+    const examples = integerPluralExamples(rules);
+    const check = (key, variant, count) => {
+      const { fields, rendered } = interpolationSample(translated[variant], count, numbers);
+      const result = instance.t(key, { ...fields, returnDetails: true });
+      assert.equal(result.exactUsedKey, variant, `${language}: ${key} form at count ${count}`);
+      assert.equal(result.res, rendered, `${language}: ${variant} text at count ${count}`);
+    };
+    for (const key of referenceKeys) {
+      if (!referencePlurals.has(key)) {
+        assert.ok(Object.hasOwn(translated, key) && instance.exists(key), `${language}: missing ${key}`);
+      }
       if (!pluralGroups.has(key)) {
-        assert.equal(instance.exists(key), true, key);
-        assert.equal(instance.t(key, { count: 3 }), translated[key].replaceAll('{{count}}', '3'));
+        check(key, key, 1_234);
         continue;
       }
-      for (const [category, count] of examples) {
-        const variant = count === 0 && Object.hasOwn(translated, `${key}_zero`)
-          ? `${key}_zero` : `${key}_${category}`;
-        const expected = translated[variant] ?? (examples.size === 1 ? translated[key] : undefined);
-        assert.ok(expected, `${language}: missing ${variant}`);
-        assert.equal(instance.t(key, { count }), expected.replaceAll('{{count}}', String(count)));
+      const customZero = Object.hasOwn(translated, `${key}_zero`);
+      const counts = new Set([...examples.values(), 1_234, ...(customZero ? [0] : [])]);
+      const permitsBase = referencePlurals.has(key) && examples.size === 1;
+      for (const count of counts) {
+        const suffix = count === 0 && customZero ? 'zero' : rules.select(count);
+        const variant = `${key}_${suffix}`;
+        const available = Object.hasOwn(translated, variant);
+        assert.ok(available || (permitsBase && Object.hasOwn(translated, key)), `${language}: missing ${variant}`);
+        check(key, available ? variant : key, count);
       }
     }
   });
