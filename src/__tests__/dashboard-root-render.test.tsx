@@ -2,6 +2,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Children, isValidElement, type ComponentProps, type EffectCallback, type ReactElement, type ReactNode } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import Dashboard from "../pages/Dashboard";
+import ReviewFilesButton from "../components/dashboard/ReviewFilesButton";
+import { useAppStore } from "../store/useAppStore";
 import FileBrowser from "../components/dashboard/FileBrowser";
 import StorageTreemap from "../components/dashboard/StorageTreemap";
 import StorageRibbon from "../components/dashboard/StorageRibbon";
@@ -63,6 +65,14 @@ vi.mock("../store/useDashboardStore", async (importOriginal) => {
     ...actual,
     useDashboardStore: Object.assign(() => actual.useDashboardStore.getState(), actual.useDashboardStore),
   };
+});
+
+vi.mock("../store/useAppStore", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../store/useAppStore")>();
+  const store = actual.useAppStore;
+  return { ...actual, useAppStore: Object.assign(
+    (select: (state: ReturnType<typeof store.getState>) => unknown) => select(store.getState()), store,
+  ) };
 });
 
 const root: RootStat = {
@@ -190,6 +200,7 @@ function renderDashboard(
 
 beforeEach(() => {
   useDashboardStore.setState(useDashboardStore.getInitialState(), true);
+  useAppStore.setState(useAppStore.getInitialState(), true);
   mock.state.length = 0;
   mock.invoke.mockReset();
   mock.listen.mockReset();
@@ -230,6 +241,29 @@ function duplicateNameFiles() {
 }
 
 describe("dashboard entry points", () => {
+  it("shows the current waiting count and reviews exactly those files", async () => {
+    function buttonState() {
+      let control: ReactElement<{ disabled: boolean; onClick: () => Promise<void>; "aria-label": string }> | undefined;
+      function Capture() {
+        const tree = ReviewFilesButton();
+        control = findElement(tree, element => element.type === "button");
+        return tree;
+      }
+      renderToStaticMarkup(<Capture />);
+      if (!control) throw new Error("Review files button missing");
+      return control.props;
+    }
+    useAppStore.setState({ pendingReadStatus: "ready", pendingFiles: [] });
+    expect(buttonState()).toMatchObject({ disabled: true, "aria-label": "dashboard.reviewFiles (0)" });
+    useAppStore.setState({ pendingFiles: [["C:/Inbox", "report.pdf"], ["D:/Work", "report.pdf"]] });
+    const waiting = buttonState();
+    expect(waiting).toMatchObject({ disabled: false, "aria-label": "dashboard.reviewFiles (2)" });
+    await waiting.onClick();
+    expect(mock.invoke).toHaveBeenCalledWith("show_review_cmd", { paths: ["C:/Inbox/report.pdf", "D:/Work/report.pdf"] });
+    useAppStore.setState({ pendingReadStatus: "failed" });
+    expect(buttonState()).toMatchObject({ disabled: true, "aria-label": "dashboard.reviewFiles. popup.pendingFilesLoadError" });
+  });
+
   it("guides a user with no watched folders to Settings", () => {
     const html = renderDashboard([]);
     expect(html).toContain("dashboard.scanNoRoots");

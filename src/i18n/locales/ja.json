@@ -333,6 +333,7 @@
     "recoveryUnavailable": "復元方法が検証されるまでファイルは削除できません。"
   },
   "dashboard": {
+    "reviewFiles": "ファイルを確認",
     "title": "ダッシュボード",
     "totalFiles": "合計ファイル数",
     "totalBytes": "合計サイズ",

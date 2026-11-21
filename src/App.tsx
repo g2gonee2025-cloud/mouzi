@@ -192,9 +192,9 @@ function App() {
           <Cleanup />
         ) : hash === "suggestions" ? (
           <Suggestions />
-        ) : (
+        ) : getCurrentWindow().label === "popup" ? (
           <Popup />
-        )}
+        ) : null}
     </div>
   );
 }

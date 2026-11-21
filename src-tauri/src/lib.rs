@@ -82,6 +82,16 @@ mod profile_tests {
     }
 }
 
+fn open_launch_destination(app: &tauri::AppHandle, args: &[String]) {
+    if integration::handle_folder_args(app, args) || args.iter().any(|arg| arg == "--autostart") {
+        return;
+    }
+    if cfg!(debug_assertions) && std::env::var("MOUZI_OPEN").as_deref() == Ok("none") {
+        return;
+    }
+    tray::queue_window_action(app, tray::WindowAction::Dashboard);
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let mut context = tauri::generate_context!();
@@ -101,16 +111,7 @@ pub fn run() {
     ));
     builder
         .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
-            if integration::handle_folder_args(app, &args) {
-                return;
-            }
-            if let Some(window) = app.get_webview_window("app") {
-                let _ = window.show();
-                let _ = window.set_focus();
-            } else if let Some(window) = app.get_webview_window("popup") {
-                let _ = window.show();
-                let _ = window.set_focus();
-            }
+            open_launch_destination(app, &args);
         }))
         .manage(AppState {
             watcher: Arc::new(Mutex::new(FolderWatcher::new(ignored_files.clone()))),
@@ -142,35 +143,18 @@ pub fn run() {
             archive::recover_pending_imports(&data_dir);
 
             // Initialize default rules on first run
-            let is_first_run = if let Ok(settings) = db::get_settings() {
-                let first = settings.first_run;
-                if first {
+            if let Ok(settings) = db::get_settings() {
+                if settings.first_run {
                     db::complete_first_run(&commands::get_system_language())
                         .map_err(|e| format!("First-run initialization failed: {e}"))?;
                 }
-                first
-            } else {
-                false
-            };
+            }
 
             // Setup system tray
             let tray_lang = db::get_settings()
                 .map(|s| s.language)
                 .unwrap_or_else(|_| "en".to_string());
             tray::setup_tray(&app_handle, &tray_lang)?;
-
-            // On first launch, show the popup so the user knows the app is running
-            if is_first_run {
-                let _ = tray::show_popup_window(&app_handle);
-            }
-
-            // Dev: open the dashboard so `tauri dev` lands on the main surface.
-            #[cfg(debug_assertions)]
-            {
-                if std::env::var("MOUZI_OPEN").unwrap_or_else(|_| "dashboard".into()) != "none" {
-                    let _ = tray::show_dashboard_window(&app_handle);
-                }
-            }
 
             // Start folder watcher
             let state = app.state::<AppState>();
@@ -181,7 +165,7 @@ pub fn run() {
 
             // Start scheduled-clean background thread
             state.scheduler.start(app_handle.clone(), state.ignored_files.clone());
-            integration::handle_folder_args(&app_handle, &std::env::args().collect::<Vec<_>>());
+            open_launch_destination(&app_handle, &std::env::args().collect::<Vec<_>>());
 
             Ok(())
         })

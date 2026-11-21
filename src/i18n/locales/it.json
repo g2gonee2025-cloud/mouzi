@@ -339,6 +339,7 @@
     "recoveryUnavailable": "La rimozione dei file richiede un metodo di recupero verificato."
   },
   "dashboard": {
+    "reviewFiles": "Rivedi file",
     "title": "Dashboard",
     "totalFiles": "File totali",
     "totalBytes": "Dimensioni totali",

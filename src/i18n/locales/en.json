@@ -337,6 +337,7 @@
     "recoveryUnavailable": "File removal is unavailable until a recovery method is verified."
   },
   "dashboard": {
+    "reviewFiles": "Review files",
     "title": "Dashboard",
     "totalFiles": "Total files",
     "totalBytes": "Total size",

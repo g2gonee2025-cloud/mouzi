@@ -339,6 +339,7 @@
     "recoveryUnavailable": "Dateien können erst entfernt werden, wenn eine Wiederherstellungsmethode geprüft wurde."
   },
   "dashboard": {
+    "reviewFiles": "Dateien prüfen",
     "title": "Dashboard",
     "totalFiles": "Dateien insgesamt",
     "totalBytes": "Gesamtgröße",

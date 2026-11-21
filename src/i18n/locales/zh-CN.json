@@ -333,6 +333,7 @@
     "recoveryUnavailable": "验证恢复方法后才能移除文件。"
   },
   "dashboard": {
+    "reviewFiles": "审阅文件",
     "title": "概览",
     "totalFiles": "文件总数",
     "totalBytes": "总大小",

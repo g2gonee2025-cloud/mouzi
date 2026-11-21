@@ -339,6 +339,7 @@
     "recoveryUnavailable": "Cần xác minh phương thức khôi phục trước khi có thể xóa tệp."
   },
   "dashboard": {
+    "reviewFiles": "Xem xét tệp",
     "title": "Bảng điều khiển",
     "totalFiles": "Tổng số tệp",
     "totalBytes": "Tổng dung lượng",

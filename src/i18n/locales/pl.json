@@ -339,6 +339,7 @@
     "recoveryUnavailable": "Usuwanie plików wymaga zweryfikowanej metody odzyskiwania."
   },
   "dashboard": {
+    "reviewFiles": "Przejrzyj pliki",
     "title": "Panel",
     "totalFiles": "Liczba plików",
     "totalBytes": "Całkowity rozmiar",

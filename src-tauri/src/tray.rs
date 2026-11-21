@@ -58,7 +58,7 @@ fn queue_window(app: &AppHandle, action: WindowAction, completion: Option<Window
         .map_err(|_| "Window dispatch has stopped".into())
 }
 
-fn queue_tray_window(app: &AppHandle, action: WindowAction) {
+pub(crate) fn queue_window_action(app: &AppHandle, action: WindowAction) {
     if let Err(error) = queue_window(app, action, None) {
         eprintln!("[tray] Could not queue window request: {error}");
     }
@@ -95,6 +95,7 @@ pub fn setup_tray(app: &AppHandle, lang: &str) -> Result<(), Box<dyn std::error:
     let mut builder = TrayIconBuilder::with_id("tray")
         .tooltip(i18n.get("tooltip"))
         .menu(&menu)
+        .show_menu_on_left_click(false)
         .on_menu_event(|app, event| {
             let action = match event.id.as_ref() {
                 "quit" => { app.exit(0); return; }
@@ -105,11 +106,11 @@ pub fn setup_tray(app: &AppHandle, lang: &str) -> Result<(), Box<dyn std::error:
                 "clean" => WindowAction::Review(Vec::new()),
                 _ => return,
             };
-            queue_tray_window(app, action);
+            queue_window_action(app, action);
         })
         .on_tray_icon_event(|tray, event| {
             if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = event {
-                queue_tray_window(tray.app_handle(), WindowAction::Popup);
+                queue_window_action(tray.app_handle(), WindowAction::Popup);
             }
         });
 
@@ -240,12 +241,18 @@ pub(crate) fn refresh_workspace_title_cmd(
 /// One workspace window for dashboard, cleanup, suggestions, and settings.
 /// The tray popup stays a separate compact flyout.
 fn show_app_window(app: &AppHandle, route: &str) -> tauri::Result<()> {
+    if let Some(popup) = app.get_webview_window("popup") {
+        popup.hide()?;
+    }
     let url = format!("/#/{route}");
     let i18n = TrayI18n::new(&tray_lang(app));
     let title = i18n.get(workspace_title_key(route));
     if let Some(window) = app.get_webview_window("app") {
         window.eval(&location_hash_script(&url))?;
         window.set_title(title)?;
+        if window.is_minimized()? {
+            window.unminimize()?;
+        }
         window.show()?;
         return window.set_focus();
     }
@@ -275,9 +282,6 @@ pub fn show_settings_window(app: &AppHandle) -> tauri::Result<()> {
 fn show_watched_folders_window(app: &AppHandle) -> tauri::Result<()> {
     show_settings_window(app)?;
     app.emit_to("app", "open-watched-folders", ())?;
-    if let Some(popup) = app.get_webview_window("popup") {
-        popup.hide()?;
-    }
     Ok(())
 }
 

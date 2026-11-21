@@ -1,6 +1,7 @@
 import { useEffect, useCallback, useState, type Dispatch, type SetStateAction } from "react";
 import { useTranslation } from "react-i18next";
 import { invoke } from "@tauri-apps/api/core";
+import ReviewFilesButton from "../components/dashboard/ReviewFilesButton";
 import {
   useDashboardStore,
   subscribeDashboardEvents,
@@ -147,6 +148,7 @@ export default function Dashboard({ view, setView }: DashboardProps) {
           <h1 className="text-base font-semibold truncate">{t("dashboard.title")}</h1>
         </div>
         <div className="flex items-center gap-2">
+          <ReviewFilesButton />
           <button
             type="button"
             onClick={() => refresh()}

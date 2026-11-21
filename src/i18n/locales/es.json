@@ -339,6 +339,7 @@
     "recoveryUnavailable": "La eliminación de archivos requiere un método de recuperación verificado."
   },
   "dashboard": {
+    "reviewFiles": "Revisar archivos",
     "title": "Panel de control",
     "totalFiles": "Archivos totales",
     "totalBytes": "Tamaño total",
