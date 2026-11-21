@@ -4,7 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { FolderOpen } from "lucide-react";
 import { formatBytes, formatTimestamp } from "../../utils/format";
 import { fileName } from "../../utils/paths";
-import { formatShare, percentOf } from "../../utils/dashboard";
+import { formatShare, percentOf, rootsWithSharedNames } from "../../utils/dashboard";
 import type { RootStat } from "../../store/useDashboardStore";
 
 interface StorageTreemapProps {
@@ -33,6 +33,7 @@ export default function StorageTreemap({
     () => [...data].sort((a, b) => b.bytes - a.bytes),
     [data],
   );
+  const sharedNames = useMemo(() => rootsWithSharedNames(data.map(({ path }) => path)), [data]);
 
   useEffect(() => {
     const listed = new Set(data.map(({ path }) => path));
@@ -83,6 +84,7 @@ export default function StorageTreemap({
           const pct = percentOf(item.bytes, totalBytes);
           const isOn = selected === item.path;
           const label = fileName(item.path) || item.path;
+          const showPath = sharedNames.has(item.path);
           const errorId = reveals.get(item.path)?.failed ? `${revealErrorId}-${index}` : undefined;
           return (
             <div
@@ -100,11 +102,14 @@ export default function StorageTreemap({
                   title={item.path}
                 >
                   <div className="flex items-center justify-between text-xs mb-1 gap-2">
-                    <span className="text-text font-medium truncate">{label}</span>
+                    <span className="text-text font-medium truncate" dir="auto">{label}</span>
                     <span className="text-text-muted tabular-nums shrink-0">
                       {formatShare(pct)} · {formatBytes(item.bytes)}
                     </span>
                   </div>
+                  {showPath && (
+                    <span className="mb-1 block wrap-anywhere text-[10px] text-text-muted" dir="auto">{item.path}</span>
+                  )}
                   <div className="h-1.5 bg-border rounded-full overflow-hidden">
                     <div
                       className="h-full rounded-full bg-primary"
@@ -128,7 +133,7 @@ export default function StorageTreemap({
                 <button
                   type="button"
                   onClick={() => openRoot(item.path)}
-                  aria-label={`${t("dashboard.openFolder")}: ${label}`}
+                  aria-label={`${t("dashboard.openFolder")}: ${showPath ? item.path : label}`}
                   aria-describedby={errorId}
                   className="inline-flex items-center justify-center w-6 h-6 rounded text-text-muted hover:text-text hover:bg-border shrink-0 focus-visible:outline-2 focus-visible:outline-primary focus-visible:outline-offset-1"
                   title={t("dashboard.openFolder")}

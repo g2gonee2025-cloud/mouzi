@@ -421,7 +421,7 @@ describe("dashboard entry points", () => {
         ...DEFAULT_DASHBOARD_VIEW,
         initialLargest: [{ path, rootPath: "C:\\work", size: 2, mtime: 1, category: "Other" }],
         initialRecent: [],
-        rootScope: "C:\\work",
+        watchedRootPaths: ["C:\\work"],
         totalFiles: 1,
         revision: 1,
         onSort: vi.fn(),
@@ -451,6 +451,16 @@ describe("dashboard entry points", () => {
     expect(newScope).toContain('aria-label="Clear Documentos filter"');
     expect(newScope).not.toContain('aria-label="Clear C:/empty-work filter"');
   });
+
+  it("shows the selected root's full path only while another configured root shares its name", () => {
+    const personal = { ...root, path: "C:/Personal/Inbox" };
+    const team = { ...root, path: "D:/Team/Inbox" };
+    const view = { ...DEFAULT_DASHBOARD_VIEW, root: team.path };
+    const chipText = (html: string) => html.split(`aria-label="Clear ${team.path} filter"`)[1]?.split("</button>")[0];
+
+    expect(chipText(renderDashboard([personal, team], view))).toContain(`>${team.path}<`);
+    expect(chipText(renderDashboard([team], view))).toContain(">Inbox<");
+  });
 });
 
 describe("dashboard search translations", () => {
@@ -473,6 +483,30 @@ describe("dashboard search translations", () => {
 });
 
 describe("configured root presentation", () => {
+  it.each(["Inbox", "INBOX"])("distinguishes a shared folder name from %s and keeps its actions scoped", async (peerName) => {
+    const personal = { ...root, path: "C:/Personal/Inbox", files: 1, bytes: 64 };
+    const team = { ...personal, path: `D:/Team/${peerName}` };
+    const unique = { ...personal, path: "E:/Projects/Library" };
+    const select = vi.fn();
+    const { html, tree } = renderStorageRoots([personal, team, unique], select);
+
+    expect(html).toContain(`>${personal.path}<`);
+    expect(html).toContain(`>${team.path}<`);
+    expect(html).toContain(">Library<");
+    expect(html).not.toContain(`>${unique.path}<`);
+
+    const filter = findElement<{ title?: string; onClick?: () => void }>(tree,
+      (element) => element.type === "button" && element.props.title === team.path);
+    filter?.props.onClick?.();
+    expect(select).toHaveBeenCalledExactlyOnceWith(team.path);
+
+    await revealRoot(tree, personal.path).click();
+    await revealRoot(tree, team.path).click();
+    expect(mock.invoke.mock.calls).toEqual([personal.path, team.path].map(path =>
+      ["open_folder_cmd", { path, directoryOnly: true }]));
+    expect(revealRoot(tree, "Library")).toBeDefined();
+  });
+
   it("shows a successfully scanned empty root and its last scan", () => {
     const html = renderToStaticMarkup(<StorageTreemap data={[root]} totalBytes={0} />);
     expect(html).toContain("empty-work");

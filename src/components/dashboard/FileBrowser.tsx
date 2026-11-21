@@ -6,7 +6,7 @@ import { Copy, ExternalLink, Search, X } from "lucide-react";
 import { formatBytes, formatTimestamp } from "../../utils/format";
 import { fileName } from "../../utils/paths";
 import {
-  categoryClass, categoryLabel, createInventoryBrowserLoader, inventoryBrowserScope,
+  categoryClass, categoryLabel, createInventoryBrowserLoader, inventoryBrowserScope, rootsWithSharedNames,
   type DashboardViewOptions, type InventoryBrowserView,
 } from "../../utils/dashboard";
 import type { InventoryFile } from "../../store/useDashboardStore";
@@ -14,7 +14,7 @@ import type { InventoryFile } from "../../store/useDashboardStore";
 interface FileBrowserProps extends DashboardViewOptions {
   initialLargest: InventoryFile[];
   initialRecent: InventoryFile[];
-  rootScope: string;
+  watchedRootPaths: readonly string[];
   totalFiles: number;
   revision: number;
   onSort: (sort: DashboardViewOptions["sort"]) => void;
@@ -30,7 +30,7 @@ export default function FileBrowser({
   query,
   category,
   root,
-  rootScope,
+  watchedRootPaths,
   totalFiles,
   revision,
   onSort,
@@ -53,7 +53,9 @@ export default function FileBrowser({
   ));
   const search = query.trim();
   const filtered = Boolean(search || category || root);
+  const rootScope = JSON.stringify([...watchedRootPaths].sort());
   const scope = inventoryBrowserScope({ sort, query: search, category, root, rootScope });
+  const showRootPath = root !== null && rootsWithSharedNames(watchedRootPaths).has(root);
   const activeView = view?.scope === scope ? view : undefined;
   const files = filtered ? activeView?.rows ?? [] : sort === "size" ? initialLargest : initialRecent;
   const loading = filtered && (activeView?.loading ?? true);
@@ -184,9 +186,12 @@ export default function FileBrowser({
               }}
               aria-label={t("dashboard.clearFilter", { name: root })}
               title={root}
-              className="inline-flex items-center gap-1 rounded-full border border-border px-2 py-0.5 text-text max-w-[240px] hover:bg-border"
+              className={`inline-flex items-center gap-1 rounded-full border border-border px-2 py-0.5 text-left text-text hover:bg-border ${showRootPath ? "max-w-full" : "max-w-[240px]"}`}
             >
-              <span className="truncate">{fileName(root) || root}</span> <X size={12} aria-hidden="true" />
+              <span className={showRootPath ? "min-w-0 wrap-anywhere" : "truncate"} dir="auto">
+                {showRootPath ? root : fileName(root) || root}
+              </span>
+              <X size={12} aria-hidden="true" className="shrink-0" />
             </button>
           )}
         </div>

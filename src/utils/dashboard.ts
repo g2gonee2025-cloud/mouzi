@@ -3,6 +3,7 @@
  *  here as hex literals. The seven keys must stay aligned with the
  *  `categorize()` arms in src-tauri/src/scan.rs. */
 import type { InventoryFile } from "../store/useDashboardStore";
+import { fileName } from "./paths";
 
 export const CATEGORY_CLASSES: Record<string, string> = {
   Documents: "bg-cat-documents",
@@ -37,6 +38,22 @@ export const DEFAULT_DASHBOARD_VIEW: DashboardViewOptions = {
 
 export function clearMissingDashboardRoot(view: DashboardViewOptions, missingRoot: string): DashboardViewOptions {
   return view.root === missingRoot ? { ...view, root: null } : view;
+}
+
+/** Find paths whose short folder names need context to tell them apart. */
+export function rootsWithSharedNames(paths: readonly string[]): Set<string> {
+  const firstByName = new Map<string, string>();
+  const shared = new Set<string>();
+  for (const path of paths) {
+    const name = (fileName(path) || path).toLowerCase();
+    const first = firstByName.get(name);
+    if (first === undefined) firstByName.set(name, path);
+    else if (first !== path) {
+      shared.add(first);
+      shared.add(path);
+    }
+  }
+  return shared;
 }
 
 interface InventoryQuery {

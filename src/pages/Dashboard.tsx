@@ -268,7 +268,7 @@ export default function Dashboard({ view, setView }: DashboardProps) {
               query={view.query}
               category={category}
               root={activeRoot}
-              rootScope={JSON.stringify(stats!.watchedRoots.map((item) => item.path).sort())}
+              watchedRootPaths={stats!.watchedRoots.map((item) => item.path)}
               totalFiles={stats!.totalFiles}
               revision={stats!.revision}
               onSort={(sort) => setView((current) => ({ ...current, sort }))}
