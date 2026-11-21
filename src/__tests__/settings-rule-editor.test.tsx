@@ -800,12 +800,18 @@ async function openIgnore() {
     ],
     folderRead: { status: "ready" },
   });
-  harness.invoke.mockImplementation(async (command: string, { folderPath, patterns }: { folderPath: string; patterns?: string[] }) => {
+  harness.invoke.mockImplementation(async (command: string, { folderPath, patterns, expectedPatterns }: {
+    folderPath: string; patterns?: string[]; expectedPatterns?: string[];
+  }) => {
     if (!files.has(folderPath)) throw new Error(`Unexpected fixture folder ${folderPath}`);
     if (command === "load_mouziignore_cmd") return [...files.get(folderPath)!];
     if (command === "save_mouziignore_cmd" && patterns) {
+      const current = files.get(folderPath)!;
+      if (expectedPatterns && JSON.stringify(current) !== JSON.stringify(expectedPatterns)) {
+        return { status: "conflict", patterns: [...current] };
+      }
       files.set(folderPath, [...patterns]);
-      return;
+      return expectedPatterns ? { status: "saved", patterns: [...patterns] } : undefined;
     }
     throw new Error(`Unexpected fixture command ${command}`);
   });
@@ -813,6 +819,39 @@ async function openIgnore() {
   await selectIgnoreFolder(folderA);
   return files;
 }
+
+it("keeps editor changes and the Ignore draft until the user reviews and saves again", async () => {
+  const files = await openIgnore();
+  typePattern("draft.tmp");
+  files.set(folderA, ["existing.tmp", "editor.tmp"]);
+
+  await click(ignoreButton("save"));
+  expect(files.get(folderA)).toEqual(["existing.tmp", "editor.tmp"]);
+  expect(ignoreField().props.value).toBe("draft.tmp");
+  expect(ignoreButton("save").props.disabled).toBe(true);
+  await click(ignoreButton("reviewWithChanges"));
+  expect(requireElement(patternRow("editor.tmp"), ignoreEditor())).toBeDefined();
+  expect(ignoreField().props.value).toBe("draft.tmp");
+
+  await click(ignoreButton("save"));
+  expect(files.get(folderA)).toEqual(["existing.tmp", "editor.tmp", "draft.tmp"]);
+  expect(ignoreButton("saved")).toBeDefined();
+});
+
+it("keeps externally removed Ignore rules out of the reviewed draft", async () => {
+  const files = await openIgnore();
+  typePattern("draft.tmp");
+  await click(ignoreButton("add"));
+  files.set(folderA, ["editor.tmp"]);
+
+  await click(ignoreButton("save"));
+  await click(ignoreButton("reviewWithChanges"));
+  expect(find(ignoreEditor(), patternRow("existing.tmp"))).toBeUndefined();
+  expect(requireElement(patternRow("draft.tmp"), ignoreEditor())).toBeDefined();
+  await click(ignoreButton("save"));
+
+  expect(files.get(folderA)).toEqual(["editor.tmp", "draft.tmp"]);
+});
 
 it("saves the new pattern typed into Ignore through the visible Save button", async () => {
   const files = await openIgnore();
@@ -979,7 +1018,7 @@ it("does not restore an unsaved Ignore draft after a write completes on another 
   let finishWrite!: () => void;
   harness.invoke.mockImplementationOnce((command, args) => {
     expect(command).toBe("save_mouziignore_cmd");
-    expect(args).toEqual({ folderPath: folderA, patterns: ["existing.tmp", "saved-while-away.tmp"] });
+    expect(args).toEqual({ folderPath: folderA, patterns: ["existing.tmp", "saved-while-away.tmp"], expectedPatterns: ["existing.tmp"] });
     return new Promise<void>((resolve) => {
       finishWrite = () => {
         files.set(folderA, args.patterns);

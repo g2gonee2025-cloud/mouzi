@@ -1,5 +1,5 @@
 use crate::db::*;
-use crate::ignore::{load_mouziignore, save_mouziignore};
+use crate::ignore::{load_mouziignore, save_mouziignore, save_mouziignore_checked, IgnoreSaveOutcome};
 use crate::rules::{scan_watched_manual_folder, WatchedManualRoot};
 use crate::scan::{self, ScanEvent};
 use crate::suppress::{SuppressionSet, SUPPRESSION_TTL};
@@ -1006,10 +1006,16 @@ pub fn load_mouziignore_cmd(folder_path: String, state: tauri::State<AppState>) 
 }
 
 #[tauri::command(async)]
-pub fn save_mouziignore_cmd(app: AppHandle, folder_path: String, patterns: Vec<String>) -> Result<(), String> {
+pub fn save_mouziignore_cmd(
+    app: AppHandle, folder_path: String, patterns: Vec<String>, expected_patterns: Option<Vec<String>>,
+) -> Result<Option<IgnoreSaveOutcome>, String> {
     with_configuration(&app, || {
         let (root, _guard) = registered_ignore_root(&folder_path)?;
-        save_mouziignore(&root.to_string_lossy(), &patterns)
+        let root = root.to_string_lossy();
+        match expected_patterns {
+            Some(expected) => save_mouziignore_checked(&root, &expected, &patterns).map(Some),
+            None => save_mouziignore(&root, &patterns).map(|()| None),
+        }
     })
 }
 

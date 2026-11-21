@@ -1,9 +1,12 @@
+use serde::Serialize;
+use std::collections::HashMap;
 use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 const IGNORE_FILE: &str = ".mouziignore";
+const IGNORE_HEADER: &str = "# Mouzi ignore rules\n# https://mouzi.cc/docs\n\n";
 
 fn is_regular_file(metadata: &Metadata) -> bool {
     #[cfg(windows)]
@@ -58,38 +61,41 @@ fn open_ignore_file(path: &Path) -> Result<Option<File>, String> {
 /// An absent file has no rules; an existing file that cannot be read is an error.
 pub fn load_mouziignore(folder_path: &str) -> Result<Vec<String>, String> {
     let path = Path::new(folder_path).join(IGNORE_FILE);
-    let Some(mut file) = open_ignore_file(&path)? else {
-        return Ok(Vec::new());
-    };
+    let mut file = open_ignore_file(&path)?;
+    let content = read_ignore_content(file.as_mut(), &path)?;
+    Ok(parse_patterns(content.as_deref().unwrap_or_default()))
+}
+
+fn read_ignore_content(file: Option<&mut File>, path: &Path) -> Result<Option<String>, String> {
+    let Some(file) = file else { return Ok(None); };
     let mut content = String::new();
     file.read_to_string(&mut content).map_err(|error| {
         format!("Unable to read ignore protection file {}: {error}", path.display())
     })?;
+    Ok(Some(content))
+}
 
-    let content = content.strip_prefix('\u{feff}').unwrap_or(&content);
-    Ok(content
-        .lines()
-        .map(|l| {
-            let l = l.trim();
-            let mut escaped = false;
-            let mut end = l.len();
+fn comment_start(line: &str) -> Option<usize> {
+    let mut escaped = false;
+    for (index, character) in line.char_indices() {
+        match character {
+            '\\' => escaped = !escaped,
+            '#' if !escaped => return Some(index),
+            _ => escaped = false,
+        }
+    }
+    None
+}
 
-            for (i, c) in l.char_indices() {
-                match c {
-                    '\\' => escaped = !escaped,
-                    '#' if !escaped => {
-                        end = i;
-                        break;
-                    }
-                    _ => escaped = false,
-                }
-            }
+fn line_pattern(line: &str, comment: Option<usize>) -> Option<String> {
+    let pattern = line[..comment.unwrap_or(line.len())].trim();
+    (!pattern.is_empty()).then(|| pattern.replace(r"\#", "#"))
+}
 
-            l[..end].trim().to_string()
-        })
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .map(|l| l.replace(r"\#", "#"))
-        .collect())
+fn parse_patterns(content: &str) -> Vec<String> {
+    content.strip_prefix('\u{feff}').unwrap_or(content).lines()
+        .filter_map(|line| line_pattern(line, comment_start(line)))
+        .collect()
 }
 
 /// Rules loaded once for a folder. Loading errors must pause that folder's work.
@@ -118,11 +124,90 @@ pub fn save_mouziignore(folder_path: &str, patterns: &[String]) -> Result<(), St
     let folder = Path::new(folder_path);
     let path = folder.join(IGNORE_FILE);
     let existing = open_ignore_file(&path)?;
-    let mut content = String::from("# Mouzi ignore rules\n# https://mouzi.cc/docs\n\n");
+    let content = new_ignore_document(patterns);
+    write_ignore_document(folder, &path, existing, &content)
+}
+
+fn new_ignore_document(patterns: &[String]) -> String {
+    let mut content = String::from(IGNORE_HEADER);
     for p in patterns {
         content.push_str(&p.replace('#', r"\#"));
         content.push('\n');
     }
+    content
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "status", rename_all = "camelCase")]
+pub enum IgnoreSaveOutcome {
+    Saved { patterns: Vec<String> },
+    Conflict { patterns: Vec<String> },
+}
+
+pub fn save_mouziignore_checked(
+    folder_path: &str, expected: &[String], patterns: &[String],
+) -> Result<IgnoreSaveOutcome, String> {
+    let folder = Path::new(folder_path);
+    let path = folder.join(IGNORE_FILE);
+    let mut existing = open_ignore_file(&path)?;
+    let document = read_ignore_content(existing.as_mut(), &path)?;
+    let current = parse_patterns(document.as_deref().unwrap_or_default());
+    if patterns == expected || patterns == current.as_slice() {
+        return Ok(IgnoreSaveOutcome::Saved { patterns: current });
+    }
+    if current.as_slice() != expected {
+        return Ok(IgnoreSaveOutcome::Conflict { patterns: current });
+    }
+    let content = match document {
+        Some(document) => edit_ignore_document(&document, patterns),
+        None => new_ignore_document(patterns),
+    };
+    write_ignore_document(folder, &path, existing, &content)?;
+    Ok(IgnoreSaveOutcome::Saved { patterns: parse_patterns(&content) })
+}
+
+fn take_pattern<'a>(remaining: &mut HashMap<&'a str, usize>, pattern: &str) -> bool {
+    let Some(count) = remaining.get_mut(pattern) else { return false; };
+    if *count == 0 { return false; }
+    *count -= 1;
+    true
+}
+
+fn edit_ignore_document(document: &str, patterns: &[String]) -> String {
+    let (signature, body) = document.strip_prefix('\u{feff}')
+        .map_or(("", document), |body| ("\u{feff}", body));
+    let newline = if body.split_once('\n').is_some_and(|(line, _)| line.ends_with('\r')) { "\r\n" } else { "\n" };
+    let mut remaining = HashMap::new();
+    for pattern in patterns { *remaining.entry(pattern.as_str()).or_insert(0usize) += 1; }
+
+    let mut content = signature.to_string();
+    for line in body.split_inclusive('\n') {
+        let comment = comment_start(line);
+        match line_pattern(line, comment) {
+            None => content.push_str(line),
+            Some(pattern) if take_pattern(&mut remaining, &pattern) => content.push_str(line),
+            Some(_) => {
+                if let Some(index) = comment {
+                    // A removed rule can leave its hand-authored annotation behind.
+                    let indent = line.len() - line.trim_start().len();
+                    content.push_str(&line[..indent]);
+                    content.push_str(&line[index..]);
+                }
+            }
+        }
+    }
+    let mut appended = false;
+    for pattern in patterns {
+        if !take_pattern(&mut remaining, pattern) { continue; }
+        if content.len() > signature.len() && !content.ends_with('\n') { content.push_str(newline); }
+        content.push_str(&pattern.replace('#', r"\#"));
+        appended = true;
+    }
+    if appended && body.ends_with('\n') { content.push_str(newline); }
+    content
+}
+
+fn write_ignore_document(folder: &Path, path: &Path, existing: Option<File>, content: &str) -> Result<(), String> {
     // Stage the full replacement before publishing it. Never truncate a path
     // supplied by the filesystem, even when the checked leaf is regular.
     static NEXT_STAGE: AtomicU64 = AtomicU64::new(0);
@@ -135,7 +220,7 @@ pub fn save_mouziignore(folder_path: &str, patterns: &[String]) -> Result<(), St
     // Windows must release the checked leaf before renaming over its name.
     // The rename updates the entry itself, never writes through a leaf link.
     drop(existing);
-    let result = written.and_then(|()| fs::rename(&stage, &path));
+    let result = written.and_then(|()| fs::rename(&stage, path));
     if let Err(error) = result {
         let _ = fs::remove_file(&stage);
         return Err(format!("Cannot save ignore protection file {}: {error}", path.display()));
@@ -278,6 +363,50 @@ mod tests {
         save_mouziignore(folder.to_str().unwrap(), &["replacement".to_string()]).unwrap();
         assert_eq!(load_mouziignore(folder.to_str().unwrap()).unwrap(), vec!["replacement"]);
 
+        fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn checked_ignore_save_keeps_editor_changes_and_preserves_document_format() {
+        let folder = temporary_folder();
+        let directory = folder.to_str().unwrap();
+        let file = folder.join(IGNORE_FILE);
+        fs::write(&file, "\u{feff}# personal notes\r\n\r\n  original.tmp  # retain this annotation\r\n").unwrap();
+        let displayed = load_mouziignore(directory).unwrap();
+        assert_eq!(displayed, ["original.tmp"]);
+
+        let edited = "\u{feff}# personal notes\r\n\r\n  original.tmp  # retain this annotation\r\neditor.tmp\r\n";
+        fs::write(&file, edited).unwrap();
+        let outcome = save_mouziignore_checked(directory, &displayed, &["original.tmp".into(), "draft#file.tmp".into()]).unwrap();
+        let IgnoreSaveOutcome::Conflict { patterns: current } = outcome else { panic!("expected conflict") };
+        assert_eq!(current, ["original.tmp", "editor.tmp"]);
+        assert_eq!(fs::read_to_string(&file).unwrap(), edited);
+
+        let comments = "\u{feff}# revised personal notes\r\n\r\n  original.tmp  # retain this annotation\r\neditor.tmp\r\n";
+        fs::write(&file, comments).unwrap();
+        let no_change = save_mouziignore_checked(directory, &current, &current).unwrap();
+        assert!(matches!(no_change, IgnoreSaveOutcome::Saved { patterns } if patterns == current));
+        assert_eq!(fs::read_to_string(&file).unwrap(), comments);
+
+        let outcome = save_mouziignore_checked(directory, &current, &["editor.tmp".into(), "draft#file.tmp".into()]).unwrap();
+        assert!(matches!(outcome, IgnoreSaveOutcome::Saved { patterns } if patterns == ["editor.tmp", "draft#file.tmp"]));
+        assert_eq!(fs::read_to_string(&file).unwrap(),
+            "\u{feff}# revised personal notes\r\n\r\n  # retain this annotation\r\neditor.tmp\r\ndraft\\#file.tmp\r\n");
+        fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn checked_ignore_save_creates_missing_file_only_for_a_real_edit() {
+        let folder = temporary_folder();
+        let directory = folder.to_str().unwrap();
+        let file = folder.join(IGNORE_FILE);
+        assert!(matches!(save_mouziignore_checked(directory, &[], &[]).unwrap(),
+            IgnoreSaveOutcome::Saved { patterns } if patterns.is_empty()));
+        assert!(!file.exists());
+        let new = vec!["report#final.pdf".to_string()];
+        assert!(matches!(save_mouziignore_checked(directory, &[], &new).unwrap(),
+            IgnoreSaveOutcome::Saved { patterns } if patterns == new));
+        assert_eq!(fs::read_to_string(&file).unwrap(), "# Mouzi ignore rules\n# https://mouzi.cc/docs\n\nreport\\#final.pdf\n");
         fs::remove_dir_all(folder).unwrap();
     }
 

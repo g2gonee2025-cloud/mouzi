@@ -1339,10 +1339,25 @@ type IgnoreDraft = {
   savedPatterns: string[];
   patterns: string[];
   input: string;
+  conflictPatterns?: string[];
 };
+
+type IgnoreSaveOutcome = { status: "saved" | "conflict"; patterns: string[] };
 
 function hasIgnoreRegistration(draft: IgnoreDraft, folders: WatchedFolder[]) {
   return folders.some((folder) => folder.path === draft.folderPath && folder.id === draft.folderId);
+}
+
+// Subtract occurrences without changing the order of the remaining patterns.
+function subtractPatterns(patterns: string[], omitted: string[]) {
+  const counts = new Map<string, number>();
+  for (const pattern of omitted) counts.set(pattern, (counts.get(pattern) ?? 0) + 1);
+  return patterns.filter((pattern) => {
+    const count = counts.get(pattern) ?? 0;
+    if (count === 0) return true;
+    counts.set(pattern, count - 1);
+    return false;
+  });
 }
 
 function IgnoreTab({ active }: { active: boolean }) {
@@ -1407,17 +1422,35 @@ function IgnoreTab({ active }: { active: boolean }) {
     return () => clearTimeout(timer);
   }, [saved]);
 
-  const updateDraft = (patterns: string[], input: string) => {
-    if (!canEdit || !current || savingDraft.current) return;
-    const next = { ...current, patterns, input };
-    const { savedPatterns } = current;
-    if (input || patterns.length !== savedPatterns.length || patterns.some((pattern, index) => pattern !== savedPatterns[index])) {
-      dirtyDrafts.current.set(current.folderPath, next);
+  const rememberDraft = (next: IgnoreDraft) => {
+    const { savedPatterns, patterns, input, conflictPatterns, folderPath } = next;
+    if (input || conflictPatterns || patterns.length !== savedPatterns.length || patterns.some((pattern, index) => pattern !== savedPatterns[index])) {
+      dirtyDrafts.current.set(folderPath, next);
     } else {
-      dirtyDrafts.current.delete(current.folderPath);
+      dirtyDrafts.current.delete(folderPath);
     }
     setDraft(next);
     setSaved(false);
+  };
+
+  const updateDraft = (patterns: string[], input: string) => {
+    if (!canEdit || !current || savingDraft.current) return;
+    rememberDraft({ ...current, patterns, input });
+  };
+
+  const reviewWithChanges = () => {
+    if (!canEdit || !current?.conflictPatterns || savingDraft.current) return;
+    const latest = current.conflictPatterns;
+    const removed = subtractPatterns(current.savedPatterns, current.patterns);
+    const added = subtractPatterns(current.patterns, current.savedPatterns);
+    const reviewed = subtractPatterns(latest, removed);
+    const reviewedSet = new Set(reviewed);
+    rememberDraft({
+      ...current,
+      savedPatterns: latest,
+      patterns: [...reviewed, ...added.filter((pattern) => !reviewedSet.has(pattern))],
+      conflictPatterns: undefined,
+    });
   };
 
   const handleAdd = () => {
@@ -1429,21 +1462,29 @@ function IgnoreTab({ active }: { active: boolean }) {
   };
 
   const handleSave = async () => {
-    if (!canEdit || !current || savingDraft.current) return;
+    if (!canEdit || !current || current.conflictPatterns || savingDraft.current) return;
     const nextPatterns = hasNewPattern ? [...patterns, pendingPattern] : patterns;
     savingDraft.current = current;
     setSaving(true);
     setSaved(false);
     setError(null);
     try {
-      await invoke("save_mouziignore_cmd", {
+      const outcome = await invoke<IgnoreSaveOutcome | null>("save_mouziignore_cmd", {
         folderPath: current.folderPath,
         patterns: nextPatterns,
+        expectedPatterns: current.savedPatterns,
       });
       if (hasIgnoreRegistration(current, useAppStore.getState().folders)) {
+        if (outcome?.status === "conflict") {
+          const conflicted = { ...current, conflictPatterns: outcome.patterns };
+          dirtyDrafts.current.set(current.folderPath, conflicted);
+          setDraft((visible) => visible === current ? conflicted : visible);
+          return;
+        }
+        const savedPatterns = outcome?.patterns ?? nextPatterns;
         dirtyDrafts.current.delete(current.folderPath);
         setDraft((visible) => visible === current
-          ? { ...current, savedPatterns: nextPatterns, patterns: nextPatterns, input: "" }
+          ? { ...current, savedPatterns, patterns: savedPatterns, input: "" }
           : visible);
         setSaved(true);
       }
@@ -1488,6 +1529,19 @@ function IgnoreTab({ active }: { active: boolean }) {
       {error && <div role="alert" className="text-sm text-red-600">{error}
         {!current && <button type="button" className="block underline mt-2" onClick={() => setRetry((value) => value + 1)}>{t("common.retry")}</button>}
       </div>}
+      {current?.conflictPatterns && (
+        <div className="space-y-2 rounded-md border border-border bg-surface-dark p-3 text-sm">
+          <p role="alert">{t("settings.ignore.conflict")}</p>
+          <p className="font-medium">{t("settings.ignore.currentPatterns")}</p>
+          {current.conflictPatterns.length === 0
+            ? <p className="text-text-muted">{t("settings.ignore.noCurrentPatterns")}</p>
+            : <ul className="ml-4 list-disc break-all">
+              {current.conflictPatterns.map((pattern, index) => <li key={index}><code>{pattern}</code></li>)}
+            </ul>}
+          <button type="button" onClick={reviewWithChanges} disabled={!canEdit}
+            className="font-medium text-primary underline">{t("settings.ignore.reviewWithChanges")}</button>
+        </div>
+      )}
 
       {selectedFolder && (
         <>
@@ -1553,7 +1607,7 @@ function IgnoreTab({ active }: { active: boolean }) {
 
           <button
             onClick={handleSave}
-            disabled={!canEdit}
+            disabled={!canEdit || Boolean(current?.conflictPatterns)}
             className="flex items-center gap-2 rounded-md bg-primary px-4 py-2.5 text-sm font-medium text-on-primary hover:bg-primary-hover transition-colors"
           >
             <Save size={16} />
