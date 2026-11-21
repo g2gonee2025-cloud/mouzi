@@ -240,14 +240,14 @@ fn inspect_duplicate_paths<'a, P: AsRef<str> + Sync, T: Send>(
     let first = batches.next().expect("parallel discovery has at least one batch");
     std::thread::scope(|scope| {
         let work = batches.map(|batch| {
-            std::thread::Builder::new().spawn_scoped(scope, || inspect_batch(batch))
-                .map_err(|_| inspect_batch(batch))
+            let worker = std::thread::Builder::new().spawn_scoped(scope, || inspect_batch(batch));
+            (batch, worker)
         }).collect::<Vec<_>>();
         let mut files = inspect_batch(first);
-        for batch in work {
-            files.extend(match batch {
+        for (batch, worker) in work {
+            files.extend(match worker {
                 Ok(worker) => worker.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
-                Err(files) => files,
+                Err(_) => inspect_batch(batch),
             });
         }
         files
