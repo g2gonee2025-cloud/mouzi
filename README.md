@@ -41,7 +41,9 @@ Dashboard totals, categories, root metadata and file lists describe scan data. T
 
 Duplicate, large-file, stale-file and empty-directory discovery is limited to current eligible roots. Hard links and physical aliases are excluded from reclaimable duplicates. Discovery reads current files rather than treating cached hashes as deletion evidence.
 
-In Duplicates, choose a keeper for each group and select the copies to remove. Mouzi initially selects every nonkeeper when the total fits in one review. If there are more than 10,000 nonkeepers, selection starts empty so you can choose a smaller batch. Check the selected count and size, then open the confirmation to page through the paths. Cancel discards that review and leaves the files in place.
+In Duplicates, choose a keeper for each group and select the copies to remove. Mouzi initially selects every nonkeeper when the total fits in one review. If there are more than 10,000 nonkeepers, selection starts empty so you can choose a smaller batch. After you narrow a batch, a fresh search clears those choices. Use **Select all** to select every nonkeeper when the results fit in one review.
+
+Check the selected count and size, then open the confirmation to inspect the paths. You can page through the list or jump to a page in a long review. Cancel discards that review and leaves the files in place.
 
 The backend prepares an expiring, single-use review containing the exact selected actions, criteria, file identities, contents and keeper evidence. Execution accepts its plan ID. It revalidates live group members and the keeper before removal. Changed files, disabled roots, replaced directories and newly nonempty directories stop or skip the affected work. A successful duplicate action retains the keeper. Failed candidates remain available for retry.
 
