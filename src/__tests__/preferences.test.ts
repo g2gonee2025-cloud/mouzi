@@ -74,7 +74,7 @@ describe("committed preference and schedule settings", () => {
   it("does not put unchanged fields or hidden schedule fields on the wire", async () => {
     useAppStore.getState().applySettings(settings());
     ipc.invoke.mockResolvedValueOnce(settings({ revision: 2, theme: "dark" }));
-    await useAppStore.getState().saveSettings(settings({ theme: "dark", schedule_enabled: true, recursive_watch: true }));
+    await useAppStore.getState().saveSettings(settings({ theme: "dark", autostart: true, schedule_enabled: true, recursive_watch: true }));
     expect(ipc.invoke).toHaveBeenCalledWith("update_settings_cmd", { settings: { theme: "dark" } });
   });
 

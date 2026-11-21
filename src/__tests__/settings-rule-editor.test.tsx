@@ -507,6 +507,15 @@ const scheduleCount = () => requireElement((node) => node.type === "select" && n
 const scheduleSwitch = () => requireElement(({ props }) => props.role === "switch" && props["aria-label"] === "settings.scheduler.enable");
 const graceNumber = () => requireElement((node) => node.type === "input" && node.props.type === "number" && node.props["aria-label"] === "settings.general.gracePeriod");
 
+it("waits for the Windows startup status even if an older profile saved On", () => {
+  openScheduler({ autostart: true });
+  const general = editor();
+  expect.soft(find(general, ({ props }) => props.role === "switch"
+    && props["aria-label"] === "settings.general.startWithSystem")).toBeUndefined();
+  expect.soft(text(general)).toContain("settings.general.startupLoading");
+  expect(requireElement(({ props }) => props["aria-label"] === "settings.general.theme", general).props.disabled).toBe(false);
+});
+
 it("keeps a cleared active time visible while preserving Cancel and an unrelated grace draft", () => {
   const persisted = openScheduler();
   change(graceNumber(), { value: "13" });
