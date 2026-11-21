@@ -54,7 +54,7 @@ export default function Suggestions() {
   const {
     suggestions,
     localAiStatus,
-    loading,
+    lookup,
     busy,
     error,
     createRuleDefault,
@@ -69,6 +69,8 @@ export default function Suggestions() {
     clearResults,
     clearError,
   } = useSuggestionsStore();
+  const loading = lookup.status === "loading";
+  const canAct = lookup.status === "ready" && !busy && !preparedPlans;
 
   const [createRule, setCreateRule] = useState(createRuleDefault);
   const [pending, setPending] = useState<ConfirmDialogProps | null>(null);
@@ -83,7 +85,7 @@ export default function Suggestions() {
 
   useEffect(() => {
     const handleFocus = () => {
-      if (!useSuggestionsStore.getState().loading) void loadSuggestions();
+      if (useSuggestionsStore.getState().lookup.status !== "loading") void loadSuggestions();
     };
     window.addEventListener("focus", handleFocus);
     return () => window.removeEventListener("focus", handleFocus);
@@ -94,7 +96,7 @@ export default function Suggestions() {
   };
 
   const reviewSuggestions = async (captured: readonly Suggestion[], opener: HTMLButtonElement) => {
-    if (!captured.length || busy || loading || pending) return;
+    if (!captured.length || !canAct || pending) return;
     const owner = beginPreview();
     if (!owner) return;
     setPreparing(owner);
@@ -149,7 +151,10 @@ export default function Suggestions() {
             </button>
           )}
           <button
-            onClick={loadSuggestions}
+            onClick={() => {
+              clearError();
+              return loadSuggestions();
+            }}
             disabled={loading || busy || !!preparedPlans}
             className="flex items-center gap-1 text-xs text-text-muted hover:text-text transition-colors disabled:opacity-50"
           >
@@ -164,7 +169,7 @@ export default function Suggestions() {
 
       {/* Content */}
       <div className="flex-1 overflow-auto p-4 space-y-4">
-        {localAiStatus && (
+        {lookup.status === "ready" && localAiStatus && (
           <p role="status" className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800 dark:border-amber-900 dark:bg-amber-900/20 dark:text-amber-200">
             {t(localAiStatus === "modelMissing" ? "suggestions.localAiModelMissing" : "suggestions.localAiUnreachable")}
           </p>
@@ -174,8 +179,22 @@ export default function Suggestions() {
             {t("suggestions.dismissChanged")}
           </p>
         )}
+        {lookup.status === "failed" && (
+          <div role="alert" className="rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700 dark:border-red-800 dark:bg-red-900/20 dark:text-red-400">
+            <p className="font-medium">{t("suggestions.readFailed")}</p>
+            <p className="mt-1 break-words">{lookup.reason}</p>
+            <button
+              type="button"
+              onClick={loadSuggestions}
+              disabled={busy || !!preparedPlans}
+              className="mt-2 rounded-md border border-current px-3 py-1 font-medium disabled:opacity-50"
+            >
+              {t("common.retry")}
+            </button>
+          </div>
+        )}
         {error && (
-          <div className="rounded-lg bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 px-4 py-3 text-sm text-red-700 dark:text-red-400">
+          <div role="alert" className="rounded-lg bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 px-4 py-3 text-sm text-red-700 dark:text-red-400">
             {error}
             <button onClick={clearError} className="ml-2 underline">
               {t("suggestions.dismiss")}
@@ -241,16 +260,16 @@ export default function Suggestions() {
         )}
 
         {/* Loading state */}
-        {loading && suggestions.length === 0 && (
-          <div className="flex items-center justify-center h-48">
-            <div className="animate-pulse text-sm text-text-muted">
-              {t("app.loading")}
-            </div>
-          </div>
+        {(lookup.status === "idle" || loading) && (
+          <p role="status" className={suggestions.length
+            ? "text-sm text-text-muted"
+            : "flex h-48 items-center justify-center text-sm text-text-muted"}>
+            {t("app.loading")}
+          </p>
         )}
 
         {/* Empty state */}
-        {!loading && suggestions.length === 0 && !results && (
+        {lookup.status === "ready" && suggestions.length === 0 && !results && (
           <div className="flex flex-col items-center justify-center h-48 text-center">
             <Sparkles size={32} className="text-text-muted mb-2" />
             <p className="text-sm text-text-muted">{t("suggestions.empty")}</p>
@@ -261,7 +280,7 @@ export default function Suggestions() {
         )}
 
         {/* Suggestion list */}
-        {suggestions.length > 0 && (
+        {lookup.status !== "failed" && suggestions.length > 0 && (
           <>
             {/* Bulk actions bar */}
             <div className="flex items-center justify-between flex-wrap gap-2">
@@ -270,7 +289,7 @@ export default function Suggestions() {
                   <input
                     type="checkbox"
                     checked={createRule}
-                    disabled={busy || loading || !!preparedPlans}
+                    disabled={!canAct}
                     onChange={(e) => setCreateRule(e.target.checked)}
                     className="rounded border-border"
                   />
@@ -280,7 +299,7 @@ export default function Suggestions() {
               <div className="flex items-center gap-2">
                 <button
                   onClick={(event) => void reviewSuggestions(suggestions, event.currentTarget)}
-                  disabled={busy || loading || !!preparedPlans}
+                  disabled={!canAct}
                   className="flex items-center gap-1 rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-on-primary hover:bg-primary-hover transition-colors disabled:opacity-50"
                 >
                   <CheckSquare size={14} />
@@ -288,7 +307,7 @@ export default function Suggestions() {
                 </button>
                 <button
                   onClick={() => dismissSuggestions(suggestions)}
-                  disabled={busy || loading || !!preparedPlans}
+                  disabled={!canAct}
                   className="flex items-center gap-1 rounded-md border border-border px-3 py-1.5 text-xs font-medium text-text-muted hover:text-text hover:bg-border transition-colors disabled:opacity-50"
                 >
                   <XSquare size={14} />
@@ -342,7 +361,7 @@ export default function Suggestions() {
                   <div className="flex items-center gap-1 shrink-0">
                     <button
                       onClick={(event) => void reviewSuggestions([s], event.currentTarget)}
-                      disabled={busy || loading || !!preparedPlans}
+                      disabled={!canAct}
                       aria-label={t("suggestions.accept")}
                       className="p-1.5 rounded-md bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-400 hover:bg-green-200 dark:hover:bg-green-900/50 transition-colors disabled:opacity-50"
                       title={t("suggestions.accept")}
@@ -351,7 +370,7 @@ export default function Suggestions() {
                     </button>
                     <button
                       onClick={() => dismissSuggestions([s])}
-                      disabled={busy || loading || !!preparedPlans}
+                      disabled={!canAct}
                       aria-label={t("suggestions.dismiss")}
                       className="p-1.5 rounded-md bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-400 hover:bg-red-200 dark:hover:bg-red-900/50 transition-colors disabled:opacity-50"
                       title={t("suggestions.dismiss")}

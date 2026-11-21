@@ -51,10 +51,14 @@ export function distinctSuggestionRules(plans: readonly SuggestionPlan[]): Sugge
   return [...distinct.values()];
 }
 
+type SuggestionsLookup =
+  | { status: "idle" | "loading" | "ready" }
+  | { status: "failed"; reason: string };
+
 interface SuggestionsState {
   suggestions: Suggestion[];
   localAiStatus: LocalAiStatus;
-  loading: boolean;
+  lookup: SuggestionsLookup;
   busy: boolean;
   error: string | null;
   createRuleDefault: boolean;
@@ -73,26 +77,33 @@ interface SuggestionsState {
 let loadGeneration = 0;
 const preview = createPreviewSlot();
 
+function isCurrentSelection(state: SuggestionsState, captured: readonly Suggestion[]): boolean {
+  return state.lookup.status === "ready" && captured.length > 0
+    && captured.every((item) => state.suggestions.includes(item));
+}
+
 async function refreshSuggestions(keepDismissalNotice = false): Promise<void> {
   const { getState, setState } = useSuggestionsStore;
   const { busy, preparedPlans, dismissChanged } = getState();
   if (busy || preparedPlans) return;
   const generation = ++loadGeneration;
-  setState({ loading: true, error: null, localAiStatus: null, dismissChanged: keepDismissalNotice && dismissChanged });
+  setState({ lookup: { status: "loading" }, localAiStatus: null, dismissChanged: keepDismissalNotice && dismissChanged });
   try {
     const { suggestions, localAiStatus } = await invoke<SuggestionsResponse>("get_suggestions_with_status_cmd", { limit: 100 });
-    if (generation === loadGeneration) setState({ suggestions, localAiStatus, loading: false });
+    if (generation === loadGeneration) setState({ suggestions, localAiStatus, lookup: { status: "ready" } });
   } catch (error) {
-    if (generation === loadGeneration) setState({ error: String(error), loading: false });
+    if (generation === loadGeneration) setState({ lookup: { status: "failed", reason: String(error) } });
   }
 }
 
 export const useSuggestionsStore = create<SuggestionsState>((set, get) => ({
-  suggestions: [], localAiStatus: null, loading: false, busy: false, error: null,
+  suggestions: [], localAiStatus: null, lookup: { status: "idle" }, busy: false, error: null,
   createRuleDefault: false, preparedPlans: null, results: null, dismissChanged: false,
   loadSuggestions: () => refreshSuggestions(),
   prepareSuggestions: async (suggestions, createRule, owner) => {
-    if (!suggestions.length || get().busy || get().preparedPlans) throw new Error("Another suggestion is being reviewed or processed");
+    const state = get();
+    if (state.busy || state.preparedPlans) throw new Error("Another suggestion is being reviewed or processed");
+    if (!isCurrentSelection(state, suggestions)) throw new Error("Suggestions changed; refresh and review again");
     let preparationId: string | undefined;
     const cancel = () => {
       if (!preparationId) return;
@@ -107,7 +118,7 @@ export const useSuggestionsStore = create<SuggestionsState>((set, get) => ({
     });
     ++loadGeneration;
     const requests = suggestions.map(({ path, suggestedCategory }) => ({ path, suggestedCategory }));
-    set({ busy: true, loading: false, error: null, dismissChanged: false });
+    set({ busy: true, error: null, dismissChanged: false });
     try {
       preparationId = await invoke<string>("begin_suggestion_preparation_cmd");
       owner?.throwIfAborted();
@@ -133,7 +144,7 @@ export const useSuggestionsStore = create<SuggestionsState>((set, get) => ({
     if (get().busy || get().preparedPlans !== plans) throw new Error("Suggestion preview changed; review again");
     preview.clear();
     ++loadGeneration;
-    set({ busy: true, loading: false, preparedPlans: null, error: null, dismissChanged: false });
+    set({ busy: true, preparedPlans: null, error: null, dismissChanged: false });
     const errors: string[] = [];
     try {
       for (const plan of plans) {
@@ -150,8 +161,8 @@ export const useSuggestionsStore = create<SuggestionsState>((set, get) => ({
     } finally { set({ busy: false, error: errors.length ? errors.join("\n") : null }); }
   },
   dismissSuggestions: async (captured) => {
-    const { loading, busy, preparedPlans } = get();
-    if (!captured.length || loading || busy || preparedPlans) return;
+    const state = get();
+    if (state.busy || state.preparedPlans || !isCurrentSelection(state, captured)) return;
     ++loadGeneration;
     set({ busy: true, error: null, dismissChanged: false });
     let changed = false;
@@ -171,9 +182,10 @@ export const useSuggestionsStore = create<SuggestionsState>((set, get) => ({
     if (changed && !get().error) await refreshSuggestions(true);
   },
   resetDismissed: async () => {
-    if (get().busy || get().preparedPlans) return;
+    const { lookup, busy, preparedPlans } = get();
+    if (lookup.status === "loading" || busy || preparedPlans) return;
     ++loadGeneration;
-    set({ busy: true, loading: false, error: null });
+    set({ busy: true, error: null });
     try {
       await invoke("reset_dismissed_suggestions_cmd");
       set({ busy: false, dismissChanged: false });

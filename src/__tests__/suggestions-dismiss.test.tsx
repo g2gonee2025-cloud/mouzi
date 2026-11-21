@@ -60,13 +60,17 @@ const dismissCommand = "dismiss_suggestion_cmd";
 const refreshCommand = "get_suggestions_with_status_cmd";
 const dismissal = ({ path, version }: typeof invoice) => [dismissCommand, { path, version }];
 
+function showVerified(...suggestions: typeof invoice[]) {
+  useSuggestionsStore.setState({ suggestions, lookup: { status: "ready" } });
+}
+
 beforeEach(() => {
   ipc.invoke.mockReset();
   useSuggestionsStore.setState(useSuggestionsStore.getInitialState(), true);
 });
 
 it("submits the listed version for normal single dismissal and removes its row", async () => {
-  useSuggestionsStore.setState({ suggestions: [invoice] });
+  showVerified(invoice);
   ipc.invoke.mockResolvedValueOnce(true);
   await dismissAction(Suggestions())();
   expect(ipc.invoke.mock.calls).toEqual([dismissal(invoice)]);
@@ -74,7 +78,7 @@ it("submits the listed version for normal single dismissal and removes its row",
 });
 
 it("refreshes a rejected single dismissal and keeps the replacement discoverable", async () => {
-  useSuggestionsStore.setState({ suggestions: [invoice] });
+  showVerified(invoice);
   ipc.invoke.mockResolvedValueOnce(false).mockResolvedValueOnce({ suggestions: [replacement], localAiStatus: null });
   await dismissAction(Suggestions())();
   expect(useSuggestionsStore.getState().suggestions).toEqual([replacement]);
@@ -83,19 +87,22 @@ it("refreshes a rejected single dismissal and keeps the replacement discoverable
 });
 
 it("continues Dismiss All after a stale card and targets only the cards shown at click", async () => {
-  useSuggestionsStore.setState({ suggestions: [invoice, receipt] });
+  showVerified(invoice, receipt);
   const click = dismissAction(Suggestions(), true);
+  let finish!: (dismissed: boolean) => void;
+  ipc.invoke.mockReturnValueOnce(new Promise<boolean>((resolve) => { finish = resolve; }))
+    .mockResolvedValueOnce(true).mockResolvedValueOnce({ suggestions: [replacement], localAiStatus: null });
+  const dismissalBatch = click();
   useSuggestionsStore.setState({ suggestions: [replacement, receipt] });
-  ipc.invoke.mockResolvedValueOnce(false).mockResolvedValueOnce(true)
-    .mockResolvedValueOnce({ suggestions: [replacement], localAiStatus: null });
-  await click();
+  finish(false);
+  await dismissalBatch;
   expect(ipc.invoke.mock.calls).toEqual([dismissal(invoice), dismissal(receipt), [refreshCommand, { limit: 100 }]]);
   expect(useSuggestionsStore.getState().suggestions).toEqual([replacement]);
   expect(find(Suggestions(), (element) => element.props.role === "status" && text(element) === "suggestions.dismissChanged")).toBeDefined();
 });
 
 it("clears an automatic-refresh dismissal notice on the next ordinary Refresh", async () => {
-  useSuggestionsStore.setState({ suggestions: [invoice] });
+  showVerified(invoice);
   const latest = { suggestions: [replacement], localAiStatus: null };
   ipc.invoke.mockResolvedValueOnce(false).mockResolvedValueOnce(latest).mockResolvedValueOnce(latest);
   await dismissAction(Suggestions())();
@@ -109,7 +116,7 @@ it("clears an automatic-refresh dismissal notice on the next ordinary Refresh", 
 });
 
 it("preserves a later bulk failure and lets the user refresh after a stale dismissal", async () => {
-  useSuggestionsStore.setState({ suggestions: [invoice, receipt] });
+  showVerified(invoice, receipt);
   ipc.invoke.mockResolvedValueOnce(false).mockRejectedValueOnce("Could not save dismissal");
   await dismissAction(Suggestions(), true)();
 
