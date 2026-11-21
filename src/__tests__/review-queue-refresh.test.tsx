@@ -397,3 +397,34 @@ it("reads successive native scopes in order without replacing a completed receip
   expect(useReviewQueueStore.getState().requestedPaths).toEqual(["C:/Fixture/later.txt"]);
   expect(useReviewQueueStore.getState().applyReceipt).toBe(receipt);
 });
+
+it("keeps a receipt on repeated requests when the first requested scope arrived late during Apply", async () => {
+  const selected = row("held", "current");
+  await initial("held-plan", [selected]);
+  const approve = approveSelection();
+  const close = render().find(node => node.type === ConfirmDialog)!.props.onClose!;
+  let finish!: (results: OperationResult[]) => void;
+  applyReply = () => new Promise(resolve => { finish = resolve; });
+  const applying = approve();
+
+  let publishScope!: (paths: string[]) => void;
+  const nextScope = ["C:/Fixture/next.txt"];
+  harness.invoke.mockImplementationOnce(() => new Promise(resolve => { publishScope = resolve; }));
+  const firstRead = useReviewQueueStore.getState().readReviewRequest();
+  await settled();
+
+  const results = [{ id: selected.id, source: selected.source, success: true, error: null }];
+  finish(results);
+  await applying;
+  close();
+  expect(render().find(node => node.type === Results)?.props.results).toEqual(results);
+
+  publishScope(nextScope);
+  await firstRead;
+  expect(useReviewQueueStore.getState().applyReceipt).toMatchObject({ status: "completed", results });
+  expect(useReviewQueueStore.getState().requestedPaths).toEqual(nextScope);
+
+  harness.invoke.mockResolvedValueOnce([...nextScope]);
+  await useReviewQueueStore.getState().readReviewRequest();
+  expect(useReviewQueueStore.getState().applyReceipt).toMatchObject({ status: "completed", results });
+});
