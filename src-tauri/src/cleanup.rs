@@ -314,14 +314,14 @@ pub fn find_empty_dirs() -> Result<FinderResult<String>, String> {
 struct PlannedAction {
     request: CleanupRequest,
     identity: safe_fs::FileIdentity,
-    /// All members of the reviewed duplicate group, including the keeper and
-    /// members the user did not select, remain required evidence.
-    group_members: Vec<String>,
+    duplicate_group: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
 struct ReviewedPlan {
     actions: Vec<PlannedAction>,
+    /// Each reviewed group includes the keeper and every unselected member.
+    duplicate_groups: Vec<Vec<String>>,
     files: HashMap<String, FileFingerprint>,
     roots: Vec<RootConfig>,
     root_identities: Vec<safe_fs::FileIdentity>,
@@ -365,18 +365,24 @@ pub fn prepare_cleanup(actions: &[CleanupRequest]) -> Result<CleanupPlanPreview,
     let candidates = if actions.iter().any(|action| action.kind == "trash_duplicate") {
         duplicate_candidates(&scope)?
     } else { Vec::new() };
-    let mut by_content: HashMap<(u64, String), Vec<String>> = HashMap::new();
+    #[derive(Default)]
+    struct CandidateGroup {
+        members: Vec<String>,
+        review_index: Option<usize>,
+    }
+    let mut by_content: HashMap<(u64, String), CandidateGroup> = HashMap::new();
     let mut files: HashMap<String, FileFingerprint> = candidates.into_iter().map(|(path, file)| {
-        by_content.entry((file.size, file.hash.clone())).or_default().push(path.clone());
+        by_content.entry((file.size, file.hash.clone())).or_default().members.push(path.clone());
         (path, file)
     }).collect();
     let mut planned = Vec::new();
+    let mut duplicate_groups = Vec::new();
     let mut victims = HashSet::new();
     let mut keepers = HashSet::new();
     let mut total_bytes = 0i64;
     for request in actions {
         let path = Path::new(&request.path);
-        let (identity, group_members) = match request.kind.as_str() {
+        let (identity, duplicate_group) = match request.kind.as_str() {
             "trash_duplicate" => {
                 if request.min_bytes.is_some() || request.days.is_some() {
                     return Err("Duplicate actions cannot include size or age criteria".into());
@@ -389,7 +395,14 @@ pub fn prepare_cleanup(actions: &[CleanupRequest]) -> Result<CleanupPlanPreview,
                 if victim.size != keeper.size || victim.hash != keeper.hash { return Err("The victim and keeper no longer have identical contents".into()); }
                 keepers.insert(keeper.identity.clone());
                 total_bytes = total_bytes.saturating_add(victim.size as i64);
-                (victim.identity.clone(), by_content[&(victim.size, victim.hash.clone())].clone())
+                let group = by_content.get_mut(&(victim.size, victim.hash.clone()))
+                    .ok_or("The duplicate group is no longer eligible for review")?;
+                let index = *group.review_index.get_or_insert_with(|| {
+                    let index = duplicate_groups.len();
+                    duplicate_groups.push(std::mem::take(&mut group.members));
+                    index
+                });
+                (victim.identity.clone(), Some(index))
             }
             "trash_large" | "trash_stale" => {
                 if request.keep_path.is_some() { return Err("Only duplicate actions may name a keeper".into()); }
@@ -410,7 +423,7 @@ pub fn prepare_cleanup(actions: &[CleanupRequest]) -> Result<CleanupPlanPreview,
                 total_bytes = total_bytes.saturating_add(current.size as i64);
                 let identity = current.identity.clone();
                 files.insert(request.path.clone(), current);
-                (identity, Vec::new())
+                (identity, None)
             }
             "remove_empty_dir" => {
                 if request.keep_path.is_some() || request.min_bytes.is_some() || request.days.is_some() {
@@ -418,21 +431,21 @@ pub fn prepare_cleanup(actions: &[CleanupRequest]) -> Result<CleanupPlanPreview,
                 }
                 let current = scope.validate_dir(path)?;
                 directory_is_empty(path)?;
-                (current.identity, Vec::new())
+                (current.identity, None)
             }
             _ => return Err(format!("Unknown cleanup action kind: {}", request.kind)),
         };
         if !victims.insert(identity.clone()) { return Err("The same physical target occurs more than once in the cleanup plan".into()); }
-        planned.push(PlannedAction { request: request.clone(), identity, group_members });
+        planned.push(PlannedAction { request: request.clone(), identity, duplicate_group });
     }
     if !victims.is_disjoint(&keepers) {
         return Err("A retained duplicate is also targeted for cleanup in this plan".into());
     }
     // Only evidence belonging to selected groups or actions needs revalidation.
-    let required: HashSet<_> = planned.iter().flat_map(|action| {
-        action.group_members.iter().cloned().chain(std::iter::once(action.request.path.clone()))
-    }).collect();
-    files.retain(|path, _| required.contains(path));
+    let required: HashSet<&str> = planned.iter().map(|action| action.request.path.as_str())
+        .chain(duplicate_groups.iter().flatten().map(String::as_str))
+        .collect();
+    files.retain(|path, _| required.contains(path.as_str()));
     if roots != root_configuration()? || root_identities != current_scope()?.root_identities() {
         return Err("Watched folders changed while the cleanup review was being prepared".into());
     }
@@ -440,7 +453,9 @@ pub fn prepare_cleanup(actions: &[CleanupRequest]) -> Result<CleanupPlanPreview,
     plans.retain(|_, plan| plan.created.elapsed() < PLAN_LIFETIME);
     if plans.len() >= MAX_PENDING_PLANS { return Err("Too many cleanup reviews are pending; close an older review and try again".into()); }
     let plan_id = new_plan_id()?;
-    plans.insert(plan_id.clone(), ReviewedPlan { actions: planned, files, roots, root_identities, created: Instant::now() });
+    plans.insert(plan_id.clone(), ReviewedPlan {
+        actions: planned, duplicate_groups, files, roots, root_identities, created: Instant::now(),
+    });
     Ok(CleanupPlanPreview {
         plan_id,
         expires_at: (Utc::now() + ChronoDuration::minutes(10)).to_rfc3339(),
@@ -505,8 +520,10 @@ fn validate_action(plan: &ReviewedPlan, scope: &safe_fs::RootScope, action: &Pla
         return directory_is_empty(Path::new(&action.request.path));
     }
     check_file(plan, scope, &action.request.path)?;
-    for member in &action.group_members {
-        if !removed.contains(member) { check_file(plan, scope, member)?; }
+    if let Some(group) = action.duplicate_group {
+        for member in &plan.duplicate_groups[group] {
+            if !removed.contains(member) { check_file(plan, scope, member)?; }
+        }
     }
     Ok(())
 }
@@ -573,14 +590,17 @@ fn execute_cleanup_plan_with(plan_id: &str, io: &mut impl CleanupIo) -> Result<V
     // revalidates its group below against the live filesystem.
     {
         let mut checked_paths = HashSet::new();
+        let mut checked_groups = HashSet::new();
         for action in &plan.actions {
             if action.request.kind == "remove_empty_dir" {
                 validate_action(&plan, &scope, action, &removed)?;
                 continue;
             }
-            for path in std::iter::once(&action.request.path).chain(&action.group_members) {
-                if checked_paths.insert(path.as_str()) {
-                    check_file(&plan, &scope, path)?;
+            let path = action.request.path.as_str();
+            if checked_paths.insert(path) { check_file(&plan, &scope, path)?; }
+            if let Some(group) = action.duplicate_group.filter(|group| checked_groups.insert(*group)) {
+                for member in &plan.duplicate_groups[group] {
+                    if checked_paths.insert(member.as_str()) { check_file(&plan, &scope, member)?; }
                 }
             }
         }
@@ -1143,6 +1163,38 @@ mod tests {
         assert_eq!(fs::read(&keeper).unwrap(), b"same");
         assert!(execute_cleanup_plan_with(&preview.plan_id, &mut io).is_err());
         assert_eq!(io.trash_calls, 1);
+    }
+
+    #[test]
+    fn one_reviewed_group_can_preserve_different_keepers() {
+        let _guard = db::serialise_test_db();
+        init();
+        let tree = TestTree::new();
+        tree.register();
+        let first_keeper = tree.file("keep-a", b"same");
+        let second_keeper = tree.file("keep-b", b"same");
+        let first = tree.file("remove-a", b"same");
+        let second = tree.file("remove-b", b"same");
+        let unrelated = tree.file("other", b"diff");
+        tree.inventory(&[&first_keeper, &second_keeper, &first, &second, &unrelated]);
+
+        let preview = prepare_cleanup(&[duplicate(&first, &first_keeper), duplicate(&second, &second_keeper)]).unwrap();
+        {
+            let plans = PLANS.lock().unwrap();
+            let plan = &plans[&preview.plan_id];
+            assert_eq!(plan.duplicate_groups.len(), 1);
+            assert_eq!(plan.duplicate_groups[0].len(), 4);
+            assert_eq!(plan.files.len(), 4);
+        }
+        assert_eq!(preview.total_bytes, 8);
+        // A change in another same-size file outside the reviewed group is immaterial.
+        fs::write(&unrelated, b"edit").unwrap();
+        let mut io = FakeIo::default();
+        let outcomes = execute_cleanup_plan_with(&preview.plan_id, &mut io).unwrap();
+        assert_eq!(outcomes.iter().map(|outcome| (&outcome.path, outcome.status.as_str())).collect::<Vec<_>>(),
+            [(&first, "ok"), (&second, "ok")]);
+        assert_eq!(fs::read(first_keeper).unwrap(), b"same");
+        assert_eq!(fs::read(second_keeper).unwrap(), b"same");
     }
 
     #[test]
