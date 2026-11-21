@@ -136,6 +136,35 @@ afterEach(() => {
   release = undefined;
 });
 
+it("shows a blocked root with healthy proposals and distinguishes a fully blocked preview from no matches", async () => {
+  const blockedRoots = [{
+    root: "C:/Fixture/bad-root",
+    error: "Unable to read ignore protection file C:/Fixture/bad-root/.mouziignore",
+  }];
+  replies.push(async () => ({ id: "mixed", entries: [row("healthy", "b")], blockedRoots }));
+  render();
+  await settled();
+  const texts = () => render().map((node) => node.props.children);
+  expect(chosen()).toEqual([true]);
+  expect(texts()).toContain("beta.unavailableFolders");
+  expect(texts()).toContain(blockedRoots[0].root);
+  expect(texts()).toContain(blockedRoots[0].error);
+  expect(texts()).not.toContain("beta.empty");
+
+  replies.push(async () => ({ id: "blocked", entries: [], blockedRoots }));
+  button("beta.refresh").onClick?.();
+  await settled();
+  expect(chosen()).toEqual([]);
+  expect(texts()).toContain(blockedRoots[0].error);
+  expect(texts()).not.toContain("beta.empty");
+
+  serve("empty", []);
+  button("beta.refresh").onClick?.();
+  await settled();
+  expect(texts()).not.toContain(blockedRoots[0].error);
+  expect(texts()).toContain("beta.empty");
+});
+
 it("keeps first and pristine refresh defaults, excluding warning rows", async () => {
   await initial("first", [row("1", "a"), row("1", "warning", "warning", true)]);
   expect(chosen()).toEqual([true, false]);
