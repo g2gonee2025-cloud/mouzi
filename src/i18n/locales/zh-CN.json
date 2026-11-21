@@ -261,6 +261,7 @@
     "confirmUndo": "恢复 {{count}} 个文件",
     "undoHelp": "将所选文件恢复到原文件夹。如果名称已被占用，恢复的文件名会加上后缀。已更改的文件会被跳过。",
     "selectRun": "选择此批次",
+    "sizeNotRecorded": "未记录大小",
     "noHistory": "没有符合筛选条件的历史记录。",
     "automatic": "自动",
     "scheduled": "定时",

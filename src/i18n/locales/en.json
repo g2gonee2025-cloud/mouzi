@@ -261,6 +261,7 @@
     "confirmUndo": "Restore {{count}} files",
     "undoHelp": "Restore the selected files to their original folders. If a name is already taken, the restored file gets a suffix. Changed files are skipped.",
     "selectRun": "Select this run",
+    "sizeNotRecorded": "Size not recorded",
     "noHistory": "No history matches these filters.",
     "automatic": "Automatic",
     "scheduled": "Scheduled",

@@ -55,7 +55,7 @@ type Element = ReactElement<Props>;
 type Match = (node: Element) => boolean;
 function text(node: ReactNode): string {
   if (Array.isArray(node)) return node.map(text).join("");
-  if (typeof node === "string") return node;
+  if (typeof node === "string" || typeof node === "number") return String(node);
   return isValidElement<Props>(node) ? text(node.props.children) : "";
 }
 function find(node: ReactNode, match: Match): Element | undefined {
@@ -136,6 +136,22 @@ async function mount() {
   cleanup = mock.effects.splice(0).map((effect) => effect());
   await settle();
 }
+
+it("distinguishes known byte sizes from an unrecorded size on each History row", async () => {
+  mock.invoke.mockResolvedValue([
+    { ...first, id: 1, file_name: "invoice.xyz", file_size: 4097 },
+    { ...first, id: 2, file_name: "empty.xyz", file_size: 0 },
+    { ...first, id: 3, file_name: "older.xyz", file_size: null },
+  ]);
+  await mount();
+  function row(name: string) {
+    return text(requireElement((node) => node.type === "label" && text(node).includes(name)));
+  }
+  expect(row("invoice.xyz")).toContain("4097 B");
+  expect(row("empty.xyz")).toContain("0 B");
+  expect(row("older.xyz")).toContain("beta.sizeNotRecorded");
+  expect(row("older.xyz")).not.toContain(" B");
+});
 
 it.each([
   { name: "one local minute", from: "2026-11-21T10:15", to: "2026-11-21T10:15" },

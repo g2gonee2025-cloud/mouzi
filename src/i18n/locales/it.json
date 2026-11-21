@@ -261,6 +261,7 @@
     "confirmUndo": "Ripristina {{count}} file",
     "undoHelp": "Ripristina i file selezionati nelle cartelle originali. Se il nome è già in uso, viene aggiunto un suffisso al file ripristinato. I file modificati vengono ignorati.",
     "selectRun": "Seleziona questa sessione",
+    "sizeNotRecorded": "Dimensione non registrata",
     "noHistory": "Nessuna voce corrisponde a questi filtri.",
     "automatic": "Automatico",
     "scheduled": "Pianificato",

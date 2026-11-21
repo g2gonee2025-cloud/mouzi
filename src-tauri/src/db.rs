@@ -126,7 +126,7 @@ pub struct OrganizationLog {
     pub run_id: Option<String>,
     pub trigger: String,
     pub file_extension: String,
-    pub file_size: u64,
+    pub file_size: Option<u64>,
     pub fingerprint: Option<String>,
     pub undo_verified: bool,
 }
@@ -1122,9 +1122,14 @@ fn action_log_from_row(row: &rusqlite::Row<'_>) -> SqliteResult<ActionLog> {
 
 pub(crate) fn get_organization_logs() -> SqliteResult<Vec<OrganizationLog>> {
     let conn = sqlite_lock()?;
+    // Older format rows received zero as a schema default. A recorded zero in
+    // organizer history carries run metadata; new acceptances carry their trigger.
     let mut stmt = conn.prepare(
         "SELECT id,timestamp,source_path,destination_path,action,file_name,file_type,undone,
-         run_id,trigger,file_extension,file_size,fingerprint,NULLIF(file_identity, '') IS NOT NULL
+         run_id,trigger,file_extension,
+         CASE WHEN file_size=0 AND trigger='legacy' AND run_id IS NULL
+              AND file_extension='' AND fingerprint IS NULL THEN NULL ELSE file_size END,
+         fingerprint,NULLIF(file_identity, '') IS NOT NULL
          FROM action_logs ORDER BY timestamp DESC,id DESC",
     )?;
     let logs = stmt.query_map([], |row| Ok(OrganizationLog {
@@ -1759,7 +1764,8 @@ fn prepare_move(source:&str, destination:&str)->Result<PreparedMove,String> {
     }
     let mtime=metadata.modified().ok().and_then(|t|t.duration_since(UNIX_EPOCH).ok()).map(|d|d.as_secs() as i64).unwrap_or(0);
     let inventory_scope = inventory_mutation_scope(&[Path::new(source), Path::new(destination), &path]);
-    Ok(PreparedMove{destination:path.to_string_lossy().into_owned(),size:metadata.len() as i64,mtime,identity,mtime_ns:metadata_mtime_ns(&metadata),owner:owner.map(|(_,id,path)|(id,path)),inventory_scope})
+    let size = i64::try_from(metadata.len()).map_err(|_| "File size cannot be recorded in history")?;
+    Ok(PreparedMove{destination:path.to_string_lossy().into_owned(),size,mtime,identity,mtime_ns:metadata_mtime_ns(&metadata),owner:owner.map(|(_,id,path)|(id,path)),inventory_scope})
 }
 
 fn reconcile_move_on(conn:&Connection,old:&str,prepared:&PreparedMove,category:Option<&str>)->SqliteResult<()> {
@@ -1796,7 +1802,6 @@ pub(crate) struct OrganizationHistory<'a> {
     pub run_id: &'a str,
     pub trigger: &'a str,
     pub extension: &'a str,
-    pub size: u64,
     pub digest: &'a str,
 }
 
@@ -1824,13 +1829,16 @@ fn finalize_moved(id:i64,log:&ActionLog,actual_destination:&str,category:Option<
     let mut conn=lock_db()?;let tx=conn.transaction().map_err(|e|e.to_string())?;
     let changed=tx.execute("UPDATE operation_intents SET completed_at=?2,status='completed',actual_destination=?3 WHERE id=?1 AND status='pending'",params![id,Utc::now().to_rfc3339(),actual_destination]).map_err(|e|e.to_string())?;
     if changed!=1 {return Err("Operation journal intent is unavailable".into());}
-    tx.execute("INSERT INTO action_logs(timestamp,source_path,destination_path,action,file_name,file_type,undone,file_identity) VALUES(?1,?2,?3,?4,?5,?6,0,?7)",params![log.timestamp.to_rfc3339(),log.source_path,actual_destination,log.action,log.file_name,log.file_type,prepared.identity]).map_err(|e|e.to_string())?;
+    let trigger = organization.as_ref().map_or("suggestion", |history| history.trigger);
+    tx.execute("INSERT INTO action_logs(timestamp,source_path,destination_path,action,file_name,file_type,undone,file_identity,file_size,trigger)
+        VALUES(?1,?2,?3,?4,?5,?6,0,?7,?8,?9)",
+        params![log.timestamp.to_rfc3339(),log.source_path,actual_destination,log.action,log.file_name,
+            log.file_type,prepared.identity,prepared.size,trigger]).map_err(|e|e.to_string())?;
     let log_id=tx.last_insert_rowid();
     if let Some(history) = organization {
         let fingerprint = format!("blake3:{}", history.digest);
-        let size = i64::try_from(history.size).map_err(|_| "File size cannot be recorded in history")?;
-        tx.execute("UPDATE action_logs SET run_id=?2,trigger=?3,file_extension=?4,file_size=?5,fingerprint=?6 WHERE id=?1",
-            params![log_id,history.run_id,history.trigger,history.extension,size,fingerprint]).map_err(|error| error.to_string())?;
+        tx.execute("UPDATE action_logs SET run_id=?2,file_extension=?3,fingerprint=?4 WHERE id=?1",
+            params![log_id,history.run_id,history.extension,fingerprint]).map_err(|error| error.to_string())?;
         tx.execute("DELETE FROM processed_files WHERE path IN (?1,?2)", params![log.source_path,inventory_source])
             .map_err(|error| error.to_string())?;
         tx.execute("INSERT INTO processed_files(path,fingerprint,restored) VALUES(?1,?2,0)

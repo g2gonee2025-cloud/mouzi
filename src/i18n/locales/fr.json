@@ -261,6 +261,7 @@
     "confirmUndo": "Restaurer {{count}} fichiers",
     "undoHelp": "Restaure les fichiers sélectionnés dans leurs dossiers d’origine. Si le nom est déjà utilisé, un suffixe est ajouté au fichier restauré. Les fichiers modifiés sont ignorés.",
     "selectRun": "Sélectionner cette session",
+    "sizeNotRecorded": "Taille non enregistrée",
     "noHistory": "Aucune entrée ne correspond à ces filtres.",
     "automatic": "Automatique",
     "scheduled": "Planifié",

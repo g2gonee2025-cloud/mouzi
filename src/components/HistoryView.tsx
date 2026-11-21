@@ -202,7 +202,7 @@ export default function HistoryView() {
             <span className="block">{log.source_path}</span>
             {log.destination_path && <span className="block">→ {log.destination_path}</span>}
             <span className="block text-xs text-text-muted">
-              {new Date(log.timestamp).toLocaleString()} · {log.file_size} B
+              {new Date(log.timestamp).toLocaleString()} · {log.file_size == null ? t("beta.sizeNotRecorded") : `${log.file_size} B`}
               {log.undone ? " · " + t("beta.undone")
                 : log.action === "delete" ? " · " + t("beta.trashHelp")
                 : !log.undo_verified ? " · " + t("beta.errors.history.unverified") : ""}

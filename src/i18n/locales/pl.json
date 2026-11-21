@@ -261,6 +261,7 @@
     "confirmUndo": "Przywróć pliki: {{count}}",
     "undoHelp": "Przywraca wybrane pliki do pierwotnych folderów. Jeśli nazwa jest już zajęta, do nazwy przywracanego pliku zostanie dodany przyrostek. Zmienione pliki zostaną pominięte.",
     "selectRun": "Zaznacz tę sesję",
+    "sizeNotRecorded": "Nie zapisano rozmiaru",
     "noHistory": "Brak historii pasującej do filtrów.",
     "automatic": "Automatycznie",
     "scheduled": "Harmonogram",

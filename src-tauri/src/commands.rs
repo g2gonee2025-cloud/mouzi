@@ -3581,6 +3581,63 @@ mod accept_tests {
     }
 
     #[test]
+    fn history_size_matches_each_accepted_file_and_its_inventory() {
+        let fixture = AcceptFixture::new("accepted_history_size");
+        let cases = [("invoice.xyz", 4097_usize), ("empty.xyz", 0)];
+        for (name, size) in cases {
+            std::fs::write(fixture.root().join(name), vec![b'x'; size]).unwrap();
+        }
+        index_fixture(&fixture);
+        let mut recorded = Vec::new();
+        for (name, size) in cases {
+            let source = fixture.root().join(name);
+            let plan = prepare_suggestion(source.to_string_lossy().into_owned(), "Documents".into(), false).unwrap();
+            let result = accept_reviewed_suggestion(&plan.plan_id, &ignored_files()).unwrap();
+            assert_eq!(result.status, "ok");
+            let destination = result.dest.unwrap();
+            assert_eq!(std::fs::read(&destination).unwrap(), vec![b'x'; size]);
+            let inventory: i64 = lock_db().unwrap().query_row(
+                "SELECT size FROM file_inventory WHERE path=?1", [&destination], |row| row.get(0),
+            ).unwrap();
+            assert_eq!(inventory, size as i64);
+            let log = history_cmd(Default::default()).unwrap().into_iter()
+                .find(|entry| entry.action.file_name == name).unwrap();
+            assert!(log.undo_verified);
+            recorded.push(serde_json::to_value(log).unwrap()["file_size"].clone());
+        }
+        assert_eq!(recorded, [serde_json::json!(4097), serde_json::json!(0)]);
+    }
+
+    #[test]
+    fn history_size_preserves_proven_values_and_reports_unrecorded_legacy_sizes() {
+        let fixture = AcceptFixture::new("legacy_history_size");
+        let destination = fixture.put("changed-since-organization.txt");
+        let conn = lock_db().unwrap();
+        // Simulate rows written by older versions. Several now point at the same
+        // changed file: its present size cannot establish any historical size.
+        let cases = [
+            ("old-accept", "accept", 0_i64, "legacy", None, None, None),
+            ("old-move", "move", 0, "legacy", None, None, None),
+            ("old-positive", "accept", 99, "legacy", None, None, Some(99_u64)),
+            ("empty-reviewed", "move", 0, "approved", Some("run"), Some("digest"), Some(0)),
+        ];
+        for (name, action, stored, trigger, run, fingerprint, _) in cases {
+            conn.execute(
+                "INSERT INTO action_logs(timestamp,source_path,destination_path,action,file_name,file_type,
+                    file_size,trigger,run_id,fingerprint) VALUES (?1,?2,?3,?4,?2,'Documents',?5,?6,?7,?8)",
+                rusqlite::params![chrono::Utc::now().to_rfc3339(), name, destination.to_str().unwrap(),
+                    action, stored, trigger, run, fingerprint],
+            ).unwrap();
+        }
+        drop(conn);
+        let history = history_cmd(Default::default()).unwrap();
+        for (name, _, _, _, _, _, expected) in cases {
+            let row = history.iter().find(|entry| entry.action.file_name == name).unwrap();
+            assert_eq!(serde_json::to_value(row).unwrap()["file_size"], serde_json::json!(expected), "{name}");
+        }
+    }
+
+    #[test]
     fn reviewed_suggestion_keeps_exact_destination_and_reconciles_real_acceptance() {
         let fixture=AcceptFixture::new("review_destination");let path=inventory_fixture(&fixture);
         let occupied=fixture.put("Documents/report.xyz");

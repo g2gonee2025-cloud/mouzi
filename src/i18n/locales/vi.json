@@ -267,6 +267,7 @@
     "confirmUndo": "Khôi phục {{count}} tệp",
     "undoHelp": "Khôi phục các tệp đã chọn vào thư mục ban đầu. Nếu tên đã được sử dụng, tệp được khôi phục sẽ có thêm hậu tố. Các tệp đã thay đổi sẽ bị bỏ qua.",
     "selectRun": "Chọn phiên này",
+    "sizeNotRecorded": "Chưa ghi nhận kích thước",
     "noHistory": "Không có lịch sử khớp với các bộ lọc.",
     "automatic": "Tự động",
     "scheduled": "Theo lịch",

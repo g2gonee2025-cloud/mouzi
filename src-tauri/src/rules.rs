@@ -726,7 +726,7 @@ fn process_file(
         _ => (crate::operations::new_run_id(), "manual"),
     };
     let history = crate::db::OrganizationHistory {
-        run_id: &run_id, trigger, extension: &file_info.extension, size: file_info.size, digest: digest.as_str(),
+        run_id: &run_id, trigger, extension: &file_info.extension, digest: digest.as_str(),
     };
     let warning = crate::db::finalize_organization_move(intent, &log, &moved, history)
         .err().map(|error| format!("Moved to {destination}, but history/inventory recording failed: {error}"));

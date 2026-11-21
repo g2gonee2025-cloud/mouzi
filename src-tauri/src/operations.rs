@@ -437,7 +437,7 @@ fn apply_item(
         undone: false,
     };
     let history = OrganizationHistory {
-        run_id, trigger: "approved", extension: &info.extension, size: info.size, digest: &item.digest,
+        run_id, trigger: "approved", extension: &info.extension, digest: &item.digest,
     };
     let history_error = db::finalize_organization_move(intent, &log, &moved, history).err()
         .map(|error| format!("Moved to {actual_destination}, but recovery record {intent} is pending: {error}"));

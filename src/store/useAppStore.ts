@@ -50,7 +50,7 @@ export interface OrganizationLog extends ActionLog {
   run_id: string | null;
   trigger: string;
   file_extension: string;
-  file_size: number;
+  file_size: number | null;
   fingerprint: string | null;
   undo_verified: boolean;
 }
