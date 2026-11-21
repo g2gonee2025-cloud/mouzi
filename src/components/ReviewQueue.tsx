@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { useTranslation } from 'react-i18next';
-import { buttonClass, primaryClass, errorText, Results, OperationResult } from './BetaControls';
-import { useAppStore } from '../store/useAppStore';
+import { buttonClass, primaryClass, errorText, Results } from './BetaControls';
+import { useReviewQueueStore } from '../store/useReviewQueueStore';
 import ConfirmDialog, { type ConfirmRequest } from './cleanup/ConfirmDialog';
 
 interface Entry { id: string; selectionKey?: string; source: string; destination: string | null; rule: string; action: string; size: number; warning: boolean; error: string | null }
@@ -21,51 +21,61 @@ function selectionKeys(entries: Entry[]) {
   return new Set(entries.flatMap(entry => isOrdinaryProposal(entry) && entry.selectionKey ? [entry.selectionKey] : []));
 }
 
-export default function ReviewQueue({ paths }: { paths: string[] | null }) {
+export default function ReviewQueue() {
   const { t } = useTranslation();
+  const paths = useReviewQueueStore(state => state.requestedPaths);
+  const receipt = useReviewQueueStore(state => state.applyReceipt);
   const [preview, setPreview] = useState<Preview | null>(null);
   const [selected, setSelected] = useState<Set<string>>(new Set());
-  const [busy, setBusy] = useState(false);
+  const [preparing, setPreparing] = useState(false);
   const [error, setError] = useState('');
   const [confirm, setConfirm] = useState<ConfirmRequest | null>(null);
-  const [results, setResults] = useState<OperationResult[]>([]);
   const currentId = useRef<string | null>(null);
   const generation = useRef(0);
   // A non-null set means the user chose the selection, even when it is empty.
   const selectionIntent = useRef<Set<string> | null>(null);
   const heading = useRef<HTMLHeadingElement>(null);
   const content = useRef<HTMLDivElement>(null);
+  const applying = receipt?.status === 'applying';
+  const busy = preparing || applying;
+
   async function refresh() {
+    const workspace = useReviewQueueStore.getState();
+    if (workspace.applyReceipt?.status === 'applying' || workspace.requestedPaths !== paths) return;
+    workspace.dismissReceipt();
     const request = ++generation.current;
+    const current = () => request === generation.current && useReviewQueueStore.getState().requestedPaths === paths;
     const intent = selectionIntent.current;
     const previous = currentId.current;
     currentId.current = null;
-    setBusy(true); setError(''); setConfirm(null); setResults([]);
+    setPreparing(true); setError(''); setConfirm(null);
     setPreview(null);
     if (content.current) content.current.scrollTop = 0;
     try {
       if (previous) await invoke('discard_preview_cmd', { id: previous });
-      if (request !== generation.current) return;
+      if (!current()) return;
       const plan = await invoke<Preview>('preview_cmd', { paths: paths?.length ? paths : null });
-      if (request !== generation.current) { await invoke('discard_preview_cmd', { id: plan.id }); return; }
+      if (!current()) { await invoke('discard_preview_cmd', { id: plan.id }); return; }
       currentId.current = plan.id; setPreview(plan);
       const ordinary = plan.entries.filter(isOrdinaryProposal);
       const carry = intent === null ? ordinary : ordinary.filter(entry => entry.selectionKey && intent.has(entry.selectionKey));
       setSelected(new Set(carry.map(entry => entry.id)));
       if (intent !== null) selectionIntent.current = selectionKeys(carry);
-    } catch (error) { if (request === generation.current) setError(errorText(error)); }
-    finally { if (request === generation.current) setBusy(false); }
+    } catch (error) { if (current()) setError(errorText(error)); }
+    finally { if (current()) setPreparing(false); }
   }
   useEffect(() => {
     selectionIntent.current = null;
-    void refresh();
+    if (!useReviewQueueStore.getState().applyReceipt) void refresh();
     return () => {
       ++generation.current;
-      if (currentId.current) void invoke('discard_preview_cmd', { id: currentId.current }).catch(() => {});
+      const abandoned = currentId.current;
+      currentId.current = null;
+      if (abandoned) void invoke('discard_preview_cmd', { id: abandoned }).catch(() => {});
     };
   }, [paths]);
   function askApply(opener: HTMLButtonElement) {
-    if (!preview) return;
+    if (busy || receipt || !preview) return;
     const entries = preview.entries.filter((entry) => !entry.error && selected.has(entry.id));
     if (!entries.length) return;
     const id = preview.id;
@@ -79,23 +89,17 @@ export default function ReviewQueue({ paths }: { paths: string[] | null }) {
       opener,
       focusFallback: () => heading.current,
       onConfirm: async () => {
-        setBusy(true);
-        try {
-          const outcomes = await invoke<OperationResult[]>('apply_preview_cmd', { id, selected: entries.map((entry) => entry.id) });
-          if (request === generation.current) setResults(outcomes);
-          const store = useAppStore.getState();
-          await Promise.allSettled([store.refreshActionViews(), store.getPendingFiles()]);
-        } catch (cause) {
-          if (request === generation.current) setError(errorText(cause));
-        } finally {
-          if (request === generation.current) {
-            if (content.current) content.current.scrollTop = 0;
-            currentId.current = null;
-            setPreview(null);
-            setSelected(new Set());
-            setBusy(false);
-          }
-        }
+        const workspace = useReviewQueueStore.getState();
+        if (workspace.applyReceipt || workspace.requestedPaths !== paths
+          || request !== generation.current || currentId.current !== id) return;
+        // Transfer ownership before dispatch. Cleanup may run while the call
+        // waits in the WebView transport or behind another native operation.
+        currentId.current = null;
+        if (content.current) content.current.scrollTop = 0;
+        setPreview(null);
+        setSelected(new Set());
+        setError('');
+        await workspace.applyReviewedPlan(id, entries.map(entry => entry.id));
       },
     });
   }
@@ -111,6 +115,7 @@ export default function ReviewQueue({ paths }: { paths: string[] | null }) {
   };
   const hasOmissions = !!(preview?.unavailableRoots?.length || preview?.blockedRoots?.length);
   const hasEntries = !!preview?.entries.length;
+  const visibleError = receipt?.status === 'failed' ? errorText(receipt.error) : error;
   return <section className="flex min-h-0 flex-1 flex-col gap-3" aria-busy={busy}>
     <div className="flex shrink-0 flex-wrap items-center justify-between gap-3">
       <h2 ref={heading} tabIndex={-1} className="text-lg font-semibold">{t('beta.review')}</h2>
@@ -130,9 +135,10 @@ export default function ReviewQueue({ paths }: { paths: string[] | null }) {
       </div>
     )}
     <div ref={content} role="region" aria-label={t('beta.review')} tabIndex={hasEntries ? 0 : undefined} className="min-h-24 space-y-3 overflow-y-auto pr-1">
-      {busy && <p role="status">{t('beta.loading')}</p>}
-      {error && <p role="alert" className="text-sm text-red-700 dark:text-red-300">{error}</p>}
-      <Results results={results} />
+      {applying && <p role="status">{t('confirm.working')}</p>}
+      {preparing && <p role="status">{t('beta.loading')}</p>}
+      {visibleError && <p role="alert" className="text-sm text-red-700 dark:text-red-300">{visibleError}</p>}
+      <Results results={receipt?.status === 'completed' ? receipt.results : []} />
       {preview && <>
         {hasOmissions && (
           <div role="status" className="space-y-1 text-sm text-amber-800 dark:text-amber-200">

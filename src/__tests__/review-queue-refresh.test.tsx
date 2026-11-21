@@ -3,6 +3,7 @@ import { Children, isValidElement, type EffectCallback, type ReactNode, type Rea
 import ReviewQueue from "../components/ReviewQueue";
 import ConfirmDialog from "../components/cleanup/ConfirmDialog";
 import { Results, type OperationResult } from "../components/BetaControls";
+import { useReviewQueueStore } from "../store/useReviewQueueStore";
 
 const harness = vi.hoisted(() => ({
   slots: [] as unknown[],
@@ -28,6 +29,12 @@ vi.mock("../components/cleanup/ConfirmDialog", () => ({ default: () => null }));
 vi.mock("../store/useAppStore", () => ({
   useAppStore: { getState: () => ({ refreshActionViews: async () => {}, getPendingFiles: async () => {} }) },
 }));
+vi.mock("../store/useReviewQueueStore", async (original) => {
+  const actual = await original<typeof import("../store/useReviewQueueStore")>();
+  const store = actual.useReviewQueueStore;
+  const snapshot = (select: (state: ReturnType<typeof store.getState>) => unknown) => select(store.getState());
+  return { ...actual, useReviewQueueStore: Object.assign(snapshot, store) };
+});
 vi.mock("react", async (original) => ({
   ...await original<typeof import("react")>(),
   useState(initial: unknown) {
@@ -72,7 +79,8 @@ type ControlProps = {
 
 function render() {
   harness.cursor = 0;
-  const root = ReviewQueue({ paths: scope });
+  if (useReviewQueueStore.getState().requestedPaths !== scope) useReviewQueueStore.setState({ requestedPaths: scope });
+  const root = ReviewQueue();
   const effect = harness.pending;
   if (effect) {
     harness.pending = undefined;
@@ -142,6 +150,7 @@ async function initial(id: string, entries: Row[]) {
 }
 
 beforeEach(() => {
+  useReviewQueueStore.setState(useReviewQueueStore.getInitialState());
   scope = null;
   harness.slots = [];
   harness.domains = undefined;
@@ -364,4 +373,22 @@ it("retires an unconfirmed plan when leaving Review", async () => {
   leaveReview();
   expect(harness.invoke).toHaveBeenCalledWith("discard_preview_cmd", { id: "unconfirmed-plan" });
   expect(harness.invoke.mock.calls.some(([command]) => command === "apply_preview_cmd")).toBe(false);
+});
+
+it("reads successive native scopes in order without replacing a completed receipt", async () => {
+  const receipt = { status: "failed", error: "The previous reviewed destination is unavailable" } as const;
+  useReviewQueueStore.setState({ applyReceipt: receipt });
+  let finishOlder!: (paths: string[]) => void;
+  harness.invoke.mockImplementationOnce(() => new Promise(resolve => { finishOlder = resolve; }))
+    .mockResolvedValueOnce(["C:/Fixture/later.txt"]);
+  const request = useReviewQueueStore.getState().readReviewRequest;
+  const older = request();
+  const newer = request();
+  await settled();
+  expect(harness.invoke.mock.calls).toEqual([["take_review_request_cmd"]]);
+  finishOlder(["C:/Fixture/earlier.txt"]);
+  await Promise.all([older, newer]);
+  expect(harness.invoke.mock.calls).toEqual([["take_review_request_cmd"], ["take_review_request_cmd"]]);
+  expect(useReviewQueueStore.getState().requestedPaths).toEqual(["C:/Fixture/later.txt"]);
+  expect(useReviewQueueStore.getState().applyReceipt).toBe(receipt);
 });

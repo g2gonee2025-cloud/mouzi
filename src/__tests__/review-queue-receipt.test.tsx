@@ -4,6 +4,7 @@ import { beforeEach, expect, it, vi } from "vitest";
 import ReviewQueue from "../components/ReviewQueue";
 import ConfirmDialog, { type ConfirmDialogProps } from "../components/cleanup/ConfirmDialog";
 import { Results, type OperationResult } from "../components/BetaControls";
+import { useReviewQueueStore } from "../store/useReviewQueueStore";
 
 const fixture = vi.hoisted(() => ({
   invoke: vi.fn(), slots: [] as unknown[], cursor: 0, effects: [] as Array<() => void>,
@@ -13,6 +14,12 @@ vi.mock("../store/useAppStore", () => ({
   useAppStore: { getState: () => ({ refreshActionViews: async () => {}, getPendingFiles: async () => {} }) },
   defaultRuleOptions: {},
 }));
+vi.mock("../store/useReviewQueueStore", async (original) => {
+  const actual = await original<typeof import("../store/useReviewQueueStore")>();
+  const store = actual.useReviewQueueStore;
+  const snapshot = (select: (state: ReturnType<typeof store.getState>) => unknown) => select(store.getState());
+  return { ...actual, useReviewQueueStore: Object.assign(snapshot, store) };
+});
 vi.mock("react-i18next", () => ({
   useTranslation: () => ({ t: (key: string) => key }),
 }));
@@ -69,10 +76,11 @@ function find(node: ReactNode, match: (element: Element) => boolean): Element | 
 const paths = [source, sibling];
 function renderQueue() {
   fixture.cursor = 0;
-  return ReviewQueue({ paths });
+  return ReviewQueue();
 }
 
 beforeEach(() => {
+  useReviewQueueStore.setState({ ...useReviewQueueStore.getInitialState(), requestedPaths: paths });
   fixture.invoke.mockReset();
   fixture.slots.length = 0;
   fixture.effects.length = 0;

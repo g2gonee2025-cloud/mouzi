@@ -9,6 +9,7 @@ import ArchiveImportPanel from "./ArchiveImportPanel";
 import ActionRefreshWarnings from "./ActionRefreshWarnings";
 import HistoryView from "./HistoryView";
 import ReviewQueue from "./ReviewQueue";
+import { useReviewQueueStore } from "../store/useReviewQueueStore";
 import { RuleConditions, errorText, ruleSizeBounds, type RuleSizeDraft } from "./BetaControls";
 import { nextDestination } from "../utils/rulePath";
 import ConfirmDialog, { type ConfirmRequest } from "./cleanup/ConfirmDialog";
@@ -279,7 +280,6 @@ export default function Settings() {
     : startup === "differentLocation"
       ? { id: "startup-location-note", text: t("settings.general.startupDifferentLocation") }
       : null;
-  const [reviewPaths, setReviewPaths] = useState<string[] | null>(null);
   const [editingRule, setEditingRule] = useState<Rule | null>(null);
   const [pickedRuleDestination, setPickedRuleDestination] = useState<string | null>(null);
   const rulePickerRequest = useRef(0);
@@ -370,14 +370,10 @@ export default function Settings() {
 
   useEffect(() => {
     let disposed = false;
-    const stops: Array<() => void> = [];
-    const openReview = async () => {
-      const paths = await invoke<string[] | null>("take_review_request_cmd");
-      if (!disposed && paths !== null) {
-        setReviewPaths(paths);
-        setTab("review");
-      }
-    };
+    const stops = [useReviewQueueStore.subscribe((next, previous) => {
+      if (!disposed && next.requestedPaths !== previous.requestedPaths) setTab("review");
+    })];
+    const openReview = () => useReviewQueueStore.getState().readReviewRequest();
     const openFolderRequest = async () => {
       const path = await invoke<string | null>("take_add_folder_request_cmd");
       if (!disposed && path) { setNewFolderPath(path); setTab("folders"); }
@@ -670,7 +666,7 @@ export default function Settings() {
           />
           <SidebarButton
             active={tab === "review"}
-            onClick={() => { setReviewPaths(null); setTab("review"); }}
+            onClick={() => setTab("review")}
             icon={<Inbox size={16} />}
             label={t("beta.review")}
           />
@@ -1085,7 +1081,7 @@ export default function Settings() {
           </div>
         )}
 
-        {tab === "review" && <ReviewQueue paths={reviewPaths} />}
+        {tab === "review" && <ReviewQueue />}
         {tab === "history" && (
           <div className="space-y-4">
             <div className="flex items-center justify-between">
