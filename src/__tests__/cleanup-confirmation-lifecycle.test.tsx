@@ -379,7 +379,7 @@ it.each([
   receipt("duplicates")!.onDone!();
   await settle();
   expect.soft(confirm().props.disabled).toBe(true);
-  expect.soft(text(render("duplicates"))).toContain("0 selected");
+  expect.soft(text(render("duplicates"))).toContain("0 selected · 0 B");
 
   const selectAll = find(render("duplicates"), button("cleanup.selectAll"));
   expect(selectAll?.props.disabled).toBe(false);

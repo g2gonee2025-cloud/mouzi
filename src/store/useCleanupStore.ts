@@ -58,6 +58,7 @@ interface CleanupState {
   keepDuplicate: (group: DuplicateGroup, path: string) => void;
   toggleDuplicateVictim: (group: DuplicateGroup, path: string) => void;
   clearDuplicateVictims: (groups: DuplicateGroup[] | null) => void;
+  selectAllDuplicateVictims: (groups: DuplicateGroup[] | null) => void;
   findLargeFiles: (minBytes: number) => Promise<void>;
   findStaleFiles: (days: number) => Promise<void>;
   findEmptyDirs: () => Promise<void>;
@@ -75,6 +76,8 @@ interface CleanupState {
 let candidatesGeneration = 0;
 let historyGeneration = 0;
 const HISTORY_PAGE_SIZE = 100;
+// A non-null selection keeps manual mode even when fresh finder results clear its paths.
+const noDuplicateVictims: ReadonlySet<string> = new Set();
 const emptyCandidates = { duplicates: null, duplicateKeepers: {}, duplicateVictims: null, largeFiles: null, staleFiles: null, emptyDirs: null };
 const inventoryEvents = ["scan-complete", "scan-finished", "folders-changed", "mutation-completed"];
 type FinderKey = "duplicates" | "largeFiles" | "staleFiles" | "emptyDirs";
@@ -141,7 +144,10 @@ export const useCleanupStore = create<CleanupState>((set, get) => {
       loading: true,
       error: null,
       [key]: waiting ?? null,
-      ...(key === "duplicates" && { duplicateKeepers: {}, duplicateVictims: null }),
+      ...(key === "duplicates" && {
+        duplicateKeepers: {},
+        duplicateVictims: state.duplicateVictims === null ? null : noDuplicateVictims,
+      }),
       unavailableRoots: { ...state.unavailableRoots, [key]: [] },
     }));
     try {
@@ -149,7 +155,10 @@ export const useCleanupStore = create<CleanupState>((set, get) => {
       if (isCurrent()) {
         activeFinder = null;
         const found: Partial<CleanupState> = { [key]: candidates };
-        if (found.duplicates) found.duplicateKeepers = keepersIn(found.duplicates, priorKeepers);
+        if (found.duplicates) {
+          found.duplicateKeepers = keepersIn(found.duplicates, priorKeepers);
+          if (duplicateCopyCount(found.duplicates) > DUPLICATE_REVIEW_LIMIT) found.duplicateVictims = noDuplicateVictims;
+        }
         set((state) => ({
           ...found,
           loading: false,
@@ -192,7 +201,11 @@ export const useCleanupStore = create<CleanupState>((set, get) => {
     }),
     clearDuplicateVictims: (groups) => set((state) => {
       if (!groups || state.duplicates !== groups) return state;
-      return { duplicateVictims: new Set() };
+      return { duplicateVictims: noDuplicateVictims };
+    }),
+    selectAllDuplicateVictims: (groups) => set((state) => {
+      if (!groups || state.duplicates !== groups || duplicateCopyCount(groups) > DUPLICATE_REVIEW_LIMIT) return state;
+      return { duplicateVictims: new Set(buildDuplicateActions(groups, state.duplicateKeepers).map((action) => action.path)) };
     }),
     findLargeFiles: (minBytes) => find("largeFiles", async () => {
       const { candidates: files, unavailableRoots } = await requestCandidates<CleanupFile>("find_large_files_cmd", { minBytes });
@@ -260,7 +273,7 @@ export const useCleanupStore = create<CleanupState>((set, get) => {
               duplicateVictims = new Set(buildDuplicateActions(duplicates ?? [], duplicateKeepers, duplicateVictims)
                 .map((action) => action.path));
             } else if (duplicateCopyCount(state.duplicates ?? []) > DUPLICATE_REVIEW_LIMIT) {
-              duplicateVictims = new Set();
+              duplicateVictims = noDuplicateVictims;
             }
           }
           return {
@@ -299,7 +312,11 @@ export const useCleanupStore = create<CleanupState>((set, get) => {
       else {
         preview.clear();
         discard(get().preparedPlan);
-        set({ ...emptyCandidates, unavailableRoots: {}, preparedPlan: null, loading: false, history: null, historyLoading: false });
+        set((state) => ({
+          ...emptyCandidates,
+          duplicateVictims: state.duplicateVictims === null ? null : noDuplicateVictims,
+          unavailableRoots: {}, preparedPlan: null, loading: false, history: null, historyLoading: false,
+        }));
       }
     },
     invalidateFileCandidates: () => {
@@ -315,7 +332,7 @@ export const useCleanupStore = create<CleanupState>((set, get) => {
         return {
           duplicates: null,
           duplicateKeepers: {},
-          duplicateVictims: null,
+          duplicateVictims: state.duplicateVictims === null ? null : noDuplicateVictims,
           largeFiles: largeFiles && { minBytes: largeFiles.minBytes, files: null },
           staleFiles: staleFiles && { days: staleFiles.days, files: null },
           unavailableRoots: emptyDirs === undefined ? {} : { emptyDirs },

@@ -153,6 +153,16 @@ export default function DuplicatesTab() {
               )}
             </div>
             <div className="flex items-center gap-2">
+              {copyCount <= DUPLICATE_REVIEW_LIMIT && (
+                <button
+                  type="button"
+                  onClick={() => store.selectAllDuplicateVictims(store.duplicates)}
+                  disabled={locked || actions.length === copyCount}
+                  className="rounded-md px-2 py-1.5 text-xs text-text-muted hover:bg-border disabled:opacity-50"
+                >
+                  {t("cleanup.selectAll")}
+                </button>
+              )}
               <button
                 type="button"
                 onClick={() => store.clearDuplicateVictims(store.duplicates)}
