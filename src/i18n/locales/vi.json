@@ -132,7 +132,7 @@
       "startupReadError": "Không thể kiểm tra cài đặt khởi động cùng hệ thống.",
       "startupWriteError": "Không thể cập nhật cài đặt khởi động cùng hệ thống.",
       "startupBlocked": "Đã tắt trong danh sách ứng dụng khởi động của Windows.",
-      "startupUnavailable": "Bản dựng này không hỗ trợ cài đặt khởi động cùng hệ thống.",
+      "startupUnavailable": "Bản dựng phát triển biệt lập này không hỗ trợ cài đặt khởi động cùng hệ thống.",
       "gracePeriod": "Thời gian chờ",
       "gracePeriodDesc": "Thời gian chờ trước khi di chuyển tệp sau lần chỉnh sửa cuối cùng. 0 = tức thì.",
       "checkFileLock": "Kiểm tra tệp đang khóa",

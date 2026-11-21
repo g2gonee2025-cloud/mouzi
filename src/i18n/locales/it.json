@@ -126,7 +126,7 @@
       "startupReadError": "Impossibile verificare l’avvio automatico.",
       "startupWriteError": "Impossibile modificare l’avvio automatico.",
       "startupBlocked": "Disattivato nelle app di avvio di Windows.",
-      "startupUnavailable": "Le impostazioni di avvio automatico non sono disponibili in questa versione.",
+      "startupUnavailable": "Le impostazioni di avvio automatico non sono disponibili in questa versione di sviluppo isolata.",
       "gracePeriod": "Periodo di grazia",
       "gracePeriodDesc": "Tempo di attesa prima di spostare un file dopo l'ultima modifica. 0 = istantaneo.",
       "checkFileLock": "Verifica blocco file",

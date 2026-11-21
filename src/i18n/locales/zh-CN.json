@@ -126,7 +126,7 @@
       "startupReadError": "无法检查开机启动设置。",
       "startupWriteError": "无法更新开机启动设置。",
       "startupBlocked": "已在 Windows 启动应用中关闭。",
-      "startupUnavailable": "此版本不支持开机启动设置。",
+      "startupUnavailable": "此隔离开发版本不支持开机启动设置。",
       "gracePeriod": "等待时间",
       "gracePeriodDesc": "文件最后修改后，等待一段时间再移动。设为 0 表示立即移动。",
       "checkFileLock": "检查文件占用",

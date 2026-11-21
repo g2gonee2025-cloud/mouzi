@@ -109,7 +109,7 @@
       "startupReadError": "No se pudo comprobar el inicio automático.",
       "startupWriteError": "No se pudo actualizar el inicio automático.",
       "startupBlocked": "Desactivado en las aplicaciones de inicio de Windows.",
-      "startupUnavailable": "Los ajustes de inicio automático no están disponibles en esta versión.",
+      "startupUnavailable": "Los ajustes de inicio automático no están disponibles en esta versión de desarrollo aislada.",
       "gracePeriod": "Período de gracia",
       "gracePeriodDesc": "Tiempo de espera antes de mover un archivo después de su última modificación. 0 = instantáneo.",
       "checkFileLock": "Verificar bloqueo de archivo",

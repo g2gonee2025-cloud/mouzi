@@ -126,7 +126,7 @@
       "startupReadError": "Could not check the startup setting.",
       "startupWriteError": "Could not update the startup setting.",
       "startupBlocked": "Turned off in Windows Startup Apps.",
-      "startupUnavailable": "Startup settings are unavailable in this build.",
+      "startupUnavailable": "Startup settings are unavailable in this isolated development build.",
       "gracePeriod": "Grace period",
       "gracePeriodDesc": "Wait time before moving a file after it was last modified. 0 = instant.",
       "checkFileLock": "Check file lock",

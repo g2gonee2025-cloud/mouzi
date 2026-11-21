@@ -126,7 +126,7 @@
       "startupReadError": "Die Autostarteinstellung konnte nicht geprüft werden.",
       "startupWriteError": "Die Autostarteinstellung konnte nicht aktualisiert werden.",
       "startupBlocked": "Im Windows-Autostart deaktiviert.",
-      "startupUnavailable": "Die Autostarteinstellungen sind in dieser Version nicht verfügbar.",
+      "startupUnavailable": "Die Autostarteinstellungen sind in dieser isolierten Entwicklungsversion nicht verfügbar.",
       "gracePeriod": "Wartezeit",
       "gracePeriodDesc": "Wartezeit, bevor eine Datei nach der letzten Änderung verschoben wird. 0 = sofort.",
       "checkFileLock": "Dateisperre prüfen",
