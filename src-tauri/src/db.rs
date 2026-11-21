@@ -2701,16 +2701,35 @@ pub fn get_stale_files_from_inventory(cutoff_mtime: i64) -> SqliteResult<Vec<Lar
 // Suggestion helpers (dismissed_suggestions + unclassified files)
 // ---------------------------------------------------------------------------
 
-pub fn dismiss_suggestion(path: &str) -> SqliteResult<()> {
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SuggestionVersion {
+    pub identity: String,
+    // Preserve integer precision when the listed version passes through JavaScript.
+    pub size: String,
+    pub mtime_ns: String,
+}
+
+pub(crate) struct SuggestionCandidate {
+    pub path: String,
+    pub category: String,
+    pub version: SuggestionVersion,
+}
+
+/// Dismiss the listed version if it is still a suggestion candidate.
+pub fn dismiss_suggestion(path: &str, version: &SuggestionVersion) -> SqliteResult<bool> {
     let conn = sqlite_lock()?;
     let now = now_epoch();
-    conn.execute(
+    let changed = conn.execute(
         "INSERT INTO dismissed_suggestions(path,dismissed_at,identity,size,mtime_ns)
-         SELECT path,?2,identity,size,mtime_ns FROM inventory_fingerprints WHERE path=?1
+         SELECT f.path,?2,f.identity,f.size,f.mtime_ns FROM inventory_fingerprints f
+         JOIN file_inventory i ON i.path=f.path
+         JOIN watched_folders w ON w.path=i.root_path AND w.enabled=1 AND w.mode<>'paused'
+         WHERE f.path=?1 AND f.identity=?3 AND CAST(f.size AS TEXT)=?4 AND f.mtime_ns=?5 AND i.category='Other'
          ON CONFLICT(path) DO UPDATE SET dismissed_at=excluded.dismissed_at,identity=excluded.identity,size=excluded.size,mtime_ns=excluded.mtime_ns",
-        params![path, now],
+        params![path, now, version.identity, version.size, version.mtime_ns],
     )?;
-    Ok(())
+    Ok(changed == 1)
 }
 
 pub fn clear_dismissed_suggestion(path: &str) -> SqliteResult<()> {
@@ -2732,10 +2751,24 @@ pub fn reset_dismissed_suggestions()->SqliteResult<()> {
     sqlite_lock()?.execute("DELETE FROM dismissed_suggestions",[])?;Ok(())
 }
 
-pub fn get_suggestion_candidates_page(limit:i64,after:Option<&str>)->Result<Vec<InventoryFile>,String> {
-    let conn=lock_db()?;
-    let mut stmt=conn.prepare("SELECT i.path,i.size,i.mtime,i.category,i.root_path FROM file_inventory i JOIN watched_folders w ON w.path=i.root_path AND w.enabled=1 AND w.mode<>'paused' JOIN inventory_fingerprints f ON f.path=i.path WHERE i.category='Other' AND (?1 IS NULL OR i.path>?1) AND NOT EXISTS(SELECT 1 FROM dismissed_suggestions d WHERE d.path=i.path AND d.identity=f.identity AND d.size=f.size AND d.mtime_ns=f.mtime_ns) ORDER BY i.path LIMIT ?2").map_err(|e|e.to_string())?;
-    let rows=stmt.query_map(params![after,limit.max(0)],|r|Ok(InventoryFile{path:r.get(0)?,size:r.get(1)?,mtime:r.get(2)?,category:r.get(3)?,root_path:r.get(4)?})).map_err(|e|e.to_string())?.collect::<SqliteResult<Vec<_>>>().map_err(|e|e.to_string())?;Ok(rows)
+pub(crate) fn get_suggestion_candidates_page(limit: i64, after: Option<&str>) -> Result<Vec<SuggestionCandidate>, String> {
+    let conn = lock_db()?;
+    let mut stmt = conn.prepare(
+        "SELECT i.path,i.category,f.identity,CAST(f.size AS TEXT) AS size_text,f.mtime_ns
+         FROM file_inventory i
+         JOIN watched_folders w ON w.path=i.root_path AND w.enabled=1 AND w.mode<>'paused'
+         JOIN inventory_fingerprints f ON f.path=i.path
+         WHERE i.category='Other' AND (?1 IS NULL OR i.path>?1)
+         AND NOT EXISTS(SELECT 1 FROM dismissed_suggestions d
+             WHERE d.path=i.path AND d.identity=f.identity AND d.size=f.size AND d.mtime_ns=f.mtime_ns)
+         ORDER BY i.path LIMIT ?2"
+    ).map_err(|error| error.to_string())?;
+    let candidates = stmt.query_map(params![after, limit.max(0)], |row| Ok(SuggestionCandidate {
+        path: row.get(0)?,
+        category: row.get(1)?,
+        version: SuggestionVersion { identity: row.get(2)?, size: row.get(3)?, mtime_ns: row.get(4)? },
+    })).map_err(|error| error.to_string())?;
+    candidates.collect::<SqliteResult<Vec<_>>>().map_err(|error| error.to_string())
 }
 
 pub fn record_suggestion_feedback(path:&str,category:&str,action_log_id:Option<i64>)->Result<(),String> {
@@ -3670,11 +3703,23 @@ mod tests {
                 conn.execute("INSERT INTO inventory_fingerprints(path,identity,size,mtime_ns) VALUES(?1,?2,1,'100')",params![path,path]).unwrap();
             }
         }
-        dismiss_suggestion("/candidate-active/000").unwrap();
-        let page=get_suggestion_candidates_page(1,Some("/candidate-active/")).unwrap();assert_eq!(page.len(),1);assert_eq!(page[0].path,"/candidate-active/001");
-        // Replacing the file under the same name invalidates the dismissal.
-        lock_db().unwrap().execute("UPDATE inventory_fingerprints SET identity='replacement' WHERE path='/candidate-active/000'",[]).unwrap();
-        let page=get_suggestion_candidates_page(1,Some("/candidate-active/")).unwrap();assert_eq!(page[0].path,"/candidate-active/000");
+        let path = "/candidate-active/000";
+        let page = get_suggestion_candidates_page(1, Some("/candidate-active/")).unwrap();
+        assert_eq!(page[0].path, path);
+        let original = &page[0].version;
+        assert!(dismiss_suggestion(path, original).unwrap());
+        let page = get_suggestion_candidates_page(1, Some("/candidate-active/")).unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].path, "/candidate-active/001");
+
+        // A new version at the same path may be suggested again.
+        lock_db().unwrap().execute("UPDATE inventory_fingerprints SET identity='replacement' WHERE path=?1", [path]).unwrap();
+        let page = get_suggestion_candidates_page(1, Some("/candidate-active/")).unwrap();
+        assert_eq!(page[0].path, path);
+        assert_eq!(page[0].version.identity, "replacement");
+        assert!(!dismiss_suggestion(path, original).unwrap());
+        assert_eq!(get_suggestion_candidates_page(1, Some("/candidate-active/")).unwrap()[0].path, path);
+        assert!(dismiss_suggestion(path, &page[0].version).unwrap());
     }
 
     #[test]

@@ -422,6 +422,7 @@
     "dismiss": "Odrzuć",
     "acceptAll": "Akceptuj wszystko",
     "dismissAll": "Odrzuć wszystko",
+    "dismissChanged": "Niektóre sugestie zmieniły się przed odrzuceniem.",
     "confidence": "ufność",
     "currentFolder": "Obecny",
     "suggested": "Sugerowany",

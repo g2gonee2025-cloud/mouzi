@@ -422,6 +422,7 @@
     "dismiss": "Ablehnen",
     "acceptAll": "Alle akzeptieren",
     "dismissAll": "Alle ablehnen",
+    "dismissChanged": "Einige Vorschläge haben sich vor dem Ausblenden geändert.",
     "confidence": "Vertrauen",
     "currentFolder": "Aktuell",
     "suggested": "Vorschlag",

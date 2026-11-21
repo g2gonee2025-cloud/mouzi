@@ -422,6 +422,7 @@
     "dismiss": "Відхилити",
     "acceptAll": "Прийняти все",
     "dismissAll": "Відхилити все",
+    "dismissChanged": "Деякі пропозиції змінилися до відхилення.",
     "confidence": "впевненість",
     "currentFolder": "Поточна",
     "suggested": "Запропоновано",

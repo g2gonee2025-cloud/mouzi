@@ -2097,10 +2097,10 @@ pub fn reset_dismissed_suggestions_cmd() -> Result<(), String> {
     reset_dismissed_suggestions().map_err(|e| e.to_string())
 }
 
-/// Dismiss a suggestion so it no longer appears in the list.
+/// Return false when the listed version is no longer eligible for dismissal.
 #[tauri::command]
-pub fn dismiss_suggestion_cmd(path: String) -> Result<(), String> {
-    crate::db::dismiss_suggestion(&path).map_err(|e| e.to_string())
+pub fn dismiss_suggestion_cmd(path: String, version: SuggestionVersion) -> Result<bool, String> {
+    crate::db::dismiss_suggestion(&path, &version).map_err(|e| e.to_string())
 }
 
 /// Move a file into its suggested category folder and optionally create a

@@ -422,6 +422,7 @@
     "dismiss": "Отклонить",
     "acceptAll": "Принять все",
     "dismissAll": "Отклонить все",
+    "dismissChanged": "Некоторые предложения изменились до отклонения.",
     "confidence": "уверенность",
     "currentFolder": "Текущая",
     "suggested": "Предложено",

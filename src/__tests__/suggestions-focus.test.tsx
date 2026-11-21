@@ -25,6 +25,7 @@ vi.mock("react-i18next", () => ({
 const invoice: Suggestion = {
   path: "C:/Fixture/invoice.unrecognized", filename: "invoice.unrecognized",
   currentCategory: "other", suggestedCategory: "documents", confidence: 0.65, source: "heuristic",
+  version: { identity: "invoice-file", size: "1", mtimeNs: "1" },
 };
 const receipt: Suggestion = {
   ...invoice, path: "C:/Fixture/receipt.unrecognized", filename: "receipt.unrecognized", source: "learned",

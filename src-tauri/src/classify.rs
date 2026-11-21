@@ -510,6 +510,7 @@ pub struct Suggestion {
     pub confidence: f64,
     pub source: PredictionSource,
     pub current_category: String,
+    pub version: db::SuggestionVersion,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -565,7 +566,7 @@ pub fn get_suggestions_with_status(limit: usize) -> Result<SuggestionsWithStatus
 
 fn collect_suggestions(
     limit: usize, provider: &dyn AiProvider, hints: &[LearnedHint],
-    mut page: impl FnMut(Option<&str>) -> Result<Vec<db::InventoryFile>, String>,
+    mut page: impl FnMut(Option<&str>) -> Result<Vec<db::SuggestionCandidate>, String>,
     cancelled: impl Fn() -> bool, budget: Duration,
 ) -> Result<SuggestionsWithStatus, String> {
     if limit == 0 { return Ok(SuggestionsWithStatus::default()); }
@@ -616,6 +617,7 @@ fn collect_suggestions(
         best.filter(|prediction| prediction.category != file.category).map(|prediction| Suggestion {
             path: file.path, filename, suggested_category: prediction.category,
             confidence: prediction.confidence, source: prediction.source, current_category: file.category,
+            version: file.version,
         })
     }).collect();
     suggestions.sort_by(|a, b| b.confidence.total_cmp(&a.confidence).then_with(|| a.path.cmp(&b.path))
@@ -662,9 +664,10 @@ mod tests {
     fn collect_fixture(provider: &dyn AiProvider, filenames: &[&str]) -> SuggestionsWithStatus {
         collect_suggestions(100, provider, &[], |after| {
             Ok(if after.is_some() { Vec::new() } else {
-                filenames.iter().map(|filename| db::InventoryFile {
-                    path: format!("fixture/{filename}"), size: 1, mtime: 0,
-                    category: "Other".into(), root_path: "fixture".into(),
+                filenames.iter().map(|filename| db::SuggestionCandidate {
+                    path: format!("fixture/{filename}"),
+                    category: "Other".into(),
+                    version: db::SuggestionVersion { identity: (*filename).into(), size: "1".into(), mtime_ns: "0".into() },
                 }).collect()
             })
         }, || false, REQUEST_BUDGET).unwrap()

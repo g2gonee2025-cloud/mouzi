@@ -428,6 +428,7 @@
     "dismiss": "Bỏ qua",
     "acceptAll": "Chấp nhận tất cả",
     "dismissAll": "Bỏ qua tất cả",
+    "dismissChanged": "Một số đề xuất đã thay đổi trước khi được bỏ qua.",
     "confidence": "độ tin cậy",
     "currentFolder": "Hiện tại",
     "suggested": "Đề xuất",

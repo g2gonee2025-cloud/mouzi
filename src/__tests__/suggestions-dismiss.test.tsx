@@ -1,0 +1,127 @@
+import { isValidElement, type ReactElement, type ReactNode } from "react";
+import { beforeEach, expect, it, vi } from "vitest";
+import Suggestions from "../pages/Suggestions";
+import { useSuggestionsStore } from "../store/useSuggestionsStore";
+
+const ipc = vi.hoisted(() => ({ invoke: vi.fn() }));
+vi.mock("@tauri-apps/api/core", () => ipc);
+vi.mock("react-i18next", () => ({ useTranslation: () => ({ t: (key: string) => key }) }));
+vi.mock("react", async (importOriginal) => ({
+  ...await importOriginal<typeof import("react")>(),
+  useEffect: () => {},
+  useLayoutEffect: () => {},
+  useRef: (current: unknown) => ({ current }),
+  useState: (value: unknown) => [value, vi.fn()],
+}));
+vi.mock("../store/useSuggestionsStore", async (importOriginal) => {
+  const { useSuggestionsStore: store, ...exports } = await importOriginal<typeof import("../store/useSuggestionsStore")>();
+  return { ...exports, useSuggestionsStore: Object.assign(store.getState, store) };
+});
+
+const invoice = {
+  path: "C:/Fixture/invoice.unrecognized",
+  filename: "invoice.unrecognized",
+  suggestedCategory: "Documents",
+  currentCategory: "Other",
+  confidence: 0.65,
+  source: "heuristic" as const,
+  version: { identity: "file-A", size: "14", mtimeNs: "1000" },
+};
+const replacement = { ...invoice, version: { identity: "file-B", size: "36", mtimeNs: "2000" } };
+const receipt = {
+  ...invoice,
+  path: "C:/Fixture/receipt.unrecognized",
+  filename: "receipt.unrecognized",
+  version: { identity: "file-C", size: "8", mtimeNs: "3000" },
+};
+
+interface Props {
+  children?: ReactNode;
+  role?: string;
+  "aria-label"?: string;
+  onClick?: () => Promise<void> | void;
+}
+function text(node: ReactNode): string {
+  if (Array.isArray(node)) return node.map(text).join("");
+  if (typeof node === "string") return node;
+  return isValidElement<Props>(node) ? text(node.props.children) : "";
+}
+function find(node: ReactNode, match: (element: ReactElement<Props>) => boolean): ReactElement<Props> | undefined {
+  if (Array.isArray(node)) return node.map((child) => find(child, match)).find(Boolean);
+  if (!isValidElement<Props>(node)) return;
+  return match(node) ? node : find(node.props.children, match);
+}
+function dismissAction(tree: ReactNode, bulk = false) {
+  const label = bulk ? "suggestions.dismissAll" : "suggestions.dismiss";
+  return find(tree, (button) => button.type === "button"
+    && (button.props["aria-label"] === label || text(button) === label))!.props.onClick!;
+}
+const dismissCommand = "dismiss_suggestion_cmd";
+const refreshCommand = "get_suggestions_with_status_cmd";
+const dismissal = ({ path, version }: typeof invoice) => [dismissCommand, { path, version }];
+
+beforeEach(() => {
+  ipc.invoke.mockReset();
+  useSuggestionsStore.setState(useSuggestionsStore.getInitialState(), true);
+});
+
+it("submits the listed version for normal single dismissal and removes its row", async () => {
+  useSuggestionsStore.setState({ suggestions: [invoice] });
+  ipc.invoke.mockResolvedValueOnce(true);
+  await dismissAction(Suggestions())();
+  expect(ipc.invoke.mock.calls).toEqual([dismissal(invoice)]);
+  expect(useSuggestionsStore.getState().suggestions).toEqual([]);
+});
+
+it("refreshes a rejected single dismissal and keeps the replacement discoverable", async () => {
+  useSuggestionsStore.setState({ suggestions: [invoice] });
+  ipc.invoke.mockResolvedValueOnce(false).mockResolvedValueOnce({ suggestions: [replacement], localAiStatus: null });
+  await dismissAction(Suggestions())();
+  expect(useSuggestionsStore.getState().suggestions).toEqual([replacement]);
+  expect(ipc.invoke.mock.calls).toEqual([dismissal(invoice), [refreshCommand, { limit: 100 }]]);
+  expect(find(Suggestions(), (element) => element.props.role === "status" && text(element) === "suggestions.dismissChanged")).toBeDefined();
+});
+
+it("continues Dismiss All after a stale card and targets only the cards shown at click", async () => {
+  useSuggestionsStore.setState({ suggestions: [invoice, receipt] });
+  const click = dismissAction(Suggestions(), true);
+  useSuggestionsStore.setState({ suggestions: [replacement, receipt] });
+  ipc.invoke.mockResolvedValueOnce(false).mockResolvedValueOnce(true)
+    .mockResolvedValueOnce({ suggestions: [replacement], localAiStatus: null });
+  await click();
+  expect(ipc.invoke.mock.calls).toEqual([dismissal(invoice), dismissal(receipt), [refreshCommand, { limit: 100 }]]);
+  expect(useSuggestionsStore.getState().suggestions).toEqual([replacement]);
+  expect(find(Suggestions(), (element) => element.props.role === "status" && text(element) === "suggestions.dismissChanged")).toBeDefined();
+});
+
+it("clears an automatic-refresh dismissal notice on the next ordinary Refresh", async () => {
+  useSuggestionsStore.setState({ suggestions: [invoice] });
+  const latest = { suggestions: [replacement], localAiStatus: null };
+  ipc.invoke.mockResolvedValueOnce(false).mockResolvedValueOnce(latest).mockResolvedValueOnce(latest);
+  await dismissAction(Suggestions())();
+  const hasNotice = () => find(Suggestions(), (element) => element.props.role === "status"
+    && text(element) === "suggestions.dismissChanged");
+  expect(hasNotice()).toBeDefined();
+
+  const refresh = find(Suggestions(), (element) => element.type === "button" && text(element) === "suggestions.refresh");
+  await refresh!.props.onClick!();
+  expect(hasNotice()).toBeUndefined();
+});
+
+it("preserves a later bulk failure and lets the user refresh after a stale dismissal", async () => {
+  useSuggestionsStore.setState({ suggestions: [invoice, receipt] });
+  ipc.invoke.mockResolvedValueOnce(false).mockRejectedValueOnce("Could not save dismissal");
+  await dismissAction(Suggestions(), true)();
+
+  const tree = Suggestions();
+  expect(text(tree)).toContain("Could not save dismissal");
+  expect(text(tree)).toContain("suggestions.dismissChanged");
+  expect(useSuggestionsStore.getState().suggestions).toEqual([receipt]);
+  expect(ipc.invoke.mock.calls).toEqual([dismissal(invoice), dismissal(receipt)]);
+  const refresh = find(tree, (element) => element.type === "button" && text(element) === "suggestions.refresh");
+  ipc.invoke.mockResolvedValueOnce({ suggestions: [replacement, receipt], localAiStatus: null });
+  await refresh!.props.onClick!();
+  expect(useSuggestionsStore.getState().suggestions).toEqual([replacement, receipt]);
+  expect(text(Suggestions())).not.toContain("Could not save dismissal");
+  expect(text(Suggestions())).not.toContain("suggestions.dismissChanged");
+});

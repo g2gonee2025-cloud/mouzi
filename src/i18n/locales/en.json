@@ -422,6 +422,7 @@
     "dismiss": "Dismiss",
     "acceptAll": "Accept all",
     "dismissAll": "Dismiss all",
+    "dismissChanged": "Some suggestions changed before dismissal.",
     "confidence": "confidence",
     "currentFolder": "Current",
     "suggested": "Suggested",

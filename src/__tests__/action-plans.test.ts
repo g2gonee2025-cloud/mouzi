@@ -5,7 +5,7 @@ import { useCleanupStore } from "../store/useCleanupStore";
 import { useSuggestionsStore, distinctSuggestionRules, type Suggestion, type SuggestionPlan } from "../store/useSuggestionsStore";
 import type { CleanupPlan } from "../utils/cleanup";
 
-const suggestion = (path: string): Suggestion => ({ path, filename: "report.xyz", suggestedCategory: "Documents", currentCategory: "Other", confidence: 0.5, source: "heuristic" });
+const suggestion = (path: string): Suggestion => ({ path, filename: "report.xyz", suggestedCategory: "Documents", currentCategory: "Other", confidence: 0.5, source: "heuristic", version: { identity: path, size: "1", mtimeNs: "1" } });
 const plan = (path: string, category = "Documents"): SuggestionPlan => ({ path, planId: `plan:${path}`, category, destination: `root/${category}/report.xyz`, rule: { extension: "xyz", destination: category, scope: "All eligible roots", priority: 10, disposition: "create", message: null } });
 const cleanupPlan: CleanupPlan = { planId: "cleanup:reviewed", expiresAt: "2026-10-03T12:00:00Z", actions: [{ kind: "trash_large", path: "a", minBytes: 100 }, { kind: "trash_large", path: "b", minBytes: 100 }], totalBytes: 200 };
 const row = (path: string) => ({ path, size: 100, mtime: 1 });

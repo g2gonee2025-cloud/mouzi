@@ -422,6 +422,7 @@
     "dismiss": "忽略",
     "acceptAll": "全部接受",
     "dismissAll": "全部忽略",
+    "dismissChanged": "部分建议在忽略前已发生变化。",
     "confidence": "置信度",
     "currentFolder": "当前文件夹",
     "suggested": "建议位置",

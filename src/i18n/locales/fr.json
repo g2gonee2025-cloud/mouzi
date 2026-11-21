@@ -422,6 +422,7 @@
     "dismiss": "Ignorer",
     "acceptAll": "Tout accepter",
     "dismissAll": "Tout ignorer",
+    "dismissChanged": "Certaines suggestions ont changé avant d’être écartées.",
     "confidence": "confiance",
     "currentFolder": "Actuel",
     "suggested": "Suggéré",
