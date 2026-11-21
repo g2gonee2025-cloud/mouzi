@@ -2567,6 +2567,44 @@ mod undo_tests {
         assert_eq!(inventory, BTreeMap::from([(source, 7), (dest, 11)]));
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn undo_clears_a_stale_indexed_file_from_a_now_empty_source_path() {
+        use std::fs;
+
+        let fixture = UndoFixture::new("stale_inventory_replacement");
+        let watched = fixture.root().join("watched");
+        fs::create_dir(&watched).unwrap();
+        let root = watched.to_str().unwrap();
+        struct Registration(i64);
+        impl Drop for Registration {
+            fn drop(&mut self) { let _ = remove_watched_folder(self.0); }
+        }
+        let _registered = Registration(register_watched_folder(root, FOLDER_MODE_MANUAL, false).unwrap());
+        let (source, dest) = stage(&watched, "report.undocheck");
+        let identity = crate::safe_fs::file_identity(Path::new(&dest)).unwrap();
+        let id = insert_log("2026-01-01T00:00:00Z", &source, Some(&dest));
+        let original = fixture.root().join("original");
+        let substitute = fixture.root().join("substitute");
+        fs::rename(&dest, &original).unwrap();
+        fs::write(&dest, b"substitute").unwrap();
+        assert_ne!(crate::safe_fs::file_identity(Path::new(&dest)).unwrap(), identity);
+        let scan = crate::scan::scan_roots(&[root.to_owned()], |_| {});
+        assert_eq!(scan[0].status, "complete", "{:?}", scan[0].error);
+        assert_eq!((scan[0].files, scan[0].bytes), (1, 10));
+        fs::rename(&dest, &substitute).unwrap();
+        fs::rename(&original, &dest).unwrap();
+        assert_eq!(crate::safe_fs::file_identity(Path::new(&dest)).unwrap(), identity);
+
+        assert_eq!(undo_action_with(id, &ignored_files()).unwrap().status, "ok");
+        assert!(!Path::new(&dest).exists());
+        assert_eq!(fs::read(&source).unwrap(), b"payload");
+        assert_eq!(fs::read(&substitute).unwrap(), b"substitute");
+        let rows = get_inventory_files("size", None, Some(root), None, 10).unwrap();
+        assert_eq!(rows.len(), 1, "the indexed substitute is no longer here");
+        assert_eq!((&rows[0].path, rows[0].size), (&source, 7));
+    }
+
     #[test]
     fn undo_leaves_present_legacy_destination_and_history_alone() {
         let fixture = UndoFixture::new("legacy_identity");
