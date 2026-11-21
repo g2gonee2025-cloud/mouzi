@@ -861,22 +861,22 @@ fn scan_folder(root: &Path, suppression: &SuppressionSet, authority: FolderAutho
         fs::read_dir(root).map_err(|error| error.to_string())
     })().map_err(|message| FolderScanError { results: Vec::new(), message })?;
     let bypass_grace = matches!(authority, FolderAuthority::WatchedManual(_) | FolderAuthority::ArchiveStaging(_));
-    let cancellation = match authority {
-        FolderAuthority::ArchiveStaging(cancellation) => cancellation,
-        _ => None,
-    };
     scan_folder_entries(
         entries.map(|entry| entry.map(|entry| entry.path()).map_err(|error| error.to_string())),
-        cancellation,
+        authority,
         |path| process_file(path, bypass_grace, root, suppression, &suppression.ticket(path), None, authority),
     )
 }
 
 fn scan_folder_entries(
     entries: impl IntoIterator<Item = Result<PathBuf, String>>,
-    cancellation: Option<&ArchiveSortCancellation<'_>>,
+    authority: FolderAuthority<'_>,
     mut process: impl FnMut(&Path) -> Result<ProcessOutcome, String>,
 ) -> Result<SortedFiles, FolderScanError> {
+    let cancellation = match authority {
+        FolderAuthority::ArchiveStaging(cancellation) => cancellation,
+        _ => None,
+    };
     let mut results = Vec::new();
     let mut errors = Vec::new();
     for entry in entries {
@@ -903,6 +903,9 @@ fn scan_folder_entries(
             Ok(ProcessOutcome::Organized { rule, destination, warning }) => {
                 results.push((file_name, rule.name, destination));
                 if let Some(warning) = warning { errors.push(warning); }
+            }
+            Ok(ProcessOutcome::Retry { reason }) if matches!(authority, FolderAuthority::ArchiveStaging(_)) => {
+                errors.push(format!("{file_name}: {reason}"));
             }
             Ok(ProcessOutcome::Skipped | ProcessOutcome::Retry { .. }) => {}
             Ok(ProcessOutcome::Retained { message }) | Err(message) => errors.push(format!("{file_name}: {message}")),
@@ -1365,7 +1368,7 @@ mod tests {
                 Ok(first.clone()),
                 if stop == "entry" { Err("forced directory entry failure".into()) } else { Ok(second.clone()) },
             ];
-            let sorting = scan_folder_entries(entries, Some(&cancellation), |path| {
+            let sorting = scan_folder_entries(entries, authority, |path| {
                 if path == second.as_path() {
                     if stop == "cancel-wait" {
                         // The outer check has already admitted this entry to the
