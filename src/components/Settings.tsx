@@ -1281,6 +1281,8 @@ function IgnoreTab() {
   const [retry, setRetry] = useState(0);
   const requestRef = useRef(0);
   const patterns = draft?.folder === selectedFolder ? draft.patterns : [];
+  const pendingPattern = newPattern.trim();
+  const hasNewPattern = pendingPattern !== "" && !patterns.includes(pendingPattern);
   const canEdit = Boolean(draft && draft.folder === selectedFolder && !loading && !saving && folders.some((f) => f.path === selectedFolder));
 
   useEffect(() => {
@@ -1313,10 +1315,8 @@ function IgnoreTab() {
   }, [saved]);
 
   const handleAdd = () => {
-    if (!canEdit || !draft) return;
-    const trimmed = newPattern.trim();
-    if (!trimmed || patterns.includes(trimmed)) return;
-    setDraft({ ...draft, patterns: [...patterns, trimmed] });
+    if (!canEdit || !draft || !hasNewPattern) return;
+    setDraft({ ...draft, patterns: [...patterns, pendingPattern] });
     setNewPattern("");
     setSaved(false);
   };
@@ -1330,14 +1330,20 @@ function IgnoreTab() {
   const handleSave = async () => {
     if (!canEdit || !draft) return;
     const request = requestRef.current;
+    const nextPatterns = hasNewPattern ? [...patterns, pendingPattern] : patterns;
     setSaving(true);
+    setSaved(false);
     setError(null);
     try {
       await invoke("save_mouziignore_cmd", {
         folderPath: draft.folder,
-        patterns: [...draft.patterns],
+        patterns: nextPatterns,
       });
-      if (request === requestRef.current) setSaved(true);
+      if (request === requestRef.current) {
+        setDraft({ ...draft, patterns: nextPatterns });
+        setNewPattern("");
+        setSaved(true);
+      }
     } catch (e) {
       if (request === requestRef.current) setError(String(e));
     } finally {
@@ -1413,14 +1419,17 @@ function IgnoreTab() {
               disabled={!canEdit}
               type="text"
               value={newPattern}
-              onChange={(e) => setNewPattern(e.target.value)}
+              onChange={(e) => {
+                setNewPattern(e.target.value);
+                setSaved(false);
+              }}
               onKeyDown={(e) => e.key === "Enter" && handleAdd()}
               placeholder={t("settings.ignore.placeholder")}
               className="flex-1 rounded-md border border-border bg-surface px-3 py-2 text-sm outline-none focus:border-primary"
             />
             <button
               onClick={handleAdd}
-              disabled={!canEdit || !newPattern.trim()}
+              disabled={!canEdit || !pendingPattern}
               className="rounded-md bg-primary px-4 py-2 text-sm font-medium text-on-primary hover:bg-primary-hover disabled:opacity-40 transition-colors"
             >
               {t("settings.ignore.add")}

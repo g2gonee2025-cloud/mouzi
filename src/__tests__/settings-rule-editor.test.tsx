@@ -3,7 +3,13 @@ import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import Settings from "../components/Settings";
 import { useAppStore, type Rule } from "../store/useAppStore";
 
-const harness = vi.hoisted(() => ({ invoke: vi.fn(), slots: [] as unknown[], cursor: 0 }));
+const harness = vi.hoisted(() => ({
+  invoke: vi.fn(),
+  slots: [] as unknown[],
+  cursor: 0,
+  effects: null as (() => void)[] | null,
+  disposeEffects: new Set<() => void>(),
+}));
 vi.mock("@tauri-apps/api/core", () => ({ invoke: harness.invoke }));
 vi.mock("react-i18next", () => ({ useTranslation: () => ({ t: (key: string) => key }) }));
 vi.mock("../i18n", () => ({
@@ -18,7 +24,20 @@ vi.mock("react", async (importOriginal) => {
   }
   return {
     ...actual,
-    useEffect: () => {},
+    useEffect: (setup: () => void | (() => void), dependencies: unknown[]) => {
+      if (!harness.effects) return;
+      const slot = harness.slots[claim(() => ({}))] as { dependencies?: unknown[]; dispose?: () => void };
+      if (slot.dependencies?.length === dependencies.length && dependencies.every((value, index) => Object.is(value, slot.dependencies?.[index]))) return;
+      harness.effects.push(() => {
+        if (slot.dispose) {
+          slot.dispose();
+          harness.disposeEffects.delete(slot.dispose);
+        }
+        slot.dependencies = dependencies;
+        slot.dispose = setup() || undefined;
+        if (slot.dispose) harness.disposeEffects.add(slot.dispose);
+      });
+    },
     useState: (initial: unknown) => {
       const index = claim(() => typeof initial === "function" ? initial() : initial);
       return [
@@ -46,6 +65,7 @@ interface Props {
   "aria-label"?: string;
   onClick?: (event: { currentTarget: HTMLButtonElement }) => unknown;
   onChange?: (event: { target: { value?: string; checked?: boolean } }) => void;
+  onKeyDown?: (event: { key: string }) => void;
   onConfirm?: () => Promise<void>;
   onClose?: () => void;
 }
@@ -144,6 +164,8 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  harness.disposeEffects.forEach((dispose) => dispose());
+  harness.disposeEffects.clear();
   vi.useRealTimers();
 });
 
@@ -334,4 +356,122 @@ it("displays a live rule's exact folder and permits an explicit scope change", a
   await submit();
   expect(harness.invoke).toHaveBeenCalledWith("update_rule_cmd", { rule: { ...scopedInvoice, folder_id: 0 } });
   expect(db.get(scopedInvoice.id)?.folder_id).toBe(0);
+});
+
+const folderA = "C:/Fixture/Manual A";
+const folderB = "C:/Fixture/Manual B";
+const ignoreButton = (key: string) => requireElement(button(`settings.ignore.${key}`), ignoreEditor());
+const ignoreField = () => requireElement((node) => node.type === "input" && node.props["aria-label"] === "settings.ignore.patterns", ignoreEditor());
+const typePattern = (value: string) => change(ignoreField(), { value });
+const patternRow = (pattern: string): Match => (node) => node.props["aria-label"] === `settings.ignore.remove: ${pattern}`;
+const removePattern = (pattern: string) => click(requireElement(patternRow(pattern), ignoreEditor()));
+
+function ignoreEditor() {
+  const { type } = requireElement((node) => typeof node.type === "function" && node.type.name === "IgnoreTab");
+  if (typeof type !== "function") throw new Error("Ignore editor is absent");
+  const effects: (() => void)[] = [];
+  harness.effects = effects;
+  try {
+    return (type as () => ReactNode)();
+  } finally {
+    harness.effects = null;
+    effects.forEach((run) => run());
+  }
+}
+
+async function selectIgnoreFolder(value: string) {
+  const select = requireElement((node) => node.type === "select" && node.props["aria-label"] === "settings.ignore.folder", ignoreEditor());
+  expect(select.props.disabled).toBe(false);
+  change(select, { value });
+  ignoreEditor();
+  await settle();
+}
+
+async function openIgnore() {
+  const files = new Map([[folderA, ["existing.tmp"]], [folderB, ["sibling.txt"]]]);
+  useAppStore.setState({ folders: [
+    { id: 1, path: folderA, enabled: true, mode: "manual" },
+    { id: 2, path: folderB, enabled: true, mode: "manual" },
+  ] });
+  harness.invoke.mockImplementation(async (command: string, { folderPath, patterns }: { folderPath: string; patterns?: string[] }) => {
+    if (!files.has(folderPath)) throw new Error(`Unexpected fixture folder ${folderPath}`);
+    if (command === "load_mouziignore_cmd") return [...files.get(folderPath)!];
+    if (command === "save_mouziignore_cmd" && patterns) {
+      files.set(folderPath, [...patterns]);
+      return;
+    }
+    throw new Error(`Unexpected fixture command ${command}`);
+  });
+  click(requireElement(({ props }) => props.label === "settings.ignore.title"));
+  await selectIgnoreFolder(folderA);
+  return files;
+}
+
+it("saves the new pattern typed into Ignore through the visible Save button", async () => {
+  const files = await openIgnore();
+  typePattern("  *.tmp  ");
+  expect(files.get(folderA)).toEqual(["existing.tmp"]);
+  expect(harness.invoke.mock.calls).toEqual([["load_mouziignore_cmd", { folderPath: folderA }]]);
+  const save = ignoreButton("save");
+  expect(save.props.disabled).toBe(false);
+  await click(save);
+  expect(ignoreButton("saved")).toBeDefined();
+  expect(files.get(folderA)).toEqual(["existing.tmp", "*.tmp"]);
+  expect(files.get(folderB)).toEqual(["sibling.txt"]);
+  expect(ignoreField().props.value).toBe("");
+  await selectIgnoreFolder(folderB);
+  expect(requireElement(patternRow("sibling.txt"), ignoreEditor())).toBeDefined();
+  await selectIgnoreFolder(folderA);
+  expect(requireElement(patternRow("*.tmp"), ignoreEditor())).toBeDefined();
+});
+
+it("stages Add and Enter without writing and saves duplicate and empty-list edits", async () => {
+  const files = await openIgnore();
+  typePattern(" caches/  ");
+  click(ignoreButton("add"));
+  typePattern("receipt.tmp");
+  ignoreField().props.onKeyDown!({ key: "Enter" });
+  typePattern("  receipt.tmp ");
+  click(ignoreButton("add"));
+  expect(files.get(folderA)).toEqual(["existing.tmp"]);
+  expect(harness.invoke).toHaveBeenCalledTimes(1);
+  await click(ignoreButton("save"));
+  expect(files.get(folderA)).toEqual(["existing.tmp", "caches/", "receipt.tmp"]);
+
+  removePattern("existing.tmp");
+  removePattern("caches/");
+  removePattern("receipt.tmp");
+  typePattern("  ");
+  expect(ignoreButton("add").props.disabled).toBe(true);
+  expect(files.get(folderA)).toEqual(["existing.tmp", "caches/", "receipt.tmp"]);
+  await click(ignoreButton("save"));
+  expect(files.get(folderA)).toEqual([]);
+});
+
+it("clears Ignore's Saved feedback when the input changes", async () => {
+  const files = await openIgnore();
+  await click(ignoreButton("save"));
+  expect(ignoreButton("saved")).toBeDefined();
+  typePattern("fresh.tmp");
+  expect(ignoreButton("save")).toBeDefined();
+  expect(files.get(folderA)).toEqual(["existing.tmp"]);
+  expect(harness.invoke).toHaveBeenCalledTimes(2);
+});
+
+it("keeps staged removals and typed Ignore text after a write failure and retries them", async () => {
+  const files = await openIgnore();
+  removePattern("existing.tmp");
+  typePattern("retry.tmp");
+  harness.invoke.mockRejectedValueOnce("Fixture write failed");
+  const failed = click(ignoreButton("save"));
+  expect(requireElement(button("common.saving"), ignoreEditor()).props.disabled).toBe(true);
+  await failed;
+  expect(text(requireElement((node) => node.props.role === "alert", ignoreEditor()))).toBe("Fixture write failed");
+  expect(ignoreField().props.value).toBe("retry.tmp");
+  expect(files.get(folderA)).toEqual(["existing.tmp"]);
+  expect(find(ignoreEditor(), patternRow("existing.tmp"))).toBeUndefined();
+  await click(ignoreButton("save"));
+  expect(files.get(folderA)).toEqual(["retry.tmp"]);
+  expect(ignoreButton("saved")).toBeDefined();
+  expect(find(ignoreEditor(), (node) => node.props.role === "alert")).toBeUndefined();
 });
