@@ -11,7 +11,7 @@
 //! expiry is testable without sleeping and so one batch can be reasoned about
 //! against a single instant.
 
-use crate::safe_fs::normalize_lexically;
+use crate::safe_fs::{file_identity, normalize_lexically, FileIdentity};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -37,15 +37,61 @@ pub const SUPPRESSION_TTL: Duration = Duration::from_secs(30);
 /// make the bound a fact rather than an assumption about log-table size.
 const MAX_ENTRIES: usize = 65_536;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct Suppression {
     armed_at: Instant,
     expires_at: Instant,
+    identity: Option<FileIdentity>,
 }
 
 struct Inner {
     entries: HashMap<String, Suppression>,
     generations: HashMap<String, Weak<AtomicU64>>,
+    undo_publication: Option<UndoPaths>,
+}
+
+struct UndoPaths {
+    leaving: (String, FileIdentity),
+    restoring: (String, FileIdentity),
+}
+
+/// In-flight guards match only the files held by the checked mover. They do
+/// not revoke tickets until a destination is actually published.
+pub(crate) struct UndoPublication<'a> {
+    set: &'a SuppressionSet,
+    finished: bool,
+}
+
+impl UndoPublication<'_> {
+    /// The caller still holds the published file handle on Windows. A
+    /// competing occupant could not have replaced it at this point.
+    pub(crate) fn commit(mut self, source_moved: bool) {
+        let mut inner = self.set.entries();
+        let Some(paths) = inner.undo_publication.take() else { return; };
+        let now = Instant::now();
+        if source_moved {
+            let (path, identity) = paths.leaving;
+            inner.entries.insert(path, Suppression {
+                armed_at: now, expires_at: now + SUPPRESSION_TTL, identity: Some(identity),
+            });
+        }
+        let (path, identity) = paths.restoring;
+        if let Some(generation) = inner.generations.get(&path).and_then(Weak::upgrade) {
+            generation.fetch_add(1, Ordering::AcqRel);
+        }
+        inner.entries.insert(path, Suppression {
+            armed_at: now, expires_at: now + SUPPRESSION_TTL, identity: Some(identity),
+        });
+        self.finished = true;
+    }
+}
+
+impl Drop for UndoPublication<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.set.entries().undo_publication = None;
+        }
+    }
 }
 
 pub struct SuppressionSet {
@@ -93,6 +139,7 @@ impl SuppressionSet {
             inner: Mutex::new(Inner {
                 entries: HashMap::new(),
                 generations: HashMap::new(),
+                undo_publication: None,
             }),
             operations: Mutex::new(()),
         }
@@ -155,18 +202,59 @@ impl SuppressionSet {
                 Suppression {
                     armed_at: now,
                     expires_at: now + ttl,
+                    identity: None,
                 },
             );
         }
     }
 
-    /// One read-only lookup. This is the only method the notify callback calls.
-    pub fn is_suppressed(&self, path: &Path, now: Instant) -> bool {
-        let inner = self.entries();
-        let Some(entry) = inner.entries.get(&key(path)) else {
-            return false;
+    /// Called only within the operation gate, after checking the source and
+    /// choosing a no-replace destination.
+    pub(crate) fn begin_undo_publication(
+        &self,
+        source: &Path,
+        source_identity: &FileIdentity,
+        destination: &Path,
+        destination_identity: &FileIdentity,
+    ) -> UndoPublication<'_> {
+        let paths = UndoPaths {
+            leaving: (key(source), source_identity.clone()),
+            restoring: (key(destination), destination_identity.clone()),
         };
-        now < entry.expires_at
+        let mut inner = self.entries();
+        debug_assert!(inner.undo_publication.is_none());
+        inner.undo_publication = Some(paths);
+        UndoPublication { set: self, finished: false }
+    }
+
+    pub(crate) fn arm_recovery_file(&self, path: &Path, identity: FileIdentity) {
+        let path = key(path);
+        let now = Instant::now();
+        self.entries().entries.insert(path, Suppression {
+            armed_at: now, expires_at: now + SUPPRESSION_TTL, identity: Some(identity),
+        });
+    }
+
+    /// Identity reads happen after releasing the suppression map lock.
+    pub fn is_suppressed(&self, path: &Path, now: Instant) -> bool {
+        let path_key = key(path);
+        let (settled, publishing) = {
+            let inner = self.entries();
+            let settled = match inner.entries.get(&path_key).filter(|entry| now < entry.expires_at) {
+                Some(entry) if entry.identity.is_none() => return true,
+                Some(entry) => entry.identity.clone(),
+                None => None,
+            };
+            let publishing = inner.undo_publication.as_ref().and_then(|paths| {
+                [&paths.leaving, &paths.restoring].into_iter()
+                    .find(|(key, _)| key == &path_key)
+                    .map(|(_, identity)| identity.clone())
+            });
+            (settled, publishing)
+        };
+        if settled.is_none() && publishing.is_none() { return false; }
+        let actual = file_identity(path).ok();
+        actual.is_some() && (actual == settled || actual == publishing)
     }
 
     /// Drop expired entries; if still over `MAX_ENTRIES`, drop the
@@ -224,7 +312,14 @@ impl SuppressionSet {
     /// Every live key, for tests that assert *which* paths were armed.
     #[cfg(test)]
     pub fn guarded_keys(&self) -> Vec<String> {
-        self.entries().entries.keys().cloned().collect()
+        let inner = self.entries();
+        let mut guarded: Vec<_> = inner.entries.keys().cloned().collect();
+        if let Some(paths) = inner.undo_publication.as_ref() {
+            guarded.extend([paths.leaving.0.clone(), paths.restoring.0.clone()]);
+            guarded.sort_unstable();
+            guarded.dedup();
+        }
+        guarded
     }
 
     /// Whether `path` currently has a guard, ignoring expiry.

@@ -125,6 +125,7 @@ enum EnqueueSource {
 
 struct PendingReview {
     root: Arc<WatchedRoot>,
+    ticket: CancellationTicket,
     excluded: bool,
 }
 
@@ -152,6 +153,7 @@ impl PendingManual {
         // A policy snapshot belongs to these tickets, even if a watcher callback
         // is waiting to queue a new version of the same path.
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.arrivals.retain(|_, arrival| arrival.ticket.is_current());
         let exclusions = pending_exclusions(&state.arrivals, |directory| {
             IgnorePatterns::from_folder(&directory.to_string_lossy())
         });
@@ -164,7 +166,7 @@ impl PendingManual {
         self.update_count(&state);
         exclusions?;
         Ok(state.arrivals.iter().filter_map(|(path, arrival)| {
-            if arrival.excluded { return None; }
+            if arrival.excluded || !arrival.ticket.is_current() { return None; }
             let path = Path::new(path);
             Some((path.parent()?.to_string_lossy().into_owned(), path.file_name()?.to_string_lossy().into_owned()))
         }).collect())
@@ -179,6 +181,7 @@ fn pending_exclusions(
     let mut roots = HashMap::new();
     let mut excluded = HashSet::new();
     for (path, arrival) in arrivals {
+        if !arrival.ticket.is_current() { continue; }
         let root = &arrival.root;
         if !roots.contains_key(&root.path) {
             roots.insert(root.path.clone(), root.guard_physical()?);
@@ -334,13 +337,6 @@ impl FolderWatcher {
         if let Some(app) = self.app_handle.as_ref() {
             let _ = app.emit("file-organized", serde_json::json!({ "file": path.to_string_lossy(), "error": error, "success": false }));
         }
-    }
-
-    /// Invalidates already-drained generations without waiting for the operation
-    /// coordinator. Callers may safely invoke this under the watcher lock.
-    pub fn cancel_paths(&self, paths: &[PathBuf]) {
-        self.suppression.invalidate(paths);
-        self.queue_cancellation().prepare()(paths);
     }
 
     pub(crate) fn queue_cancellation(&self) -> WatcherQueueCancellation {
@@ -582,7 +578,7 @@ impl FolderWatcher {
             let mut pending = self.pending.lock().unwrap_or_else(|error| error.into_inner());
             let removed = pending.iter().filter(|item| item.root.watch_is_active() && !valid(&item.root, false))
                 .map(|item| item.path.clone()).collect::<Vec<_>>();
-            pending.retain(|item| item.root.watch_is_active() && valid(&item.root, false));
+            pending.retain(|item| item.ticket.is_current() && item.root.watch_is_active() && valid(&item.root, false));
             removed
         };
         self.suppression.invalidate(&removed);
@@ -590,7 +586,7 @@ impl FolderWatcher {
             let mut manual = self.pending_manual.state.lock().unwrap_or_else(|error| error.into_inner());
             let mut stale = Vec::new();
             for (path, arrival) in &manual.arrivals {
-                if !pending_review_is_current(Path::new(path), &arrival.root, folders)? {
+                if !arrival.ticket.is_current() || !pending_review_is_current(Path::new(path), &arrival.root, folders)? {
                     stale.push(path.clone());
                 }
             }
@@ -701,6 +697,7 @@ fn enqueue_path(path: &Path, source: EnqueueSource, root: &Arc<WatchedRoot>, pen
         && (is_folder_auto_mode(&folder.mode) || is_folder_manual_mode(&folder.mode)))
         else { return Ok(()); };
     let _guard = root.guard_physical()?;
+    let ticket = suppression.ticket(path);
     if !path.is_file() || should_ignore_file(path) || suppression.is_suppressed(path, Instant::now())
         || is_file_ignored_by_mouziignore(path)? { return Ok(()); }
     if path_is_baselined(path, folder)? { return Ok(()); }
@@ -715,15 +712,16 @@ fn enqueue_path(path: &Path, source: EnqueueSource, root: &Arc<WatchedRoot>, pen
             // being checked. Reconcile against its current baseline before
             // inserting, under the same queue lock as pruning.
             let folders = get_watched_folders().map_err(|error| error.to_string())?;
-            if !pending_review_is_current(path, root, &folders)? { return Ok(()); }
+            if !pending_review_is_current(path, root, &folders)? || !ticket.is_current()
+                || suppression.is_suppressed(path, Instant::now()) { return Ok(()); }
             let key = path.to_string_lossy();
             if source == EnqueueSource::CatchUp && queue.arrivals.get(key.as_ref())
-                .is_some_and(|arrival| !arrival.excluded && Arc::ptr_eq(&arrival.root, root)) {
+                .is_some_and(|arrival| arrival.ticket.is_current() && !arrival.excluded && Arc::ptr_eq(&arrival.root, root)) {
                 return Ok(());
             }
             let previous = queue.arrivals.insert(
                 key.into_owned(),
-                PendingReview { root: root.clone(), excluded: false },
+                PendingReview { root: root.clone(), ticket, excluded: false },
             );
             if !queue.exclusions_unavailable && previous.is_none_or(|arrival| arrival.excluded) {
                 manual.visible_count.fetch_add(1, Ordering::Release);
@@ -739,7 +737,8 @@ fn enqueue_path(path: &Path, source: EnqueueSource, root: &Arc<WatchedRoot>, pen
         let settings = get_settings().map_err(|error| error.to_string())?;
         let mut item = pending_item(path, root, suppression, Duration::from_secs(settings.grace_period_seconds.max(2) as u64));
         let mut pending = pending.lock().unwrap_or_else(|error| error.into_inner());
-        if !root.watch_is_active() { return Ok(()); }
+        if !root.watch_is_active() || !ticket.is_current()
+            || suppression.is_suppressed(path, Instant::now()) { return Ok(()); }
         if let Some(index) = pending.iter().position(|previous| same_path(&previous.path, path)) {
             let previous = &pending[index];
             // A real notification may have queued a recovery entry already.
@@ -751,7 +750,9 @@ fn enqueue_path(path: &Path, source: EnqueueSource, root: &Arc<WatchedRoot>, pen
             }
             pending.remove(index);
         }
-        suppression.invalidate(&[path.to_path_buf()]);
+        if source == EnqueueSource::Notification {
+            suppression.invalidate(&[path.to_path_buf()]);
+        }
         item.ticket = suppression.ticket(path);
         pending.push(item);
     }
@@ -805,20 +806,18 @@ pub(crate) struct WatcherQueueCancellation {
 }
 
 impl WatcherQueueCancellation {
-    /// Wait for queue access before taking the operation gate. The returned
-    /// callback prunes only validated paths, then releases both queue locks.
-    pub(crate) fn prepare(&self) -> impl FnOnce(&[PathBuf]) + '_ {
-        let mut manual = self.pending_manual.state.lock().unwrap_or_else(|error| error.into_inner());
-        let mut pending = self.pending.lock().unwrap_or_else(|error| error.into_inner());
-        move |paths| {
-            pending.retain(|item| !paths.iter().any(|path| same_path(path, &item.path)));
-            manual.arrivals.retain(|path, _| !paths.iter().any(|cancelled| same_path(cancelled, Path::new(path))));
+    /// Undo invalidates the exact publication's ticket under the operation
+    /// gate. Prune after releasing the gate so queue admission can finish.
+    pub(crate) fn prune_invalidated(&self) {
+        self.pending.lock().unwrap_or_else(|error| error.into_inner())
+            .retain(|item| item.ticket.is_current());
+        {
+            let mut manual = self.pending_manual.state.lock().unwrap_or_else(|error| error.into_inner());
+            manual.arrivals.retain(|_, arrival| arrival.ticket.is_current());
             self.pending_manual.update_count(&manual);
-            drop(pending);
-            drop(manual);
-            if let Some(app) = self.app_handle.as_ref() {
-                update_pending_tooltip(app, &self.pending_manual);
-            }
+        }
+        if let Some(app) = self.app_handle.as_ref() {
+            update_pending_tooltip(app, &self.pending_manual);
         }
     }
 }
@@ -840,12 +839,18 @@ mod tests {
         let later = root.path.join("later.undocheck");
         for path in [&reviewed, &later] {
             cancellation.pending.lock().unwrap().push(pending_item(path, &root, &suppression, Duration::ZERO));
-            cancellation.pending_manual.state.lock().unwrap().arrivals.insert(path.to_string_lossy().into_owned(), PendingReview { root: root.clone(), excluded: false });
+            cancellation.pending_manual.state.lock().unwrap().arrivals.insert(path.to_string_lossy().into_owned(), PendingReview {
+                root: root.clone(), ticket: suppression.ticket(path), excluded: false,
+            });
         }
         let _busy_watcher = watcher.lock().unwrap();
-        let cancel = cancellation.prepare();
-        let _operation = suppression.with_operation();
-        cancel(&[reviewed]);
+        {
+            let _operation = suppression.with_operation();
+            suppression.invalidate(&[reviewed]);
+            assert!(cancellation.pending.try_lock().is_ok());
+            assert!(cancellation.pending_manual.state.try_lock().is_ok());
+        }
+        cancellation.prune_invalidated();
 
         let pending = cancellation.pending.try_lock().unwrap();
         assert_eq!(pending.len(), 1);
@@ -1012,10 +1017,13 @@ mod tests {
         // The watcher currently enqueues only top-level files. Review also
         // applies these protections to explicit requests for nested files.
         let mut arrivals = HashMap::new();
+        let suppression = SuppressionSet::new();
         for path in [root.path.join("root-top.txt"), child.join("root-nested.txt"),
             child.join("parent-nested.txt"), child.join("sibling.txt")] {
             fs::write(&path, b"fixture").unwrap();
-            arrivals.insert(path.to_string_lossy().into_owned(), PendingReview { root: root.clone(), excluded: false });
+            arrivals.insert(path.to_string_lossy().into_owned(), PendingReview {
+                root: root.clone(), ticket: suppression.ticket(&path), excluded: false,
+            });
         }
         let mut reads = HashMap::new();
         let actual = pending_exclusions(&arrivals, |directory| {
@@ -1049,7 +1057,9 @@ mod tests {
         {
             let mut pending = watcher.pending_manual.state.lock().unwrap();
             for path in [&unreadable, &present, &absent] {
-                pending.arrivals.insert(path.clone(), PendingReview { root: root.clone(), excluded: false });
+                pending.arrivals.insert(path.clone(), PendingReview {
+                    root: root.clone(), ticket: watcher.suppression.ticket(Path::new(path)), excluded: false,
+                });
             }
         }
         assert!(watcher.prune_queues(&folders).is_err());

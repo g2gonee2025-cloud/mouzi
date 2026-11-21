@@ -843,6 +843,12 @@ fn discard_copy(output: &File, path: &Path, identity: FileIdentity, message: Str
     }
 }
 
+/// Begins an observer's guard for the exact output about to be published.
+/// The returned callback records a retained output and whether the source moved.
+/// Dropping the callback without calling it releases the guard on failure.
+pub(crate) type MovePublicationFence<'held> =
+    dyn Fn(&Path, &FileIdentity) -> Box<dyn FnOnce(bool) + 'held> + 'held;
+
 // None denotes a publication collision with the stage successfully discarded.
 // Keep the published file open until the caller closes and checks the source.
 fn copy_verified(
@@ -851,6 +857,7 @@ fn copy_verified(
     destination: &Path,
     parent: &File,
     remove_source: impl FnOnce(&File, &Path) -> Result<(), String>,
+    fence: Option<&MovePublicationFence<'_>>,
 ) -> Result<Option<(FileIdentity, File)>, MoveFailure> {
     #[cfg(windows)]
     windows_fs::require_unnamed_stream(source)?;
@@ -911,6 +918,7 @@ fn copy_verified(
     if let Err(message) = prepared {
         return Err(discard_copy(&output, &stage, output_identity, message));
     }
+    let publication = fence.map(|fence| fence(destination, &output_identity));
     #[cfg(windows)]
     let published = windows_fs::rename(&output, destination);
     #[cfg(not(windows))]
@@ -934,7 +942,10 @@ fn copy_verified(
                 source_preserved: true,
                 message,
             },
-            failure => failure,
+            failure => {
+                if let Some(record) = publication { record(false); }
+                failure
+            }
         });
     }
     let verified = (|| -> Result<(), String> {
@@ -953,9 +964,14 @@ fn copy_verified(
         Ok(())
     })();
     if let Err(message) = verified {
-        return Err(discard_copy(&output, destination, output_identity, message));
+        let failure = discard_copy(&output, destination, output_identity, message);
+        if matches!(&failure, MoveFailure::RetainedOutput { .. }) {
+            if let Some(record) = publication { record(false); }
+        }
+        return Err(failure);
     }
     if let Err(error) = remove_source(source, src) {
+        if let Some(record) = publication { record(false); }
         return Err(MoveFailure::RetainedOutput {
             path: destination.to_path_buf(),
             identity: Some(output_identity),
@@ -964,6 +980,7 @@ fn copy_verified(
             message: format!("Could not remove source at {}: {error}", src.display()),
         });
     }
+    if let Some(record) = publication { record(true); }
     Ok(Some((output_identity, output)))
 }
 
@@ -994,7 +1011,14 @@ pub(crate) fn move_file_checked_expected_detailed(src: &Path, dest: &Path, expec
 pub(crate) fn move_file_checked_expected_content_detailed(
     src: &Path, dest: &Path, expected: &FileIdentity, digest: Option<&str>,
 ) -> Result<MoveResult, MoveFailure> {
-    move_file_checked_content_inner(src, dest, Some(expected), digest, None, false, true)
+    move_file_checked_content_inner(src, dest, Some(expected), digest, None, false, true, None)
+}
+
+pub(crate) fn move_file_checked_expected_content_with_fence(
+    src: &Path, dest: &Path, expected: &FileIdentity, digest: Option<&str>,
+    fence: &MovePublicationFence<'_>,
+) -> Result<MoveResult, MoveFailure> {
+    move_file_checked_content_inner(src, dest, Some(expected), digest, None, false, true, Some(fence))
 }
 
 /// Validate reviewed contents using the same write-denying source handle that
@@ -1049,23 +1073,24 @@ pub fn move_reviewed_file(src: &Path, dest: &Path, expected: &FileIdentity, dige
 }
 
 pub(crate) fn move_reviewed_file_detailed(src: &Path, dest: &Path, expected: &FileIdentity, digest: &str) -> Result<MoveResult, MoveFailure> {
-    move_file_checked_content_inner(src, dest, Some(expected), Some(digest), None, false, false)
+    move_file_checked_content_inner(src, dest, Some(expected), Some(digest), None, false, false, None)
 }
 
 pub(crate) fn move_organization_file(
     src: &Path, dest: &Path, expected: &FileIdentity, digest: &str, modified: std::time::SystemTime,
     exact_destination: bool,
 ) -> Result<MoveResult, MoveFailure> {
-    move_file_checked_content_inner(src, dest, Some(expected), Some(digest), Some(modified), false, !exact_destination)
+    move_file_checked_content_inner(src, dest, Some(expected), Some(digest), Some(modified), false, !exact_destination, None)
 }
 
 fn move_file_checked_inner(src: &Path, dest: &Path, expected: Option<&FileIdentity>, force_copy: bool) -> Result<MoveResult, String> {
-    move_file_checked_content_inner(src, dest, expected, None, None, force_copy, true).map_err(|error| error.to_string())
+    move_file_checked_content_inner(src, dest, expected, None, None, force_copy, true, None).map_err(|error| error.to_string())
 }
 
 fn move_file_checked_content_inner(
     src: &Path, dest: &Path, expected: Option<&FileIdentity>, expected_digest: Option<&str>,
     expected_modified: Option<std::time::SystemTime>, force_copy: bool, allow_rename: bool,
+    fence: Option<&MovePublicationFence<'_>>,
 ) -> Result<MoveResult, MoveFailure> {
     if !src.is_absolute() || has_dot_component(src) { return Err("Move source must be absolute and have no dot segments".into()); }
     #[cfg(windows)]
@@ -1112,14 +1137,18 @@ fn move_file_checked_content_inner(
             requested.clone()
         };
         if !force_copy {
+            let publication = fence.map(|fence| fence(&actual, &identity));
             match rename_no_replace(&source, src, &actual) {
-                Ok(()) => return Ok(MoveResult { source: canonical_source, renamed: actual != requested, destination: actual, identity }),
+                Ok(()) => {
+                    if let Some(record) = publication { record(true); }
+                    return Ok(MoveResult { source: canonical_source, renamed: actual != requested, destination: actual, identity });
+                }
                 Err(error) if allow_rename && collision_error(&error) => continue,
                 Err(error) if cross_device_error(&error) => {}
                 Err(error) => return Err(format!("Cannot move {} to {}: {}", src.display(), actual.display(), error).into()),
             }
         }
-        let (actual_identity, output_guard) = match copy_verified(&mut source, src, &actual, &guards[0], remove_open_source)? {
+        let (actual_identity, output_guard) = match copy_verified(&mut source, src, &actual, &guards[0], remove_open_source, fence)? {
             Some(published) => published,
             None if allow_rename => continue,
             None => return Err("Reviewed destination is now occupied; preview again".into()),
@@ -1750,7 +1779,7 @@ mod tests {
         let mut handle = open_guard(&source, false, true).unwrap();
         let result = copy_verified(&mut handle, &source, &destination, &guards[0], |_, _| {
             panic!("collision must not request source removal")
-        }).unwrap();
+        }, None).unwrap();
         assert!(result.is_none());
         assert_eq!(fs::read(&source).unwrap(), b"source");
         assert_eq!(fs::read(&destination).unwrap(), b"competitor");
@@ -1770,7 +1799,7 @@ mod tests {
         let mut handle = open_guard(&source, false, true).unwrap();
         let error = copy_verified(&mut handle, &source, &destination, &guards[0], |_, _| {
             Err("injected source removal failure".into())
-        }).unwrap_err();
+        }, None).unwrap_err();
         let MoveFailure::RetainedOutput {
             path, identity: Some(identity), verified: true, source_preserved: true, ..
         } = error else { panic!("Unexpected result: {error}") };

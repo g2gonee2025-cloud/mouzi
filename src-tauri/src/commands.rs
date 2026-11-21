@@ -71,24 +71,18 @@ pub fn history_cmd(filter: crate::operations::HistoryFilter) -> Result<Vec<Organ
 
 #[tauri::command]
 pub async fn undo_selected_cmd(
-    window: tauri::WebviewWindow, mut ids: Vec<i64>,
+    window: tauri::WebviewWindow, ids: Vec<i64>,
 ) -> Result<Vec<SelectedUndoResult>, String> {
     if window.label() != "app" {
         return Err("History restoration is available only in the workspace window".into());
     }
-    let ignored = window.state::<AppState>().ignored_files.clone();
+    let state = window.state::<AppState>();
+    let ignored = state.ignored_files.clone();
+    let watcher = state.watcher.clone();
     let app = window.app_handle().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let _operation = ignored.with_operation();
-        ids.sort_unstable_by(|a, b| b.cmp(a));
-        ids.dedup();
-        let mut results = Vec::with_capacity(ids.len());
-        for id in ids {
-            let outcome = read_undo_target(id)
-                .and_then(|target| finish_undo(&target, &ignored))
-                .unwrap_or_else(failed_undo);
-            results.push(SelectedUndoResult { id, outcome });
-        }
+        let results = undo_selected_with(ids, &ignored);
+        prune_cancelled_watch_work(&watcher);
         if !results.is_empty() {
             let _ = app.emit("mutation-completed", ());
         }
@@ -366,9 +360,8 @@ pub fn get_stats_cmd() -> Result<Vec<(String, i64)>, String> {
 // straight back after the grace period with its log row already marked undone.
 // The app undoes its own undo. Do not hoist either lock back over the loop.
 //
-// Phase 1 reads the candidate rows under the DB lock and releases it; phase 2
-// does the moves holding neither lock, after arming the whole batch's
-// suppression window; phase 3 writes each row's outcome under a short lock.
+// The mover guards each verified publication using its exact output identity.
+// Neither the DB nor the watcher queue is locked while the file moves.
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize)]
@@ -466,7 +459,9 @@ fn record_undo_move_failure(intent: i64, error: crate::safe_fs::MoveFailure, ign
             Err(journal) => format!("{error}. Undo recovery record {intent} remains pending. Journal error: {journal}"),
         },
         MoveFailure::RetainedOutput { path, identity, verified, source_preserved, message } => {
-            ignored_files.arm(std::slice::from_ref(&path), Instant::now(), SUPPRESSION_TTL);
+            if let Some(identity) = identity.clone() {
+                ignored_files.arm_recovery_file(&path, identity);
+            }
             let actual = path.to_string_lossy();
             let identity = identity.map(|identity| identity.key());
             let output = if verified { "Verified copy" } else { "Unverified output" };
@@ -515,19 +510,21 @@ fn finish_undo(target: &UndoTarget, ignored_files: &IgnoredFiles) -> Result<Undo
     }).transpose()?;
 
     let source_path = Path::new(&target.source);
-    ignored_files.invalidate(&[dest_path.to_path_buf(), source_path.to_path_buf()]);
-    arm_suppression(ignored_files, &[dest.to_owned(), target.source.clone()])?;
     let intent = begin_undo_intent(target.id, dest, &target.source, expected)
         .map_err(|error| format!("Undo was not started: could not persist operation intent: {error}"))?;
 
-    notify_move_observer();
-    let moved = match crate::safe_fs::move_file_checked_expected_content_detailed(dest_path, source_path, &identity, digest) {
+    let fence = |actual: &Path, output: &crate::safe_fs::FileIdentity| -> Box<dyn FnOnce(bool) + '_> {
+        let guard = ignored_files.begin_undo_publication(dest_path, &identity, actual, output);
+        notify_move_observer();
+        Box::new(move |source_moved| guard.commit(source_moved))
+    };
+    let moved = match crate::safe_fs::move_file_checked_expected_content_with_fence(
+        dest_path, source_path, &identity, digest, &fence,
+    ) {
         Ok(moved) => moved,
         Err(error) => return Err(record_undo_move_failure(intent, error, ignored_files)),
     };
     let actual = moved.destination.to_string_lossy().into_owned();
-    // A collision can select a new path. Arm it as soon as the move returns.
-    arm_suppression(ignored_files, &[actual.clone(), target.source.clone()])?;
     let resulting_identity = moved.identity.key();
     let status = if moved.renamed { "collision" } else { "ok" };
     let finalized = observe_undo_restore(intent, &actual, &resulting_identity)
@@ -575,19 +572,28 @@ fn undo_action_with(id: i64, ignored_files: &IgnoredFiles) -> Result<UndoResult,
     Ok(finish_undo(&target, ignored_files).unwrap_or_else(failed_undo))
 }
 
-fn cancel_undo_paths(
-    target: &UndoTarget, cancel_paths: impl FnOnce(&[PathBuf]) -> Result<(), String>,
-) -> Result<(), String> {
-    if let Some(dest) = target.destination().filter(|_| target.saved_identity().is_some()) {
-        cancel_paths(&[PathBuf::from(&target.source), PathBuf::from(dest)])?;
+fn undo_selected_with(mut ids: Vec<i64>, ignored: &IgnoredFiles) -> Vec<SelectedUndoResult> {
+    let _operation = ignored.with_operation();
+    ids.sort_unstable_by(|a, b| b.cmp(a));
+    ids.dedup();
+    ids.into_iter().map(|id| {
+        let outcome = read_undo_target(id)
+            .and_then(|target| finish_undo(&target, ignored))
+            .unwrap_or_else(failed_undo);
+        SelectedUndoResult { id, outcome }
+    }).collect()
+}
+
+fn prune_cancelled_watch_work(watcher: &std::sync::Mutex<crate::watcher::FolderWatcher>) {
+    let queues = watcher.lock().ok().map(|watcher| watcher.queue_cancellation());
+    if let Some(queues) = queues {
+        queues.prune_invalidated();
     }
-    Ok(())
 }
 
 fn undo_all_with(
     ignored_files: &IgnoredFiles,
     reviewed_ids: &[i64],
-    cancel_pending: impl FnOnce(&[PathBuf]),
 ) -> Result<UndoAllResult, String> {
     let _operation = ignored_files.with_operation();
     let reviewed: HashSet<_> = reviewed_ids.iter().copied().collect();
@@ -602,17 +608,6 @@ fn undo_all_with(
     if targets.len() != reviewed.len() {
         return Err("The reviewed history changed. Close this dialog and reopen Revert All to review the current actions.".into());
     }
-
-    // Include currently absent destinations that a preceding restore may create.
-    let armed: Vec<_> = targets.iter().flat_map(|target| {
-        std::iter::once(target.source.clone()).chain(target.dest.iter().filter(|path| !path.is_empty()).cloned())
-    }).collect();
-    if !armed.is_empty() {
-        let paths: Vec<_> = armed.iter().map(PathBuf::from).collect();
-        ignored_files.invalidate(&paths);
-        cancel_pending(&paths);
-    }
-    arm_suppression(ignored_files, &armed)?;
 
     let results: Vec<_> = targets.iter().map(|target| {
         finish_undo(target, ignored_files).unwrap_or_else(failed_undo)
@@ -657,12 +652,8 @@ fn notify_move_observer() {}
 
 #[tauri::command(async)]
 pub fn undo_action_cmd(app: AppHandle, id: i64, state: tauri::State<AppState>) -> Result<UndoResult, String> {
-    let target = read_undo_target(id)?;
-    cancel_undo_paths(&target, |paths| {
-        state.watcher.lock().map_err(|_| "Watcher state unavailable")?.cancel_paths(paths);
-        Ok(())
-    })?;
     let result = undo_action_with(id, &state.ignored_files);
+    prune_cancelled_watch_work(&state.watcher);
     let _ = app.emit("mutation-completed", ());
     result
 }
@@ -681,10 +672,8 @@ pub fn undo_all_cmd(
     state: tauri::State<AppState>,
     reviewed_ids: Vec<i64>,
 ) -> Result<UndoAllResult, String> {
-    let cancellation = state.watcher.lock().map_err(|_| "Watcher state unavailable")?
-        .queue_cancellation();
-    let cancel_paths = cancellation.prepare();
-    let result = undo_all_with(&state.ignored_files, &reviewed_ids, cancel_paths);
+    let result = undo_all_with(&state.ignored_files, &reviewed_ids);
+    prune_cancelled_watch_work(&state.watcher);
     let _ = app.emit("mutation-completed", ());
     result
 }
@@ -2470,7 +2459,7 @@ mod undo_tests {
 
     fn review_and_undo_all(ignored: &IgnoredFiles) -> Result<UndoAllResult, String> {
         let ids: Vec<_> = preview_undo_all_cmd()?.into_iter().map(|row| row.id).collect();
-        undo_all_with(ignored, &ids, |_| {})
+        undo_all_with(ignored, &ids)
     }
 
     /// Put a file where a logged move left it, and return (source, dest).
@@ -2500,8 +2489,6 @@ mod undo_tests {
         let ignored = ignored_files();
         let paths = [Path::new(&source), Path::new(&dest)];
         let tickets = paths.map(|path| ignored.ticket(path));
-        let target = read_undo_target(id).unwrap();
-        cancel_undo_paths(&target, |_| panic!("Legacy Undo must not cancel pending arrivals")).unwrap();
         let result = undo_action_with(id, &ignored).unwrap();
 
         assert_eq!(result.status, "failed");
@@ -2514,7 +2501,6 @@ mod undo_tests {
 
         let held = fixture.root().join("held-legacy.undocheck");
         std::fs::rename(&dest, &held).unwrap();
-        cancel_undo_paths(&target, |_| panic!("A missing legacy file must not cancel pending arrivals")).unwrap();
         assert_eq!(undo_action_with(id, &ignored).unwrap().status, "missing");
         assert!(tickets.iter().all(|ticket| ticket.is_current()));
         assert_eq!(std::fs::read(held).unwrap(), b"payload");
@@ -2533,7 +2519,7 @@ mod undo_tests {
              WHEN OLD.id={id} AND NEW.undone=1
              BEGIN SELECT RAISE(ABORT,'fixture history write failed'); END;"
         )).unwrap();
-        let batch = undo_all_with(&ignored_files(), &[id], |_| {});
+        let batch = undo_all_with(&ignored_files(), &[id]);
         lock_db().unwrap().execute_batch("DROP TRIGGER interrupt_undo_history").unwrap();
 
         let batch = batch.unwrap();
@@ -2587,7 +2573,7 @@ mod undo_tests {
         let reviewed: Vec<_> = preview_undo_all_cmd().unwrap().into_iter().map(|row| row.id).collect();
         assert_eq!(reviewed, [missing_verified, verified]);
         assert_eq!(counts.undoable, 2);
-        assert!(undo_all_with(&ignored_files(), &[legacy], |_| panic!("legacy row must not cancel queued work")).is_err());
+        assert!(undo_all_with(&ignored_files(), &[legacy]).is_err());
 
         let recent = serde_json::to_value(get_logs_cmd(50).unwrap()).unwrap();
         let recent = recent.as_array().unwrap();
@@ -2658,9 +2644,10 @@ mod undo_tests {
         let (late_source, late_dest) = stage(fixture.root(), "late.undocheck");
         insert_log(time, &late_source, Some(&late_dest));
         let reviewed_ids = [preview[1], preview[0], preview[0]];
-        let restored = undo_all_with(&ignored_files(), &reviewed_ids, |paths| {
-            assert_eq!(paths, [PathBuf::from(&middle), end.clone(), PathBuf::from(&source), PathBuf::from(&middle)]);
-        }).unwrap();
+        let ignored = ignored_files();
+        let late_ticket = ignored.ticket(Path::new(&late_source));
+        let restored = undo_all_with(&ignored, &reviewed_ids).unwrap();
+        assert!(late_ticket.is_current());
 
         assert_eq!(restored.count, 2, "Only the reviewed rows may be restored");
         assert_eq!(std::fs::read(source).unwrap(), b"payload");
@@ -2669,9 +2656,9 @@ mod undo_tests {
 
         clear_logs().unwrap();
         insert_log(time, &late_source, Some(&late_dest));
-        let stale = undo_all_with(&ignored_files(), &preview, |_| {
-            panic!("A cleared preview must not reserve any new path");
-        }).unwrap_err();
+        let ignored = ignored_files();
+        let stale = undo_all_with(&ignored, &preview).unwrap_err();
+        assert!(ignored.guarded_keys().is_empty(), "a cleared review cannot guard paths");
         assert!(stale.contains("reviewed history changed"));
         assert_eq!(std::fs::read(late_dest).unwrap(), b"payload");
     }
@@ -3020,38 +3007,38 @@ mod undo_tests {
         );
     }
 
-    /// The old batch armed each path after its own move, so a watcher event
-    /// racing a later row found no guard at all.
     #[test]
-    fn undo_batch_arms_every_path_before_the_first_move() {
+    fn undo_batch_guards_each_verified_move_before_publication() {
         let fixture = UndoFixture::new("armed");
         let root = fixture.root();
         let ignored = ignored_files();
-        let mut sources = Vec::new();
+        let mut paths = Vec::new();
         for rank in 0..4 {
             let (source, dest) = stage(root, &format!("c{rank}.undocheck"));
             log_at(rank, &source, Some(&dest));
-            sources.push(source);
+            paths.push((source, dest));
         }
 
-        let at_first_move = Arc::new(Mutex::new(Vec::new()));
-        let _observer = ObserverReset(snapshot_guard_on_first_move(&ignored, &at_first_move));
+        let samples = Arc::new(Mutex::new(Vec::new()));
+        let observer_samples = samples.clone();
+        let observer_ignored = ignored.clone();
+        let _observer = ObserverReset(set_move_observer(Some(Arc::new(move || {
+            observer_samples.lock().unwrap().push(observer_ignored.guarded_keys());
+        }))));
+        let outcome = review_and_undo_all(&ignored).expect("undo_all_with");
+        assert_eq!(outcome.count, 4);
+        assert!(outcome.results.iter().all(|result| result.status == "ok"));
 
-        let outcome = review_and_undo_all(&ignored);
-
-        assert_eq!(outcome.expect("undo_all_with").count, 4);
-
-        let guarded = at_first_move.lock().unwrap();
-        assert_eq!(
-            guarded.len(),
-            8,
-            "both paths of all four rows must be guarded before the first rename: {guarded:?}"
-        );
-        for source in &sources {
-            assert!(
-                guarded.contains(&guarded_key(source)),
-                "{source} had no guard when the first rename ran"
-            );
+        paths.reverse();
+        let samples = samples.lock().unwrap();
+        assert_eq!(samples.len(), paths.len());
+        for (rank, (guarded, (source, dest))) in samples.iter().zip(&paths).enumerate() {
+            assert!(guarded.contains(&guarded_key(source)), "{source} had no publication guard");
+            assert!(guarded.contains(&guarded_key(dest)), "{dest} had no publication guard");
+            for (later_source, later_dest) in &paths[rank + 1..] {
+                assert!(!guarded.contains(&guarded_key(later_source)));
+                assert!(!guarded.contains(&guarded_key(later_dest)));
+            }
         }
     }
 
@@ -3133,8 +3120,8 @@ mod undo_tests {
         let expected = ["missing.undocheck", "occupied.undocheck", "replaced.undocheck", "sibling.undocheck"];
         assert_eq!(names(), expected);
 
-        let cancellation = watcher.queue_cancellation();
-        let outcome = undo_all_with(&ignored, &[occupied_id, missing_id, replaced_id, free_id], cancellation.prepare()).unwrap();
+        let outcome = undo_all_with(&ignored, &[occupied_id, missing_id, replaced_id, free_id]).unwrap();
+        watcher.queue_cancellation().prune_invalidated();
         assert_eq!(outcome.results.iter().map(|row| row.status.as_str()).collect::<Vec<_>>(),
             ["ok", "failed", "missing", "collision"]);
         assert_eq!(names(), expected);
