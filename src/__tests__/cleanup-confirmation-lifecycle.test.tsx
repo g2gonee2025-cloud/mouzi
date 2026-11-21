@@ -25,6 +25,10 @@ vi.mock("react-i18next", () => ({ useTranslation: () => ({
 }) }));
 vi.mock("../components/cleanup/ConfirmDialog", () => ({ default: () => null }));
 vi.mock("../components/cleanup/ResultsPanel", () => ({ default: () => null }));
+vi.mock("../utils/format", async (importOriginal) => ({
+  ...await importOriginal<typeof import("../utils/format")>(),
+  formatTimestamp: () => "Fixture date",
+}));
 vi.mock("../store/useCleanupStore", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../store/useCleanupStore")>();
   const store = actual.useCleanupStore;
@@ -160,6 +164,112 @@ beforeEach(() => {
 });
 
 afterEach(() => mock.effects.forEach(({ stop }) => stop?.()));
+
+type NonDuplicateTab = Exclude<Tab, "duplicates">;
+const selectAllControl = (tree: ReactNode) => find(find(tree, (node) => node.type === "label" &&
+  text(node).startsWith("cleanup.selectAll")), (node) => node.type === "input");
+const rowCheckbox = (tree: ReactNode, path: string) => find(tree, (node) =>
+  node.type === "input" && node.props["aria-label"] === path)!.props;
+
+async function findPaths(tab: NonDuplicateTab, paths: string[]) {
+  mock.invoke.mockResolvedValueOnce(tab === "empty" ? paths : paths.map((path, index) => ({
+    path, size: report.size + paths.length - index, mtime: index + 1,
+  })));
+  find(render(tab), button(findLabel[tab]))!.props.onClick!({ currentTarget: opener });
+  await settle();
+  return render(tab);
+}
+
+it.each(["empty", "large", "stale"] as const)("bounds deliberate bulk selection and exact reviewed paths for %s", async (tab) => {
+  const limit = 10_000;
+  const paths = Array.from({ length: limit + 2 }, (_, index) => {
+    const displayedOrder = tab === "empty" ? index : limit + 1 - index;
+    return `C:/Fixture/item-${String(displayedOrder).padStart(5, "0")}`;
+  });
+  const before = await findPaths(tab, paths);
+  const [first] = paths;
+  const edge = paths[limit - 1];
+  const outside = paths[limit];
+  const later = paths[limit + 1];
+  const selectBatch = button("cleanup.selectFirstBatch");
+  const reviewButton = button("cleanup.confirm");
+  expect.soft(selectAllControl(before)).toBeUndefined();
+  expect.soft(text(before)).toContain("cleanup.selectionLimit");
+  expect(find(before, reviewButton)?.props.disabled).toBe(true);
+  expect(rowCheckbox(before, first).checked).toBe(false);
+  expect(rowCheckbox(before, outside).checked).toBe(false);
+  const batch = find(before, selectBatch);
+  expect(batch).toBeDefined();
+
+  rowCheckbox(before, edge).onChange!();
+  find(render(tab), selectBatch)!.props.onClick!({ currentTarget: opener });
+  const filled = render(tab);
+  expect(rowCheckbox(filled, first).checked).toBe(true);
+  expect(rowCheckbox(filled, edge)).toMatchObject({ checked: true, disabled: false });
+  expect(rowCheckbox(filled, outside)).toMatchObject({ checked: false, disabled: true });
+  rowCheckbox(filled, outside).onChange!();
+  const stillBounded = render(tab);
+  expect(rowCheckbox(stillBounded, outside).checked).toBe(false);
+  expect(mock.invoke).toHaveBeenCalledTimes(1);
+  find(stillBounded, reviewButton)!.props.onClick!({ currentTarget: opener });
+  await settle();
+  const fullReview = dialog(render(tab))!;
+  expect(fullReview.preview).toEqual(paths.slice(0, limit));
+  expect(mock.invoke.mock.calls.filter(([command]) => command === "prepare_cleanup_cmd")).toHaveLength(1);
+  fullReview.onClose!();
+
+  rowCheckbox(render(tab), edge).onChange!();
+  const withSpace = render(tab);
+  expect(rowCheckbox(withSpace, outside).disabled).toBe(false);
+  rowCheckbox(withSpace, outside).onChange!();
+  const swapped = render(tab);
+  expect(rowCheckbox(swapped, edge)).toMatchObject({ checked: false, disabled: true });
+  expect(rowCheckbox(swapped, outside)).toMatchObject({ checked: true, disabled: false });
+  expect(rowCheckbox(swapped, later)).toMatchObject({ checked: false, disabled: true });
+  expect(find(swapped, selectBatch)?.props.disabled).toBe(true);
+
+  find(swapped, button("beta.clearSelection"))!.props.onClick!({ currentTarget: opener });
+  const cleared = render(tab);
+  expect(find(cleared, reviewButton)?.props.disabled).toBe(true);
+  expect(rowCheckbox(cleared, first).checked).toBe(false);
+  rowCheckbox(cleared, outside).onChange!();
+  const custom = render(tab);
+  expect(find(custom, selectBatch)?.props.disabled).toBe(true);
+  expect(text(custom)).toContain("cleanup.selectionOutsideBatch");
+  // Even a callback retained from the previous enabled render cannot overwrite the custom selection.
+  batch!.props.onClick!({ currentTarget: opener });
+  const preserved = render(tab);
+  expect(rowCheckbox(preserved, outside).checked).toBe(true);
+  expect(rowCheckbox(preserved, first).checked).toBe(false);
+  find(preserved, reviewButton)!.props.onClick!({ currentTarget: opener });
+  await settle();
+  const subsetReview = dialog(render(tab))!;
+  expect(subsetReview.preview).toEqual([outside]);
+  expect(mock.invoke.mock.calls.filter(([command]) => command === "prepare_cleanup_cmd")).toHaveLength(2);
+  subsetReview.onClose!();
+  expect(rowCheckbox(await findPaths(tab, paths), outside).checked).toBe(false);
+  expect(sent()).toEqual([]);
+}, 20_000);
+
+it.each([0, 1, 10_000])("keeps ordinary Select all for %i eligible paths", async (count) => {
+  const paths = Array.from({ length: count }, (_, index) => `C:/Fixture/ordinary-${index}`);
+  const tree = await findPaths("empty", paths);
+  expect(find(tree, button("cleanup.selectFirstBatch"))).toBeUndefined();
+  if (!count) {
+    expect(selectAllControl(tree)).toBeUndefined();
+    expect(find(tree, button("cleanup.confirm"))).toBeUndefined();
+    return;
+  }
+  const all = selectAllControl(tree)!;
+  expect(all.props.checked).toBe(false);
+  all.props.onChange!();
+  const selected = render("empty");
+  expect(selectAllControl(selected)?.props.checked).toBe(true);
+  expect(rowCheckbox(selected, paths[count - 1]).checked).toBe(true);
+  selectAllControl(selected)!.props.onChange!();
+  expect(find(render("empty"), button("cleanup.confirm"))?.props.disabled).toBe(true);
+  expect(mock.invoke).toHaveBeenCalledTimes(1);
+});
 
 function duplicateCard(hash = "fixture-content") {
   const card = find(render("duplicates"), (node) => node.props.group?.hash === hash)!;
