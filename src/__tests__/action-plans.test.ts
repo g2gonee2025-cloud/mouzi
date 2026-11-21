@@ -45,6 +45,7 @@ it("discards a late finder and refuses a preview invalidated during preparation"
   const rejection = expect(preparing).rejects.toThrow("candidates changed");
   useCleanupStore.getState().invalidateCandidates(); pending.resolve(cleanupPlan);
   await rejection;
+  expect(ipc.invoke).toHaveBeenCalledWith("discard_cleanup_plan_cmd", { planId: cleanupPlan.planId });
   expect(useCleanupStore.getState().preparedPlan).toBeNull();
   expect(useCleanupStore.getState().largeFiles).toEqual({ minBytes: 20, files: [row("current")] });
   expect(useCleanupStore.getState().unavailableRoots.largeFiles).toEqual(["W:/current"]);
@@ -96,16 +97,35 @@ it("releases an abandoned cleanup review without letting its response replace a 
 
   const nextOwner = new AbortController();
   const second = useCleanupStore.getState().prepareCleanup(cleanupPlan.actions, nextOwner.signal);
-  abandoned.resolve(cleanupPlan);
-  await rejection;
-  expect(useCleanupStore.getState()).toMatchObject({ busy: true, preparedPlan: null, error: null });
   const nextPlan = { ...cleanupPlan, planId: "cleanup:next" };
   next.resolve(nextPlan);
   await second;
+  abandoned.resolve(cleanupPlan);
+  await rejection;
+  const discarded = () => ipc.invoke.mock.calls.filter(([command]) => command === "discard_cleanup_plan_cmd");
+  expect(discarded()).toEqual([["discard_cleanup_plan_cmd", { planId: cleanupPlan.planId }]]);
   expect(useCleanupStore.getState().preparedPlan).toBe(nextPlan);
 
   nextOwner.abort();
   expect(useCleanupStore.getState()).toMatchObject({ busy: false, preparedPlan: null });
+  expect(discarded()).toEqual([
+    ["discard_cleanup_plan_cmd", { planId: cleanupPlan.planId }],
+    ["discard_cleanup_plan_cmd", { planId: nextPlan.planId }],
+  ]);
+});
+
+it("lets a replacement review use the slot released by Cancel", async () => {
+  const released = deferred<void>();
+  const nextPlan = { ...cleanupPlan, planId: "cleanup:replacement" };
+  ipc.invoke.mockResolvedValueOnce(cleanupPlan).mockReturnValueOnce(released.promise).mockResolvedValueOnce(nextPlan);
+  const owner = new AbortController();
+  await useCleanupStore.getState().prepareCleanup(cleanupPlan.actions, owner.signal);
+  owner.abort();
+  const replacement = useCleanupStore.getState().prepareCleanup(cleanupPlan.actions);
+  expect(ipc.invoke.mock.calls.map(([command]) => command)).toEqual(["prepare_cleanup_cmd", "discard_cleanup_plan_cmd"]);
+  released.resolve();
+  expect(await replacement).toBe(nextPlan);
+  expect(ipc.invoke.mock.lastCall).toEqual(["prepare_cleanup_cmd", { actions: cleanupPlan.actions }]);
 });
 
 it("retains confirmed cleanup results after the preview owner leaves", async () => {

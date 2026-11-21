@@ -92,7 +92,16 @@ async function requestCandidates<Item>(command: string, args?: Record<string, nu
 
 export const useCleanupStore = create<CleanupState>((set, get) => {
   const preview = createPreviewSlot();
+  const pendingDiscards = new Set<Promise<void>>();
   let activeFinder: { key: FinderKey; generation: number } | null = null;
+
+  function discard(plan: CleanupPlan | null) {
+    if (!plan) return;
+    const released = Promise.resolve(invoke<void>("discard_cleanup_plan_cmd", { planId: plan.planId }))
+      .catch((error) => console.error("Could not discard cleanup review", error));
+    pendingDiscards.add(released);
+    void released.then(() => pendingDiscards.delete(released));
+  }
 
   async function readHistory(older: boolean) {
     const { history, historyCursor, historyLoading } = get();
@@ -175,18 +184,31 @@ export const useCleanupStore = create<CleanupState>((set, get) => {
       const kind = actions[0]?.kind;
       const { busy, preparedPlan, receipts } = get();
       if (!kind || busy || preparedPlan || receipts[kind]) throw new Error("Another cleanup is being reviewed or processed");
-      const isCurrent = preview.begin(owner, () => set({ busy: false, preparedPlan: null }));
+      const isCurrent = preview.begin(owner, () => {
+        discard(get().preparedPlan);
+        set({ busy: false, preparedPlan: null });
+      });
       const generation = ++candidatesGeneration;
+      const checkCurrent = () => {
+        owner?.throwIfAborted();
+        if (!isCurrent() || generation !== candidatesGeneration) throw new Error("Cleanup candidates changed; search and review again");
+      };
       activeFinder = null;
       const snapshot = actions.map((action) => ({ ...action }));
       set({ busy: true, loading: false, error: null });
+      let plan: CleanupPlan | null = null;
       try {
-        const plan = await invoke<CleanupPlan>("prepare_cleanup_cmd", { actions: snapshot });
-        owner?.throwIfAborted();
-        if (generation !== candidatesGeneration) throw new Error("Cleanup candidates changed; search and review again");
+        // A full native pool must receive our previous discard before this replacement.
+        if (pendingDiscards.size) {
+          await Promise.all(pendingDiscards);
+          checkCurrent();
+        }
+        plan = await invoke<CleanupPlan>("prepare_cleanup_cmd", { actions: snapshot });
+        checkCurrent();
         set({ preparedPlan: plan, busy: false });
         return plan;
       } catch (error) {
+        discard(plan);
         if (isCurrent()) {
           preview.clear();
           set({ error: String(error), busy: false });
@@ -242,6 +264,7 @@ export const useCleanupStore = create<CleanupState>((set, get) => {
       if (get().busy) set({ loading: false, history: null, historyLoading: false });
       else {
         preview.clear();
+        discard(get().preparedPlan);
         set({ ...emptyCandidates, unavailableRoots: {}, preparedPlan: null, loading: false, history: null, historyLoading: false });
       }
     },

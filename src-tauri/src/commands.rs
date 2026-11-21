@@ -1817,6 +1817,11 @@ pub fn prepare_cleanup_cmd(actions: Vec<crate::cleanup::CleanupRequest>, state: 
     crate::cleanup::prepare_cleanup(&actions)
 }
 
+#[tauri::command]
+pub fn discard_cleanup_plan_cmd(plan_id: String) -> Result<(), String> {
+    crate::cleanup::discard_cleanup_plan(&plan_id)
+}
+
 /// Execute a batch of cleanup actions (trash files / remove empty dirs).
 #[tauri::command(async)]
 pub fn execute_cleanup_cmd(

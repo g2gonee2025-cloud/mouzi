@@ -263,6 +263,7 @@ pub fn run() {
             find_stale_files_cmd,
             find_empty_dirs_cmd,
             prepare_cleanup_cmd,
+            discard_cleanup_plan_cmd,
             execute_cleanup_cmd,
             get_suggestions_cmd,
             get_suggestions_with_status_cmd,

@@ -684,6 +684,11 @@ pub fn execute_cleanup_plan(plan_id: &str) -> Result<Vec<CleanupOutcome>, String
     execute_cleanup_plan_with(plan_id, &mut NativeCleanupIo::default())
 }
 
+pub fn discard_cleanup_plan(plan_id: &str) -> Result<(), String> {
+    PLANS.lock().map_err(|_| "Cleanup plan storage is unavailable")?.remove(plan_id);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1073,6 +1078,40 @@ mod tests {
         fs::rename(&keeper, tree.0.join("keeper-moved.txt")).unwrap();
         assert!(execute_cleanup_plan_with(&missing_plan.plan_id, &mut io).is_err());
         assert_eq!(io.trash_calls, 0);
+    }
+
+    #[test]
+    fn discarding_one_unused_cleanup_plan_frees_its_slot_and_preserves_other_plans() {
+        let _guard = db::serialise_test_db();
+        init();
+        let tree = TestTree::new();
+        tree.register();
+        let empty = tree.0.join("empty");
+        fs::create_dir(&empty).unwrap();
+        let actions = [directory(&empty.to_string_lossy())];
+        let mut held = Vec::new();
+        for _ in 0..MAX_PENDING_PLANS {
+            held.push(prepare_cleanup(&actions).unwrap().plan_id);
+        }
+        assert!(prepare_cleanup(&actions).unwrap_err().contains("Too many cleanup reviews"));
+
+        let abandoned = held.pop().unwrap();
+        discard_cleanup_plan(&abandoned).unwrap();
+        discard_cleanup_plan(&abandoned).unwrap();
+        let replacement = prepare_cleanup(&actions).unwrap();
+        assert!(prepare_cleanup(&actions).unwrap_err().contains("Too many cleanup reviews"));
+        let mut io = FakeIo::default();
+        assert!(execute_cleanup_plan_with(&abandoned, &mut io).is_err());
+        assert_eq!((io.intent_calls, io.directory_calls), (0, 0));
+        assert!(empty.is_dir());
+
+        let independent = held.pop().unwrap();
+        execute_cleanup_plan_with(&independent, &mut io).unwrap();
+        discard_cleanup_plan(&independent).unwrap();
+        assert!(execute_cleanup_plan_with(&independent, &mut io).is_err());
+        assert_eq!((io.intent_calls, io.directory_calls), (1, 1));
+        discard_cleanup_plan(&replacement.plan_id).unwrap();
+        for plan_id in held { discard_cleanup_plan(&plan_id).unwrap(); }
     }
 
     #[test]

@@ -108,6 +108,7 @@ const button = (label: string) => (node: Element) => node.type === "button" && t
 const dialog = (tree: ReactNode) => find(tree, (node) => node.type === ConfirmDialog)?.props;
 const guidance = (tree: ReactNode) => find(tree, (node) => node.props.role === "status" && text(node) === notice);
 const sent = () => mock.invoke.mock.calls.filter(([command]) => command === "execute_cleanup_cmd");
+const discarded = () => mock.invoke.mock.calls.filter(([command]) => command === "discard_cleanup_plan_cmd");
 const settle = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
 
 function render(tab: Tab) {
@@ -152,6 +153,7 @@ beforeEach(() => {
       };
     }
     if (command === "get_cleanup_history_page_cmd") return { entries: [], nextCursor: null };
+    if (command === "discard_cleanup_plan_cmd") return;
     throw Error("Unexpected command " + command);
   });
 });
@@ -335,6 +337,7 @@ it.each<Tab>(["duplicates", "large", "stale", "empty"])("retires an invalidated 
   expect(previous.focusFallback?.()).toBe(findControl);
   await previous.onConfirm?.();
   expect(sent()).toEqual([]);
+  expect(discarded()).toEqual([["discard_cleanup_plan_cmd", { planId: "fixture-plan" }]]);
   expect(guidance(render(tab))).toBeDefined();
 });
 
@@ -344,10 +347,20 @@ it("keeps the exact review across a published scan and distinguishes Cancel from
   useCleanupStore.getState().invalidateFileCandidates();
   expect(dialog(render("duplicates"))?.onConfirm).toBe(review.onConfirm);
   expect(useCleanupStore.getState().preparedPlan).toBe(plan);
+  expect(discarded()).toEqual([]);
   review.onClose?.();
   expect(dialog(render("duplicates"))).toBeUndefined();
   expect(useCleanupStore.getState().preparedPlan).toBeNull();
   expect(guidance(render("duplicates"))).toBeUndefined();
+  expect(sent()).toEqual([]);
+  expect(discarded()).toEqual([["discard_cleanup_plan_cmd", { planId: "fixture-plan" }]]);
+});
+
+it("discards an open plan when its Cleanup tab unmounts", async () => {
+  const review = await open("empty");
+  closeTab();
+  await review.onConfirm?.();
+  expect(discarded()).toEqual([["discard_cleanup_plan_cmd", { planId: "fixture-plan" }]]);
   expect(sent()).toEqual([]);
 });
 
@@ -382,6 +395,7 @@ it("preserves a dispatched confirmation through overlapping events and shows its
   expect(guidance(receipt)).toBeUndefined();
   expect(find(receipt, (node) => node.type === ResultsPanel)?.props.results).toEqual(outcomes);
   expect(useCleanupStore.getState().receipts.trash_large?.outcomes).toEqual(outcomes);
+  expect(discarded()).toEqual([]);
 });
 
 const receipt = (tab: Tab) => find(render(tab), (node) => node.type === ResultsPanel)?.props;
