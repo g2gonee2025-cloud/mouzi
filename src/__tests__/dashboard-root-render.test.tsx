@@ -138,6 +138,18 @@ describe("dashboard entry points", () => {
     expect(html).not.toContain("dashboard.noFiles");
   });
 
+  it("shows activity from the store after the entry inventory read", () => {
+    useDashboardStore.setState({ weeklyStats: [{ file_type: "Friday invoices", count: 2 }] });
+    const html = renderDashboard([{ ...root, files: 1, bytes: 256 }]);
+    expect(html).toContain("dashboard.organizedThisWeek");
+    expect(html).toContain("Friday invoices");
+    expect(html).toContain(">2<");
+    useDashboardStore.setState({ weeklyStats: [] });
+    const empty = mountedDashboard().html;
+    expect(empty).toContain("dashboard.noOrganized");
+    expect(empty).not.toContain("Friday invoices");
+  });
+
   it("warns above retained rows when reopening after a root failed outside the dashboard", () => {
     const retained = { path: `${root.path}/retained.txt`, rootPath: root.path, size: 100, mtime: 1, category: "Other" };
     const failed = { ...root, status: "failed" as const, stale: true, files: 1, bytes: 100, error: "Folder is unavailable" };

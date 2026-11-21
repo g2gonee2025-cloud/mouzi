@@ -1,10 +1,8 @@
 import { afterEach, expect, it, vi } from "vitest";
 import { renderToStaticMarkup } from "react-dom/server";
-import Dashboard from "../pages/Dashboard";
+import ActivityTimeline from "../components/dashboard/ActivityTimeline";
 import Popup from "../components/Popup";
 import { useAppStore } from "../store/useAppStore";
-import { EMPTY_INSIGHTS, useDashboardStore } from "../store/useDashboardStore";
-import { DEFAULT_DASHBOARD_VIEW } from "../utils/dashboard";
 
 type ActivityMessages = Record<string, Record<string, string>>;
 const locales = import.meta.glob<ActivityMessages>("../i18n/locales/*.json", {
@@ -29,40 +27,20 @@ vi.mock("../store/useAppStore", async (importOriginal) => {
   };
   return { ...actual, useAppStore: Object.assign(readSnapshot, actual.useAppStore) };
 });
-vi.mock("../store/useDashboardStore", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("../store/useDashboardStore")>();
-  return { ...actual, useDashboardStore: Object.assign(actual.useDashboardStore.getState, actual.useDashboardStore) };
-});
-
 const activity = [{ file_type: "Friday invoices", count: 2 }];
-const root = {
-  path: "C:/Fixture/Activity", files: 1, bytes: 256, status: "complete" as const,
-  stale: false, lastScanAt: null, error: null,
-};
 
 afterEach(() => {
   useAppStore.setState(useAppStore.getInitialState(), true);
-  useDashboardStore.setState(useDashboardStore.getInitialState(), true);
 });
 
 function renderActivity(locale: ActivityMessages) {
   messages = locale;
-  useDashboardStore.setState({
-    stats: {
-      revision: 1, totalFiles: root.files, totalBytes: root.bytes, watchedRoots: [root],
-      categoryBreakdown: [{ category: "Other", files: root.files, bytes: root.bytes }],
-      largestFiles: [], recentFiles: [], scanEligibleRoots: 1, lastScanAt: null,
-      insights: EMPTY_INSIGHTS, ageBuckets: [],
-    },
-    weeklyStats: activity,
-  });
   useAppStore.setState({ stats: activity, folderRead: { status: "ready" } });
-  const dashboard = () => renderToStaticMarkup(<Dashboard view={DEFAULT_DASHBOARD_VIEW} setView={vi.fn()} />);
-  const populated = dashboard();
+  const populated = renderToStaticMarkup(<ActivityTimeline data={activity} />);
+  const empty = renderToStaticMarkup(<ActivityTimeline data={[]} />);
   const tray = renderToStaticMarkup(<Popup />);
-  useDashboardStore.setState({ weeklyStats: [] });
   useAppStore.setState({ stats: [] });
-  return { populated, empty: dashboard(), tray, emptyTray: renderToStaticMarkup(<Popup />) };
+  return { populated, empty, tray, emptyTray: renderToStaticMarkup(<Popup />) };
 }
 
 it.each(Object.entries(locales))("renders a seven-day window in Dashboard and tray for %s", (_path, locale) => {
