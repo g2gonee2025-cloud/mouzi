@@ -2317,6 +2317,11 @@ fn register_inventory_search(conn: &Connection) -> SqliteResult<()> {
 
 fn inventory_files_sql(sort: &str, filtered: bool) -> String {
     let recent = sort == "mtime";
+    let columns = "i.path, i.size, i.mtime, i.category, i.root_path";
+    let watched = "i.root_path IN (SELECT path FROM watched_folders)";
+    let filters = "AND (?1 = '' OR i.category = ?1)
+                   AND (?2 = '' OR i.root_path = ?2)
+                   AND (?3 = '' OR mouzi_path_contains(i.path,?3))";
     // Keep the indexed prefix for the snapshot; filtered searches may favor a root lookup.
     let index = if recent && !filtered { " INDEXED BY idx_file_inventory_mtime" } else { "" };
     let (join, order) = if recent {
@@ -2328,20 +2333,33 @@ fn inventory_files_sql(sort: &str, filtered: bool) -> String {
     } else {
         ("", "i.size DESC, i.path ASC")
     };
-    let (filters, limit) = if filtered {
-        (
-            "AND (?1 = '' OR i.category = ?1)
-             AND (?2 = '' OR i.root_path = ?2)
-             AND (?3 = '' OR mouzi_path_contains(i.path,?3))",
-            "?4",
-        )
-    } else {
-        ("", "50")
-    };
+    if recent && filtered {
+        // Read precise timestamps only for eligible rows that can make the cutoff.
+        // Expand the final second when the coarse limit may split a tie.
+        return format!(
+            "WITH coarse AS MATERIALIZED (
+                 SELECT i.id, i.mtime
+                 FROM file_inventory i
+                 WHERE {watched} {filters}
+                 ORDER BY i.mtime DESC
+                 LIMIT ?4
+             ), boundary AS MATERIALIZED (
+                 SELECT CASE WHEN count(*) = ?4 THEN min(mtime) END AS mtime FROM coarse
+             ), candidates AS (
+                 SELECT id FROM coarse WHERE mtime IS NOT (SELECT mtime FROM boundary)
+                 UNION ALL
+                 SELECT i.id FROM file_inventory i INDEXED BY idx_file_inventory_mtime
+                 WHERE i.mtime = (SELECT mtime FROM boundary) AND {watched} {filters}
+             )
+             SELECT {columns}
+             FROM candidates c JOIN file_inventory i ON i.id = c.id{join}
+             ORDER BY {order} LIMIT ?4"
+        );
+    }
+    let (filters, limit) = if filtered { (filters, "?4") } else { ("", "50") };
     format!(
-        "SELECT i.path, i.size, i.mtime, i.category, i.root_path FROM file_inventory i{index}{join}
-         WHERE i.root_path IN (SELECT path FROM watched_folders)
-           {filters}
+        "SELECT {columns} FROM file_inventory i{index}{join}
+         WHERE {watched} {filters}
          ORDER BY {order}
          LIMIT {limit}"
     )
@@ -3342,6 +3360,28 @@ mod tests {
             assert!(snapshot.iter().map(|file| &file.path).eq(expected), "snapshot {sort}");
             assert!(filtered.iter().map(|file| &file.path).eq(expected), "filtered {sort}");
         }
+    }
+
+    #[test]
+    fn recent_files_cutoff_preserves_scope_at_zero_one_exact_and_larger_limits() {
+        let conn = mem_conn_with_inventory();
+        let root = "/boundary";
+        conn.execute_batch("INSERT INTO watched_folders(path,mode) VALUES('/boundary','manual'),('/another','manual')").unwrap();
+        let second = 1_795_176_000;
+        let older = add_recent_fixture(&conn, root, "a-receipt[1].txt", 1, second, Some(100));
+        let newest = add_recent_fixture(&conn, root, "z-receipt[1].txt", 1, second, Some(900));
+        let sibling = add_recent_fixture(&conn, "/another", "receipt[1].txt", 1, second, Some(950));
+        add_recent_fixture(&conn, "/removed", "receipt[1].txt", 1, second, Some(990));
+        add_recent_fixture(&conn, root, "receipt-1.txt", 1, second, Some(980));
+        let other_category = add_recent_fixture(&conn, root, "code-receipt[1].txt", 1, second, Some(970));
+        conn.execute("UPDATE file_inventory SET category='Code' WHERE path=?1", [&other_category]).unwrap();
+        let expected = [&newest, &older];
+        for limit in [0, 1, 2, 4] {
+            let rows = get_inventory_files_on(&conn, "mtime", Some("Documents"), Some(root), Some("RECEIPT[1]"), limit).unwrap();
+            assert!(rows.iter().map(|file| &file.path).eq(expected.into_iter().take(limit as usize)), "limit {limit}");
+        }
+        let all_roots = get_inventory_files_on(&conn, "mtime", Some("Documents"), None, Some("RECEIPT[1]"), 1).unwrap();
+        assert_eq!(all_roots[0].path, sibling);
     }
 
     #[test]
