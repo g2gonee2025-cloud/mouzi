@@ -1543,6 +1543,9 @@ pub async fn import_rules_cmd(window: tauri::WebviewWindow, replace: bool) -> Re
 mod rule_transfer_tests {
     use super::*;
     use std::fs;
+    use std::io::Write;
+
+    const UTF8_SIGNATURE: &[u8] = b"\xEF\xBB\xBF";
 
     fn test_move_rule(name: &str, folder_id: i64) -> Rule {
         Rule {
@@ -1590,9 +1593,17 @@ mod rule_transfer_tests {
         let entries = read_rule_import(&file).unwrap();
         let unrelated = test_watched_folder(1, &desktop);
         let original = test_watched_folder(2, &downloads);
-        let resolved = resolve_rule_import(&entries, &[unrelated.clone(), original.clone()]).unwrap();
+        let receiving_folders = [unrelated.clone(), original.clone()];
+        let resolved = resolve_rule_import(&entries, &receiving_folders).unwrap();
         assert_eq!(resolved.rules[0].folder_id, 0);
         assert_eq!(resolved.rules[1].folder_id, 2);
+
+        let marked_file = root.0.join("Règles de dossier.JSON");
+        fs::write(&marked_file, [UTF8_SIGNATURE, export.as_slice()].concat()).unwrap();
+        let marked_entries = read_rule_import(&marked_file).unwrap();
+        let marked = resolve_rule_import(&marked_entries, &receiving_folders).unwrap();
+        assert_eq!(marked.rules, resolved.rules);
+        drop(marked);
         drop(resolved);
 
         let error = resolve_rule_import(&entries, &[unrelated]).err().unwrap();
@@ -1618,6 +1629,37 @@ mod rule_transfer_tests {
     }
 
     #[test]
+    fn imports_one_utf8_signature_before_global_rules() {
+        let rule = test_move_rule("Café — 文件\u{feff}", 0);
+        let export = encode_rule_transfer(vec![rule.clone()], &[]).unwrap();
+        assert!(!export.starts_with(UTF8_SIGNATURE));
+        let marked = [UTF8_SIGNATURE, export.as_slice()].concat();
+        let entries = decode_rule_transfer(&marked).unwrap();
+        assert_eq!(resolve_rule_import(&entries, &[]).unwrap().rules, vec![rule]);
+    }
+
+    #[test]
+    fn rejects_invalid_and_non_utf8_rule_documents() {
+        let rule = test_move_rule("Café", 0);
+        let export = encode_rule_transfer(vec![rule], &[]).unwrap();
+        let text = std::str::from_utf8(&export).unwrap();
+        let utf16le: Vec<u8> = text.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let utf16be: Vec<u8> = text.encode_utf16().flat_map(u16::to_be_bytes).collect();
+        let invalid = [
+            ("repeated signature", [UTF8_SIGNATURE, UTF8_SIGNATURE, export.as_slice()].concat()),
+            ("signature after whitespace", [b" ".as_slice(), UTF8_SIGNATURE, export.as_slice()].concat()),
+            ("trailing signature", [export.as_slice(), UTF8_SIGNATURE].concat()),
+            ("UTF-16LE", [b"\xFF\xFE".as_slice(), utf16le.as_slice()].concat()),
+            ("UTF-16BE", [b"\xFE\xFF".as_slice(), utf16be.as_slice()].concat()),
+            ("invalid UTF-8", [UTF8_SIGNATURE, b"[\xFF]"].concat()),
+            ("unfinished marked JSON", [UTF8_SIGNATURE, &export[..export.len() - 1]].concat()),
+        ];
+        for (description, bytes) in invalid {
+            assert!(decode_rule_transfer(&bytes).is_err(), "{description}");
+        }
+    }
+
+    #[test]
     fn exports_valid_rules_without_replacing_a_selected_file() {
         let root = std::env::temp_dir().join(format!("mouzi-rule-transfer-{}", std::process::id()));
         fs::create_dir(&root).unwrap();
@@ -1638,7 +1680,8 @@ mod rule_transfer_tests {
         let root = std::env::temp_dir().join(format!("mouzi-rule-transfer-limits-{}", std::process::id()));
         fs::create_dir(&root).unwrap();
         let path = root.join("rules.json");
-        let file = fs::File::create(&path).unwrap();
+        let mut file = fs::File::create(&path).unwrap();
+        file.write_all(UTF8_SIGNATURE).unwrap();
         file.set_len(MAX_RULE_TRANSFER_BYTES + 1).unwrap();
         drop(file);
         assert!(read_rule_import(&path).unwrap_err().contains("16 MiB"));
