@@ -1784,6 +1784,7 @@ mod tests {
             ("held.r106move", b"held payload"),
             ("good.r106move", b"movable payload"),
             ("ignored.r106skip", b"ignored payload"),
+            ("unmatched.r106other", b"unmatched payload"),
         ]);
         let original = fs::read(&source).unwrap();
         let cancelled = AtomicBool::new(false);
@@ -1800,21 +1801,29 @@ mod tests {
             // for writing. Acquire it only after the verified ZIP extraction.
             let sharing_guard = hold.then(|| OpenOptions::new().read(true).share_mode(1).open(&held).unwrap());
             assert_eq!(crate::rules::is_file_locked(&held), hold);
+            let skipped = ["ignored.r106skip", "unmatched.r106other"].map(|name| staging.join(name));
+            let skip_guards = skipped.each_ref().map(|path| {
+                let guard = OpenOptions::new().read(true).share_mode(1).open(path).unwrap();
+                assert!(crate::rules::is_file_locked(path));
+                guard
+            });
             let sorting = crate::rules::manual_scan_folder_cancelable(
                 staging, &crate::suppress::SuppressionSet::new(), &cancelled,
             );
             let summary = crate::commands::finish_archive_sort(intent, staging, extraction.extracted_files, sorting);
             drop(sharing_guard);
+            drop(skip_guards);
 
-            assert_eq!(summary.extracted_count, Some(3));
+            assert_eq!(summary.extracted_count, Some(4));
             assert_eq!(summary.sorted_count, if hold { 1 } else { 2 });
             assert_eq!(fs::read(staging.join("Filed").join("good.r106move")).unwrap(), b"movable payload");
             assert_eq!(fs::read(staging.join("ignored.r106skip")).unwrap(), b"ignored payload");
+            assert_eq!(fs::read(staging.join("unmatched.r106other")).unwrap(), b"unmatched payload");
             assert_eq!(fs::read(&source).unwrap(), original);
             let manifest: serde_json::Value = serde_json::from_slice(
                 &fs::read(staging.with_extension("manifest.json")).unwrap(),
             ).unwrap();
-            assert_eq!(manifest["extractedCount"], 3);
+            assert_eq!(manifest["extractedCount"], 4);
             assert_eq!(manifest["sortedResults"].as_array().unwrap().len(), summary.sorted_count);
             let conn = db::lock_db().unwrap();
             let staging_prefix = staging.to_string_lossy();
@@ -1836,6 +1845,10 @@ mod tests {
                 assert_eq!(manifest["status"], "partial");
                 assert!(message.as_deref().is_some_and(|message| message.contains(diagnostic)));
                 assert!(manifest["message"].as_str().is_some_and(|message| message.contains(diagnostic)));
+                for name in ["ignored.r106skip", "unmatched.r106other"] {
+                    assert!(!summary.issue.as_deref().unwrap().contains(name));
+                    assert!(!manifest["message"].as_str().unwrap().contains(name));
+                }
                 assert!(manifest["remainingEntries"].as_array().unwrap().iter().any(|row| row["name"] == "held.r106move"));
                 assert!(!staging.join("Filed").join("held.r106move").exists());
             } else {

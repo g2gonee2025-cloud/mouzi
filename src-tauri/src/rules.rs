@@ -145,15 +145,20 @@ pub fn scan_file(path: &Path) -> Option<FileInfo> {
 }
 
 pub(crate) fn describe_file(path: &Path, metadata: &fs::Metadata) -> Option<FileInfo> {
+    let mut info = describe_file_name(path, metadata)?;
+    if info.extension.is_empty() {
+        info.extension = extension_from_header(path).ok().flatten().unwrap_or_default();
+    }
+    Some(info)
+}
+
+fn describe_file_name(path: &Path, metadata: &fs::Metadata) -> Option<FileInfo> {
     let name = path.file_name()?.to_string_lossy().to_string();
-    let mut extension = path
+    let extension = path
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_lowercase();
-    if extension.is_empty() {
-        extension = extension_from_header(path).unwrap_or_default();
-    }
     Some(FileInfo {
         path: path.to_path_buf(),
         name,
@@ -163,18 +168,18 @@ pub(crate) fn describe_file(path: &Path, metadata: &fs::Metadata) -> Option<File
     })
 }
 
-fn extension_from_header(path: &Path) -> Option<String> {
-    let (mut file, _ancestors) = crate::safe_fs::open_guarded_regular_file(path).ok()?;
+fn extension_from_header(path: &Path) -> Result<Option<String>, String> {
+    let (mut file, _ancestors) = crate::safe_fs::open_guarded_regular_file(path)?;
     let mut header = [0u8; 16];
-    let count = file.read(&mut header).ok()?;
+    let count = file.read(&mut header).map_err(|error| error.to_string())?;
     let header = &header[..count];
     if header.starts_with(b"MZ") || header.starts_with(b"\x7fELF")
         || [[0xfe,0xed,0xfa,0xce],[0xfe,0xed,0xfa,0xcf],[0xce,0xfa,0xed,0xfe],[0xcf,0xfa,0xed,0xfe]]
             .iter().any(|magic| header.starts_with(magic))
     {
-        return Some("exe".into());
+        return Ok(Some("exe".into()));
     }
-    infer::get(header).map(|kind| kind.extension().to_ascii_lowercase())
+    Ok(infer::get(header).map(|kind| kind.extension().to_ascii_lowercase()))
 }
 
 pub(crate) fn matches_rule(file: &FileInfo, rule: &Rule) -> bool {
@@ -580,6 +585,31 @@ pub(crate) fn process_watched_file(
     process_file(path, false, &root.path, suppression, ticket, expected_identity, FolderAuthority::RegisteredWatch(root))
 }
 
+fn unavailable_source(path: &Path, authority: FolderAuthority<'_>, reason: String) -> Result<ProcessOutcome, String> {
+    if matches!(authority, FolderAuthority::ArchiveStaging(_)) {
+        // Imported files are retained in staging. A lock matters only if a rule
+        // needs the file or if its eligibility could not be determined.
+        if crate::operations::suspicious_name(path) { return Ok(ProcessOutcome::Skipped); }
+        let metadata = fs::symlink_metadata(path).map_err(|error| format!("{reason}: {error}"))?;
+        if !metadata.is_file() { return Err(reason); }
+        let mut file = describe_file_name(path, &metadata).ok_or_else(|| reason.clone())?;
+        if file.extension.is_empty() {
+            file.extension = extension_from_header(path).map_err(|error| {
+                format!("{reason}. Cannot read file header to select an archive rule: {error}")
+            })?.unwrap_or_default();
+        }
+        let rules = get_rules().map_err(|error| format!("Cannot read organizer rules: {error}"))?;
+        if file.modified_day.is_none() && rules.iter().any(|rule| rule.enabled && rule.folder_id == 0
+            && (rule.options.modified_after.is_some() || rule.options.modified_before.is_some())) {
+            return Err(format!("{reason}. Cannot read modification date to select an archive rule"));
+        }
+        if matching_rule_in_root(&file, None, &[], &rules).is_none_or(|rule| rule.action == "ignore") {
+            return Ok(ProcessOutcome::Skipped);
+        }
+    }
+    Ok(ProcessOutcome::Retry { reason })
+}
+
 fn process_file(
     path: &Path,
     bypass_grace: bool,
@@ -643,14 +673,14 @@ fn process_file(
         return Ok(ProcessOutcome::Retry { reason: "File is still settling".into() });
     }
     if settings.lock_check_enabled && is_file_locked(path) {
-        return Ok(ProcessOutcome::Retry { reason: "File is locked".into() });
+        return unavailable_source(path, authority, "File is locked".into());
     }
     if crate::operations::suspicious_name(path) {
         return Ok(ProcessOutcome::Skipped);
     }
     let (mut source_file, _source_ancestors) = match crate::safe_fs::open_guarded_regular_file(path) {
         Ok(file) => file,
-        Err(error) => return Ok(ProcessOutcome::Retry { reason: error }),
+        Err(error) => return unavailable_source(path, authority, error),
     };
     let identity = crate::safe_fs::identity_from_handle(&source_file)?;
     if expected_identity.is_some_and(|expected| expected != &identity) {
