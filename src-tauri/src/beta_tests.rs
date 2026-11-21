@@ -1,6 +1,41 @@
-use super::{undo_action_with, validate_rule_destination};
+use super::{rule_for_editor, rule_from_editor, undo_action_with, validate_rule_destination};
 use crate::{db, operations as op, rules, suppress::SuppressionSet};
 use std::{fs, path::{Path, PathBuf}, sync::{Arc, MutexGuard}};
+
+#[test]
+fn rule_editor_wire_preserves_exact_u64_sizes_without_altering_file_json() {
+    let mut rule = db::Rule {
+        name: "Exact byte limits".into(), extensions: vec!["*".into()], action: "ignore".into(),
+        options: db::RuleOptions {
+            min_size: Some(u64::MAX - 1), max_size: Some(u64::MAX),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let stored = serde_json::to_value(&rule).unwrap();
+    assert_eq!(stored["options"]["max_size"].as_u64(), Some(u64::MAX));
+    let mut wire = rule_for_editor(rule.clone()).unwrap();
+    assert_eq!(wire["options"]["min_size"], "18446744073709551614");
+    assert_eq!(wire["options"]["max_size"], "18446744073709551615");
+    assert_eq!(rule_from_editor(wire.clone()).unwrap(), rule);
+    assert_eq!(rule_from_editor(stored).unwrap(), rule);
+
+    for invalid in ["1e3", "-1", "1.5", "", "18446744073709551616"] {
+        wire["options"]["min_size"] = serde_json::Value::String(invalid.into());
+        assert_eq!(rule_from_editor(wire.clone()).unwrap_err(), "validation.size");
+    }
+    wire["options"]["min_size"] = serde_json::Value::String(u64::MAX.to_string());
+    assert!(validate_rule_destination(&rule_from_editor(wire.clone()).unwrap()).is_ok());
+    wire["options"]["max_size"] = serde_json::Value::String((u64::MAX - 1).to_string());
+    assert_eq!(validate_rule_destination(&rule_from_editor(wire).unwrap()).unwrap_err(), "validation.size");
+
+    rule.options.min_size = Some(0);
+    rule.options.max_size = None;
+    let ordinary = rule_for_editor(rule.clone()).unwrap();
+    assert_eq!(ordinary["options"]["min_size"].as_u64(), Some(0));
+    assert!(ordinary["options"]["max_size"].is_null());
+    assert_eq!(rule_from_editor(ordinary).unwrap(), rule);
+}
 
 struct Fixture {
     root: PathBuf,

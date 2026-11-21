@@ -1,7 +1,8 @@
 import { Children, isValidElement, type ReactElement, type ReactNode } from "react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import Settings from "../components/Settings";
-import { useAppStore, type AppSettings, type Rule, type ScheduleSettings, type WatchedFolder } from "../store/useAppStore";
+import { RuleConditions } from "../components/BetaControls";
+import { defaultRuleOptions, useAppStore, type AppSettings, type Rule, type ScheduleSettings, type WatchedFolder } from "../store/useAppStore";
 
 const harness = vi.hoisted(() => ({
   invoke: vi.fn(),
@@ -118,6 +119,13 @@ const change = (node: Element, target: { value?: string; checked?: boolean }) =>
 const submit = () => click(requireElement((node) => button("settings.rules.save")(node) || button("settings.rules.edit")(node)));
 const settle = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
 
+function ruleSizeField(label: string) {
+  const conditions = requireElement((node) => node.type === RuleConditions);
+  const tree = RuleConditions(conditions.props as unknown as Parameters<typeof RuleConditions>[0]);
+  const group = requireElement((node) => node.type === "label" && text(node.props.children) === label, tree);
+  return requireElement((node) => node.type === "input", group);
+}
+
 async function remove(name: string) {
   click(requireElement(({ props }) => props["aria-label"] === `confirm.op.deleteRule: ${name}`));
   const confirm = requireElement(({ props }) => props.title === "confirm.op.deleteRule" && !!props.onConfirm);
@@ -130,6 +138,98 @@ const receipts: Rule = { ...invoice, id: 2, name: "Receipts", priority: 6 };
 const db = new Map<number, Rule>();
 let nextId = 10;
 let ruleReadFails = false;
+
+it("rule size draft refuses exponent notation and leaves the saved guard in place", async () => {
+  const guarded = { ...invoice, options: { ...defaultRuleOptions, min_size: 1500, max_size: 5000 } };
+  db.set(1, guarded);
+  useAppStore.setState({ rules: [guarded] });
+  edit("Invoices");
+  change(ruleSizeField("beta.minSize"), { value: "1e3" });
+
+  await submit();
+
+  expect(harness.invoke).not.toHaveBeenCalledWith("update_rule_cmd", expect.anything());
+  expect(db.get(1)?.options?.min_size).toBe(1500);
+  expect(ruleSizeField("beta.minSize").props.value).toBe("1e3");
+  expect(requireElement(button("settings.rules.save")).props.disabled).toBe(true);
+});
+
+it("rule size draft writes the exact integer beyond the JavaScript safe range", async () => {
+  const guarded = { ...invoice, options: { ...defaultRuleOptions, min_size: 1 } };
+  db.set(1, guarded);
+  useAppStore.setState({ rules: [guarded] });
+  edit("Invoices");
+  change(ruleSizeField("beta.minSize"), { value: "9007199254740993" });
+
+  await submit();
+
+  expect(db.get(1)?.options?.min_size).toBe("9007199254740993");
+});
+
+it.each(["1e", "-", "1.25", "  ", "18446744073709551616"])("keeps invalid byte text %s visible without changing saved bounds", async (raw) => {
+  const guarded = { ...invoice, options: { ...defaultRuleOptions, min_size: 20, max_size: 30 } };
+  db.set(1, guarded);
+  useAppStore.setState({ rules: [guarded] });
+  edit("Invoices");
+  change(ruleSizeField("beta.maxSize"), { value: raw });
+
+  expect(ruleSizeField("beta.maxSize").props.value).toBe(raw);
+  expect(ruleSizeField("beta.maxSize").props["aria-invalid"]).toBe(true);
+  await submit();
+  expect(db.get(1)).toEqual(guarded);
+  expect(harness.invoke).not.toHaveBeenCalledWith("update_rule_cmd", expect.anything());
+});
+
+it("blocks an inversion that would round to equal JavaScript numbers", async () => {
+  edit("Invoices");
+  change(ruleSizeField("beta.minSize"), { value: "9007199254740993" });
+  change(ruleSizeField("beta.maxSize"), { value: "9007199254740992" });
+
+  expect(requireElement(button("settings.rules.save")).props.disabled).toBe(true);
+  await submit();
+  expect(harness.invoke).not.toHaveBeenCalledWith("update_rule_cmd", expect.anything());
+});
+
+it("saves zero, positive equal bounds, and then clears only the emptied field", async () => {
+  const limits = { ...defaultRuleOptions, min_size: 3, max_size: 5, modified_after: "2026-01-01", rename_template: "{stem}-kept.{extension}" };
+  const guarded = { ...invoice, options: limits };
+  db.set(1, guarded);
+  useAppStore.setState({ rules: [guarded] });
+  edit("Invoices");
+  change(ruleSizeField("beta.minSize"), { value: "0000" });
+  change(ruleSizeField("beta.maxSize"), { value: "000" });
+  expect(ruleSizeField("beta.minSize").props.value).toBe("0000");
+  await submit();
+  expect(db.get(1)?.options).toEqual({ ...limits, min_size: 0, max_size: 0 });
+
+  edit("Invoices");
+  change(ruleSizeField("beta.minSize"), { value: "0007" });
+  change(ruleSizeField("beta.maxSize"), { value: "7" });
+  expect(ruleSizeField("beta.minSize").props.value).toBe("0007");
+  await submit();
+  expect(db.get(1)?.options).toEqual({ ...limits, min_size: 7, max_size: 7 });
+
+  edit("Invoices");
+  change(ruleSizeField("beta.minSize"), { value: "" });
+  await submit();
+  expect(db.get(1)?.options).toEqual({ ...limits, min_size: null, max_size: 7 });
+});
+
+it("shows the exact stored u64 and preserves it on unrelated edits and the enabled toggle", async () => {
+  const limits = { ...defaultRuleOptions, min_size: "9007199254740993", max_size: "18446744073709551615" };
+  const guarded = { ...invoice, options: limits };
+  db.set(1, guarded);
+  useAppStore.setState({ rules: [guarded] });
+  edit("Invoices");
+  expect(ruleSizeField("beta.minSize").props.value).toBe(limits.min_size);
+  expect(ruleSizeField("beta.maxSize").props.value).toBe(limits.max_size);
+  change(requireElement(nameField), { value: "Exact size" });
+  await submit();
+  expect(db.get(1)).toMatchObject({ name: "Exact size", options: limits });
+
+  await toggle("Exact size");
+  expect(db.get(1)).toMatchObject({ enabled: false, options: limits });
+});
 
 beforeEach(() => {
   harness.slots.length = 0;

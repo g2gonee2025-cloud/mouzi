@@ -20,7 +20,7 @@ export interface Rule {
 }
 
 export interface RuleOptions {
-  min_size: number | null; max_size: number | null;
+  min_size: number | string | null; max_size: number | string | null;
   modified_after: string | null; modified_before: string | null;
   rename_template: string;
 }

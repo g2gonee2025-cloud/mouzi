@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { useAppStore, Rule, ScheduleSettings, WatchedFolder, type PreferencesPatch } from "../store/useAppStore";
+import { defaultRuleOptions, useAppStore, Rule, ScheduleSettings, WatchedFolder, type PreferencesPatch } from "../store/useAppStore";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -9,7 +9,7 @@ import ArchiveImportPanel from "./ArchiveImportPanel";
 import ActionRefreshWarnings from "./ActionRefreshWarnings";
 import HistoryView from "./HistoryView";
 import ReviewQueue from "./ReviewQueue";
-import { RuleConditions, errorText } from "./BetaControls";
+import { RuleConditions, errorText, ruleSizeBounds, type RuleSizeDraft } from "./BetaControls";
 import { nextDestination } from "../utils/rulePath";
 import ConfirmDialog, { type ConfirmRequest } from "./cleanup/ConfirmDialog";
 import {
@@ -228,6 +228,8 @@ export default function Settings() {
   const [reviewPaths, setReviewPaths] = useState<string[] | null>(null);
   const [editingRule, setEditingRule] = useState<Rule | null>(null);
   const [ruleExtensionsInput, setRuleExtensionsInput] = useState<string | null>(null);
+  const [ruleSizeDraft, setRuleSizeDraft] = useState<RuleSizeDraft>({ min_size: "", max_size: "" });
+  const sizeBounds = ruleSizeBounds(ruleSizeDraft);
   const folderPaths = new Map(folders.map((folder) => [folder.id, folder.path]));
   const missingRuleFolder = !!editingRule?.folder_id && !folderPaths.has(editingRule.folder_id);
   const ruleScopeReady = !editingRule?.folder_id || (folderRead.status === "ready" && !missingRuleFolder);
@@ -364,14 +366,24 @@ export default function Settings() {
   const beginRuleEdit = (rule: Rule) => {
     setEditingRule(rule);
     setRuleExtensionsInput(null);
+    setRuleSizeDraft({
+      min_size: String(rule.options?.min_size ?? ""),
+      max_size: String(rule.options?.max_size ?? ""),
+    });
   };
 
   const handleSaveRule = async () => {
-    if (!editingRule || !ruleScopeReady) return;
-    const rule = ruleExtensionsInput === null ? editingRule : {
+    if (!editingRule || !ruleScopeReady || !sizeBounds) return;
+    const rule: Rule = {
       ...editingRule,
-      extensions: ruleExtensionsInput.split(",").map((extension) => extension.trim()),
+      ...(ruleExtensionsInput === null ? {} : {
+        extensions: ruleExtensionsInput.split(",").map((extension) => extension.trim()),
+      }),
     };
+    if (sizeBounds.min_size !== (editingRule.options?.min_size ?? null)
+      || sizeBounds.max_size !== (editingRule.options?.max_size ?? null)) {
+      rule.options = { ...defaultRuleOptions, ...editingRule.options, ...sizeBounds };
+    }
     if (await runWrite(() => rule.id ? updateRule(rule) : addRule(rule))) setEditingRule(null);
   };
 
@@ -860,7 +872,8 @@ export default function Settings() {
                     </select>
                   </label>
                 </div>
-                <RuleConditions rule={editingRule} onChange={setEditingRule} />
+                <RuleConditions rule={editingRule} onChange={setEditingRule} sizeDraft={ruleSizeDraft} invalidSize={!sizeBounds}
+                  onSizeChange={(field, value) => setRuleSizeDraft((draft) => ({ ...draft, [field]: value }))} />
                 {editingRule.action === "move" && (
                   <>
                     <label className="flex items-center gap-2 text-sm">
@@ -891,7 +904,7 @@ export default function Settings() {
                 <div className="flex gap-2">
                   <button
                     onClick={handleSaveRule}
-                    disabled={!ruleScopeReady}
+                    disabled={!ruleScopeReady || !sizeBounds}
                     className="flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-on-primary hover:bg-primary-hover disabled:opacity-50"
                   >
                     <Save size={14} />

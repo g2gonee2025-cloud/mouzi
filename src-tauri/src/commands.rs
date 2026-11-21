@@ -166,8 +166,38 @@ pub fn get_system_language() -> String {
 }
 
 #[tauri::command]
-pub fn get_rules_cmd() -> Result<Vec<Rule>, String> {
-    get_rules().map_err(|e| e.to_string())
+pub fn get_rules_cmd() -> Result<Vec<serde_json::Value>, String> {
+    get_rules().map_err(|error| error.to_string())?.into_iter().map(rule_for_editor).collect()
+}
+
+const RULE_BYTE_FIELDS: [&str; 2] = ["min_size", "max_size"];
+const JS_MAX_SAFE_INTEGER: u64 = (1 << 53) - 1;
+
+// JavaScript cannot represent all u64 integers. Keep this conversion on the
+// Settings wire so the saved and exported Rule representation stays unchanged.
+fn rule_for_editor(rule: Rule) -> Result<serde_json::Value, String> {
+    let mut wire = serde_json::to_value(rule).map_err(|error| error.to_string())?;
+    for field in RULE_BYTE_FIELDS {
+        let Some(value) = wire.get_mut("options").and_then(|options| options.get_mut(field)) else { continue; };
+        if let Some(bytes) = value.as_u64().filter(|&bytes| bytes > JS_MAX_SAFE_INTEGER) {
+            *value = serde_json::Value::String(bytes.to_string());
+        }
+    }
+    Ok(wire)
+}
+
+fn rule_from_editor(mut wire: serde_json::Value) -> Result<Rule, String> {
+    for field in RULE_BYTE_FIELDS {
+        let Some(value) = wire.get_mut("options").and_then(|options| options.get_mut(field)) else { continue; };
+        if let Some(text) = value.as_str() {
+            if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err("validation.size".into());
+            }
+            let bytes = text.parse::<u64>().map_err(|_| "validation.size")?;
+            *value = serde_json::Value::from(bytes);
+        }
+    }
+    serde_json::from_value(wire).map_err(|error| error.to_string())
 }
 
 /// Reject a move rule that could only ever rename a file in place.
@@ -240,13 +270,15 @@ fn reconcile_saved_folders(
 }
 
 #[tauri::command(async)]
-pub fn add_rule_cmd(app: AppHandle, rule: Rule) -> Result<i64, String> {
+pub fn add_rule_cmd(app: AppHandle, rule: serde_json::Value) -> Result<i64, String> {
+    let rule = rule_from_editor(rule)?;
     validate_rule_destination(&rule)?;
     with_configuration(&app, || add_rule(&rule).map_err(|e| e.to_string()))
 }
 
 #[tauri::command(async)]
-pub fn update_rule_cmd(app: AppHandle, rule: Rule) -> Result<(), String> {
+pub fn update_rule_cmd(app: AppHandle, rule: serde_json::Value) -> Result<(), String> {
+    let rule = rule_from_editor(rule)?;
     validate_rule_destination(&rule)?;
     with_configuration(&app, || {
         update_rule(&rule).map_err(|error| match error {
