@@ -379,6 +379,102 @@ fn unavailable_sibling_is_reported_and_healthy_operations_work() {
 }
 
 #[test]
+fn unreadable_review_exclusions_leave_healthy_roots_and_explicit_scope_intact() {
+    let mut fixture = Fixture::new();
+    fixture.add(&fixture.rule());
+    let affected = fixture.write("blocked.txt", "blocked data");
+    let healthy_dir = fixture.root.join("healthy");
+    fs::create_dir(&healthy_dir).unwrap();
+    let healthy_root = RegisteredFolder::manual(&healthy_dir);
+    fixture.add(&db::Rule { folder_id: healthy_root.0, ..fixture.rule() });
+    let healthy = fixture.write("healthy/healthy.txt", "healthy data");
+    let bad_policy = fixture.root.join(".mouziignore");
+    fs::write(&bad_policy, [0xff]).unwrap();
+
+    let exercise = |paths, shown: &[&Path], blocked: &[&Path]| {
+        let preview = op::preview(paths, &fixture.suppression).unwrap();
+        let mut actual = preview.entries.iter().map(|entry| Path::new(&entry.source)).collect::<Vec<_>>();
+        actual.sort();
+        assert_eq!(actual, shown);
+        assert!(preview.entries.iter().all(|entry| entry.error.is_none()));
+        let json = serde_json::to_value(&preview).unwrap();
+        let rows = json.get("blockedRoots").and_then(serde_json::Value::as_array).map(Vec::as_slice).unwrap_or_default();
+        assert_eq!(rows.len(), blocked.len());
+        for root in blocked {
+            let row = rows.iter().find(|row| row["root"].as_str().is_some_and(|path| Path::new(path) == *root)).unwrap();
+            let detail = row["error"].as_str().unwrap();
+            assert!(detail.contains(".mouziignore"));
+            assert!(detail.contains("Unable to read"));
+        }
+        op::discard(&preview.id);
+    };
+
+    exercise(None, &[&healthy], &[&fixture.root]);
+    exercise(Some(vec![healthy.to_string_lossy().into_owned()]), &[&healthy], &[]);
+    exercise(Some(vec![affected.to_string_lossy().into_owned()]), &[], &[&fixture.root]);
+
+    // A healthy preview does not authorize a file after its policy changes.
+    let verified = fixture.preview(&[&healthy]);
+    let healthy_policy = healthy_dir.join(".mouziignore");
+    fs::write(&healthy_policy, [0xff]).unwrap();
+    let failed = fixture.apply(&verified, 0);
+    assert!(!failed.success);
+    assert!(failed.error.unwrap().contains(".mouziignore"));
+    exercise(None, &[], &[&fixture.root, &healthy_dir]);
+    fs::remove_file(&healthy_policy).unwrap();
+
+    // A missing source remains ineligible at execution.
+    let verified = fixture.preview(&[&healthy]);
+    let stored = fs::read(&healthy).unwrap();
+    fs::remove_file(&healthy).unwrap();
+    let failed = fixture.apply(&verified, 0);
+    assert!(!failed.success);
+    assert_eq!(failed.error.as_deref(), Some("preview.changed"));
+    fs::write(&healthy, stored).unwrap();
+
+    fs::remove_file(&bad_policy).unwrap();
+    exercise(None, &[&affected, &healthy], &[]);
+    assert_eq!(fs::read(&affected).unwrap(), b"blocked data");
+    assert_eq!(fs::read(&healthy).unwrap(), b"healthy data");
+    assert!(!fixture.root.join("Sorted").exists());
+    assert!(!healthy_dir.join("Sorted").exists());
+}
+
+#[test]
+fn unreadable_nested_review_exclusions_block_the_whole_owning_root_without_reserving_a_name() {
+    let mut fixture = Fixture::new();
+    let healthy_dir = fixture.root.join("zz-healthy");
+    fs::create_dir(&healthy_dir).unwrap();
+    let healthy_root = RegisteredFolder::manual(&healthy_dir);
+    let bad_parent = fixture.root.join("zz-exclusions");
+    fs::create_dir(&bad_parent).unwrap();
+    let shared_destination = fixture.root.join("Sorted");
+    let original_rule = db::Rule {
+        destination: shared_destination.to_string_lossy().into_owned(),
+        ..fixture.rule()
+    };
+    fixture.add(&original_rule);
+    fixture.add(&db::Rule { folder_id: healthy_root.0, ..original_rule });
+    let earlier = fixture.write("same.txt", "excluded root data");
+    let nested = fixture.write("zz-exclusions/report.txt", "nested data");
+    let healthy = fixture.write("zz-healthy/same.txt", "healthy data");
+    fs::write(bad_parent.join(".mouziignore"), [0xff]).unwrap();
+
+    let preview = fixture.preview(&[&earlier, &nested, &healthy]);
+    assert_eq!(preview.entries.len(), 1);
+    assert_eq!(Path::new(&preview.entries[0].source), &healthy);
+    assert!(preview.entries[0].error.is_none());
+    let destination = preview.entries[0].destination.as_deref().unwrap();
+    assert_eq!(Path::new(destination).file_name(), healthy.file_name());
+    let json = serde_json::to_value(&preview).unwrap();
+    assert_eq!(json["blockedRoots"].as_array().unwrap().len(), 1);
+    assert_eq!(Path::new(json["blockedRoots"][0]["root"].as_str().unwrap()), &fixture.root);
+    assert!(json["blockedRoots"][0]["error"].as_str().unwrap().contains("zz-exclusions"));
+    op::discard(&preview.id);
+    assert!(!shared_destination.exists());
+}
+
+#[test]
 fn unavailable_reviewed_root_fails_independently_at_apply() {
     let mut fixture = Fixture::new();
     let healthy_rule = fixture.rule();
