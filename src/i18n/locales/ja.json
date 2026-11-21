@@ -494,6 +494,8 @@
     "working": "処理中…",
     "failed": "失敗しました: {{error}}",
     "word": "削除",
+    "moveWord": "移動",
+    "restoreWord": "復元",
     "op": {
       "cleanNow": "今すぐファイルを移動",
       "acceptAll": "すべての提案を受け入れる",

@@ -509,6 +509,8 @@
     "working": "Trabajando…",
     "failed": "No se pudo completar: {{error}}",
     "word": "ELIMINAR",
+    "moveWord": "MOVER",
+    "restoreWord": "RESTAURAR",
     "op": {
       "cleanNow": "Mover los archivos ahora",
       "acceptAll": "Aceptar todas las sugerencias",

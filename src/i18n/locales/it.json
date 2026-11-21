@@ -509,6 +509,8 @@
     "working": "Elaborazione…",
     "failed": "Operazione non riuscita: {{error}}",
     "word": "ELIMINA",
+    "moveWord": "SPOSTA",
+    "restoreWord": "RIPRISTINA",
     "op": {
       "cleanNow": "Sposta i file ora",
       "acceptAll": "Accetta tutti i suggerimenti",

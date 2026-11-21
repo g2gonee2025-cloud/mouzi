@@ -509,6 +509,8 @@
     "working": "En cours…",
     "failed": "Échec de l'opération : {{error}}",
     "word": "SUPPRIMER",
+    "moveWord": "DÉPLACER",
+    "restoreWord": "RESTAURER",
     "op": {
       "cleanNow": "Déplacer les fichiers maintenant",
       "acceptAll": "Accepter toutes les suggestions",

@@ -509,6 +509,8 @@
     "working": "Pracuję…",
     "failed": "Nie udało się: {{error}}",
     "word": "USUŃ",
+    "moveWord": "PRZENIEŚ",
+    "restoreWord": "PRZYWRÓĆ",
     "op": {
       "cleanNow": "Przenieś pliki teraz",
       "acceptAll": "Przyjmij wszystkie sugestie",

@@ -504,6 +504,8 @@
     "working": "Wird ausgeführt…",
     "failed": "Das hat nicht geklappt: {{error}}",
     "word": "LÖSCHEN",
+    "moveWord": "VERSCHIEBEN",
+    "restoreWord": "WIEDERHERSTELLEN",
     "op": {
       "cleanNow": "Dateien jetzt verschieben",
       "acceptAll": "Alle Vorschläge annehmen",

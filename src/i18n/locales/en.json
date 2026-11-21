@@ -504,6 +504,8 @@
     "working": "Working…",
     "failed": "That did not work: {{error}}",
     "word": "DELETE",
+    "moveWord": "MOVE",
+    "restoreWord": "RESTORE",
     "op": {
       "cleanNow": "Move files now",
       "acceptAll": "Accept all suggestions",

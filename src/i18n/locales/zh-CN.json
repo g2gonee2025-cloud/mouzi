@@ -494,6 +494,8 @@
     "working": "正在处理…",
     "failed": "操作失败：{{error}}",
     "word": "DELETE",
+    "moveWord": "移动",
+    "restoreWord": "恢复",
     "op": {
       "cleanNow": "立即移动文件",
       "acceptAll": "接受所有建议",
