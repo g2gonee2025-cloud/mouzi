@@ -965,14 +965,18 @@ mod tests {
         assert_eq!(stale_parent_only, BTreeSet::from([sibling]));
     }
 
-    fn probe_unavailable_nested_root(mode: &str) {
+    fn probe_unavailable_nested_root(mode: &str, name: &str, registered_name: &str) {
         let mut fixture = SuggestionInventoryFixture::new();
         let parent = fixture.directory.join("A");
-        let child = parent.join("Child");
+        let child = parent.join(name);
         let peer = fixture.directory.join("Z");
         fixture.register(&parent);
         fixture.register(&peer);
-        let previous_child = fixture.put("A/Child/Subdir/opaque-child.r109probe");
+        if name != registered_name && !safe_fs::guard_directory(&parent).unwrap().has_ascii_case_aliases() {
+            eprintln!("Fixture volume does not confirm a case-insensitive parent");
+            return;
+        }
+        let previous_child = fixture.put(&format!("A/{name}/Subdir/opaque-child.r109probe"));
         let sibling = fixture.put("A/Independent/opaque-sibling.r109probe");
         let anchor_file = fixture.put("A/opaque-anchor.r109probe");
         let outside = fixture.put("Z/opaque-peer.r109probe");
@@ -982,10 +986,14 @@ mod tests {
 
         // The folder picker may return a plain DOS path while the inventory's
         // parent walk used the canonical extended spelling.
+        let typed = parent.join(registered_name);
         #[cfg(windows)]
-        let registration = PathBuf::from(child.to_str().unwrap().strip_prefix(r"\\?\").unwrap());
+        let registration = typed.to_str().unwrap().strip_prefix(r"\\?\")
+            .filter(|path| path.as_bytes().get(1) == Some(&b':'))
+            .map(PathBuf::from).unwrap_or(typed);
         #[cfg(not(windows))]
-        let registration = child.clone();
+        let registration = typed;
+        assert_eq!(safe_fs::file_identity(&registration).unwrap(), safe_fs::file_identity(&child).unwrap());
         fixture.register_with_mode(&registration, mode);
         fs::rename(&child, fixture.directory.join("MovedChild")).unwrap();
 
@@ -993,24 +1001,32 @@ mod tests {
         let result = collect_inventory_suggestions(200, &model, &[], || false).unwrap();
         assert_eq!(fixture.paths(&result), BTreeSet::from([sibling, anchor_file, outside]));
         assert_eq!(*model.0.lock().unwrap(), ["opaque-sibling.r109probe", "opaque-anchor.r109probe", "opaque-peer.r109probe"]);
-        let issues = fixture.policy_issues(result);
+        let wire = serde_json::to_value(result).unwrap();
+        let issues: Vec<_> = wire["policyIssues"].as_array().unwrap().iter()
+            .filter(|issue| issue["root"] == registration.to_str().unwrap()).collect();
         if mode == db::FOLDER_MODE_PAUSED {
             assert!(issues.is_empty());
         } else {
             assert_eq!(issues.len(), 1);
-            assert_eq!(issues[0]["root"], registration.to_str().unwrap());
+            assert!(issues[0]["message"].as_str().unwrap().contains("Cannot inspect"));
         }
         assert_eq!(fs::read(fixture.directory.join("MovedChild/Subdir/opaque-child.r109probe")).unwrap(), b"fixture-only payload");
     }
 
     #[test]
     fn suggestion_policy_listing_preserves_unavailable_nested_root_boundary() {
-        probe_unavailable_nested_root(db::FOLDER_MODE_MANUAL);
+        probe_unavailable_nested_root(db::FOLDER_MODE_MANUAL, "Child", "Child");
     }
 
     #[test]
     fn suggestion_policy_listing_preserves_unavailable_paused_nested_root_boundary() {
-        probe_unavailable_nested_root(db::FOLDER_MODE_PAUSED);
+        probe_unavailable_nested_root(db::FOLDER_MODE_PAUSED, "Child", "Child");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn suggestion_policy_listing_preserves_unavailable_unicode_alias_boundary() {
+        probe_unavailable_nested_root(db::FOLDER_MODE_MANUAL, "Été", "été");
     }
 
     type FakeResponse = Result<TransportResponse, ProviderFailure>;
