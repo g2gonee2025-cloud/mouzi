@@ -2,6 +2,7 @@ import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { Children, isValidElement, type EffectCallback, type ReactNode, type ReactElement } from "react";
 import ReviewQueue from "../components/ReviewQueue";
 import ConfirmDialog from "../components/cleanup/ConfirmDialog";
+import { Results, type OperationResult } from "../components/BetaControls";
 
 const harness = vi.hoisted(() => ({
   slots: [] as unknown[],
@@ -52,6 +53,7 @@ vi.mock("react", async (original) => ({
 let scope: string[] | null;
 let release: (() => void) | undefined;
 const replies: Array<() => Promise<unknown>> = [];
+let applyReply: (() => Promise<OperationResult[]>) | undefined;
 const settled = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
 
 type ControlProps = {
@@ -61,6 +63,7 @@ type ControlProps = {
   disabled?: boolean;
   count?: number;
   preview?: unknown[];
+  results?: OperationResult[];
   onClick?: (event?: { currentTarget: object }) => void;
   onChange?: () => void;
   onConfirm?: () => Promise<void>;
@@ -98,6 +101,21 @@ function checks() {
   return render().filter((node) => node.type === "input" && node.props.type === "checkbox").map((node) => node.props);
 }
 
+function leaveReview() {
+  release?.();
+  release = undefined;
+  harness.slots = [];
+  harness.domains = undefined;
+  harness.pending = undefined;
+}
+
+function approveSelection() {
+  button("beta.apply").onClick?.({ currentTarget: {} });
+  const action = render().find((node) => node.type === ConfirmDialog)?.props.onConfirm;
+  expect(action).toBeDefined();
+  return action!;
+}
+
 type Row = ReturnType<typeof row>;
 function row(sequence: string, file: string, evidence = file, warning = false) {
   return {
@@ -129,19 +147,19 @@ beforeEach(() => {
   harness.domains = undefined;
   harness.pending = undefined;
   replies.length = 0;
+  applyReply = undefined;
   harness.invoke.mockReset().mockImplementation((command: string) => {
     if (command === "preview_cmd") {
       const reply = replies.shift();
       if (!reply) throw new Error("Unexpected preview command");
       return reply();
     }
-    return Promise.resolve(command === "apply_preview_cmd" ? [] : undefined);
+    return command === "apply_preview_cmd" && applyReply ? applyReply() : Promise.resolve(command === "apply_preview_cmd" ? [] : undefined);
   });
 });
 
 afterEach(() => {
-  release?.();
-  release = undefined;
+  leaveReview();
 });
 
 it("shows a blocked root with healthy proposals and distinguishes a fully blocked preview from no matches", async () => {
@@ -287,4 +305,63 @@ it("discards a delayed obsolete refresh response after a new routed scope", asyn
   await settled();
   expect(chosen()).toEqual([true]);
   expect(harness.invoke).toHaveBeenCalledWith("discard_preview_cmd", { id: "obsolete" });
+});
+
+it("keeps a submitted plan and collision receipt through navigation until an explicit scoped refresh", async () => {
+  const selected = row("held", "approved");
+  await initial("held-plan", [selected]);
+  const approve = approveSelection();
+  let finish!: (results: OperationResult[]) => void;
+  applyReply = () => new Promise(resolve => { finish = resolve; });
+  const running = approve();
+  const outcomes = [{ id: selected.id, source: selected.source, success: true, error: null,
+    actualDestination: "C:/Fixture/Filed/approved_0.txt" }];
+  try {
+    leaveReview();
+    expect(harness.invoke).not.toHaveBeenCalledWith("discard_preview_cmd", { id: "held-plan" });
+    scope = ["C:/Fixture/next.txt"];
+    const pending = render();
+    expect(pending.map(node => node.props.children)).toContain("confirm.working");
+    expect(button("beta.refresh").disabled).toBe(true);
+    expect(pending.some(node => node.type === "button" && node.props.children === "beta.apply")).toBe(false);
+    void approve();
+    expect(harness.invoke.mock.calls.filter(([command]) => command === "apply_preview_cmd"))
+      .toEqual([["apply_preview_cmd", { id: "held-plan", selected: ["held-approved"] }]]);
+  } finally {
+    finish(outcomes);
+    await running;
+  }
+  expect(render().find(node => node.type === Results)?.props.results).toEqual(outcomes);
+  leaveReview();
+  expect(render().find(node => node.type === Results)?.props.results).toEqual(outcomes);
+  expect(harness.invoke.mock.calls.filter(([command]) => command === "preview_cmd")).toEqual([["preview_cmd", { paths: null }]]);
+
+  serve("next-plan", [row("next", "next")]);
+  button("beta.refresh").onClick?.();
+  await settled();
+  expect(render().find(node => node.type === Results)?.props.results).toEqual([]);
+  expect(harness.invoke).toHaveBeenCalledWith("preview_cmd", { paths: ["C:/Fixture/next.txt"] });
+  expect(chosen()).toEqual([true]);
+});
+
+it("keeps the exact rejected apply outcome when Review is opened again", async () => {
+  await initial("failing-plan", [row("failing", "a")]);
+  let fail!: (error: string) => void;
+  applyReply = () => new Promise((_, reject) => { fail = reject; });
+  const running = approveSelection()();
+  leaveReview();
+  fail("The reviewed destination is unavailable");
+  await running;
+  render();
+  await settled();
+  expect(render().map(node => node.props.children)).toContain("The reviewed destination is unavailable");
+  expect(harness.invoke).not.toHaveBeenCalledWith("discard_preview_cmd", { id: "failing-plan" });
+});
+
+it("retires an unconfirmed plan when leaving Review", async () => {
+  await initial("unconfirmed-plan", [row("unconfirmed", "a")]);
+  approveSelection();
+  leaveReview();
+  expect(harness.invoke).toHaveBeenCalledWith("discard_preview_cmd", { id: "unconfirmed-plan" });
+  expect(harness.invoke.mock.calls.some(([command]) => command === "apply_preview_cmd")).toBe(false);
 });
