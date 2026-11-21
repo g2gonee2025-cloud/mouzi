@@ -156,7 +156,9 @@ export default function FileListTab({
         headingRef={resultsHeading}
         results={receipt.outcomes}
         onDone={() => {
-          if (store.dismissReceipt(cleanupKind, receipt.planId)) handleFind();
+          if (!store.dismissReceipt(cleanupKind, receipt.planId)) return;
+          if (useCleanupStore.getState().loading) setChecked(new Set());
+          else handleFind();
         }}
         error={receipt.error}
       />

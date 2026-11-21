@@ -65,7 +65,9 @@ export default function EmptyDirsTab() {
         headingRef={resultsHeading}
         results={receipt.outcomes}
         onDone={() => {
-          if (store.dismissReceipt("remove_empty_dir", receipt.planId)) handleFind();
+          if (!store.dismissReceipt("remove_empty_dir", receipt.planId)) return;
+          if (useCleanupStore.getState().loading) setChecked(new Set());
+          else handleFind();
         }}
         error={receipt.error}
       />

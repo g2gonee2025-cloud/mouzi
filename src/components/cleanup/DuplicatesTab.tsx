@@ -66,7 +66,9 @@ export default function DuplicatesTab() {
         headingRef={resultsHeading}
         results={receipt.outcomes}
         onDone={() => {
-          if (store.dismissReceipt("trash_duplicate", receipt.planId)) void handleFind();
+          if (store.dismissReceipt("trash_duplicate", receipt.planId) && !useCleanupStore.getState().loading) {
+            void handleFind();
+          }
         }}
         error={receipt.error}
       />
