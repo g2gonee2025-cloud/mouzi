@@ -21,7 +21,7 @@ const port = fork?.port ?? 19221;
 const endpoint = `http://127.0.0.1:${port}`;
 await mkdir(fixture, { recursive: true });
 const report = { exe, sha256: createHash('sha256').update(await readFile(exe)).digest('hex'), started: new Date().toISOString(), cases: [], errors: [], cleanup: [] };
-if (fork) assert.equal(report.sha256, fork.sha256.toLowerCase(), 'The tested executable changed');
+if (fork) report.launchHashes = [];
 report.contract = fork ? 'fork' : stable ? 'direct-stable' : 'private-beta';
 let child, browser, page, originalSettings, folderId, originalLogs, originalRules, originalFolders;
 let profileReady = false;
@@ -34,6 +34,11 @@ const button = name => page.getByRole('button', { name, exact: true });
 const field = name => fork ? page.getByLabel(name, { exact: true }) : page.getByText(name, { exact: true }).locator('..').locator('input').first();
 async function until(check, message, timeout = 15000) { const end = Date.now() + timeout; while (Date.now() < end) { if (await check()) return; await new Promise(r => setTimeout(r, 150)); } throw Error(message); }
 async function start() {
+  if (fork) {
+    const hash = createHash('sha256').update(await readFile(exe)).digest('hex');
+    assert.equal(hash, fork.sha256.toLowerCase(), 'The executable changed before launch');
+    report.launchHashes.push(hash);
+  }
   const env = fork ? process.env : { ...process.env, WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: '--remote-debugging-port=19221 --remote-debugging-address=127.0.0.1' };
   child = spawn(exe, fork || stable ? ['--add-folder', fixture] : [], { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'], env });
   child.stdout.on('data', chunk => console.log(String(chunk)));

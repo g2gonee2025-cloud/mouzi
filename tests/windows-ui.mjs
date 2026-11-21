@@ -151,6 +151,8 @@ async function main(args) {
     await scenarios({ ...artifact, run, fixture, port, release });
     const out = JSON.parse(await readFile(receipt, 'utf8'));
     assert.equal(out.sha256.toLowerCase(), artifact.sha256);
+    assert.deepEqual(out.launchHashes, [artifact.sha256, artifact.sha256], 'Both launches must use the verified build.');
+    assert.equal((await identify(release)).sha256, artifact.sha256, 'The executable changed during testing.');
     assert.equal(out.contract, 'fork');
     assert.equal(out.profileRestored, true);
     assert(!out.failure && out.errors.length === 0 && out.cases.length === 13 && new Set(out.cases.map(c => c.name)).size === 13 && out.cases.every(c => c.status === 'PASS'), 'Expected all 13 fork scenarios to pass.');
