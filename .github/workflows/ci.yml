@@ -87,6 +87,9 @@ jobs:
           Write-Host "Executable: src-tauri/target/release/mouzi.exe ($($executable.Length) bytes)"
           Write-Host "Executable SHA-256: $($hash.Hash)"
 
+      - name: Exercise the unsigned executable in Windows
+        run: npm run test:windows-ui -- --ci-release
+
   native-trash:
     name: Explicit Windows Recycle Bin integration
     if: github.event_name == 'workflow_dispatch' && inputs.native_trash
