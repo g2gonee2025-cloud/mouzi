@@ -318,6 +318,7 @@
     "scanInactiveRoots": "Resume or enable a watched folder in Settings to scan.",
     "scanAlready": "A scan is already running",
     "revealFailed": "Could not show {{file}} in its folder. It may have moved or been removed.",
+    "rootRevealFailed": "Could not show the watched folder {{path}}. Check that it exists, then try again.",
     "refresh": "Refresh",
     "searchFiles": "Search files",
     "noIndexedFiles": "No files are indexed in your watched folders.",

@@ -318,6 +318,7 @@
     "scanInactiveRoots": "Riattiva una cartella monitorata in Impostazioni per avviare la scansione.",
     "scanAlready": "Una scansione è già in corso",
     "revealFailed": "Impossibile mostrare {{file}} nella sua cartella. Il file potrebbe essere stato spostato o rimosso.",
+    "rootRevealFailed": "Impossibile mostrare la cartella monitorata {{path}}. Verifica che esista e riprova.",
     "refresh": "Aggiorna",
     "searchFiles": "Cerca file",
     "noIndexedFiles": "Nessun file è indicizzato nelle cartelle osservate.",

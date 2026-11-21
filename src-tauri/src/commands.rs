@@ -868,7 +868,10 @@ pub fn cancel_archive_import_cmd(app: AppHandle, job_id: Option<u64>) -> Result<
 }
 
 #[tauri::command]
-pub fn open_folder_cmd(path: String) -> Result<(), String> {
+pub fn open_folder_cmd(path: String, directory_only: Option<bool>) -> Result<(), String> {
+    if directory_only.unwrap_or(false) {
+        return open_folder_path(&path);
+    }
     if path.starts_with("http://") || path.starts_with("https://") {
         return open_web_url(&path);
     }

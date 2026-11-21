@@ -318,6 +318,7 @@
     "scanInactiveRoots": "Réactivez un dossier surveillé dans Réglages pour lancer une analyse.",
     "scanAlready": "Une analyse est déjà en cours",
     "revealFailed": "Impossible d’afficher {{file}} dans son dossier. Le fichier a peut-être été déplacé ou supprimé.",
+    "rootRevealFailed": "Impossible d’afficher le dossier surveillé {{path}}. Vérifiez qu’il existe, puis réessayez.",
     "refresh": "Actualiser",
     "searchFiles": "Rechercher des fichiers",
     "noIndexedFiles": "Aucun fichier n’est indexé dans vos dossiers surveillés.",

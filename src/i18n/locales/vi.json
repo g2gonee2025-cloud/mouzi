@@ -324,6 +324,7 @@
     "scanInactiveRoots": "Tiếp tục theo dõi hoặc bật một thư mục trong Cài đặt để quét.",
     "scanAlready": "Đã có một lần quét đang chạy",
     "revealFailed": "Không thể hiển thị {{file}} trong thư mục. Tệp có thể đã bị di chuyển hoặc xóa.",
+    "rootRevealFailed": "Không thể hiển thị thư mục đang theo dõi {{path}}. Hãy kiểm tra xem thư mục có tồn tại rồi thử lại.",
     "refresh": "Làm mới",
     "searchFiles": "Tìm tệp",
     "noIndexedFiles": "Chưa có tệp nào được lập chỉ mục trong các thư mục theo dõi.",

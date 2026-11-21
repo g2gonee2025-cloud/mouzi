@@ -318,6 +318,7 @@
     "scanInactiveRoots": "请在设置中恢复或启用一个监控文件夹，然后开始扫描。",
     "scanAlready": "正在进行另一次扫描",
     "revealFailed": "无法在文件夹中显示 {{file}}。文件可能已被移动或删除。",
+    "rootRevealFailed": "无法显示监控文件夹 {{path}}。请确认该文件夹存在，然后重试。",
     "refresh": "刷新",
     "searchFiles": "搜索文件",
     "noIndexedFiles": "监控文件夹中没有已建立索引的文件。",

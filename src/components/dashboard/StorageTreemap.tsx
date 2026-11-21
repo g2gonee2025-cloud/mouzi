@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { useEffect, useId, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { invoke } from "@tauri-apps/api/core";
 import { FolderOpen } from "lucide-react";
@@ -14,6 +14,11 @@ interface StorageTreemapProps {
   onSelect?: (path: string | null) => void;
 }
 
+interface RootReveal {
+  attempt: symbol;
+  failed: boolean;
+}
+
 export default function StorageTreemap({
   data,
   totalBytes,
@@ -21,11 +26,21 @@ export default function StorageTreemap({
   onSelect,
 }: StorageTreemapProps) {
   const { t } = useTranslation();
+  const revealErrorId = useId();
+  const [reveals, setReveals] = useState<ReadonlyMap<string, RootReveal>>(new Map());
 
   const sorted = useMemo(
     () => [...data].sort((a, b) => b.bytes - a.bytes),
     [data],
   );
+
+  useEffect(() => {
+    const listed = new Set(data.map(({ path }) => path));
+    setReveals((current) => {
+      const retained = new Map([...current].filter(([path]) => listed.has(path)));
+      return retained.size === current.size ? current : retained;
+    });
+  }, [data]);
 
   if (sorted.length === 0) {
     return (
@@ -39,21 +54,36 @@ export default function StorageTreemap({
   }
 
   const openRoot = async (path: string) => {
+    const attempt = Symbol();
+    setReveals((current) => {
+      const updated = new Map(current);
+      updated.set(path, { attempt, failed: current.get(path)?.failed ?? false });
+      return updated;
+    });
+    let failed = false;
     try {
-      await invoke("open_folder_cmd", { path });
+      await invoke("open_folder_cmd", { path, directoryOnly: true });
     } catch {
-      // ignore
+      failed = true;
     }
+    setReveals((current) => {
+      if (current.get(path)?.attempt !== attempt) return current;
+      const updated = new Map(current);
+      if (failed) updated.set(path, { attempt, failed });
+      else updated.delete(path);
+      return updated;
+    });
   };
 
   return (
     <div className="rounded-xl border border-border bg-surface-dark p-4 h-full">
       <h3 className="text-sm font-semibold text-text mb-3">{t("dashboard.watchedRoots")}</h3>
       <div className="space-y-2">
-        {sorted.map((item) => {
+        {sorted.map((item, index) => {
           const pct = percentOf(item.bytes, totalBytes);
           const isOn = selected === item.path;
           const label = fileName(item.path) || item.path;
+          const errorId = reveals.get(item.path)?.failed ? `${revealErrorId}-${index}` : undefined;
           return (
             <div
               key={item.path}
@@ -99,12 +129,18 @@ export default function StorageTreemap({
                   type="button"
                   onClick={() => openRoot(item.path)}
                   aria-label={`${t("dashboard.openFolder")}: ${label}`}
+                  aria-describedby={errorId}
                   className="inline-flex items-center justify-center w-6 h-6 rounded text-text-muted hover:text-text hover:bg-border shrink-0 focus-visible:outline-2 focus-visible:outline-primary focus-visible:outline-offset-1"
                   title={t("dashboard.openFolder")}
                 >
                   <FolderOpen size={13} aria-hidden="true" />
                 </button>
               </div>
+              {errorId && (
+                <p id={errorId} role="alert" className="mt-1 text-xs text-red-700 dark:text-red-400 [overflow-wrap:anywhere]">
+                  {t("dashboard.rootRevealFailed", { path: item.path })}
+                </p>
+              )}
             </div>
           );
         })}

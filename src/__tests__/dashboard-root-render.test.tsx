@@ -45,9 +45,12 @@ vi.mock("react", async (importOriginal) => {
 
 vi.mock("react-i18next", () => ({
   useTranslation: () => ({
-    t: (key: string, values?: { date?: string; name?: string }) => {
+    t: (key: string, values?: { date?: string; name?: string; path?: string }) => {
       if (key === "dashboard.rootLastScan") return en.dashboard.rootLastScan.replace("{{date}}", values?.date ?? "{{date}}");
       if (key === "dashboard.clearFilter") return en.dashboard.clearFilter.replace("{{name}}", values?.name ?? "{{name}}");
+      if (key === "dashboard.rootRevealFailed") {
+        return (en.dashboard as Record<string, string>).rootRevealFailed?.replace("{{path}}", values?.path ?? "{{path}}") ?? key;
+      }
       return key === "categories.Documents" ? "Documentos" : key;
     },
   }),
@@ -103,6 +106,42 @@ function findElement<Props>(tree: ReactNode, matches: (element: ReactElement<Pro
     const nested = findElement(node.props.children, matches);
     if (nested) return nested;
   }
+}
+
+function renderStorageRoots(data: RootStat[], onSelect = vi.fn(), selected?: string) {
+  let tree: ReactNode;
+  function CaptureStorage() {
+    mock.cursor = 0;
+    mock.renderingDashboard = true;
+    try {
+      tree = StorageTreemap({ data, totalBytes: 0, onSelect, selected });
+      return tree;
+    } finally {
+      mock.renderingDashboard = false;
+    }
+  }
+  const html = renderToStaticMarkup(<CaptureStorage />);
+  for (const effect of mock.effects.splice(0)) effect();
+  return { html, tree };
+}
+
+function revealRoot(tree: ReactNode, name: string) {
+  const action = findElement<{
+    "aria-label"?: string; "aria-describedby"?: string; onClick?: () => Promise<void>;
+  }>(tree, (element) => element.type === "button" && element.props["aria-label"] === `dashboard.openFolder: ${name}`);
+  if (!action?.props.onClick) throw new Error(`Show in folder was absent for ${name}`);
+  return { click: action.props.onClick, description: action.props["aria-describedby"] };
+}
+
+function rootAlert(tree: ReactNode) {
+  return findElement<{ id?: string; role?: string }>(tree, (element) => element.props.role === "alert");
+}
+
+function deferredReveal() {
+  let resolve!: () => void;
+  let reject!: (error: Error) => void;
+  const result = new Promise<void>((success, failure) => { resolve = success; reject = failure; });
+  return { result, resolve, reject };
 }
 
 function clickActivityRetry(tree: ReactNode) {
@@ -467,5 +506,65 @@ describe("configured root presentation", () => {
     expect(activity).not.toContain("categories.My receipts");
     expect(activity).toContain("Documents");
     expect(activity).not.toContain("Documentos");
+  });
+});
+
+describe("watched-root Show in folder", () => {
+  it("opens the exact root in directory-only mode", async () => {
+    mock.invoke.mockResolvedValueOnce(undefined);
+    await revealRoot(renderStorageRoots([root]).tree, "empty-work").click();
+    expect(mock.invoke.mock.calls).toEqual([["open_folder_cmd", { path: root.path, directoryOnly: true }]]);
+  });
+
+  it("shows a row-specific alert and clears it only when the same root successfully opens", async () => {
+    const peer = { ...root, path: "D:/success/working" };
+    const selected = vi.fn();
+    const current = () => renderStorageRoots([root, peer], selected, root.path);
+    mock.invoke.mockRejectedValueOnce(new Error("Fixture directory is missing"));
+    await revealRoot(current().tree, "empty-work").click();
+
+    const failed = current();
+    expect(failed.html).toContain(`Could not show the watched folder ${root.path}. Check that it exists, then try again.`);
+    const alert = rootAlert(failed.tree);
+    expect(alert?.props.id).toBeTruthy();
+    expect(revealRoot(failed.tree, "empty-work").description).toBe(alert?.props.id);
+    expect(revealRoot(failed.tree, "working").description).toBeUndefined();
+    const filter = findElement<{
+      title?: string; "aria-pressed"?: boolean; onClick?: () => void;
+    }>(failed.tree, (element) => element.type === "button" && element.props.title === root.path);
+    expect(filter?.props["aria-pressed"]).toBe(true);
+    filter?.props.onClick?.();
+    expect(selected).toHaveBeenCalledExactlyOnceWith(null);
+
+    mock.invoke.mockResolvedValueOnce(undefined);
+    await revealRoot(failed.tree, "working").click();
+    expect(rootAlert(current().tree)).toBeDefined();
+    const retry = deferredReveal();
+    mock.invoke.mockReturnValueOnce(retry.result);
+    const pending = revealRoot(current().tree, "empty-work").click();
+    expect(rootAlert(current().tree)).toBeDefined();
+    retry.resolve();
+    await pending;
+    expect(rootAlert(current().tree)).toBeUndefined();
+  });
+
+  it("ignores older attempts and completions for removed roots", async () => {
+    const old = deferredReveal();
+    mock.invoke.mockReturnValueOnce(old.result).mockRejectedValueOnce(new Error("Newest reveal failed"));
+    const first = revealRoot(renderStorageRoots([root]).tree, "empty-work").click();
+    await revealRoot(renderStorageRoots([root]).tree, "empty-work").click();
+    expect(rootAlert(renderStorageRoots([root]).tree)).toBeDefined();
+    old.resolve();
+    await first;
+    expect(rootAlert(renderStorageRoots([root]).tree)).toBeDefined();
+
+    const beforeRemoval = deferredReveal();
+    mock.invoke.mockReturnValueOnce(beforeRemoval.result);
+    const removed = revealRoot(renderStorageRoots([root]).tree, "empty-work").click();
+    expect(rootAlert(renderStorageRoots([]).tree)).toBeUndefined();
+    expect(rootAlert(renderStorageRoots([root]).tree)).toBeUndefined();
+    beforeRemoval.reject(new Error("The previous root went away"));
+    await removed;
+    expect(rootAlert(renderStorageRoots([root]).tree)).toBeUndefined();
   });
 });

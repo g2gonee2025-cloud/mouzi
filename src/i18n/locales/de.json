@@ -318,6 +318,7 @@
     "scanInactiveRoots": "Setze die Überwachung eines Ordners in den Einstellungen fort oder aktiviere einen Ordner, um zu scannen.",
     "scanAlready": "Ein Scan läuft bereits",
     "revealFailed": "{{file}} konnte nicht im Ordner angezeigt werden. Die Datei wurde möglicherweise verschoben oder entfernt.",
+    "rootRevealFailed": "Der überwachte Ordner {{path}} konnte nicht angezeigt werden. Prüfen Sie, ob er noch vorhanden ist, und versuchen Sie es erneut.",
     "refresh": "Aktualisieren",
     "searchFiles": "Dateien suchen",
     "noIndexedFiles": "In deinen überwachten Ordnern sind keine Dateien indexiert.",

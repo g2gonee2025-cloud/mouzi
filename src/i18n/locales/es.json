@@ -318,6 +318,7 @@
     "scanInactiveRoots": "Reanuda o activa una carpeta vigilada en Ajustes para escanear.",
     "scanAlready": "Ya hay un escaneo en curso",
     "revealFailed": "No se pudo mostrar {{file}} en su carpeta. Es posible que se haya movido o eliminado.",
+    "rootRevealFailed": "No se pudo mostrar la carpeta supervisada {{path}}. Comprueba que existe y vuelve a intentarlo.",
     "refresh": "Actualizar",
     "searchFiles": "Buscar archivos",
     "noIndexedFiles": "No hay archivos indexados en tus carpetas vigiladas.",
