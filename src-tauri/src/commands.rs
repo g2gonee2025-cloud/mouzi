@@ -2481,6 +2481,51 @@ mod undo_tests {
         insert_log(&format!("2026-01-01T00:00:{rank:02}Z"), source, dest);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn undo_reconciles_the_inventory_after_a_case_only_rename() {
+        use std::collections::BTreeMap;
+        use std::fs;
+
+        let fixture = UndoFixture::new("inventory_spelling");
+        let root = fixture.root().to_str().unwrap();
+        struct Registration(i64);
+        impl Drop for Registration {
+            fn drop(&mut self) { let _ = remove_watched_folder(self.0); }
+        }
+        let _registered = Registration(register_watched_folder(root, FOLDER_MODE_MANUAL, false).unwrap());
+        let (source, dest) = stage(fixture.root(), "report.undocheck");
+        let (control_source, control_dest) = stage(fixture.root(), "plain.undocheck");
+        let time = "2026-01-01T00:00:00Z";
+        let changed = insert_log(time, &source, Some(&dest));
+        let control = insert_log(time, &control_source, Some(&control_dest));
+        let old_identity = crate::safe_fs::file_identity(Path::new(&dest)).unwrap();
+        let temporary = Path::new(&dest).with_file_name("intermediate.undocheck");
+        let renamed = Path::new(&dest).with_file_name("Report.undocheck");
+        fs::rename(&dest, &temporary).unwrap();
+        fs::rename(&temporary, &renamed).unwrap();
+        assert_eq!(crate::safe_fs::file_identity(Path::new(&dest)).unwrap(), old_identity,
+            "the Windows fixture needs ordinary case-insensitive lookup of the recorded path");
+
+        let scan = crate::scan::scan_roots(&[root.to_owned()], |_| {});
+        assert_eq!(scan[0].status, "complete", "{:?}", scan[0].error);
+        assert_eq!((scan[0].files, scan[0].bytes), (2, 14));
+        let inventory = || get_inventory_files("size", None, Some(root), None, 10).unwrap()
+            .into_iter().map(|row| (row.path, row.size)).collect::<BTreeMap<_, _>>();
+        let renamed = renamed.to_str().unwrap().to_owned();
+        assert_eq!(inventory(), BTreeMap::from([(renamed.clone(), 7), (control_dest, 7)]));
+
+        let ignored = ignored_files();
+        assert_eq!(undo_action_with(control, &ignored).unwrap().status, "ok");
+        assert_eq!(inventory(), BTreeMap::from([(renamed.clone(), 7), (control_source.clone(), 7)]));
+        assert_eq!(undo_action_with(changed, &ignored).unwrap().status, "ok");
+        assert_eq!(undone_of(&source), 1);
+        assert_eq!(fs::read(&source).unwrap(), b"payload");
+        assert_eq!(fs::read(&control_source).unwrap(), b"payload");
+        assert!(!Path::new(&renamed).exists());
+        assert_eq!(inventory(), BTreeMap::from([(source, 7), (control_source, 7)]));
+    }
+
     #[test]
     fn undo_leaves_present_legacy_destination_and_history_alone() {
         let fixture = UndoFixture::new("legacy_identity");
