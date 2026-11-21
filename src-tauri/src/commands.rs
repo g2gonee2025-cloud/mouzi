@@ -982,8 +982,15 @@ pub fn get_downloads_folder() -> Result<String, String> {
 #[tauri::command(async)]
 pub fn initialize_defaults_cmd(app: AppHandle) -> Result<(), String> {
     let downloads = get_downloads_folder()?;
-    crate::safe_fs::validate_root(Path::new(&downloads))?;
-    with_configuration(&app, || initialize_defaults_atomic(&downloads, FOLDER_MODE_MANUAL).map_err(|e| e.to_string()))
+    with_configuration(&app, || initialize_downloads_defaults(&downloads))
+}
+
+fn initialize_downloads_defaults(downloads: &str) -> Result<(), String> {
+    let path = Path::new(downloads);
+    let _guard = crate::safe_fs::guard_directory(path)?;
+    let canonical = crate::safe_fs::validate_root(path)?;
+    let identity = crate::safe_fs::file_identity(&canonical)?;
+    initialize_defaults_atomic(downloads, FOLDER_MODE_MANUAL, &identity).map_err(|error| error.to_string())
 }
 
 #[tauri::command]

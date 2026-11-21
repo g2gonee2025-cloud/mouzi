@@ -379,6 +379,29 @@ fn unavailable_sibling_is_reported_and_healthy_operations_work() {
 }
 
 #[test]
+fn default_downloads_registration_is_ready_immediately_and_keeps_its_original_identity() {
+    let mut fixture = Fixture::new();
+    fixture.add(&fixture.rule());
+    let downloads = fixture.root.join("Downloads");
+    fs::create_dir(&downloads).unwrap();
+    let path = downloads.to_str().unwrap();
+    super::initialize_downloads_defaults(path).unwrap();
+    let registration = || db::get_watched_folders().unwrap().into_iter().find(|row| row.path == path).unwrap();
+    let row = registration();
+    let _folder = RegisteredFolder(row.id.unwrap());
+    let original = crate::safe_fs::file_identity(&downloads).unwrap().key();
+    assert_eq!(row.watch_identity.as_ref(), Some(&original));
+    assert_eq!(crate::safe_fs::eligible_scope(&[row]).unwrap().active_roots().len(), 1);
+
+    fs::rename(&downloads, fixture.root.join("previous")).unwrap();
+    fs::create_dir(&downloads).unwrap();
+    super::initialize_downloads_defaults(path).unwrap();
+    let row = registration();
+    assert_eq!(row.watch_identity.as_ref(), Some(&original));
+    assert!(crate::safe_fs::eligible_scope(&[row]).unwrap().active_roots().is_empty());
+}
+
+#[test]
 fn manual_review_skips_replaced_and_unbound_nested_roots_until_registered_identity_returns() {
     let mut fixture = Fixture::new();
     fixture.add(&db::Rule { folder_id: 0, ..fixture.rule() });

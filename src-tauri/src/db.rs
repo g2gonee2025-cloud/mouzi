@@ -562,10 +562,13 @@ fn insert_default_rules_on(conn:&Connection)->SqliteResult<()> {
     Ok(())
 }
 
-pub fn initialize_defaults_atomic(downloads:&str,mode:&str)->SqliteResult<()> {
+pub fn initialize_defaults_atomic(downloads: &str, mode: &str, identity: &crate::safe_fs::FileIdentity) -> SqliteResult<()> {
     let ancestors = configured_inventory_ancestors(downloads, &get_watched_folders()?);
     let mut conn=sqlite_lock()?;let tx=conn.transaction()?;
-    let changed = tx.execute("INSERT OR IGNORE INTO watched_folders(path,enabled,mode) VALUES(?1,1,?2)",params![downloads,mode])?;
+    let changed = tx.execute(
+        "INSERT OR IGNORE INTO watched_folders(path,enabled,mode,watch_identity) VALUES(?1,1,?2,?3)",
+        params![downloads, mode, identity.key()],
+    )?;
     tx.execute("INSERT OR IGNORE INTO inventory_roots(root_path) VALUES(?1)",[downloads])?;
     if changed > 0 {
         mark_inventory_ancestors_stale(&tx, &ancestors)?;
