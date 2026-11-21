@@ -213,31 +213,76 @@ fn inventory_paths() -> Result<Vec<CleanupFile>, String> {
     db::get_large_files_from_inventory(0).map_err(|error| format!("Cannot read file inventory: {error}"))
 }
 
+const MAX_DUPLICATE_WORKERS: usize = 8;
+const DUPLICATE_FILES_PER_WORKER: usize = 128;
+// Overlapping finder and review requests can still proceed serially.
+static PARALLEL_DUPLICATE_DISCOVERY: Mutex<()> = Mutex::new(());
+
+fn inspect_duplicate_paths<'a, P: AsRef<str> + Sync, T: Send>(
+    paths: &'a [P],
+    worker_limit: usize,
+    inspect: impl Fn(&Path) -> Option<T> + Sync,
+) -> Vec<(&'a str, T)> {
+    let inspect_batch = |batch: &'a [P]| {
+        batch.iter().filter_map(|path| {
+            let path = path.as_ref();
+            inspect(Path::new(path)).map(|file| (path, file))
+        }).collect::<Vec<_>>()
+    };
+    let workers = worker_limit.min(paths.len().div_ceil(DUPLICATE_FILES_PER_WORKER));
+    if workers <= 1 {
+        return inspect_batch(paths);
+    }
+
+    // Complete each batch independently, then gather in input order before
+    // deduplicating physical identities. Never let the fastest alias win.
+    let mut batches = paths.chunks(paths.len().div_ceil(workers));
+    let first = batches.next().expect("parallel discovery has at least one batch");
+    std::thread::scope(|scope| {
+        let work = batches.map(|batch| {
+            std::thread::Builder::new().spawn_scoped(scope, || inspect_batch(batch))
+                .map_err(|_| inspect_batch(batch))
+        }).collect::<Vec<_>>();
+        let mut files = inspect_batch(first);
+        for batch in work {
+            files.extend(match batch {
+                Ok(worker) => worker.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+                Err(files) => files,
+            });
+        }
+        files
+    })
+}
+
 fn duplicate_candidates(scope: &safe_fs::RootScope) -> Result<Vec<(String, FileFingerprint)>, String> {
+    let paths: Vec<_> = inventory_paths()?.into_iter().map(|row| row.path).collect();
+    let parallel = (paths.len() > DUPLICATE_FILES_PER_WORKER)
+        .then(|| PARALLEL_DUPLICATE_DISCOVERY.try_lock().ok()).flatten();
+    let worker_limit = if parallel.is_some() {
+        std::thread::available_parallelism().map_or(1, |count| count.get().min(MAX_DUPLICATE_WORKERS))
+    } else {
+        1
+    };
     let mut seen = HashSet::new();
-    let mut by_size: HashMap<u64, Vec<String>> = HashMap::new();
-    for row in inventory_paths()? {
-        if let Ok(current) = scope.validate_file(Path::new(&row.path)) {
-            // A hard-link entry does not independently reclaim a file's bytes.
-            if current.link_count == 1 && seen.insert(current.identity) {
-                by_size.entry(current.metadata.len()).or_default().push(row.path);
-            }
+    let mut by_size: HashMap<u64, Vec<&str>> = HashMap::new();
+    for (path, (identity, size)) in inspect_duplicate_paths(&paths, worker_limit, |path| {
+        let current = scope.validate_file(path).ok()?;
+        // A hard-link entry does not independently reclaim a file's bytes.
+        (current.link_count == 1).then(|| (current.identity, current.metadata.len()))
+    }) {
+        if seen.insert(identity) {
+            by_size.entry(size).or_default().push(path);
         }
     }
-    let mut files = Vec::new();
+    let same_size: Vec<_> = by_size.into_values().filter(|paths| paths.len() > 1).flatten().collect();
     let mut seen = HashSet::new();
     // Size is a live, cheap candidate filter; every reported match still uses
     // one full-content digest domain and no persisted hash evidence.
-    for paths in by_size.into_values().filter(|paths| paths.len() > 1) {
-        for path in paths {
-            if let Ok(current) = fingerprint(scope, Path::new(&path)) {
-                if current.links == 1 && seen.insert(current.identity.clone()) {
-                    files.push((path, current));
-                }
-            }
-        }
-    }
-    Ok(files)
+    Ok(inspect_duplicate_paths(&same_size, worker_limit, |path| fingerprint(scope, path).ok())
+        .into_iter()
+        .filter(|(_, current)| current.links == 1 && seen.insert(current.identity.clone()))
+        .map(|(path, current)| (path.to_owned(), current))
+        .collect())
 }
 
 pub fn find_duplicates() -> Result<FinderResult<DuplicateGroup>, String> {
@@ -1043,6 +1088,26 @@ mod tests {
         let groups = result.candidates();
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].files.len(), 2);
+    }
+
+    #[test]
+    fn duplicate_batches_keep_input_order_after_a_later_batch_runs_first() {
+        let paths: Vec<_> = (0..DUPLICATE_FILES_PER_WORKER * 2).map(|index| index.to_string()).collect();
+        let (later_started, later_ready) = std::sync::mpsc::sync_channel(1);
+        let later_ready = Mutex::new(later_ready);
+        let inspect = |path: &Path| {
+            let index = path.to_str().unwrap().parse::<usize>().unwrap();
+            if index == 0 {
+                later_ready.lock().unwrap().recv_timeout(Duration::from_secs(5)).unwrap();
+            } else if index == DUPLICATE_FILES_PER_WORKER {
+                later_started.send(()).unwrap();
+            }
+            (index % 3 != 0).then_some(index)
+        };
+        let expected: Vec<_> = paths.iter().enumerate()
+            .filter(|(index, _)| index % 3 != 0)
+            .map(|(index, path)| (path.as_str(), index)).collect();
+        assert_eq!(inspect_duplicate_paths(&paths, 2, inspect), expected);
     }
 
     #[test]
