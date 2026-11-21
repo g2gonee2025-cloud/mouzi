@@ -80,6 +80,8 @@ interface Props {
   role?: string;
   title?: string;
   "aria-label"?: string;
+  "aria-checked"?: boolean;
+  "aria-describedby"?: string;
   "aria-invalid"?: boolean;
   onClick?: (event: { currentTarget: HTMLButtonElement }) => unknown;
   onChange?: (event: { target: { value?: string; checked?: boolean } }) => void;
@@ -506,14 +508,56 @@ const saveSchedule = () => scheduleAction("common.save");
 const scheduleCount = () => requireElement((node) => node.type === "select" && node.props["aria-label"] === "settings.scheduler.timesPerDay");
 const scheduleSwitch = () => requireElement(({ props }) => props.role === "switch" && props["aria-label"] === "settings.scheduler.enable");
 const graceNumber = () => requireElement((node) => node.type === "input" && node.props.type === "number" && node.props["aria-label"] === "settings.general.gracePeriod");
+const startupSwitch: Match = ({ props }) => props.role === "switch" && props["aria-label"] === "settings.general.startWithSystem";
 
 it("waits for the Windows startup status even if an older profile saved On", () => {
   openScheduler({ autostart: true });
   const general = editor();
-  expect.soft(find(general, ({ props }) => props.role === "switch"
-    && props["aria-label"] === "settings.general.startWithSystem")).toBeUndefined();
+  expect.soft(find(general, startupSwitch)).toBeUndefined();
   expect.soft(text(general)).toContain("settings.general.startupLoading");
   expect(requireElement(({ props }) => props["aria-label"] === "settings.general.theme", general).props.disabled).toBe(false);
+});
+
+it("retries a failed startup lookup and can explicitly enable a Windows-blocked registration", async () => {
+  openScheduler({ autostart: true });
+  harness.invoke.mockRejectedValueOnce("Registration read was denied");
+  await useAppStore.getState().loadStartupStatus();
+  expect(find(editor(), startupSwitch)).toBeUndefined();
+  expect(text(editor())).toContain("settings.general.startupReadError Registration read was denied");
+
+  harness.invoke.mockResolvedValueOnce("blockedBySystem");
+  click(requireElement(button("common.retry")));
+  await settle();
+  expect(requireElement(startupSwitch).props).toMatchObject({ "aria-checked": false, "aria-describedby": "startup-blocked-note" });
+  expect(text(editor())).toContain("settings.general.startupBlocked");
+  expect(text(editor())).not.toContain("settings.general.startupReadError");
+
+  harness.invoke.mockResolvedValueOnce("enabled").mockResolvedValueOnce("enabled");
+  click(requireElement(startupSwitch));
+  expect(find(editor(), startupSwitch)).toBeUndefined();
+  expect(text(editor())).toContain("settings.general.startupSaving");
+  await settle();
+  expect(requireElement(startupSwitch).props["aria-checked"]).toBe(true);
+  expect(harness.invoke.mock.calls).toEqual([
+    ["get_startup_status_cmd"], ["get_startup_status_cmd"], ["set_startup_enabled_cmd", { enabled: true }], ["get_startup_status_cmd"],
+  ]);
+});
+
+it("keeps unavailable startup and a verified failed change separate from other preferences", async () => {
+  openScheduler({ autostart: true });
+  harness.invoke.mockResolvedValueOnce("unavailable");
+  await useAppStore.getState().loadStartupStatus();
+  expect(find(editor(), startupSwitch)).toBeUndefined();
+  expect(text(editor())).toContain("settings.general.startupUnavailable");
+
+  harness.invoke.mockResolvedValueOnce("enabled").mockRejectedValueOnce("Windows refused the change").mockResolvedValueOnce("enabled");
+  await useAppStore.getState().loadStartupStatus();
+  click(requireElement(startupSwitch));
+  await settle();
+  expect(requireElement(startupSwitch).props["aria-checked"]).toBe(true);
+  expect(text(editor())).toContain("settings.general.startupWriteError Windows refused the change");
+  expect(requireElement(({ props }) => props["aria-label"] === "settings.general.theme").props.disabled).toBe(false);
+  expect(harness.invoke.mock.calls).not.toContainEqual(["update_settings_cmd", { settings: { autostart: false } }]);
 });
 
 it("keeps a cleared active time visible while preserving Cancel and an unrelated grace draft", () => {

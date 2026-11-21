@@ -72,9 +72,16 @@ export interface AppSettings extends ScheduleSettings {
 }
 
 export type PreferencesPatch = Partial<Pick<AppSettings,
-  'language' | 'theme' | 'autostart' | 'grace_period_seconds' |
+  'language' | 'theme' | 'grace_period_seconds' |
   'lock_check_enabled' | 'local_ai_enabled' | 'local_ai_model' | 'auto_update_enabled'
 >>;
+
+export type StartupStatus = 'enabled' | 'disabled' | 'blockedBySystem' | 'unavailable';
+
+type StartupRead =
+  | { status: 'loading' }
+  | { status: 'ready'; effective: StartupStatus }
+  | { status: 'failed'; reason: string };
 
 export interface HistoryCounts {
   total: number;
@@ -159,6 +166,9 @@ interface AppState {
   stats: { file_type: string; count: number }[];
   statsReadStatus: ReadStatus;
   settings: AppSettings | null;
+  startupRead: StartupRead;
+  startupWriting: boolean;
+  startupWriteError: string | null;
   schedule: ScheduleSettings | null;
   pendingFiles: PendingFile[];
   pendingReadStatus: ReadStatus;
@@ -176,7 +186,8 @@ interface AppState {
   loadSettings: () => Promise<void>;
   applySettings: (settings: AppSettings) => void;
   saveSettings: (settings: PreferencesPatch) => Promise<void>;
-  setAutostart: (enabled: boolean) => Promise<void>;
+  loadStartupStatus: (signal?: AbortSignal) => Promise<void>;
+  setAutostart: (enabled: boolean, expected?: StartupRead) => Promise<void>;
   loadRules: (reportRefreshError?: boolean) => Promise<void>;
   loadFolders: (afterWrite?: boolean) => Promise<void>;
   loadLogs: (reportActionWarning?: boolean, options?: { refreshHistoryCounts?: boolean }) => Promise<void>;
@@ -226,6 +237,7 @@ let countsRequest = 0;
 let statsRequest = 0;
 let pendingRequest = 0;
 let archiveStateRequest = 0;
+let startupRequest = 0;
 const noActionRefreshErrors: ActionRefreshErrors = { history: null, historyCounts: null, stats: null };
 
 function withActionRefreshError(state: AppState, key: keyof ActionRefreshErrors, value: string | null) {
@@ -251,6 +263,9 @@ export const useAppStore = create<AppState>((set, get) => ({
   stats: [],
   statsReadStatus: 'loading',
   settings: null,
+  startupRead: { status: 'loading' },
+  startupWriting: false,
+  startupWriteError: null,
   schedule: null,
   pendingFiles: [],
   pendingReadStatus: 'loading',
@@ -283,7 +298,7 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   saveSettings: async (settings) => {
     // Keep the wire patch narrow even if a caller passes a settings object.
-    const allowed = ['language', 'theme', 'autostart', 'grace_period_seconds',
+    const allowed = ['language', 'theme', 'grace_period_seconds',
       'lock_check_enabled', 'local_ai_enabled', 'local_ai_model'] as const;
     const current = get().settings;
     const patch = Object.fromEntries(allowed.filter((key) =>
@@ -294,15 +309,42 @@ export const useAppStore = create<AppState>((set, get) => ({
     get().applySettings(committed);
   },
 
-  setAutostart: async (enabled) => {
-    const { settings } = get();
-    if (!settings) return;
-    if (enabled) {
-      await invoke('enable_autostart_cmd');
-    } else {
-      await invoke('disable_autostart_cmd');
+  loadStartupStatus: async (signal) => {
+    if (signal?.aborted || get().startupWriting) return;
+    const request = ++startupRequest;
+    set({ startupRead: { status: 'loading' } });
+    try {
+      const effective = await invoke<StartupStatus>('get_startup_status_cmd');
+      if (!['enabled', 'disabled', 'blockedBySystem', 'unavailable'].includes(effective)) {
+        throw new Error('Windows returned an unrecognized startup status');
+      }
+      if (!signal?.aborted && request === startupRequest) {
+        set({ startupRead: { status: 'ready', effective } });
+      }
+    } catch (error) {
+      if (!signal?.aborted && request === startupRequest) {
+        set({ startupRead: { status: 'failed', reason: String(error) } });
+      }
     }
-    await get().saveSettings({ autostart: enabled });
+  },
+
+  setAutostart: async (enabled, expected) => {
+    const { startupRead, startupWriting } = get();
+    if (startupWriting || startupRead.status !== 'ready' || startupRead.effective === 'unavailable'
+        || (expected && expected !== startupRead)) return;
+    if (startupRead.effective === (enabled ? 'enabled' : 'disabled')) return;
+    ++startupRequest;
+    set({ startupWriting: true, startupWriteError: null });
+    let startupWriteError: string | null = null;
+    try {
+      await invoke<StartupStatus>('set_startup_enabled_cmd', { enabled });
+    } catch (error) {
+      startupWriteError = String(error);
+    } finally {
+      // A rejected native command may already have changed Windows state.
+      set({ startupWriting: false, startupRead: { status: 'loading' }, startupWriteError });
+      await get().loadStartupStatus();
+    }
   },
 
   loadRules: async (reportRefreshError = false) => {
@@ -606,4 +648,23 @@ export async function observeArchiveImportState(signal: AbortSignal): Promise<vo
   signal.addEventListener('abort', unlisten, { once: true });
   // Listen first so no change between the read and registration is lost.
   await useAppStore.getState().loadArchiveImportState();
+}
+
+export async function observeStartupStatus(signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return;
+  if (!useAppStore.getState().startupWriting) {
+    ++startupRequest;
+    useAppStore.setState({ startupRead: { status: 'loading' } });
+  }
+  const refresh = () => useAppStore.getState().loadStartupStatus(signal);
+  window.addEventListener('focus', refresh);
+  signal.addEventListener('abort', () => window.removeEventListener('focus', refresh), { once: true });
+  try {
+    const unlisten = await listen('startup-status-changed', () => { void refresh(); });
+    if (signal.aborted) unlisten();
+    else signal.addEventListener('abort', unlisten, { once: true });
+  } catch {
+    // Entry, focus and explicit retry still read Windows if event setup fails.
+  }
+  await refresh();
 }

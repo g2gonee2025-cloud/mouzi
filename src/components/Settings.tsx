@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { defaultRuleOptions, useAppStore, Rule, ScheduleSettings, WatchedFolder, type PreferencesPatch } from "../store/useAppStore";
+import { defaultRuleOptions, observeStartupStatus, useAppStore, Rule, ScheduleSettings, WatchedFolder, type PreferencesPatch } from "../store/useAppStore";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -226,6 +226,10 @@ export default function Settings() {
     undoAll,
     settings,
     saveSettings,
+    startupRead,
+    startupWriting,
+    startupWriteError,
+    loadStartupStatus,
     setAutostart,
     schedule,
     getSchedule,
@@ -235,6 +239,9 @@ export default function Settings() {
   } = useAppStore();
 
   const [tab, setTab] = useState<Tab>("folders");
+  const startup = startupRead.status === "ready" ? startupRead.effective : null;
+  const startupOn = startup === "enabled";
+  const startupCanChange = !startupWriting && startup !== null && startup !== "unavailable";
   const [reviewPaths, setReviewPaths] = useState<string[] | null>(null);
   const [editingRule, setEditingRule] = useState<Rule | null>(null);
   const [ruleExtensionsInput, setRuleExtensionsInput] = useState<string | null>(null);
@@ -288,6 +295,13 @@ export default function Settings() {
     Promise.all([loadRules(), loadFolders().catch(() => {}), loadLogs(), getSchedule()])
       .catch((e) => setWriteError(String(e)));
   }, [loadRules, loadFolders, loadLogs, getSchedule]);
+
+  useEffect(() => {
+    if (tab !== "general") return;
+    const owner = new AbortController();
+    void observeStartupStatus(owner.signal);
+    return () => owner.abort();
+  }, [tab]);
 
   useEffect(() => {
     let disposed = false;
@@ -1093,24 +1107,47 @@ export default function Settings() {
                   <option value="dark">{t("settings.general.themeDark")}</option>
                 </select>
               </div>
-              <div className="flex items-center justify-between">
-                <label className="text-sm font-medium text-text-muted">
-                  {t("settings.general.startWithSystem")}
-                </label>
-                <button
-                  role="switch"
-                  aria-label={t("settings.general.startWithSystem")}
-                  aria-checked={settings?.autostart ?? false}
-                  disabled={!settings}
-                  onClick={() => { void runWrite(() => setAutostart(!settings?.autostart)); }}
-                  className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${settings?.autostart ? "bg-primary" : "bg-surface-dark"
-                    }`}
-                >
-                  <span
-                    className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${settings?.autostart ? "translate-x-6" : "translate-x-1"
-                      }`}
-                  />
-                </button>
+              <div className="space-y-1">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-sm font-medium text-text-muted">{t("settings.general.startWithSystem")}</span>
+                  {startupCanChange && (
+                    <button
+                      type="button"
+                      role="switch"
+                      aria-label={t("settings.general.startWithSystem")}
+                      aria-checked={startupOn}
+                      aria-describedby={startup === "blockedBySystem" ? "startup-blocked-note" : undefined}
+                      onClick={() => { void setAutostart(!startupOn, startupRead); }}
+                      className={`relative inline-flex h-6 w-11 shrink-0 items-center rounded-full transition-colors ${startupOn ? "bg-primary" : "bg-surface-dark"}`}
+                    >
+                      <span className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${startupOn ? "translate-x-6" : "translate-x-1"}`} />
+                    </button>
+                  )}
+                </div>
+                {(startupWriting || startupRead.status === "loading") && (
+                  <p role="status" className="text-xs text-text-muted">
+                    {t(startupWriting ? "settings.general.startupSaving" : "settings.general.startupLoading")}
+                  </p>
+                )}
+                {!startupWriting && startup === "blockedBySystem" && (
+                  <p id="startup-blocked-note" role="status" className="text-xs text-text-muted">{t("settings.general.startupBlocked")}</p>
+                )}
+                {!startupWriting && startup === "unavailable" && (
+                  <p role="status" className="text-xs text-text-muted">{t("settings.general.startupUnavailable")}</p>
+                )}
+                {startupWriteError && (
+                  <p role="alert" className="text-xs text-red-700 dark:text-red-400 break-words">
+                    {t("settings.general.startupWriteError")} {startupWriteError}
+                  </p>
+                )}
+                {startupRead.status === "failed" && (
+                  <div className="text-xs text-red-700 dark:text-red-400">
+                    <p role="alert" className="break-words">{t("settings.general.startupReadError")} {startupRead.reason}</p>
+                    <button type="button" className="mt-1 underline" onClick={() => { void loadStartupStatus(); }}>
+                      {t("common.retry")}
+                    </button>
+                  </div>
+                )}
               </div>
 
               {/* Grace Period */}

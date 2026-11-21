@@ -4,7 +4,7 @@ const ipc = vi.hoisted(() => ({ invoke: vi.fn(), listen: vi.fn() }));
 vi.mock("@tauri-apps/api/core", () => ipc);
 vi.mock("@tauri-apps/api/event", () => ({ listen: ipc.listen }));
 
-import { observeArchiveImportState, useAppStore, type AppSettings, type ArchiveImportState } from "../store/useAppStore";
+import { observeArchiveImportState, observeStartupStatus, useAppStore, type AppSettings, type ArchiveImportState, type StartupStatus } from "../store/useAppStore";
 
 function settings(patch: Partial<AppSettings> = {}): AppSettings {
   return {
@@ -96,14 +96,105 @@ describe("committed preference and schedule settings", () => {
     expect(useAppStore.getState().settings).toEqual(current);
   });
 
-  it("patches autostart without serializing scheduler values", async () => {
-    useAppStore.getState().applySettings(settings());
-    ipc.invoke.mockResolvedValueOnce(undefined).mockResolvedValueOnce(settings({ revision: 2, autostart: true }));
-    await useAppStore.getState().setAutostart(true);
+});
+
+describe("Windows startup preference", () => {
+  it("writes only the native setting on and off, then reads it back without changing SQLite settings", async () => {
+    const prior = settings();
+    const store = useAppStore.getState();
+    store.applySettings(prior);
+    ipc.invoke.mockResolvedValueOnce("blockedBySystem")
+      .mockResolvedValueOnce("enabled").mockResolvedValueOnce("enabled")
+      .mockResolvedValueOnce("disabled").mockResolvedValueOnce("disabled");
+    await store.loadStartupStatus();
+    expect(useAppStore.getState().startupRead).toEqual({ status: "ready", effective: "blockedBySystem" });
+    await store.setAutostart(true, useAppStore.getState().startupRead);
+    expect(useAppStore.getState().startupRead).toEqual({ status: "ready", effective: "enabled" });
+    await store.setAutostart(false, useAppStore.getState().startupRead);
     expect(ipc.invoke.mock.calls).toEqual([
-      ["enable_autostart_cmd"],
-      ["update_settings_cmd", { settings: { autostart: true } }],
+      ["get_startup_status_cmd"],
+      ["set_startup_enabled_cmd", { enabled: true }],
+      ["get_startup_status_cmd"],
+      ["set_startup_enabled_cmd", { enabled: false }],
+      ["get_startup_status_cmd"],
     ]);
+    expect(useAppStore.getState()).toMatchObject({
+      settings: prior, startupRead: { status: "ready", effective: "disabled" }, startupWriteError: null,
+    });
+  });
+
+  it("refuses stale and pending actions even if a later native read gives the same value", async () => {
+    const store = useAppStore.getState();
+    ipc.invoke.mockResolvedValueOnce("disabled");
+    await store.loadStartupStatus();
+    const before = useAppStore.getState().startupRead;
+    const older = deferred<StartupStatus>();
+    const latest = deferred<StartupStatus>();
+    ipc.invoke.mockReturnValueOnce(older.promise).mockReturnValueOnce(latest.promise);
+    const pending = store.loadStartupStatus();
+    const fresh = store.loadStartupStatus();
+    await store.setAutostart(true, before);
+    latest.resolve("disabled");
+    await fresh;
+    older.resolve("enabled");
+    await pending;
+    await store.setAutostart(true, before);
+    expect(useAppStore.getState().startupRead).toEqual({ status: "ready", effective: "disabled" });
+    expect(ipc.invoke.mock.calls).toEqual(Array.from({ length: 3 }, () => ["get_startup_status_cmd"]));
+  });
+
+  it("reports a rejected native write and trusts the effective status observed afterward", async () => {
+    const store = useAppStore.getState();
+    const write = deferred<StartupStatus>();
+    const recheck = deferred<StartupStatus>();
+    ipc.invoke.mockResolvedValueOnce("enabled").mockReturnValueOnce(write.promise).mockReturnValueOnce(recheck.promise);
+    await store.loadStartupStatus();
+    const before = useAppStore.getState().startupRead;
+    const active = store.setAutostart(false, before);
+    await store.setAutostart(false, before);
+    await store.loadStartupStatus();
+    expect(ipc.invoke.mock.calls).toHaveLength(2);
+    expect(useAppStore.getState().startupWriting).toBe(true);
+
+    write.reject("Native write could not finish");
+    await vi.waitFor(() => expect(ipc.invoke.mock.calls).toHaveLength(3));
+    expect(useAppStore.getState().startupRead).toEqual({ status: "loading" });
+    await store.setAutostart(false, before);
+    expect(ipc.invoke.mock.calls).toHaveLength(3);
+    recheck.resolve("enabled");
+    await active;
+    expect(useAppStore.getState()).toMatchObject({
+      startupRead: { status: "ready", effective: "enabled" },
+      startupWriteError: "Native write could not finish",
+      startupWriting: false,
+    });
+  });
+
+  it("rechecks on startup events and focus, and stops observing when General leaves", async () => {
+    const lifetime = new AbortController();
+    const windowFixture = new EventTarget();
+    const stop = vi.fn();
+    vi.stubGlobal("window", windowFixture);
+    try {
+      ipc.listen.mockResolvedValueOnce(stop);
+      ipc.invoke.mockResolvedValueOnce("disabled").mockResolvedValueOnce("enabled").mockResolvedValueOnce("blockedBySystem");
+      await observeStartupStatus(lifetime.signal);
+      expect(ipc.listen).toHaveBeenCalledExactlyOnceWith("startup-status-changed", expect.any(Function));
+      expect(useAppStore.getState().startupRead).toEqual({ status: "ready", effective: "disabled" });
+      windowFixture.dispatchEvent(new Event("focus"));
+      await vi.waitFor(() => expect(useAppStore.getState().startupRead).toEqual({ status: "ready", effective: "enabled" }));
+      const notify = ipc.listen.mock.calls[0][1];
+      notify();
+      await vi.waitFor(() => expect(useAppStore.getState().startupRead).toEqual({ status: "ready", effective: "blockedBySystem" }));
+      lifetime.abort();
+      notify();
+      windowFixture.dispatchEvent(new Event("focus"));
+      expect(ipc.invoke.mock.calls).toEqual(Array.from({ length: 3 }, () => ["get_startup_status_cmd"]));
+      expect(stop).toHaveBeenCalledOnce();
+    } finally {
+      lifetime.abort();
+      vi.unstubAllGlobals();
+    }
   });
 });
 
