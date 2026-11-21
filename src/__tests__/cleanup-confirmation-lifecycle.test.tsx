@@ -65,7 +65,8 @@ type Props = Partial<ConfirmDialogProps> & {
   disabled?: boolean;
   ref?: { current: HTMLButtonElement | null };
   onClick?: (event: { currentTarget: HTMLButtonElement }) => void;
-  onChange?: () => void;
+  value?: string | number;
+  onChange?: (event?: { target: { value: string } }) => void;
   results?: CleanupOutcome[];
 };
 type Element = ReactElement<Props>;
@@ -202,4 +203,97 @@ it("preserves a dispatched confirmation through overlapping events and shows its
   expect(guidance(receipt)).toBeUndefined();
   expect(find(receipt, (node) => node.type === ResultsPanel)?.props.results).toEqual(outcomes);
   expect(useCleanupStore.getState().results).toEqual(outcomes);
+});
+
+type FileTab = "large" | "stale";
+const mib = 1_048_576;
+const findCommand = {
+  large: "find_large_files_cmd",
+  stale: "find_stale_files_cmd",
+};
+const finderArguments = {
+  large: (value: number) => ({ minBytes: value }),
+  stale: (value: number) => ({ days: value }),
+};
+
+function threshold(tree: ReactNode) {
+  return find(tree, (node) => node.type === "input" && node.props.type === "number")!.props;
+}
+
+function replaceThreshold(tab: FileTab, value: string) {
+  threshold(render(tab)).onChange!({ target: { value } });
+  return render(tab);
+}
+
+function findFiles(tree: ReactNode) {
+  return find(tree, button("Find files"))!.props;
+}
+
+it.each([
+  { tab: "large", replacement: "1.5", expected: 1.5 * mib },
+  { tab: "stale", replacement: "25", expected: 25 },
+] as const)("clears and replaces the $tab threshold without submitting a default", async ({ tab, replacement, expected }) => {
+  const original = render(tab);
+  find(original, (node) => node.type === "input" && node.props.type === "checkbox")!.props.onChange!();
+  expect(find(render(tab), button("cleanup.confirm"))?.props.disabled).toBe(false);
+
+  const blank = replaceThreshold(tab, "");
+  expect(String(threshold(blank).value)).toBe("");
+  expect(findFiles(blank).disabled).toBe(true);
+  expect(find(blank, button("cleanup.confirm"))).toBeUndefined();
+  findFiles(blank).onClick!({ currentTarget: findControl });
+  expect(mock.invoke).not.toHaveBeenCalled();
+
+  const edited = replaceThreshold(tab, replacement);
+  expect(String(threshold(edited).value)).toBe(replacement);
+  expect(findFiles(edited).disabled).toBe(false);
+  mock.invoke.mockResolvedValueOnce([]);
+  findFiles(edited).onClick!({ currentTarget: findControl });
+  await settle();
+  expect(mock.invoke).toHaveBeenCalledExactlyOnceWith(findCommand[tab], finderArguments[tab](expected));
+});
+
+it.each([
+  ["large", "0.5"],
+  ["large", "1.1"],
+  ["large", "1.0000000000000001"],
+  ["large", "8589934592"],
+  ["stale", "0"],
+  ["stale", "2.5"],
+  ["stale", "1.00000000000000001"],
+  ["stale", "106751991167301"],
+] as const)("blocks the %s input %s before IPC", (tab, raw) => {
+  const tree = replaceThreshold(tab, raw);
+  expect(String(threshold(tree).value)).toBe(raw);
+  expect(findFiles(tree).disabled).toBe(true);
+  expect(find(tree, button("cleanup.confirm"))).toBeUndefined();
+  findFiles(tree).onClick!({ currentTarget: findControl });
+  expect(mock.invoke).not.toHaveBeenCalled();
+});
+
+it.each([
+  ["large", "1.00000095367431640625", 1_048_577, "1.00000095367431640625"],
+  ["large", "15e-1", 1_572_864, "1.5"],
+  ["large", "8589934591.99999904632568359375", Number.MAX_SAFE_INTEGER, "8589934591.99999904632568359375"],
+  ["stale", "106751991167300", 106751991167300, "106751991167300"],
+] as const)("retries an exact %s threshold %s across a tab remount", async (tab, raw, payload, savedText) => {
+  const edited = replaceThreshold(tab, raw);
+  expect(findFiles(edited).disabled).toBe(false);
+  mock.invoke.mockRejectedValueOnce("Finder unavailable");
+  findFiles(edited).onClick!({ currentTarget: findControl });
+  await settle();
+
+  mock.effects.forEach(({ stop }) => stop?.());
+  mock.effects.clear();
+  mock.slots.length = 0;
+  const remounted = render(tab);
+  expect(String(threshold(remounted).value)).toBe(savedText);
+  expect(findFiles(remounted).disabled).toBe(false);
+  expect(find(remounted, button("cleanup.confirm"))).toBeUndefined();
+
+  mock.invoke.mockResolvedValueOnce([]);
+  findFiles(remounted).onClick!({ currentTarget: findControl });
+  await settle();
+  const call = [findCommand[tab], finderArguments[tab](payload)];
+  expect(mock.invoke.mock.calls).toEqual([call, call]);
 });

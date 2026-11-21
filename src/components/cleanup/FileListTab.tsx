@@ -10,7 +10,43 @@ import ConfirmDialog from "./ConfirmDialog";
 import { useCleanupConfirmation } from "./useCleanupConfirmation";
 import UnavailableCleanupRoots from "./UnavailableCleanupRoots";
 
-const BYTES_PER_MIB = 1_048_576;
+const BYTES_PER_MIB = 1_048_576n;
+const MIB_FRACTION_DIGITS = 20;
+const MAX_MIN_BYTES = BigInt(Number.MAX_SAFE_INTEGER);
+// Rust multiplies days by 86,400 using a checked i64 operation.
+const MAX_STALE_DAYS = 9_223_372_036_854_775_807n / 86_400n;
+
+function formatSizeThreshold(minBytes: bigint): string {
+  const whole = minBytes / BYTES_PER_MIB;
+  const remainder = minBytes % BYTES_PER_MIB;
+  if (remainder === 0n) return String(whole);
+  // Multiply the remainder by 5^20 to express remainder / 2^20 in decimal.
+  const fraction = String(remainder * 5n ** BigInt(MIB_FRACTION_DIGITS))
+    .padStart(MIB_FRACTION_DIGITS, "0").replace(/0+$/, "");
+  return whole + "." + fraction;
+}
+
+function parseThreshold(raw: string, isBytes: boolean): number | null {
+  const match = /^(\d*)(?:\.(\d+))?(?:e([+-]?\d+))?$/i.exec(raw);
+  if (!match) return null;
+  const [, whole, fraction = "", exponent = "0"] = match;
+  const digits = (whole + fraction).replace(/^0+/, "");
+  const significant = digits.replace(/0+$/, "");
+  const scale = fraction.length - Number(exponent) - (digits.length - significant.length);
+  // A safe byte count has at most 16 digits, and a MiB fraction has at most 20.
+  if (!significant || !Number.isInteger(scale) || scale > MIB_FRACTION_DIGITS || significant.length - scale > 16) return null;
+
+  const multiplier = isBytes ? BYTES_PER_MIB : 1n;
+  const scaled = BigInt(significant) * multiplier;
+  const numerator = scale < 0 ? scaled * 10n ** BigInt(-scale) : scaled;
+  const divisor = scale > 0 ? 10n ** BigInt(scale) : 1n;
+  const criterion = numerator / divisor;
+  const maximum = isBytes ? MAX_MIN_BYTES : MAX_STALE_DAYS;
+  if (numerator % divisor !== 0n || criterion < multiplier || criterion > maximum) return null;
+  return Number(criterion);
+}
+
+const MAX_SIZE_THRESHOLD = formatSizeThreshold(MAX_MIN_BYTES);
 
 interface FileListTabProps {
   kind: "large" | "stale";
@@ -37,18 +73,23 @@ export default function FileListTab({
   const { t } = useTranslation();
   const store = useCleanupStore();
   const thresholdId = useId();
-  const [draftThreshold, setDraftThreshold] = useState<number | null>(null);
+  const [draftThreshold, setDraftThreshold] = useState<string | null>(null);
   const [checked, setChecked] = useState<Set<string>>(new Set());
   const [showResults, setShowResults] = useState(false);
   const { pending, reviewNeedsSearch, clearReviewNotice, openReview } = useCleanupConfirmation(() => setShowResults(true));
   const findButton = useRef<HTMLButtonElement>(null);
   const resultsHeading = useRef<HTMLHeadingElement>(null);
 
-  const finderKey = kind === "large" ? "largeFiles" : "staleFiles";
+  const isBytes = kind === "large";
+  const finderKey = isBytes ? "largeFiles" : "staleFiles";
   const search = store[finderKey];
-  const searchedThreshold = search && ("minBytes" in search ? search.minBytes / BYTES_PER_MIB : search.days);
-  const threshold = draftThreshold ?? searchedThreshold ?? defaultThreshold;
-  const data = search && threshold === searchedThreshold ? search.files : null;
+  const searchedCriterion = search && ("minBytes" in search ? search.minBytes : search.days);
+  const savedThreshold = search && ("minBytes" in search
+    ? formatSizeThreshold(BigInt(search.minBytes))
+    : String(search.days));
+  const threshold = draftThreshold ?? savedThreshold ?? String(defaultThreshold);
+  const criterion = parseThreshold(threshold, isBytes);
+  const data = search && criterion === searchedCriterion ? search.files : null;
   const unavailableRoots = data && store.unavailableRoots[finderKey];
 
   const checkedFiles = useMemo(
@@ -57,12 +98,13 @@ export default function FileListTab({
   );
 
   const handleFind = () => {
+    if (criterion === null) return;
     clearReviewNotice();
     setDraftThreshold(threshold);
-    if (kind === "large") {
-      store.findLargeFiles(threshold * BYTES_PER_MIB);
+    if (isBytes) {
+      store.findLargeFiles(criterion);
     } else {
-      store.findStaleFiles(threshold);
+      store.findStaleFiles(criterion);
     }
     setChecked(new Set());
     setShowResults(false);
@@ -125,8 +167,6 @@ export default function FileListTab({
     );
   }
 
-  const isBytes = kind === "large";
-
   return (
     <div className="space-y-3">
       <div className="flex items-center gap-3">
@@ -143,9 +183,12 @@ export default function FileListTab({
             id={thresholdId}
             type="number"
             min={1}
+            max={isBytes ? MAX_SIZE_THRESHOLD : String(MAX_STALE_DAYS)}
+            step={isBytes ? "any" : 1}
             value={threshold}
+            aria-invalid={criterion === null || undefined}
             onChange={(event) => {
-              setDraftThreshold(Math.max(1, Number(event.target.value)));
+              setDraftThreshold(event.target.value);
               setChecked(new Set());
             }}
             className="w-20 rounded-md border border-border bg-surface px-2 py-1 text-xs text-text"
@@ -153,7 +196,7 @@ export default function FileListTab({
           <button
             ref={findButton}
             onClick={handleFind}
-          disabled={store.loading || store.busy || !!store.preparedPlan}
+            disabled={criterion === null || store.loading || store.busy || !!store.preparedPlan}
             className="flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-on-primary hover:bg-primary-hover disabled:opacity-50 transition-colors"
           >
             <Search size={14} />
