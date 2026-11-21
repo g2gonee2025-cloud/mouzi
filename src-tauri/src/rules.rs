@@ -1004,6 +1004,144 @@ mod tests {
     }
 
     #[test]
+    fn nested_scoped_move_uses_its_reviewed_destination_in_silent_mode() {
+        use crate::db;
+        let _serial = db::serialise_test_db();
+        db::init_test_db();
+        let path = std::env::temp_dir().join(format!(
+            "mouzi-nested-scoped-move-{}-{}", std::process::id(), Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        fs::create_dir(&path).unwrap();
+        let path = fs::canonicalize(path).unwrap();
+        struct Fixture {
+            path: PathBuf,
+            folders: Vec<i64>,
+            rules: Vec<i64>,
+        }
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                if let Ok(conn) = db::lock_db() {
+                    let path = self.path.to_string_lossy();
+                    let _ = conn.execute("DELETE FROM action_logs WHERE instr(source_path, ?1) = 1", [path.as_ref()]);
+                    let _ = conn.execute("DELETE FROM operation_intents WHERE instr(source_path, ?1) = 1", [path.as_ref()]);
+                    let _ = conn.execute("DELETE FROM processed_files WHERE instr(path, ?1) = 1", [path.as_ref()]);
+                }
+                for id in &self.rules { let _ = db::delete_rule(*id); }
+                for id in self.folders.iter().rev() { let _ = db::remove_watched_folder(*id); }
+                let _ = fs::remove_dir_all(&self.path);
+            }
+        }
+        let mut fixture = Fixture { path, folders: Vec::new(), rules: Vec::new() };
+        let parent = fixture.path.join("Workspace");
+        let inbox = parent.join("Filed").join("Inbox");
+        let actual_target = inbox.join("Filed");
+        fs::create_dir_all(&actual_target).unwrap();
+        for root in [&parent, &inbox] {
+            fixture.folders.push(db::register_watched_folder(
+                &root.to_string_lossy(), db::FOLDER_MODE_MANUAL, false,
+            ).unwrap());
+        }
+        let [parent_id, inbox_id]: [i64; 2] = fixture.folders.as_slice().try_into().unwrap();
+
+        for (ext, destination, scope, action, priority) in [
+            ("scoped104", "Filed", inbox_id, "move", i32::MIN),
+            ("control104", "Done", inbox_id, "move", i32::MIN),
+            ("global104", "Filed", 0, "move", i32::MIN),
+            ("other104", "OutsideScope", parent_id, "move", i32::MIN),
+            ("other104", "", 0, "ignore", i32::MIN + 1),
+        ] {
+            let mut saved = rule(destination);
+            saved.name = format!("R104 {ext} {scope}");
+            saved.extensions = vec![ext.into()];
+            saved.folder_id = scope;
+            saved.action = action.into();
+            saved.priority = priority;
+            fixture.rules.push(db::add_rule(&saved).unwrap());
+        }
+
+        let scoped = inbox.join("arrived.scoped104");
+        let control = inbox.join("arrived.control104");
+        let global = inbox.join("arrived.global104");
+        let elsewhere = inbox.join("arrived.other104");
+        let already_filed = actual_target.join("existing.scoped104");
+        for file in [&scoped, &control, &global, &elsewhere, &already_filed] {
+            fs::write(file, file.file_name().unwrap().to_string_lossy().as_bytes()).unwrap();
+            fs::OpenOptions::new().write(true).open(file).unwrap()
+                .set_modified(SystemTime::now() - Duration::from_secs(86_401)).unwrap();
+        }
+        let scoped_target = actual_target.join(scoped.file_name().unwrap());
+        let control_target = inbox.join("Done").join(control.file_name().unwrap());
+        let suppression = SuppressionSet::new();
+        let preview = crate::operations::preview(Some(
+            [&scoped, &control].iter().map(|file| file.to_string_lossy().into_owned()).collect(),
+        ), &suppression).unwrap();
+        crate::operations::discard(&preview.id);
+        assert_eq!(preview.entries.len(), 2);
+        for (source, destination) in [(&scoped, &scoped_target), (&control, &control_target)] {
+            let entry = preview.entries.iter().find(|entry| Path::new(&entry.source) == source).unwrap();
+            assert!(entry.error.is_none(), "{:?}", entry.error);
+            assert_eq!(entry.destination.as_deref().map(Path::new), Some(destination.as_path()));
+        }
+
+        db::update_folder_mode(inbox_id, db::FOLDER_MODE_SILENT).unwrap();
+        let row = get_watched_folders().unwrap().into_iter().find(|row| row.id == Some(inbox_id)).unwrap();
+        let authority = WatchedRoot::capture_unattended(&row, false).unwrap();
+        let process = |file: &Path, suppression: &SuppressionSet| {
+            process_watched_file(file, &authority, suppression, &suppression.ticket(file), None).unwrap()
+        };
+        for (file, explanation) in [
+            (&global, "global anti-loop across roots"),
+            (&elsewhere, "rule scoped to a different root"),
+            (&already_filed, "file already beneath the actual target"),
+        ] {
+            assert!(matches!(process(file, &suppression), ProcessOutcome::Skipped), "{explanation}");
+            assert_eq!(fs::read(file).unwrap(), file.file_name().unwrap().to_string_lossy().as_bytes());
+        }
+        assert!(matches!(process(&control, &suppression), ProcessOutcome::Organized { warning: None, .. }));
+        assert!(!control.exists());
+        assert_eq!(fs::read(&control_target).unwrap(), b"arrived.control104");
+        let mut control_rule = get_rules().unwrap().into_iter()
+            .find(|rule| rule.id == Some(fixture.rules[1])).unwrap();
+        control_rule.destination = "Again".into();
+        db::update_rule(&control_rule).unwrap();
+        assert!(matches!(process(&control_target, &SuppressionSet::new()), ProcessOutcome::Skipped));
+        assert_eq!(fs::read(&control_target).unwrap(), b"arrived.control104");
+        assert!(!inbox.join("Again").exists());
+
+        let original_identity = crate::safe_fs::file_identity(&scoped).unwrap();
+        let outcome = process(&scoped, &suppression);
+        assert!(matches!(outcome, ProcessOutcome::Organized { warning: None, .. }),
+            "the scoped file must move to the destination already shown in Review");
+        assert!(!scoped.exists());
+        assert_eq!(crate::safe_fs::file_identity(&scoped_target).unwrap(), original_identity);
+        assert_eq!(fs::read(&scoped_target).unwrap(), b"arrived.scoped104");
+        {
+            let conn = db::lock_db().unwrap();
+            let path = fixture.path.to_string_lossy();
+            for table in ["action_logs", "operation_intents"] {
+                let count: i64 = conn.query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE instr(source_path, ?1) = 1"),
+                    [path.as_ref()], |row| row.get(0),
+                ).unwrap();
+                assert_eq!(count, 2, "{table}");
+            }
+            let source = scoped.to_string_lossy();
+            let actual: String = conn.query_row(
+                "SELECT actual_destination FROM operation_intents WHERE source_path=?1 AND status='completed'",
+                [source.as_ref()], |row| row.get(0),
+            ).unwrap();
+            assert_eq!(fs::canonicalize(actual).unwrap(), fs::canonicalize(scoped_target).unwrap());
+        }
+
+        db::update_folder_mode(inbox_id, db::FOLDER_MODE_MANUAL).unwrap();
+        fs::write(&scoped, b"new manual arrival").unwrap();
+        fs::OpenOptions::new().write(true).open(&scoped).unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(86_401)).unwrap();
+        assert!(matches!(process(&scoped, &SuppressionSet::new()), ProcessOutcome::Skipped));
+        assert_eq!(fs::read(&scoped).unwrap(), b"new manual arrival");
+    }
+
+    #[test]
     fn manual_batch_authority_is_revoked_when_paused_or_replaced() {
         let _serial = crate::db::serialise_test_db();
         crate::db::init_test_db();
