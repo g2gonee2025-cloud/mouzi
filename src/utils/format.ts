@@ -2,12 +2,12 @@ import i18n from "../i18n";
 
 /**
  * Human-readable file size string from bytes.
- * E.g. 1536 → "1.50 KB", 1048576 → "1.00 MB"
+ * E.g. 1536 → "1.50 KiB", 1048576 → "1.00 MiB"
  */
 export function formatBytes(bytes: number): string {
   if (bytes < 0) return "0 B";
   if (bytes === 0) return "0 B";
-  const units = ["B", "KB", "MB", "GB", "TB"];
+  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
   const base = 1024;
   let unitIndex = 0;
   let value = bytes;

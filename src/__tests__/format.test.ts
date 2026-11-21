@@ -14,24 +14,24 @@ describe("formatBytes", () => {
     expect(formatBytes(512)).toBe("512 B");
   });
 
-  it("formats KB", () => {
-    expect(formatBytes(1536)).toBe("1.50 KB");
+  it("formats KiB", () => {
+    expect(formatBytes(1536)).toBe("1.50 KiB");
   });
 
-  it("formats MB", () => {
-    expect(formatBytes(3_145_728)).toBe("3.00 MB");
+  it("formats MiB", () => {
+    expect(formatBytes(3_145_728)).toBe("3.00 MiB");
   });
 
-  it("formats GB", () => {
-    expect(formatBytes(2_147_483_648)).toBe("2.00 GB");
+  it("formats GiB", () => {
+    expect(formatBytes(2_147_483_648)).toBe("2.00 GiB");
   });
 
-  it("formats TB", () => {
-    expect(formatBytes(1_099_511_627_776)).toBe("1.00 TB");
+  it("formats TiB", () => {
+    expect(formatBytes(1_099_511_627_776)).toBe("1.00 TiB");
   });
 
   it("handles fractional values", () => {
-    expect(formatBytes(1_500_000)).toBe("1.43 MB");
+    expect(formatBytes(1_500_000)).toBe("1.43 MiB");
   });
 });
 

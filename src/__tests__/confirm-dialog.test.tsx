@@ -35,7 +35,7 @@ it.each([3, 10, 26])("states the minimum when only %i items are known", (count) 
   expect(markup).toContain(`At least ${count} items`);
 });
 
-it.each([[0, "0 B"], [2048, "2.00 KB"]])("shows the known size for %i bytes in a simple confirmation", (bytes, size) => {
+it.each([[0, "0 B"], [2048, "2.00 KiB"]])("shows the known size for %i bytes in a simple confirmation", (bytes, size) => {
   const markup = renderConfirm(3, { bytes });
   expect(markup).toContain(`Total size: ${size}`);
   expect(markup).not.toContain("Total size unavailable.");
