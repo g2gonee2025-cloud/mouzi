@@ -618,20 +618,26 @@ impl FolderWatcher {
         let Some(root) = self.watchers.get(folder_path).map(|watch| &watch.root) else { return; };
         if !auto_root_is_current(root) { return; }
         let Ok(settings) = get_settings() else { return; };
-        let paths = {
+        let arrivals = {
             let mut manual = self.pending_manual.state.lock().unwrap_or_else(|error| error.into_inner());
-            let paths = manual.arrivals.iter().filter(|(path, arrival)| Arc::ptr_eq(&arrival.root, root)
-                && !crate::operations::suspicious_name(Path::new(path)))
-                .map(|(path, _)| PathBuf::from(path)).collect::<Vec<_>>();
-            for path in &paths { manual.arrivals.remove(path.to_string_lossy().as_ref()); }
+            let mut arrivals = Vec::new();
+            manual.arrivals.retain(|path, arrival| {
+                if !Arc::ptr_eq(&arrival.root, root) || crate::operations::suspicious_name(Path::new(path)) {
+                    return true;
+                }
+                if arrival.ticket.is_current() {
+                    arrivals.push((PathBuf::from(path), arrival.ticket.clone()));
+                }
+                false
+            });
             self.pending_manual.update_count(&manual);
-            paths
+            arrivals
         };
-        for path in paths {
-            if self.suppression.is_suppressed(&path, Instant::now()) { continue; }
-            let item = pending_item(&path, root, &self.suppression,
+        for (path, ticket) in arrivals {
+            let item = pending_item(&path, root, ticket,
                 Duration::from_secs(settings.grace_period_seconds.max(2) as u64));
             let mut pending = self.pending.lock().unwrap_or_else(|error| error.into_inner());
+            if !item.ticket.is_current() || self.suppression.is_suppressed(&path, Instant::now()) { continue; }
             pending.retain(|previous| !same_path(&previous.path, &path));
             pending.push(item);
         }
@@ -648,9 +654,9 @@ fn register_root_watch(root: &WatchedRoot, callback: impl notify::EventHandler) 
     Ok(watcher)
 }
 
-fn pending_item(path: &Path, root: &Arc<WatchedRoot>, suppression: &SuppressionSet, grace: Duration) -> PendingFile {
+fn pending_item(path: &Path, root: &Arc<WatchedRoot>, ticket: CancellationTicket, grace: Duration) -> PendingFile {
     PendingFile { path: path.to_path_buf(), root: root.clone(), scheduled: Instant::now() + grace.max(MIN_SETTLING),
-        attempts: 0, ticket: suppression.ticket(path), identity: crate::safe_fs::file_identity(path).ok(),
+        attempts: 0, ticket, identity: crate::safe_fs::file_identity(path).ok(),
         fingerprint: fingerprint(path).ok() }
 }
 
@@ -735,11 +741,12 @@ fn enqueue_path(path: &Path, source: EnqueueSource, root: &Arc<WatchedRoot>, pen
         }
     } else if is_folder_auto_mode(&folder.mode) {
         let settings = get_settings().map_err(|error| error.to_string())?;
-        let mut item = pending_item(path, root, suppression, Duration::from_secs(settings.grace_period_seconds.max(2) as u64));
+        let mut item = pending_item(path, root, ticket, Duration::from_secs(settings.grace_period_seconds.max(2) as u64));
         let mut pending = pending.lock().unwrap_or_else(|error| error.into_inner());
-        if !root.watch_is_active() || !ticket.is_current()
+        if !root.watch_is_active() || !item.ticket.is_current()
             || suppression.is_suppressed(path, Instant::now()) { return Ok(()); }
-        if let Some(index) = pending.iter().position(|previous| same_path(&previous.path, path)) {
+        let existing = pending.iter().position(|previous| same_path(&previous.path, path));
+        if let Some(index) = existing {
             let previous = &pending[index];
             // A real notification may have queued a recovery entry already.
             // Keep its deadline if catch-up observes the same exact version.
@@ -748,12 +755,9 @@ fn enqueue_path(path: &Path, source: EnqueueSource, root: &Arc<WatchedRoot>, pen
                 && previous.fingerprint.is_some() && previous.fingerprint == item.fingerprint {
                 return Ok(());
             }
-            pending.remove(index);
         }
-        if source == EnqueueSource::Notification {
-            suppression.invalidate(&[path.to_path_buf()]);
-        }
-        item.ticket = suppression.ticket(path);
+        if source == EnqueueSource::Notification && !item.ticket.renew() { return Ok(()); }
+        if let Some(index) = existing { pending.remove(index); }
         pending.push(item);
     }
     Ok(())
@@ -838,7 +842,7 @@ mod tests {
         let reviewed = root.path.join("reviewed.undocheck");
         let later = root.path.join("later.undocheck");
         for path in [&reviewed, &later] {
-            cancellation.pending.lock().unwrap().push(pending_item(path, &root, &suppression, Duration::ZERO));
+            cancellation.pending.lock().unwrap().push(pending_item(path, &root, suppression.ticket(path), Duration::ZERO));
             cancellation.pending_manual.state.lock().unwrap().arrivals.insert(path.to_string_lossy().into_owned(), PendingReview {
                 root: root.clone(), ticket: suppression.ticket(path), excluded: false,
             });
@@ -1095,6 +1099,39 @@ mod tests {
             if let Some(id) = self.id { let _ = crate::db::remove_watched_folder(id); }
             let _ = std::fs::remove_dir_all(&self.parent);
         }
+    }
+
+    #[test]
+    fn switching_to_silent_keeps_live_manual_work_without_reviving_cancelled_tickets() {
+        use crate::db::{self, FOLDER_MODE_MANUAL, FOLDER_MODE_SILENT};
+
+        let _serial = db::serialise_test_db();
+        db::init_test_db();
+        let mut fixture = RecoveryFixture::new();
+        let root = fixture.root();
+        let configured = root.to_str().unwrap();
+        for name in ["restored.txt", "new.txt"] {
+            std::fs::write(root.join(name), name).unwrap();
+        }
+        let id = db::register_watched_folder(configured, FOLDER_MODE_MANUAL, false).unwrap();
+        fixture.id = Some(id);
+        let folders: Vec<_> = get_watched_folders().unwrap().into_iter().filter(|f| f.id == Some(id)).collect();
+        let suppression = Arc::new(SuppressionSet::new());
+        let mut watcher = FolderWatcher::new(suppression.clone());
+        watcher.reconcile_watches_for_folders(&folders, Instant::now(), false, true).unwrap();
+        assert_eq!(watcher.get_pending_files().unwrap().len(), 2);
+
+        let watched = &watcher.watchers[configured].root.path;
+        let restored = watched.join("restored.txt");
+        let new_file = watched.join("new.txt");
+        suppression.invalidate(&[restored]);
+        db::update_folder_mode(id, FOLDER_MODE_SILENT).unwrap();
+        watcher.flush_manual_to_pending(configured);
+
+        let pending = watcher.pending.lock().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].path, new_file);
+        assert!(pending[0].ticket.is_current());
     }
 
     #[test]

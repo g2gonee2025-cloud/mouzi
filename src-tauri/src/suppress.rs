@@ -111,6 +111,16 @@ impl CancellationTicket {
     pub fn is_current(&self) -> bool {
         self.generation.load(Ordering::Acquire) == self.expected
     }
+
+    /// Replace older queued work only if no operation has cancelled this event.
+    pub(crate) fn renew(&mut self) -> bool {
+        let next = self.expected.wrapping_add(1);
+        if self.generation.compare_exchange(self.expected, next, Ordering::AcqRel, Ordering::Acquire).is_err() {
+            return false;
+        }
+        self.expected = next;
+        true
+    }
 }
 
 /// The key a path is stored under, computed in exactly one place.
