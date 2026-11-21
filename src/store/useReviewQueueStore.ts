@@ -3,10 +3,10 @@ import { create } from "zustand";
 import type { OperationResult } from "../components/BetaControls";
 import { useAppStore } from "./useAppStore";
 
-type ApplyReceipt =
-  | { status: "applying" }
+type ApplyOutcome =
   | { status: "completed"; results: OperationResult[] }
   | { status: "failed"; error: string };
+type ApplyReceipt = { status: "applying" } | (ApplyOutcome & { presented?: true });
 
 interface ReviewQueueState {
   requestedPaths: string[] | null;
@@ -16,6 +16,7 @@ interface ReviewQueueState {
   takeReviewNavigation: () => boolean;
   requestFullQueue: () => void;
   applyReviewedPlan: (id: string, selected: string[]) => Promise<void>;
+  markReceiptPresented: (receipt: ApplyReceipt) => void;
   dismissReceipt: () => void;
 }
 
@@ -30,9 +31,12 @@ export const useReviewQueueStore = create<ReviewQueueState>((set, get) => ({
   applyReceipt: null,
 
   readReviewRequest: () => {
+    const previous = get().applyReceipt;
     const read = lastRequestRead.then(async () => {
       const paths = await invoke<string[] | null>("take_review_request_cmd");
-      if (Array.isArray(paths)) set({ requestedPaths: paths, hasUnopenedRequest: true });
+      if (!Array.isArray(paths)) return;
+      const advance = previous && previous.status !== "applying" && previous.presented && get().applyReceipt === previous;
+      set({ requestedPaths: paths, hasUnopenedRequest: true, ...(advance ? { applyReceipt: null } : {}) });
     });
     lastRequestRead = read.catch(() => {});
     return read;
@@ -63,6 +67,12 @@ export const useReviewQueueStore = create<ReviewQueueState>((set, get) => ({
     set({ applyReceipt: { status: "completed", results } });
     const store = useAppStore.getState();
     void Promise.allSettled([store.refreshActionViews(), store.getPendingFiles()]);
+  },
+
+  markReceiptPresented: (receipt) => {
+    if (receipt.status !== "applying" && !receipt.presented && get().applyReceipt === receipt) {
+      set({ applyReceipt: { ...receipt, presented: true } });
+    }
   },
 
   dismissReceipt: () => {

@@ -10,6 +10,7 @@ const harness = vi.hoisted(() => ({
   cursor: 0,
   domains: undefined as readonly unknown[] | undefined,
   pending: undefined as EffectCallback | undefined,
+  layoutEffects: [] as Array<() => void>,
   invoke: vi.fn(),
 }));
 
@@ -55,6 +56,9 @@ vi.mock("react", async (original) => ({
       harness.pending = effect;
     }
   },
+  useLayoutEffect(effect: () => void) {
+    harness.layoutEffects.push(effect);
+  },
 }));
 
 let scope: string[] | null;
@@ -81,6 +85,7 @@ function render() {
   harness.cursor = 0;
   if (useReviewQueueStore.getState().requestedPaths !== scope) useReviewQueueStore.setState({ requestedPaths: scope });
   const root = ReviewQueue();
+  harness.layoutEffects.splice(0).forEach(effect => effect());
   const effect = harness.pending;
   if (effect) {
     harness.pending = undefined;

@@ -36,6 +36,7 @@ vi.mock("react", async (importOriginal) => {
   return {
     ...actual,
     useEffect: (effect: () => void) => { fixture.effects.push(effect); },
+    useLayoutEffect: (effect: () => void) => { fixture.effects.push(effect); },
     useState: (initial: unknown) => {
       const index = claim(initial);
       return [

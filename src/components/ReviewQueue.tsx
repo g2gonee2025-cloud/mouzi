@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { useTranslation } from 'react-i18next';
 import { buttonClass, primaryClass, errorText, Results } from './BetaControls';
@@ -31,6 +31,7 @@ export default function ReviewQueue() {
   const [error, setError] = useState('');
   const [confirm, setConfirm] = useState<ConfirmRequest | null>(null);
   const currentId = useRef<string | null>(null);
+  const submittedScope = useRef<{ paths: string[] | null } | null>(null);
   const generation = useRef(0);
   // A non-null set means the user chose the selection, even when it is empty.
   const selectionIntent = useRef<Set<string> | null>(null);
@@ -74,6 +75,14 @@ export default function ReviewQueue() {
       if (abandoned) void invoke('discard_preview_cmd', { id: abandoned }).catch(() => {});
     };
   }, [paths]);
+
+  // Only a receipt shown in the submitting view can yield to a fresh native request.
+  useLayoutEffect(() => {
+    if (!confirm && receipt && submittedScope.current?.paths === paths) {
+      useReviewQueueStore.getState().markReceiptPresented(receipt);
+    }
+  }, [confirm, paths, receipt]);
+
   function askApply(opener: HTMLButtonElement) {
     if (busy || receipt || !preview) return;
     const entries = preview.entries.filter((entry) => !entry.error && selected.has(entry.id));
@@ -95,6 +104,7 @@ export default function ReviewQueue() {
         // Transfer ownership before dispatch. Cleanup may run while the call
         // waits in the WebView transport or behind another native operation.
         currentId.current = null;
+        submittedScope.current = { paths };
         if (content.current) content.current.scrollTop = 0;
         setPreview(null);
         setSelected(new Set());

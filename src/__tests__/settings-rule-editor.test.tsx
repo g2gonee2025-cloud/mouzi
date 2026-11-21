@@ -52,22 +52,24 @@ vi.mock("react", async (importOriginal) => {
     if (!(index in harness.slots)) harness.slots[index] = initialize();
     return index;
   }
+  const trackEffect = (setup: () => void | (() => void), dependencies: unknown[]) => {
+    if (!harness.effects) return;
+    const slot = harness.slots[claim(() => ({}))] as { dependencies?: unknown[]; dispose?: () => void };
+    if (slot.dependencies?.length === dependencies.length && dependencies.every((value, index) => Object.is(value, slot.dependencies?.[index]))) return;
+    harness.effects.push(() => {
+      if (slot.dispose) {
+        slot.dispose();
+        harness.disposeEffects.delete(slot.dispose);
+      }
+      slot.dependencies = dependencies;
+      slot.dispose = setup() || undefined;
+      if (slot.dispose) harness.disposeEffects.add(slot.dispose);
+    });
+  };
   return {
     ...actual,
-    useEffect: (setup: () => void | (() => void), dependencies: unknown[]) => {
-      if (!harness.effects) return;
-      const slot = harness.slots[claim(() => ({}))] as { dependencies?: unknown[]; dispose?: () => void };
-      if (slot.dependencies?.length === dependencies.length && dependencies.every((value, index) => Object.is(value, slot.dependencies?.[index]))) return;
-      harness.effects.push(() => {
-        if (slot.dispose) {
-          slot.dispose();
-          harness.disposeEffects.delete(slot.dispose);
-        }
-        slot.dependencies = dependencies;
-        slot.dispose = setup() || undefined;
-        if (slot.dispose) harness.disposeEffects.add(slot.dispose);
-      });
-    },
+    useEffect: trackEffect,
+    useLayoutEffect: trackEffect,
     useState: (initial: unknown) => {
       const index = claim(() => typeof initial === "function" ? initial() : initial);
       return [
