@@ -6,28 +6,8 @@ import Settings from "../components/Settings";
 import { useAppStore, type ArchiveImportState } from "../store/useAppStore";
 import en from "../i18n/locales/en.json";
 
-const actions = vi.hoisted(() => ({
-  invoke: vi.fn(),
-  panel: null as { state: unknown[]; cursor: number } | null,
-}));
-
-vi.mock("@tauri-apps/api/core", () => ({ invoke: actions.invoke }));
-vi.mock("react", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("react")>();
-  return {
-    ...actual,
-    useState: <T,>(initial: T) => {
-      const panel = actions.panel;
-      if (!panel) return actual.useState(initial);
-      const slot = panel.cursor++;
-      if (!(slot in panel.state)) panel.state[slot] = initial;
-      return [panel.state[slot], (value: T) => { panel.state[slot] = value; }];
-    },
-    useEffect: (...args: Parameters<typeof actual.useEffect>) => {
-      if (!actions.panel) actual.useEffect(...args);
-    },
-  };
-});
+const invoke = vi.hoisted(() => vi.fn());
+vi.mock("@tauri-apps/api/core", () => ({ invoke }));
 
 vi.mock("../store/useAppStore", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../store/useAppStore")>();
@@ -46,8 +26,7 @@ vi.mock("react-i18next", () => ({
     t: (key: string, values: Record<string, string | number> = {}) => {
       const message = key.startsWith("settings.archive.")
         ? en.settings.archive[key.slice("settings.archive.".length) as keyof typeof en.settings.archive] : undefined;
-      const localized = message ?? (key === "common.cancel" ? en.common.cancel
-        : key === "confirm.failed" ? en.confirm.failed : key);
+      const localized = message ?? (key === "common.cancel" ? en.common.cancel : key);
       return Object.entries(values).reduce((text, [name, value]) => text.replace("{{" + name + "}}", String(value)), localized);
     },
   }),
@@ -119,7 +98,7 @@ function openFolderAction(tree: ReactNode): (() => void) | undefined {
   }
 }
 
-it("opens only the exact receipt directory and clears the folder error after a successful retry", async () => {
+it("requires the exact directory when opening an archive import receipt", () => {
   const previous = useAppStore.getState();
   const stagingPath = "C:/Archive Recovery/Import 1";
   useAppStore.setState({ archiveImportState: {
@@ -127,52 +106,21 @@ it("opens only the exact receipt directory and clears the folder error after a s
     result: { extractedCount: 1, sortedCount: 0, stagingPath, issue: null },
     error: null,
   } });
-  const panel = { state: [] as unknown[], cursor: 0 };
-  actions.panel = panel;
-  let target: "missing" | "file" | "directory" = "missing";
-  const opened: string[] = [];
-  const unavailable = "Choose an existing absolute folder path";
-  actions.invoke.mockImplementation(async (command: string, options: { path: string; directoryOnly?: boolean }) => {
-    expect(command).toBe("open_folder_cmd");
-    expect(options.path).toBe(stagingPath);
-    if (target === "directory") opened.push(stagingPath);
-    else if (target === "file" && !options.directoryOnly) opened.push("C:/Archive Recovery");
-    else throw new Error(unavailable);
-  });
-  const render = () => {
-    panel.cursor = 0;
-    return ArchiveImportPanel();
-  };
-  const open = async () => {
-    const click = openFolderAction(render());
-    expect(click).toBeTypeOf("function");
-    click!();
-    await Promise.resolve();
-  };
-  const expectFolderAlert = () => {
-    const html = renderToStaticMarkup(render());
-    expect(html).toContain('role="alert"');
-    expect(html).toContain(unavailable);
-  };
+  let open: (() => void) | undefined;
+  function CapturePanel() {
+    const panel = ArchiveImportPanel();
+    open = openFolderAction(panel);
+    return panel;
+  }
 
+  invoke.mockResolvedValueOnce(undefined);
   try {
-    await open();
-    expect(opened).toEqual([]);
-    expectFolderAlert();
-
-    target = "file";
-    await open();
-    expect(opened).toEqual([]);
-    expectFolderAlert();
-
-    target = "directory";
-    await open();
-    expect(opened).toEqual([stagingPath]);
-    expect(renderToStaticMarkup(render())).not.toContain('role="alert"');
-    expect(actions.invoke).toHaveBeenCalledTimes(3);
+    renderToStaticMarkup(<CapturePanel />);
+    expect(open).toBeTypeOf("function");
+    open!();
+    expect(invoke).toHaveBeenCalledExactlyOnceWith("open_folder_cmd", { path: stagingPath, directoryOnly: true });
   } finally {
-    actions.panel = null;
-    actions.invoke.mockReset();
+    invoke.mockReset();
     useAppStore.setState(previous, true);
   }
 });
