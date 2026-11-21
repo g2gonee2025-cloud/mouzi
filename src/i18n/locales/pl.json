@@ -126,6 +126,7 @@
       "startupReadError": "Nie udało się sprawdzić ustawienia autostartu.",
       "startupWriteError": "Nie udało się zmienić ustawienia autostartu.",
       "startupBlocked": "Wyłączono na liście aplikacji uruchamianych przy starcie systemu Windows.",
+      "startupDifferentLocation": "W ustawieniach uruchamiania systemu Windows wskazano inną lokalizację Mouzi. Włącz tę opcję, aby użyć tej kopii.",
       "startupUnavailable": "Ustawienia autostartu są niedostępne w tej odizolowanej wersji deweloperskiej.",
       "gracePeriod": "Okres karencji",
       "gracePeriodDesc": "Czas oczekiwania przed przeniesieniem pliku po ostatniej modyfikacji. 0 = natychmiast.",

@@ -76,7 +76,8 @@ export type PreferencesPatch = Partial<Pick<AppSettings,
   'lock_check_enabled' | 'local_ai_enabled' | 'local_ai_model' | 'auto_update_enabled'
 >>;
 
-export type StartupStatus = 'enabled' | 'disabled' | 'blockedBySystem' | 'unavailable';
+const startupStatuses = ['enabled', 'disabled', 'blockedBySystem', 'differentLocation', 'unavailable'] as const;
+export type StartupStatus = (typeof startupStatuses)[number];
 
 type StartupRead =
   | { status: 'loading' }
@@ -315,7 +316,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     set({ startupRead: { status: 'loading' } });
     try {
       const effective = await invoke<StartupStatus>('get_startup_status_cmd');
-      if (!['enabled', 'disabled', 'blockedBySystem', 'unavailable'].includes(effective)) {
+      if (!startupStatuses.includes(effective)) {
         throw new Error('Windows returned an unrecognized startup status');
       }
       if (!signal?.aborted && request === startupRequest) {

@@ -126,6 +126,7 @@
       "startupReadError": "Impossible de vérifier le démarrage automatique.",
       "startupWriteError": "Impossible de modifier le démarrage automatique.",
       "startupBlocked": "Désactivé dans les applications de démarrage de Windows.",
+      "startupDifferentLocation": "Windows est configuré pour lancer Mouzi depuis un autre emplacement. Activez cette option pour utiliser cette copie.",
       "startupUnavailable": "Les réglages du démarrage automatique sont indisponibles dans cette version de développement isolée.",
       "gracePeriod": "Délai de grâce",
       "gracePeriodDesc": "Temps d'attente avant de déplacer un fichier après sa dernière modification. 0 = instantané.",

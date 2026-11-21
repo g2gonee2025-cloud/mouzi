@@ -126,6 +126,7 @@
       "startupReadError": "Could not check the startup setting.",
       "startupWriteError": "Could not update the startup setting.",
       "startupBlocked": "Turned off in Windows Startup Apps.",
+      "startupDifferentLocation": "Windows is set to start Mouzi from a different location. Turn this on to use this copy.",
       "startupUnavailable": "Startup settings are unavailable in this isolated development build.",
       "gracePeriod": "Grace period",
       "gracePeriodDesc": "Wait time before moving a file after it was last modified. 0 = instant.",

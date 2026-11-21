@@ -274,6 +274,11 @@ export default function Settings() {
   const startup = startupRead.status === "ready" ? startupRead.effective : null;
   const startupOn = startup === "enabled";
   const startupCanChange = !startupWriting && startup !== null && startup !== "unavailable";
+  const startupNote = startup === "blockedBySystem"
+    ? { id: "startup-blocked-note", text: t("settings.general.startupBlocked") }
+    : startup === "differentLocation"
+      ? { id: "startup-location-note", text: t("settings.general.startupDifferentLocation") }
+      : null;
   const [reviewPaths, setReviewPaths] = useState<string[] | null>(null);
   const [editingRule, setEditingRule] = useState<Rule | null>(null);
   const [pickedRuleDestination, setPickedRuleDestination] = useState<string | null>(null);
@@ -1176,7 +1181,7 @@ export default function Settings() {
                       role="switch"
                       aria-label={t("settings.general.startWithSystem")}
                       aria-checked={startupOn}
-                      aria-describedby={startup === "blockedBySystem" ? "startup-blocked-note" : undefined}
+                      aria-describedby={startupNote?.id}
                       onClick={() => { void setAutostart(!startupOn, startupRead); }}
                       className={`relative inline-flex h-6 w-11 shrink-0 items-center rounded-full transition-colors ${startupOn ? "bg-primary" : "bg-surface-dark"}`}
                     >
@@ -1189,8 +1194,8 @@ export default function Settings() {
                     {t(startupWriting ? "settings.general.startupSaving" : "settings.general.startupLoading")}
                   </p>
                 )}
-                {!startupWriting && startup === "blockedBySystem" && (
-                  <p id="startup-blocked-note" role="status" className="text-xs text-text-muted">{t("settings.general.startupBlocked")}</p>
+                {!startupWriting && startupNote && (
+                  <p id={startupNote.id} role="status" className="text-xs text-text-muted">{startupNote.text}</p>
                 )}
                 {!startupWriting && startup === "unavailable" && (
                   <p role="status" className="text-xs text-text-muted">{t("settings.general.startupUnavailable")}</p>

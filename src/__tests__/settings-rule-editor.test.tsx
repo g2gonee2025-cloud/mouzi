@@ -88,6 +88,7 @@ interface Props {
   checked?: boolean;
   label?: string;
   role?: string;
+  id?: string;
   title?: string;
   "aria-label"?: string;
   "aria-checked"?: boolean;
@@ -713,6 +714,44 @@ it("retries a failed startup lookup and can explicitly enable a Windows-blocked 
   expect(harness.invoke.mock.calls).toEqual([
     ["get_startup_status_cmd"], ["get_startup_status_cmd"], ["set_startup_enabled_cmd", { enabled: true }], ["get_startup_status_cmd"],
   ]);
+});
+
+it("offers explicit adoption when Windows points to another Mouzi location", async () => {
+  const persisted = openScheduler({ autostart: true });
+  harness.invoke.mockResolvedValueOnce("differentLocation");
+  await useAppStore.getState().loadStartupStatus();
+  const general = editor();
+  expect.soft(text(general)).toContain("settings.general.startupDifferentLocation");
+  expect.soft(text(general)).not.toContain("settings.general.startupReadError");
+  expect.soft(find(general, startupSwitch)?.props).toMatchObject({
+    "aria-checked": false, "aria-describedby": "startup-location-note",
+  });
+  expect(harness.invoke.mock.calls).toEqual([["get_startup_status_cmd"]]);
+  expect(requireElement(({ props }) => props.id === "startup-location-note", general).props.role).toBe("status");
+
+  harness.invoke.mockRejectedValueOnce("Windows refused this copy").mockResolvedValueOnce("differentLocation");
+  click(requireElement(startupSwitch));
+  expect(find(editor(), startupSwitch)).toBeUndefined();
+  expect(text(editor())).toContain("settings.general.startupSaving");
+  expect(text(editor())).not.toContain("settings.general.startupDifferentLocation");
+  await settle();
+  expect(requireElement(startupSwitch).props["aria-checked"]).toBe(false);
+  expect(text(editor())).toContain("settings.general.startupWriteError Windows refused this copy");
+  expect(text(editor())).toContain("settings.general.startupDifferentLocation");
+
+  harness.invoke.mockResolvedValueOnce("enabled").mockResolvedValueOnce("enabled");
+  click(requireElement(startupSwitch));
+  await settle();
+  expect(requireElement(startupSwitch).props["aria-checked"]).toBe(true);
+  expect(requireElement(startupSwitch).props["aria-describedby"]).toBeUndefined();
+  expect(text(editor())).not.toContain("settings.general.startupDifferentLocation");
+  expect(text(editor())).not.toContain("Windows refused this copy");
+  expect(harness.invoke.mock.calls).toEqual([
+    ["get_startup_status_cmd"],
+    ["set_startup_enabled_cmd", { enabled: true }], ["get_startup_status_cmd"],
+    ["set_startup_enabled_cmd", { enabled: true }], ["get_startup_status_cmd"],
+  ]);
+  expect(persisted()).toMatchObject({ autostart: true, revision: 4 });
 });
 
 it("keeps unavailable startup and a verified failed change separate from other preferences", async () => {
