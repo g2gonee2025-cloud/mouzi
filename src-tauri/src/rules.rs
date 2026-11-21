@@ -100,25 +100,37 @@ pub fn should_ignore_file(path: &Path) -> bool {
 }
 
 /// Check whether a file is ignored by the `.mouziignore` in its parent folder.
-/// This is the single helper used by both the watcher and the manual Clean Now path
-/// so both code paths behave identically.
 pub fn is_file_ignored_by_mouziignore(path: &Path) -> Result<bool, String> {
-    if let Some(parent) = path.parent() {
-        let patterns = load_mouziignore(&parent.to_string_lossy())?;
-        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-            return Ok(is_ignored(name, &patterns));
-        }
+    match path.parent() {
+        Some(parent) => ignored_in_folder(parent, path.file_name().and_then(|name| name.to_str())),
+        None => Ok(false),
     }
-    Ok(false)
+}
+
+fn ignored_in_folder(directory: &Path, name: Option<&str>) -> Result<bool, String> {
+    let patterns = load_mouziignore(&directory.to_string_lossy())?;
+    Ok(name.is_some_and(|name| is_ignored(name, &patterns)))
 }
 
 pub(crate) fn organization_path_is_protected(path: &Path, root: &Path) -> Result<bool, String> {
-    if should_ignore_file(path) || is_file_ignored_by_mouziignore(path)? {
+    organization_path_is_protected_with(path, root, ignored_in_folder)
+}
+
+pub(crate) fn organization_path_is_protected_with(
+    path: &Path,
+    root: &Path,
+    mut ignored_in: impl FnMut(&Path, Option<&str>) -> Result<bool, String>,
+) -> Result<bool, String> {
+    if should_ignore_file(path) {
         return Ok(true);
     }
-    if path.parent().is_some_and(|parent| !same_path(parent, root)) {
-        let patterns = load_mouziignore(&root.to_string_lossy())?;
-        return Ok(path.file_name().and_then(|name| name.to_str()).is_some_and(|name| is_ignored(name, &patterns)));
+    let Some(parent) = path.parent() else { return Ok(false); };
+    let name = path.file_name().and_then(|name| name.to_str());
+    if ignored_in(parent, name)? {
+        return Ok(true);
+    }
+    if !same_path(parent, root) {
+        return ignored_in(root, name);
     }
     Ok(false)
 }

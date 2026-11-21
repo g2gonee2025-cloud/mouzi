@@ -1,11 +1,13 @@
 use crate::db::{get_settings, get_watched_folders, is_folder_auto_mode, is_folder_manual_mode, WatchedFolder};
-use crate::rules::{is_file_ignored_by_mouziignore, process_watched_file, same_path, should_ignore_file, ProcessOutcome, WatchedRoot};
+use crate::ignore::IgnorePatterns;
+use crate::rules::{is_file_ignored_by_mouziignore, organization_path_is_protected_with, process_watched_file, same_path, should_ignore_file, ProcessOutcome, WatchedRoot};
 use crate::safe_fs::FileIdentity;
 use crate::suppress::{CancellationTicket, SuppressionSet};
 use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 use tauri::{Emitter, Manager};
 #[cfg(not(target_os = "windows"))]
@@ -85,12 +87,84 @@ struct WatchFailure {
     delay: Duration,
 }
 
+struct PendingReview {
+    root: Arc<WatchedRoot>,
+    excluded: bool,
+}
+
+#[derive(Default)]
+struct PendingManualState {
+    arrivals: HashMap<String, PendingReview>,
+    exclusions_unavailable: bool,
+}
+
+#[derive(Default)]
+struct PendingManual {
+    state: Mutex<PendingManualState>,
+    visible_count: AtomicUsize,
+}
+
+impl PendingManual {
+    fn update_count(&self, state: &PendingManualState) {
+        let count = if state.exclusions_unavailable { 0 } else {
+            state.arrivals.values().filter(|arrival| !arrival.excluded).count()
+        };
+        self.visible_count.store(count, Ordering::Release);
+    }
+
+    fn visible_files(&self) -> Result<Vec<(String, String)>, String> {
+        // A policy snapshot belongs to these tickets, even if a watcher callback
+        // is waiting to queue a new version of the same path.
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let exclusions = pending_exclusions(&state.arrivals, |directory| {
+            IgnorePatterns::from_folder(&directory.to_string_lossy())
+        });
+        state.exclusions_unavailable = exclusions.is_err();
+        if let Ok(excluded) = &exclusions {
+            for (path, arrival) in &mut state.arrivals {
+                arrival.excluded = excluded.contains(path);
+            }
+        }
+        self.update_count(&state);
+        exclusions?;
+        Ok(state.arrivals.iter().filter_map(|(path, arrival)| {
+            if arrival.excluded { return None; }
+            let path = Path::new(path);
+            Some((path.parent()?.to_string_lossy().into_owned(), path.file_name()?.to_string_lossy().into_owned()))
+        }).collect())
+    }
+}
+
+fn pending_exclusions(
+    arrivals: &HashMap<String, PendingReview>,
+    mut read_patterns: impl FnMut(&Path) -> Result<IgnorePatterns, String>,
+) -> Result<HashSet<String>, String> {
+    let mut patterns = HashMap::<PathBuf, IgnorePatterns>::new();
+    let mut roots = HashMap::new();
+    let mut excluded = HashSet::new();
+    for (path, arrival) in arrivals {
+        let root = &arrival.root;
+        if !roots.contains_key(&root.path) {
+            roots.insert(root.path.clone(), root.guard_physical()?);
+        }
+        let is_excluded = organization_path_is_protected_with(Path::new(path), &root.path, |directory, name| {
+            if !patterns.contains_key(directory) {
+                let _guard = if directory != root.path.as_path() { Some(crate::safe_fs::guard_directory(directory)?) } else { None };
+                patterns.insert(directory.to_path_buf(), read_patterns(directory)?);
+            }
+            Ok(name.is_some_and(|name| patterns[directory].is_ignored(name)))
+        })?;
+        if is_excluded { excluded.insert(path.clone()); }
+    }
+    Ok(excluded)
+}
+
 pub struct FolderWatcher {
     watchers: HashMap<String, ActiveWatch>,
     failures: HashMap<String, WatchFailure>,
     callback_warnings: Arc<Mutex<HashMap<String, String>>>,
     pending: Arc<Mutex<Vec<PendingFile>>>,
-    pending_manual: Arc<Mutex<HashMap<String, Arc<WatchedRoot>>>>,
+    pending_manual: Arc<PendingManual>,
     suppression: Arc<SuppressionSet>,
     handle: Option<std::thread::JoinHandle<()>>,
     app_handle: Option<tauri::AppHandle>,
@@ -99,7 +173,7 @@ pub struct FolderWatcher {
 impl FolderWatcher {
     pub fn new(suppression: Arc<SuppressionSet>) -> Self {
         Self { watchers: HashMap::new(), failures: HashMap::new(), callback_warnings: Arc::new(Mutex::new(HashMap::new())), pending: Arc::new(Mutex::new(Vec::new())),
-            pending_manual: Arc::new(Mutex::new(HashMap::new())), suppression, handle: None, app_handle: None }
+            pending_manual: Arc::new(PendingManual::default()), suppression, handle: None, app_handle: None }
     }
 
     fn processing_view(&self, app_handle: tauri::AppHandle) -> Self {
@@ -349,8 +423,12 @@ impl FolderWatcher {
                 | notify::EventKind::Modify(notify::event::ModifyKind::Name(
                     notify::event::RenameMode::From | notify::event::RenameMode::Both)));
             let mut warning = None;
+            let mut ignore_changed = false;
             for path in event.paths {
                 if !callback_root.watch_is_active() { return; }
+                ignore_changed |= path.file_name().and_then(|name| name.to_str()).is_some_and(|name| {
+                    if cfg!(windows) { name.eq_ignore_ascii_case(".mouziignore") } else { name == ".mouziignore" }
+                });
                 let result = (|| {
                     if may_remove && path.parent() == Some(callback_root.path.as_path()) {
                         let _guard = callback_root.guard_physical()?;
@@ -364,6 +442,12 @@ impl FolderWatcher {
                         warning = Some(format!("{}: {error}", path.display()));
                     }
                 }
+            }
+            if ignore_changed {
+                if let Err(error) = manual.visible_files() {
+                    if warning.is_none() { warning = Some(error); }
+                }
+                if let Some(app) = app.as_ref() { update_pending_tooltip(app, &manual); }
             }
             record_callback_health(app.as_ref(), &warnings, &callback_root, warning, false);
         })?;
@@ -421,14 +505,15 @@ impl FolderWatcher {
         };
         self.suppression.invalidate(&removed);
         {
-            let mut manual = self.pending_manual.lock().unwrap_or_else(|error| error.into_inner());
+            let mut manual = self.pending_manual.state.lock().unwrap_or_else(|error| error.into_inner());
             let mut stale = Vec::new();
-            for (path, root) in manual.iter() {
-                if !pending_review_is_current(Path::new(path), root, folders)? {
+            for (path, arrival) in &manual.arrivals {
+                if !pending_review_is_current(Path::new(path), &arrival.root, folders)? {
                     stale.push(path.clone());
                 }
             }
-            for path in stale { manual.remove(&path); }
+            for path in stale { manual.arrivals.remove(&path); }
+            self.pending_manual.update_count(&manual);
         }
         self.update_tray_tooltip();
         Ok(())
@@ -443,11 +528,9 @@ impl FolderWatcher {
     pub fn get_pending_files(&self) -> Result<Vec<(String, String)>, String> {
         let folders = get_watched_folders().map_err(|error| error.to_string())?;
         self.prune_queues(&folders)?;
-        Ok(self.pending_manual.lock().unwrap_or_else(|error| error.into_inner()).keys()
-            .filter_map(|path| {
-                let path = Path::new(path);
-                Some((path.parent()?.to_string_lossy().to_string(), path.file_name()?.to_string_lossy().to_string()))
-            }).collect())
+        let result = self.pending_manual.visible_files();
+        self.update_tray_tooltip();
+        result
     }
 
     pub fn flush_manual_to_pending(&mut self, folder_path: &str) {
@@ -455,11 +538,12 @@ impl FolderWatcher {
         if !auto_root_is_current(root) { return; }
         let Ok(settings) = get_settings() else { return; };
         let paths = {
-            let mut manual = self.pending_manual.lock().unwrap_or_else(|error| error.into_inner());
-            let paths = manual.iter().filter(|(path, observing_root)| Arc::ptr_eq(observing_root, root)
+            let mut manual = self.pending_manual.state.lock().unwrap_or_else(|error| error.into_inner());
+            let paths = manual.arrivals.iter().filter(|(path, arrival)| Arc::ptr_eq(&arrival.root, root)
                 && !crate::operations::suspicious_name(Path::new(path)))
                 .map(|(path, _)| PathBuf::from(path)).collect::<Vec<_>>();
-            for path in &paths { manual.remove(&path.to_string_lossy().to_string()); }
+            for path in &paths { manual.arrivals.remove(path.to_string_lossy().as_ref()); }
+            self.pending_manual.update_count(&manual);
             paths
         };
         for path in paths {
@@ -515,17 +599,17 @@ fn pending_review_is_current(path: &Path, root: &WatchedRoot, folders: &[Watched
     }
 }
 
-fn update_pending_tooltip(app: &tauri::AppHandle, manual: &Arc<Mutex<HashMap<String, Arc<WatchedRoot>>>>) {
+fn update_pending_tooltip(app: &tauri::AppHandle, manual: &Arc<PendingManual>) {
     let queue = manual.clone();
     let handle = app.clone();
     let _ = app.run_on_main_thread(move || {
-        let count = queue.lock().unwrap_or_else(|error| error.into_inner()).len();
+        let count = queue.visible_count.load(Ordering::Acquire);
         crate::tray::update_tray_tooltip(&handle, count);
     });
 }
 
 fn enqueue_path(path: &Path, root: &Arc<WatchedRoot>, pending: &Mutex<Vec<PendingFile>>,
-    manual: &Arc<Mutex<HashMap<String, Arc<WatchedRoot>>>>, suppression: &SuppressionSet, app: Option<&tauri::AppHandle>) -> Result<(), String> {
+    manual: &Arc<PendingManual>, suppression: &SuppressionSet, app: Option<&tauri::AppHandle>) -> Result<(), String> {
     if !root.watch_is_active() || path.parent() != Some(root.path.as_path()) || !path.is_file() { return Ok(()); }
     let folders = get_watched_folders().map_err(|error| error.to_string())?;
     let Some(folder) = folders.iter().find(|folder| folder.enabled && root.matches_registration(folder)
@@ -538,13 +622,19 @@ fn enqueue_path(path: &Path, root: &Arc<WatchedRoot>, pending: &Mutex<Vec<Pendin
     if crate::operations::already_processed(path)? { return Ok(()); }
     if is_folder_manual_mode(&folder.mode) || crate::operations::suspicious_name(path) {
         {
-            let mut queue = manual.lock().unwrap_or_else(|error| error.into_inner());
+            let mut queue = manual.state.lock().unwrap_or_else(|error| error.into_inner());
             // A configuration write may have committed while this event was
             // being checked. Reconcile against its current baseline before
             // inserting, under the same queue lock as pruning.
             let folders = get_watched_folders().map_err(|error| error.to_string())?;
             if !pending_review_is_current(path, root, &folders)? { return Ok(()); }
-            queue.insert(path.to_string_lossy().to_string(), root.clone());
+            let previous = queue.arrivals.insert(
+                path.to_string_lossy().into_owned(),
+                PendingReview { root: root.clone(), excluded: false },
+            );
+            if !queue.exclusions_unavailable && previous.is_none_or(|arrival| arrival.excluded) {
+                manual.visible_count.fetch_add(1, Ordering::Release);
+            }
         }
         if let Some(app) = app {
             let _ = app.emit("file-detected", serde_json::json!({
@@ -607,7 +697,7 @@ fn recursive_watch_enabled_from(env: Option<&str>, stored: bool) -> bool {
 
 pub(crate) struct WatcherQueueCancellation {
     pending: Arc<Mutex<Vec<PendingFile>>>,
-    pending_manual: Arc<Mutex<HashMap<String, Arc<WatchedRoot>>>>,
+    pending_manual: Arc<PendingManual>,
     app_handle: Option<tauri::AppHandle>,
 }
 
@@ -615,11 +705,12 @@ impl WatcherQueueCancellation {
     /// Wait for queue access before taking the operation gate. The returned
     /// callback prunes only validated paths, then releases both queue locks.
     pub(crate) fn prepare(&self) -> impl FnOnce(&[PathBuf]) + '_ {
-        let mut manual = self.pending_manual.lock().unwrap_or_else(|error| error.into_inner());
+        let mut manual = self.pending_manual.state.lock().unwrap_or_else(|error| error.into_inner());
         let mut pending = self.pending.lock().unwrap_or_else(|error| error.into_inner());
         move |paths| {
             pending.retain(|item| !paths.iter().any(|path| same_path(path, &item.path)));
-            manual.retain(|path, _| !paths.iter().any(|cancelled| same_path(cancelled, Path::new(path))));
+            manual.arrivals.retain(|path, _| !paths.iter().any(|cancelled| same_path(cancelled, Path::new(path))));
+            self.pending_manual.update_count(&manual);
             drop(pending);
             drop(manual);
             if let Some(app) = self.app_handle.as_ref() {
@@ -646,7 +737,7 @@ mod tests {
         let later = root.path.join("later.undocheck");
         for path in [&reviewed, &later] {
             cancellation.pending.lock().unwrap().push(pending_item(path, &root, &suppression, Duration::ZERO));
-            cancellation.pending_manual.lock().unwrap().insert(path.to_string_lossy().into_owned(), root.clone());
+            cancellation.pending_manual.state.lock().unwrap().arrivals.insert(path.to_string_lossy().into_owned(), PendingReview { root: root.clone(), excluded: false });
         }
         let _busy_watcher = watcher.lock().unwrap();
         let cancel = cancellation.prepare();
@@ -656,7 +747,8 @@ mod tests {
         let pending = cancellation.pending.try_lock().unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].path, later);
-        let manual = cancellation.pending_manual.try_lock().unwrap();
+        let state = cancellation.pending_manual.state.try_lock().unwrap();
+        let manual = &state.arrivals;
         assert_eq!(manual.len(), 1);
         assert!(manual.contains_key(later.to_str().unwrap()));
     }
@@ -744,7 +836,93 @@ mod tests {
 
             assert!(db::set_only_new(id, true).unwrap());
             watcher.reconcile_baseline(id).unwrap();
-            assert!(watcher.pending_manual.lock().unwrap().is_empty());
+            assert!(watcher.pending_manual.state.lock().unwrap().arrivals.is_empty());
+        }
+    }
+
+    #[test]
+    fn pending_exclusions_revalidate_the_public_queue_without_dropping_arrivals() {
+        use crate::db::{self, FOLDER_MODE_MANUAL};
+        use crate::ignore::save_mouziignore;
+        use std::fs;
+
+        let _serial = db::serialise_test_db();
+        db::init_test_db();
+        let mut fixture = RecoveryFixture::new();
+        let directory = fixture.root();
+        let id = db::register_watched_folder(directory.to_str().unwrap(), FOLDER_MODE_MANUAL, false).unwrap();
+        fixture.id = Some(id);
+        let row = get_watched_folders().unwrap().into_iter().find(|folder| folder.id == Some(id)).unwrap();
+        let root = Arc::new(WatchedRoot::capture(&row).unwrap());
+        let watcher = FolderWatcher::new(Arc::new(SuppressionSet::new()));
+        let protected = root.path.join("protected.txt");
+        let sibling = root.path.join("sibling.txt");
+        let original = db::history_counts().unwrap().total;
+        for (path, bytes) in [(&protected, b"protected contents".as_slice()), (&sibling, b"sibling contents".as_slice())] {
+            fs::write(path, bytes).unwrap();
+            enqueue_path(path, &root, &watcher.pending, &watcher.pending_manual, &watcher.suppression, None).unwrap();
+        }
+        let names = || {
+            let mut found = watcher.get_pending_files().unwrap().into_iter().map(|(_, name)| name).collect::<Vec<_>>();
+            found.sort();
+            found
+        };
+        let folder_path = root.path.to_str().unwrap();
+        assert_eq!(names(), ["protected.txt", "sibling.txt"]);
+        assert_eq!(watcher.pending_manual.visible_count.load(Ordering::Acquire), 2);
+        save_mouziignore(folder_path, &["protected.txt".into()]).unwrap();
+        assert_eq!(names(), ["sibling.txt"]);
+        assert_eq!(watcher.pending_manual.visible_count.load(Ordering::Acquire), 1);
+        assert_eq!(watcher.pending_manual.state.lock().unwrap().arrivals.len(), 2);
+
+        // A decoding failure must be visible and must leave both queued arrivals intact.
+        fs::write(root.path.join(".mouziignore"), [0xff]).unwrap();
+        assert!(watcher.get_pending_files().unwrap_err().contains("Unable to read ignore protection file"));
+        assert_eq!(watcher.pending_manual.visible_count.load(Ordering::Acquire), 0);
+        assert_eq!(watcher.pending_manual.state.lock().unwrap().arrivals.len(), 2);
+        fs::remove_file(root.path.join(".mouziignore")).unwrap();
+
+        assert_eq!(names(), ["protected.txt", "sibling.txt"]);
+        assert_eq!(watcher.pending_manual.visible_count.load(Ordering::Acquire), 2);
+        assert_eq!(fs::read(&protected).unwrap(), b"protected contents");
+        assert_eq!(fs::read(&sibling).unwrap(), b"sibling contents");
+        assert_eq!(db::history_counts().unwrap().total, original);
+    }
+
+    #[test]
+    fn pending_exclusions_match_review_and_read_each_directory_once() {
+        use crate::ignore::save_mouziignore;
+        use std::fs;
+
+        let fixture = RecoveryFixture::new();
+        let folder = WatchedFolder {
+            id: Some(1), path: fixture.root().to_string_lossy().into_owned(),
+            enabled: true, mode: crate::db::FOLDER_MODE_MANUAL.into(), only_new: false,
+        };
+        let root = Arc::new(WatchedRoot::capture(&folder).unwrap());
+        let child = root.path.join("child");
+        fs::create_dir(&child).unwrap();
+        save_mouziignore(root.path.to_str().unwrap(), &["root-*.txt".into()]).unwrap();
+        save_mouziignore(child.to_str().unwrap(), &["parent-*.txt".into()]).unwrap();
+
+        // The watcher currently enqueues only top-level files. Exercise the
+        // shared Review policy for the nested paths it can receive as well.
+        let mut arrivals = HashMap::new();
+        for path in [root.path.join("root-top.txt"), child.join("root-nested.txt"),
+            child.join("parent-nested.txt"), child.join("sibling.txt")] {
+            fs::write(&path, b"fixture").unwrap();
+            arrivals.insert(path.to_string_lossy().into_owned(), PendingReview { root: root.clone(), excluded: false });
+        }
+        let mut reads = HashMap::new();
+        let actual = pending_exclusions(&arrivals, |directory| {
+            *reads.entry(directory.to_path_buf()).or_insert(0) += 1;
+            IgnorePatterns::from_folder(directory.to_str().unwrap())
+        }).unwrap();
+        assert_eq!(reads, HashMap::from([(root.path.clone(), 1), (child, 1)]));
+        assert_eq!(actual.len(), 3);
+        for source in arrivals.keys() {
+            let expected = crate::rules::organization_path_is_protected(Path::new(source), &root.path).unwrap();
+            assert_eq!(actual.contains(source), expected, "{source}");
         }
     }
 
@@ -765,21 +943,21 @@ mod tests {
         let absent = fixture.root().join("absent.txt").to_string_lossy().into_owned();
         let folders = [folder];
         {
-            let mut pending = watcher.pending_manual.lock().unwrap();
+            let mut pending = watcher.pending_manual.state.lock().unwrap();
             for path in [&unreadable, &present, &absent] {
-                pending.insert(path.clone(), root.clone());
+                pending.arrivals.insert(path.clone(), PendingReview { root: root.clone(), excluded: false });
             }
         }
         assert!(watcher.prune_queues(&folders).is_err());
-        let mut pending = watcher.pending_manual.lock().unwrap();
-        assert!(pending.contains_key(&unreadable));
-        assert!(pending.contains_key(&present));
-        pending.remove(&unreadable);
+        let mut pending = watcher.pending_manual.state.lock().unwrap();
+        assert!(pending.arrivals.contains_key(&unreadable));
+        assert!(pending.arrivals.contains_key(&present));
+        pending.arrivals.remove(&unreadable);
         drop(pending);
         watcher.prune_queues(&folders).unwrap();
-        let pending = watcher.pending_manual.lock().unwrap();
-        assert!(pending.contains_key(&present));
-        assert!(!pending.contains_key(&absent));
+        let pending = watcher.pending_manual.state.lock().unwrap();
+        assert!(pending.arrivals.contains_key(&present));
+        assert!(!pending.arrivals.contains_key(&absent));
     }
 
     struct RecoveryFixture {
@@ -860,7 +1038,7 @@ mod tests {
         watcher.reconcile_watches_for_folders(&folders, retry_at, false, false).unwrap();
         assert!(!Arc::ptr_eq(&watcher.watchers[path].root, &recovered));
         enqueue_path(&arrival, &recovered, &watcher.pending, &watcher.pending_manual, &watcher.suppression, None).unwrap();
-        assert!(Arc::ptr_eq(&watcher.pending_manual.lock().unwrap()[arrival.to_str().unwrap()], &watcher.watchers[path].root));
+        assert!(Arc::ptr_eq(&watcher.pending_manual.state.lock().unwrap().arrivals[arrival.to_str().unwrap()].root, &watcher.watchers[path].root));
     }
 
     #[test]
