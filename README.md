@@ -8,7 +8,7 @@ The supported build target for this fork is Windows 10/11 with WebView2. Upstrea
 
 New profiles start without watched folders, scheduled cleaning or local AI. Default organizer rules are initialized together with the detected supported system language. Existing profiles keep their saved preferences and rules.
 
-**Start with System** in General Settings shows Mouzi’s Windows startup registration. If you turn Mouzi off in Windows Startup Apps, it stays off when you reopen Mouzi. To enable it again, use the switch in General Settings or Windows Startup Apps.
+**Start with System** in General Settings shows Mouzi’s Windows startup registration. If you move Mouzi and Windows still points to the old location, turn on the switch in the copy you want to start. If you turn Mouzi off in Windows Startup Apps, it stays off when you reopen Mouzi. To enable it again, use the switch in General Settings or Windows Startup Apps.
 
 Choose **Add a watched folder** in the tray popup to open Watched Folders in Settings. Once you add a folder, the popup offers **Organize Now** to review proposed changes. **Close** hides the popup and leaves Mouzi running. To exit, right-click the tray icon and choose **Quit**.
 
@@ -26,6 +26,8 @@ Clean Now opens the review queue for enabled, nonpaused folders. Review the exac
 Mouzi remembers the physical identity of each newly registered watched folder. When the folder goes offline, the watcher retries and resumes when the same folder returns. Settings shows a problem if a different folder occupies its path. To use the replacement, remove the old registration and add the new folder. For an older registration without a saved identity, startup binds to the folder then present at the saved path. If that path is offline, reconnect the intended folder and restart Mouzi or add the folder again in Settings.
 
 Rules can apply to all watched folders or to one folder. Conditions include extension, filename pattern, size, and modification date. Rules can move, rename, or ignore files. Existing delete rules are visible in review with a recovery error. Relative destinations resolve under the watched root, and collision suffixes preserve existing files.
+
+Rule import accepts UTF-8 JSON with or without a leading byte-order mark, so you can edit an export in a Windows text editor and import it again.
 
 The rule editor shows the destination it will save. For a rule that applies to all watched folders, picking a subfolder such as `Inbox\Filed` stores `Filed` under each source folder. Picking a watched folder itself keeps its full path. For a rule limited to one folder, picking a destination outside it also keeps the full path.
 
@@ -80,6 +82,8 @@ New imports live under the application's data directory in `archive-imports/`, w
 SQLite stores an operation intent before app-managed file mutations and finalizes history/inventory afterward. Persistence failures are surfaced with actual filesystem outcomes and pending recovery evidence. The journal is recovery evidence, not automatic crash rollback or a finished recovery UI.
 
 Move history supports single Undo, selected Undo, and Undo All, including accepted suggestions. Filter organization runs by text, rule, extension, or date. Reviewed moves save a content fingerprint that Undo checks before restoring. If the original name is occupied, Undo restores the file with a suffix. Move records with a saved file identity let Undo verify the file at the recorded destination. Older records without that identity remain visible and require manual restoration when a file is present. An interrupted Undo keeps a recovery record and asks you to inspect the recorded paths before restoring manually. Revert All restores the moves covered by its confirmation. Moves recorded afterward stay organized. If a file is missing, History keeps the move eligible for another Undo attempt when the file returns to its recorded destination. The interface counts restored files and missing files separately. Clear History removes the records covered by its confirmation and preserves later moves and their Undo actions. An interrupted restore keeps the History record needed for recovery. Use Windows Recycle Bin to restore cleanup items that are present there.
+
+After Revert All, the receipt lists the full path of each file restored under a new name. A receipt with these paths stays available in the current Settings session until you dismiss it or run Revert All again.
 
 ## Scheduling and settings
 
