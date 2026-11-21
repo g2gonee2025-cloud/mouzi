@@ -125,7 +125,11 @@ pub fn save_mouziignore(folder_path: &str, patterns: &[String]) -> Result<(), St
     let path = folder.join(IGNORE_FILE);
     let existing = open_ignore_file(&path)?;
     let content = new_ignore_document(patterns);
-    write_ignore_document(folder, &path, existing, &content)
+    if write_ignore_document(&path, existing, None, &content)? {
+        Ok(())
+    } else {
+        Err(format!("Ignore protection file {} changed during save", path.display()))
+    }
 }
 
 fn new_ignore_document(patterns: &[String]) -> String {
@@ -149,8 +153,14 @@ pub fn save_mouziignore_checked(
 ) -> Result<IgnoreSaveOutcome, String> {
     let folder = Path::new(folder_path);
     let path = folder.join(IGNORE_FILE);
-    let mut existing = open_ignore_file(&path)?;
-    let document = read_ignore_content(existing.as_mut(), &path)?;
+    let existing = open_ignore_file(&path)?;
+    save_checked_document(&path, existing, expected, patterns)
+}
+
+fn save_checked_document(
+    path: &Path, mut existing: Option<File>, expected: &[String], patterns: &[String],
+) -> Result<IgnoreSaveOutcome, String> {
+    let document = read_ignore_content(existing.as_mut(), path)?;
     let current = parse_patterns(document.as_deref().unwrap_or_default());
     if patterns == expected || patterns == current.as_slice() {
         return Ok(IgnoreSaveOutcome::Saved { patterns: current });
@@ -158,11 +168,15 @@ pub fn save_mouziignore_checked(
     if current.as_slice() != expected {
         return Ok(IgnoreSaveOutcome::Conflict { patterns: current });
     }
-    let content = match document {
-        Some(document) => edit_ignore_document(&document, patterns),
+    let content = match document.as_deref() {
+        Some(document) => edit_ignore_document(document, patterns),
         None => new_ignore_document(patterns),
     };
-    write_ignore_document(folder, &path, existing, &content)?;
+    if !write_ignore_document(path, existing, document.as_deref(), &content)? {
+        let mut current = open_ignore_file(path)?;
+        let document = read_ignore_content(current.as_mut(), path)?;
+        return Ok(IgnoreSaveOutcome::Conflict { patterns: parse_patterns(document.as_deref().unwrap_or_default()) });
+    }
     Ok(IgnoreSaveOutcome::Saved { patterns: parse_patterns(&content) })
 }
 
@@ -207,25 +221,51 @@ fn edit_ignore_document(document: &str, patterns: &[String]) -> String {
     content
 }
 
-fn write_ignore_document(folder: &Path, path: &Path, existing: Option<File>, content: &str) -> Result<(), String> {
+/// A false result means a different file or document won publication.
+fn write_ignore_document(
+    path: &Path, existing: Option<File>, original: Option<&str>, content: &str,
+) -> Result<bool, String> {
     // Stage the full replacement before publishing it. Never truncate a path
     // supplied by the filesystem, even when the checked leaf is regular.
     static NEXT_STAGE: AtomicU64 = AtomicU64::new(0);
     let serial = NEXT_STAGE.fetch_add(1, Ordering::Relaxed);
-    let stage = folder.join(format!("{IGNORE_FILE}.{}.{serial}.tmp", std::process::id()));
-    let mut file = OpenOptions::new().write(true).create_new(true).open(&stage)
+    let destination = std::path::absolute(path).map_err(|error| error.to_string())?;
+    let parent = destination.parent().ok_or("Ignore protection file has no parent directory")?;
+    let _parent_guard = crate::safe_fs::guard_directory(parent)?;
+    let stage = destination.with_file_name(format!("{IGNORE_FILE}.{}.{serial}.tmp", std::process::id()));
+    let mut file = crate::safe_fs::create_guarded_staging_file(&stage)
         .map_err(|error| format!("Cannot stage ignore protection file: {error}"))?;
-    let written = file.write_all(content.as_bytes()).and_then(|()| file.sync_all());
-    drop(file);
-    // Windows must release the checked leaf before renaming over its name.
-    // The rename updates the entry itself, never writes through a leaf link.
-    drop(existing);
-    let result = written.and_then(|()| fs::rename(&stage, path));
-    if let Err(error) = result {
-        let _ = fs::remove_file(&stage);
-        return Err(format!("Cannot save ignore protection file {}: {error}", path.display()));
+    let identity = crate::safe_fs::identity_from_handle(&file)
+        .map_err(|error| format!("Cannot identify staging file {}: {error}", stage.display()))?;
+    let save_error = |error| format!("Cannot save ignore protection file {}: {error}", path.display());
+    let result = (|| {
+        file.write_all(content.as_bytes()).and_then(|()| file.sync_all()).map_err(save_error)?;
+        let Some(previous) = existing else {
+            return crate::safe_fs::publish_staged_file(&file, &stage, &destination).map_err(save_error);
+        };
+        let Some(mut current) = open_ignore_file(&destination)? else { return Ok(false); };
+        if crate::safe_fs::identity_from_handle(&previous)? != crate::safe_fs::identity_from_handle(&current)? {
+            return Ok(false);
+        }
+        if let Some(original) = original {
+            if read_ignore_content(Some(&mut current), path)?.as_deref() != Some(original) {
+                return Ok(false);
+            }
+        }
+        // Windows denies edits through staging. Replacing an existing name requires
+        // releasing its read guards, so an external edit during the final rename is still possible.
+        drop(current);
+        drop(previous);
+        drop(file);
+        fs::rename(&stage, &destination).map(|()| true).map_err(save_error)
+    })();
+    if !matches!(result, Ok(true)) {
+        if let Err(cleanup) = crate::safe_fs::remove_regular_file_expected(&stage, &identity) {
+            let cause = result.err().unwrap_or_else(|| "Ignore protection file changed during save".into());
+            return Err(format!("{cause}. Cannot remove staging file {}: {cleanup}", stage.display()));
+        }
     }
-    Ok(())
+    result
 }
 
 /// Check if a file name matches any of the ignore patterns.
@@ -398,6 +438,53 @@ mod tests {
         assert!(matches!(save_mouziignore_checked(directory, &[], &new).unwrap(),
             IgnoreSaveOutcome::Saved { patterns } if patterns == new));
         assert_eq!(fs::read_to_string(&file).unwrap(), "# Mouzi ignore rules\n# https://mouzi.cc/docs\n\nreport\\#final.pdf\n");
+        fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn first_ignore_save_reports_competing_file_and_preserves_its_bytes() {
+        let folder = temporary_folder();
+        let path = folder.join(IGNORE_FILE);
+        let draft = ["draft.tmp".to_string()];
+        for document in ["", "# editor notes only\r\n", "\u{feff}# editor\r\nkeep.tmp # keep this annotation\r\n"] {
+            let observed = open_ignore_file(&path).unwrap();
+            assert!(observed.is_none());
+            fs::write(&path, document).unwrap();
+            let outcome = save_checked_document(&path, observed, &[], &draft).unwrap();
+            assert!(matches!(outcome, IgnoreSaveOutcome::Conflict { patterns } if patterns == parse_patterns(document)));
+            assert_eq!(fs::read(&path).unwrap(), document.as_bytes());
+            assert_eq!(fs::read_dir(&folder).unwrap().count(), 1);
+            fs::remove_file(&path).unwrap();
+        }
+        fs::remove_dir(folder).unwrap();
+    }
+
+    #[test]
+    fn first_ignore_save_reports_unreadable_competing_file_as_an_error() {
+        let folder = temporary_folder();
+        let path = folder.join(IGNORE_FILE);
+        let observed = open_ignore_file(&path).unwrap();
+        fs::write(&path, [0xff, 0xfe]).unwrap();
+        let result = save_checked_document(&path, observed, &[], &["draft.tmp".into()]);
+        assert!(result.unwrap_err().contains("Unable to read ignore protection file"));
+        assert_eq!(fs::read(&path).unwrap(), [0xff, 0xfe]);
+        assert_eq!(fs::read_dir(&folder).unwrap().count(), 1);
+        fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checked_replacement_detects_an_edit_during_staging() {
+        let folder = temporary_folder();
+        let path = folder.join(IGNORE_FILE);
+        let original = "# my notes\nkeep.tmp\n";
+        fs::write(&path, original).unwrap();
+        let observed = open_ignore_file(&path).unwrap();
+        let edited = "# revised notes\nkeep.tmp\n";
+        fs::write(&path, edited).unwrap();
+        assert!(!write_ignore_document(&path, observed, Some(original), "draft.tmp\n").unwrap());
+        assert_eq!(fs::read_to_string(&path).unwrap(), edited);
+        assert_eq!(fs::read_dir(&folder).unwrap().count(), 1);
         fs::remove_dir_all(folder).unwrap();
     }
 
