@@ -90,14 +90,16 @@ pub fn run() {
         context.config_mut().product_name = Some("Mouzi Development".into());
     }
     let ignored_files = Arc::new(SuppressionSet::new());
-    tauri::Builder::default()
+    let builder = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
-        .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_autostart::init(
-            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
-            Some(vec!["--autostart"]),
-        ))
+        .plugin(tauri_plugin_dialog::init());
+    #[cfg(not(windows))]
+    let builder = builder.plugin(tauri_plugin_autostart::init(
+        tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+        Some(vec!["--autostart"]),
+    ));
+    builder
         .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
             if integration::handle_folder_args(app, &args) {
                 return;
