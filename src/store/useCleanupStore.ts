@@ -2,7 +2,7 @@ import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { createPreviewSlot } from "./previewRequest";
-import { buildDuplicateActions, duplicateCopyCount, DUPLICATE_REVIEW_LIMIT, resolveKeeper } from "../utils/cleanup";
+import { buildDuplicateActions, duplicateCopyCount, CLEANUP_REVIEW_LIMIT, resolveKeeper } from "../utils/cleanup";
 import type { DuplicateGroup, CleanupFile, CleanupRequest, CleanupOutcome, CleanupPlan } from "../utils/cleanup";
 
 export interface CleanupLogEntry {
@@ -157,7 +157,7 @@ export const useCleanupStore = create<CleanupState>((set, get) => {
         const found: Partial<CleanupState> = { [key]: candidates };
         if (found.duplicates) {
           found.duplicateKeepers = keepersIn(found.duplicates, priorKeepers);
-          if (duplicateCopyCount(found.duplicates) > DUPLICATE_REVIEW_LIMIT) found.duplicateVictims = noDuplicateVictims;
+          if (duplicateCopyCount(found.duplicates) > CLEANUP_REVIEW_LIMIT) found.duplicateVictims = noDuplicateVictims;
         }
         set((state) => ({
           ...found,
@@ -194,7 +194,7 @@ export const useCleanupStore = create<CleanupState>((set, get) => {
           || !group.files.some((file) => file.path === path)) return state;
       const selected = new Set(duplicateVictims ?? buildDuplicateActions(duplicates, duplicateKeepers).map((action) => action.path));
       if (!selected.delete(path)) {
-        if (selected.size >= DUPLICATE_REVIEW_LIMIT) return state;
+        if (selected.size >= CLEANUP_REVIEW_LIMIT) return state;
         selected.add(path);
       }
       return { duplicateVictims: selected };
@@ -204,7 +204,7 @@ export const useCleanupStore = create<CleanupState>((set, get) => {
       return { duplicateVictims: noDuplicateVictims };
     }),
     selectAllDuplicateVictims: (groups) => set((state) => {
-      if (!groups || state.duplicates !== groups || duplicateCopyCount(groups) > DUPLICATE_REVIEW_LIMIT) return state;
+      if (!groups || state.duplicates !== groups || duplicateCopyCount(groups) > CLEANUP_REVIEW_LIMIT) return state;
       return { duplicateVictims: new Set(buildDuplicateActions(groups, state.duplicateKeepers).map((action) => action.path)) };
     }),
     findLargeFiles: (minBytes) => find("largeFiles", async () => {
@@ -272,7 +272,7 @@ export const useCleanupStore = create<CleanupState>((set, get) => {
             if (duplicateVictims !== null) {
               duplicateVictims = new Set(buildDuplicateActions(duplicates ?? [], duplicateKeepers, duplicateVictims)
                 .map((action) => action.path));
-            } else if (duplicateCopyCount(state.duplicates ?? []) > DUPLICATE_REVIEW_LIMIT) {
+            } else if (duplicateCopyCount(state.duplicates ?? []) > CLEANUP_REVIEW_LIMIT) {
               duplicateVictims = noDuplicateVictims;
             }
           }

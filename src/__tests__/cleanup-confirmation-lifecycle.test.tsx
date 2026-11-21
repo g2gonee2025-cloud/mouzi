@@ -1,6 +1,7 @@
 import { isValidElement, type EffectCallback, type ReactElement, type ReactNode } from "react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import ConfirmDialog, { type ConfirmDialogProps } from "../components/cleanup/ConfirmDialog";
+import { CleanupSelectionControls } from "../components/cleanup/CleanupSelection";
 import DuplicatesTab from "../components/cleanup/DuplicatesTab";
 import EmptyDirsTab from "../components/cleanup/EmptyDirsTab";
 import FileListTab from "../components/cleanup/FileListTab";
@@ -105,8 +106,18 @@ function text(node: ReactNode): string {
   return isValidElement<Props>(node) ? text(node.props.children) : "";
 }
 function find(node: ReactNode, match: (element: Element) => boolean): Element | undefined {
-  if (Array.isArray(node)) return node.map((child) => find(child, match)).find(Boolean);
+  if (Array.isArray(node)) {
+    for (const child of node) {
+      const result = find(child, match);
+      if (result) return result;
+    }
+    return;
+  }
   if (!isValidElement<Props>(node)) return;
+  if (node.type === CleanupSelectionControls) {
+    const draw = node.type as (props: Props) => ReactNode;
+    return find(draw(node.props), match);
+  }
   return match(node) ? node : find(node.props.children, match);
 }
 const button = (label: string) => (node: Element) => node.type === "button" && text(node.props.children) === label;
@@ -194,7 +205,7 @@ it.each(["empty", "large", "stale"] as const)("bounds deliberate bulk selection 
   const selectBatch = button("cleanup.selectFirstBatch");
   const reviewButton = button("cleanup.confirm");
   expect.soft(selectAllControl(before)).toBeUndefined();
-  expect.soft(text(before)).toContain("cleanup.selectionLimit");
+  expect.soft(find(before, (node) => node.type === "p" && text(node) === "cleanup.selectionLimit")).toBeDefined();
   expect(find(before, reviewButton)?.props.disabled).toBe(true);
   expect(rowCheckbox(before, first).checked).toBe(false);
   expect(rowCheckbox(before, outside).checked).toBe(false);
@@ -235,7 +246,7 @@ it.each(["empty", "large", "stale"] as const)("bounds deliberate bulk selection 
   rowCheckbox(cleared, outside).onChange!();
   const custom = render(tab);
   expect(find(custom, selectBatch)?.props.disabled).toBe(true);
-  expect(text(custom)).toContain("cleanup.selectionOutsideBatch");
+  expect(find(custom, (node) => node.props.role === "status" && text(node) === "cleanup.selectionOutsideBatch")).toBeDefined();
   // Even a callback retained from the previous enabled render cannot overwrite the custom selection.
   batch!.props.onClick!({ currentTarget: opener });
   const preserved = render(tab);

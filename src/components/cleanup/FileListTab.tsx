@@ -1,14 +1,17 @@
-import { useState, useCallback, useId, useMemo, useRef } from "react";
+import { useState, useId, useMemo, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import { useCleanupStore } from "../../store/useCleanupStore";
 import { formatBytes, formatTimestamp } from "../../utils/format";
-import type { CleanupRequest } from "../../utils/cleanup";
+import { CLEANUP_REVIEW_LIMIT, type CleanupFile, type CleanupRequest } from "../../utils/cleanup";
 import { Search, Trash2, ExternalLink } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import ResultsPanel from "./ResultsPanel";
 import ConfirmDialog from "./ConfirmDialog";
 import { useCleanupConfirmation } from "./useCleanupConfirmation";
 import UnavailableCleanupRoots from "./UnavailableCleanupRoots";
+import { CleanupSelectionControls, useCleanupSelection } from "./CleanupSelection";
+
+const filePath = (file: CleanupFile) => file.path;
 
 const BYTES_PER_MIB = 1_048_576n;
 const MIB_FRACTION_DIGITS = 20;
@@ -74,7 +77,6 @@ export default function FileListTab({
   const store = useCleanupStore();
   const thresholdId = useId();
   const [draftThreshold, setDraftThreshold] = useState<string | null>(null);
-  const [checked, setChecked] = useState<Set<string>>(new Set());
   const { pending, reviewNeedsSearch, clearReviewNotice, openReview } = useCleanupConfirmation();
   const findButton = useRef<HTMLButtonElement>(null);
   const resultsHeading = useRef<HTMLHeadingElement>(null);
@@ -91,6 +93,9 @@ export default function FileListTab({
   const threshold = draftThreshold ?? savedThreshold ?? String(defaultThreshold);
   const criterion = parseThreshold(threshold, isBytes);
   const data = search && criterion === searchedCriterion ? search.files : null;
+  const isCurrent = () => useCleanupStore.getState()[finderKey] === search;
+  const selection = useCleanupSelection(data, filePath, isCurrent);
+  const { checked, atLimit } = selection;
   const unavailableRoots = data && store.unavailableRoots[finderKey];
 
   const checkedFiles = useMemo(
@@ -107,29 +112,11 @@ export default function FileListTab({
     } else {
       store.findStaleFiles(criterion);
     }
-    setChecked(new Set());
+    selection.clear();
   };
 
-  const toggle = useCallback((path: string) => {
-    setChecked((prev) => {
-      const next = new Set(prev);
-      if (next.has(path)) next.delete(path);
-      else next.add(path);
-      return next;
-    });
-  }, []);
-
-  const toggleAll = useCallback(() => {
-    if (!data) return;
-    if (checked.size === data.length) {
-      setChecked(new Set());
-    } else {
-      setChecked(new Set(data.map((f) => f.path)));
-    }
-  }, [data, checked]);
-
   const handleConfirm = async (opener: HTMLButtonElement) => {
-    if (!search || checkedFiles.length === 0 || useCleanupStore.getState()[finderKey] !== search) return;
+    if (!search || !isCurrent() || !checkedFiles.length || checkedFiles.length > CLEANUP_REVIEW_LIMIT) return;
     const actions = checkedFiles.map(({ path }): CleanupRequest => "minBytes" in search
       ? { kind: "trash_large", path, minBytes: search.minBytes }
       : { kind: "trash_stale", path, days: search.days },
@@ -157,7 +144,7 @@ export default function FileListTab({
         results={receipt.outcomes}
         onDone={() => {
           if (!store.dismissReceipt(cleanupKind, receipt.planId)) return;
-          if (useCleanupStore.getState().loading) setChecked(new Set());
+          if (useCleanupStore.getState().loading) selection.clear();
           else handleFind();
         }}
         error={receipt.error}
@@ -187,7 +174,7 @@ export default function FileListTab({
             aria-invalid={criterion === null || undefined}
             onChange={(event) => {
               setDraftThreshold(event.target.value);
-              setChecked(new Set());
+              selection.clear();
             }}
             className="w-20 rounded-md border border-border bg-surface px-2 py-1 text-xs text-text"
           />
@@ -224,16 +211,8 @@ export default function FileListTab({
 
       {data && data.length > 0 && (
         <>
-          <div className="flex items-center justify-between px-1">
-            <label className="flex items-center gap-2 text-xs text-text-muted cursor-pointer">
-              <input
-                type="checkbox"
-                checked={data.length > 0 && checked.size === data.length}
-                onChange={toggleAll}
-                className="rounded border-border"
-              />
-              {t("cleanup.selectAll")} ({data.length})
-            </label>
+          <div className="flex flex-wrap items-start justify-between gap-2 px-1">
+            <CleanupSelectionControls selection={selection} />
             <button
               onClick={(event) => void handleConfirm(event.currentTarget)}
               disabled={store.busy || checked.size === 0}
@@ -260,7 +239,8 @@ export default function FileListTab({
                       type="checkbox"
                       aria-label={f.path}
                       checked={checked.has(f.path)}
-                      onChange={() => toggle(f.path)}
+                      disabled={atLimit && !checked.has(f.path)}
+                      onChange={() => selection.toggle(f.path)}
                       className="rounded border-border shrink-0"
                     />
                     <div className="flex-1 min-w-0">

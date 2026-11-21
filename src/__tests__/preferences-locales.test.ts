@@ -11,6 +11,7 @@ const keys = [
   "dashboard.rootFailed", "dashboard.rootLastScan", "dashboard.scanFailed",
   "settings.ignore.extensionTip", "settings.ignore.folderTip", "settings.ignore.officeTip", "settings.ignore.exactTip",
   "cleanup.historyLoading", "cleanup.historyError", "cleanup.notSearched", "cleanup.reviewChanged", "cleanup.historyUnknown",
+  "cleanup.selectFirstBatch", "cleanup.selectionLimit", "cleanup.selectionOutsideBatch",
   "beta.allWatched", "beta.recoveryUnavailable",
   ...["resetDismissed", "rulePreview", "ruleScope", "rulePriority", "ruleExtension", "ruleDestination", "ruleAlreadyCovered", "ruleConflict", "ruleNotApplicable", "partial", "preparing", "ruleCount", "planChanged"].map((name) => `suggestions.${name}`),
   ...["Documents", "Images", "Videos", "Audio", "Archives", "Code", "Other"].map((name) => `categories.${name}`),
@@ -56,6 +57,15 @@ describe("preferences and inventory translations", () => {
       expect(translation(locale, "settings.history.showing")).toContain("{{shown}}");
       expect(translation(locale, "settings.history.showing")).toContain("{{total}}");
       expect(translation(locale, "dashboard.rootLastScan")).toContain("{{date}}");
+    }
+  });
+
+  it("formats all cleanup review limits in the selected language", async () => {
+    for (const [language, formatted] of [["en", "10,000"], ["de", "10.000"]] as const) {
+      expect(await initI18n(language)).toBe(language);
+      for (const key of ["selectFirstBatch", "selectionLimit", "selectionOutsideBatch"]) {
+        expect(i18n.t(`cleanup.${key}`, { limit: 10_000 })).toContain(formatted);
+      }
     }
   });
 });

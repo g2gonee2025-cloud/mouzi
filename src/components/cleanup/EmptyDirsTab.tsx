@@ -1,17 +1,23 @@
-import { useState, useCallback, useRef } from "react";
+import { useRef } from "react";
 import { useTranslation } from "react-i18next";
 import { useCleanupStore } from "../../store/useCleanupStore";
-import type { CleanupRequest } from "../../utils/cleanup";
+import { CLEANUP_REVIEW_LIMIT, type CleanupRequest } from "../../utils/cleanup";
 import { Search, Trash2, FolderX } from "lucide-react";
 import ResultsPanel from "./ResultsPanel";
 import ConfirmDialog from "./ConfirmDialog";
 import { useCleanupConfirmation } from "./useCleanupConfirmation";
 import UnavailableCleanupRoots from "./UnavailableCleanupRoots";
+import { CleanupSelectionControls, useCleanupSelection } from "./CleanupSelection";
+
+const directoryPath = (path: string) => path;
 
 export default function EmptyDirsTab() {
   const { t } = useTranslation();
   const store = useCleanupStore();
-  const [checked, setChecked] = useState<Set<string>>(new Set());
+  const directories = store.emptyDirs;
+  const isCurrent = () => useCleanupStore.getState().emptyDirs === directories;
+  const selection = useCleanupSelection(directories, directoryPath, isCurrent);
+  const { checked, atLimit } = selection;
   const receipt = store.receipts.remove_empty_dir;
   const { pending, reviewNeedsSearch, clearReviewNotice, openReview } = useCleanupConfirmation();
   const findButton = useRef<HTMLButtonElement>(null);
@@ -20,30 +26,13 @@ export default function EmptyDirsTab() {
   const handleFind = () => {
     clearReviewNotice();
     store.findEmptyDirs();
-    setChecked(new Set());
+    selection.clear();
   };
 
-  const toggle = useCallback((path: string) => {
-    setChecked((prev) => {
-      const next = new Set(prev);
-      if (next.has(path)) next.delete(path);
-      else next.add(path);
-      return next;
-    });
-  }, []);
-
-  const toggleAll = useCallback(() => {
-    const data = store.emptyDirs ?? [];
-    if (checked.size === data.length) {
-      setChecked(new Set());
-    } else {
-      setChecked(new Set(data));
-    }
-  }, [store.emptyDirs, checked]);
-
   const handleConfirm = async (opener: HTMLButtonElement) => {
-    const paths = (store.emptyDirs ?? []).filter((path) => checked.has(path));
-    if (!paths.length) return;
+    if (!isCurrent()) return;
+    const paths = (directories ?? []).filter((path) => checked.has(path));
+    if (!paths.length || paths.length > CLEANUP_REVIEW_LIMIT) return;
     const actions: CleanupRequest[] = paths.map((path) => ({
       kind: "remove_empty_dir",
       path,
@@ -66,7 +55,7 @@ export default function EmptyDirsTab() {
         results={receipt.outcomes}
         onDone={() => {
           if (!store.dismissReceipt("remove_empty_dir", receipt.planId)) return;
-          if (useCleanupStore.getState().loading) setChecked(new Set());
+          if (useCleanupStore.getState().loading) selection.clear();
           else handleFind();
         }}
         error={receipt.error}
@@ -106,16 +95,8 @@ export default function EmptyDirsTab() {
 
       {data.length > 0 && (
         <>
-          <div className="flex items-center justify-between px-1">
-            <label className="flex items-center gap-2 text-xs text-text-muted cursor-pointer">
-              <input
-                type="checkbox"
-                checked={checked.size === data.length}
-                onChange={toggleAll}
-                className="rounded border-border"
-              />
-              {t("cleanup.selectAll")} ({data.length})
-            </label>
+          <div className="flex flex-wrap items-start justify-between gap-2 px-1">
+            <CleanupSelectionControls selection={selection} />
             <button
               onClick={(event) => void handleConfirm(event.currentTarget)}
               disabled={store.busy || checked.size === 0}
@@ -139,7 +120,8 @@ export default function EmptyDirsTab() {
                     type="checkbox"
                     aria-label={path}
                     checked={checked.has(path)}
-                    onChange={() => toggle(path)}
+                    disabled={atLimit && !checked.has(path)}
+                    onChange={() => selection.toggle(path)}
                     className="rounded border-border shrink-0"
                   />
                   <FolderX size={14} className="text-text-muted shrink-0" />

@@ -8,7 +8,7 @@ import {
 import { fileName, parentDir } from "../../utils/paths";
 import {
   duplicateCopyCount,
-  DUPLICATE_REVIEW_LIMIT,
+  CLEANUP_REVIEW_LIMIT,
   sortGroups,
   buildDuplicateActions,
   resolveKeeper,
@@ -76,7 +76,7 @@ export default function DuplicatesTab() {
     }
     return { paths, byGroup, bytes };
   }, [actions, groups]);
-  const atLimit = actions.length >= DUPLICATE_REVIEW_LIMIT;
+  const atLimit = actions.length >= CLEANUP_REVIEW_LIMIT;
 
   const handleFind = () => {
     clearReviewNotice();
@@ -85,7 +85,7 @@ export default function DuplicatesTab() {
 
   const handleConfirm = async (opener: HTMLButtonElement) => {
     const current = useCleanupStore.getState();
-    if (actions.length === 0 || actions.length > DUPLICATE_REVIEW_LIMIT || current.duplicates !== store.duplicates
+    if (actions.length === 0 || actions.length > CLEANUP_REVIEW_LIMIT || current.duplicates !== store.duplicates
         || current.duplicateKeepers !== selected || current.duplicateVictims !== victims) return;
     await openReview(actions, {
       title: t("confirm.op.trashDuplicates"),
@@ -148,12 +148,12 @@ export default function DuplicatesTab() {
             <div className="text-xs text-text-muted">
               <span>{groups.length} {t("cleanup.groupCount")} &middot;{" "}</span>
               <span aria-live="polite">{t("cleanup.duplicateSelection", { count: actions.length, size: formatBytes(selection.bytes) })}</span>
-              {copyCount > DUPLICATE_REVIEW_LIMIT && (
-                <p>{t("cleanup.duplicateSelectionLimit", { limit: DUPLICATE_REVIEW_LIMIT.toLocaleString() })}</p>
+              {copyCount > CLEANUP_REVIEW_LIMIT && (
+                <p>{t("cleanup.duplicateSelectionLimit", { limit: CLEANUP_REVIEW_LIMIT.toLocaleString() })}</p>
               )}
             </div>
             <div className="flex items-center gap-2">
-              {copyCount <= DUPLICATE_REVIEW_LIMIT && (
+              {copyCount <= CLEANUP_REVIEW_LIMIT && (
                 <button
                   type="button"
                   onClick={() => store.selectAllDuplicateVictims(store.duplicates)}
@@ -174,7 +174,7 @@ export default function DuplicatesTab() {
               <button
                 type="button"
                 onClick={(event) => void handleConfirm(event.currentTarget)}
-                disabled={locked || actions.length === 0 || actions.length > DUPLICATE_REVIEW_LIMIT}
+                disabled={locked || actions.length === 0 || actions.length > CLEANUP_REVIEW_LIMIT}
                 className="flex items-center gap-1.5 rounded-md bg-red-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-red-700 disabled:opacity-50 transition-colors"
               >
                 <Trash2 size={14} />

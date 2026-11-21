@@ -12,7 +12,7 @@ export interface DuplicateGroup {
   files: DuplicateFile[];
 }
 
-export const DUPLICATE_REVIEW_LIMIT = 10_000;
+export const CLEANUP_REVIEW_LIMIT = 10_000;
 
 export function duplicateCopyCount(groups: readonly DuplicateGroup[]): number {
   return groups.reduce((total, group) => total + Math.max(0, group.files.length - 1), 0);
@@ -235,7 +235,7 @@ export function buildDuplicateActions(
   keptByGroup: Readonly<Record<string, string | undefined>>,
   selected: ReadonlySet<string> | null = null,
 ): CleanupRequest[] {
-  if (selected === null && duplicateCopyCount(groups) > DUPLICATE_REVIEW_LIMIT) return [];
+  if (selected === null && duplicateCopyCount(groups) > CLEANUP_REVIEW_LIMIT) return [];
   const actions: CleanupRequest[] = [];
   for (const g of groups) {
     const keepPath = resolveKeeper(g, keptByGroup);
