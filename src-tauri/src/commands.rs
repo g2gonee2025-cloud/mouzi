@@ -1817,7 +1817,7 @@ pub fn prepare_cleanup_cmd(actions: Vec<crate::cleanup::CleanupRequest>, state: 
     crate::cleanup::prepare_cleanup(&actions)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn discard_cleanup_plan_cmd(plan_id: String) -> Result<(), String> {
     crate::cleanup::discard_cleanup_plan(&plan_id)
 }

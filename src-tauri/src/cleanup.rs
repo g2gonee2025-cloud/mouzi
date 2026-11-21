@@ -685,7 +685,9 @@ pub fn execute_cleanup_plan(plan_id: &str) -> Result<Vec<CleanupOutcome>, String
 }
 
 pub fn discard_cleanup_plan(plan_id: &str) -> Result<(), String> {
-    PLANS.lock().map_err(|_| "Cleanup plan storage is unavailable")?.remove(plan_id);
+    // Release the registry lock before dropping a large review's file evidence.
+    let discarded = PLANS.lock().map_err(|_| "Cleanup plan storage is unavailable")?.remove(plan_id);
+    drop(discarded);
     Ok(())
 }
 
