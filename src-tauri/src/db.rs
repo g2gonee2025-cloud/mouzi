@@ -800,6 +800,10 @@ fn inventory_mutation_revision(conn: &Connection) -> SqliteResult<i64> {
     conn.query_row("SELECT mutation_revision FROM inventory_state WHERE id=1", [], |row| row.get(0))
 }
 
+fn inventory_revision(conn: &Connection) -> SqliteResult<i64> {
+    conn.query_row("SELECT revision FROM inventory_state WHERE id=1", [], |row| row.get(0))
+}
+
 fn scanning_inventory_roots(conn: &Connection) -> SqliteResult<Vec<ScanningInventoryRoot>> {
     let mut statement = conn.prepare(
         "SELECT r.root_path, r.generation, w.id FROM inventory_roots r
@@ -1937,6 +1941,13 @@ fn observe_undo_output(id: i64, actual: &str, identity: Option<&str>, observatio
     Ok(())
 }
 
+fn guard_absent_undo_source(path: &Path) -> Option<crate::safe_fs::AncestorGuard> {
+    let guard = crate::safe_fs::guard_directory(path.parent()?).ok()?;
+    let absent = std::fs::symlink_metadata(path)
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+    absent.then_some(guard)
+}
+
 pub fn finalize_undo_intent(
     id: i64, action_log_id: i64, recorded_path: &str, moved: &crate::safe_fs::MoveResult,
 ) -> Result<(), String> {
@@ -1969,8 +1980,20 @@ pub fn finalize_undo_intent(
     if prepared.identity != expected {
         return Err("Restored file was replaced before history finalization".into());
     }
+    // A differently identified row could be stale or reflect a replacement.
+    // Check vacancy off-lock and require the snapshot to remain unchanged.
+    let revision = {
+        let conn = lock_db()?;
+        inventory_revision(&conn).map_err(|error| error.to_string())?
+    };
+    let source_vacancy = guard_absent_undo_source(&moved.source);
+    let recorded_vacancy = (inventory_source != recorded_path)
+        .then(|| guard_absent_undo_source(Path::new(recorded_path))).flatten();
     let mut conn = lock_db()?;
     let tx = conn.transaction().map_err(|error| error.to_string())?;
+    let source_confirmed_empty = source_vacancy.is_some()
+        && (inventory_source == recorded_path || recorded_vacancy.is_some())
+        && inventory_revision(&tx).map_err(|error| error.to_string())? == revision;
     let original_identity: String = tx.query_row(
         "UPDATE operation_intents SET completed_at=?2,status='completed'
          WHERE id=?1 AND status='pending' AND undo_action_log_id=?3 AND source_path=?4
@@ -2001,8 +2024,10 @@ pub fn finalize_undo_intent(
         let identity: Option<String> = tx.query_row(
             "SELECT identity FROM inventory_fingerprints WHERE path=?1", [&path], |row| row.get(0),
         ).optional().map_err(|error| error.to_string())?;
-        // A scan can publish a replacement at the old path after the move.
-        if identity.as_deref().is_some_and(|identity| identity != original_identity.as_str()) { continue; }
+        if !source_confirmed_empty
+            && identity.as_deref().is_some_and(|identity| identity != original_identity.as_str()) {
+            continue;
+        }
         // Accepted suggestions revert to the original category. For other
         // moves, transfer only an override that belongs to the restored file.
         tx.execute(
@@ -2562,7 +2587,7 @@ pub fn get_dashboard_snapshot() -> SqliteResult<DashboardSnapshot> {
         let (index,files,bytes)=row?; age_buckets[index].files=files;age_buckets[index].bytes=bytes;
     }
     drop(age_stmt);
-    let revision=tx.query_row("SELECT revision FROM inventory_state WHERE id=1",[],|r|r.get(0))?;
+    let revision=inventory_revision(&tx)?;
     let snapshot=DashboardSnapshot{total_files,total_bytes,category_breakdown,largest_files,recent_files,watched_roots:roots,scan_eligible_roots,last_scan_at,insights,age_buckets,revision};
     tx.commit()?;
     Ok(snapshot)

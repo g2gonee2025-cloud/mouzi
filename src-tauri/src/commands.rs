@@ -3061,7 +3061,7 @@ mod undo_tests {
         assert_eq!(pending[0].observed_identity.as_deref(), Some(retained_identity.key().as_str()));
         assert!(pending[0].retained_message.as_deref().unwrap().contains("Verified copy"));
         let retained = crate::safe_fs::MoveResult {
-            source: PathBuf::from(&dest), destination: actual, identity: retained_identity, renamed: true,
+            source: PathBuf::from(&dest), destination: actual.clone(), identity: retained_identity, renamed: true,
         };
         assert!(finalize_undo_intent(intent, id, &dest, &retained).is_err());
         let retry = undo_action_with(id, &ignored).unwrap();
