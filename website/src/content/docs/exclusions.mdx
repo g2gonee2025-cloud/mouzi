@@ -4,7 +4,7 @@ description: Keep selected files out of rules and understand Mouzi's built-in sa
 section: Rules
 order: 3
 platforms: [windows, linux]
-updated: 2026-08-27
+updated: 2026-11-21
 ---
 
 Mouzi applies built-in exclusions and then reads an optional `.mouziignore` file from each watched folder.
@@ -23,6 +23,8 @@ Zero-byte files are not automatically excluded. File-lock checking is a separate
 ## Create a .mouziignore file
 
 Place `.mouziignore` in the top level of a watched folder. You can edit it yourself or manage its entries in Mouzi's settings.
+
+For Mouzi 0.2.1, save the file as **UTF-8 without a byte-order mark (BOM)**. A UTF-8 BOM can prevent the first filename pattern from matching. If you save the file as UTF-16, Mouzi loads no custom exclusions and may organize files you meant to keep.
 
 ```text
 # Keep an installer in Downloads
