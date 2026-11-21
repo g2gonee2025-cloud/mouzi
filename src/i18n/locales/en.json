@@ -14,6 +14,7 @@
     "foldersLoadError": "Could not load watched folders: {{error}}",
     "recentActions": "Recent Actions",
     "noActions": "No actions yet",
+    "recentActionsReadFailed": "Could not load recent actions.",
     "weeklyStats": "Last 7 days",
     "undo": "Undo",
     "settings": "Settings",

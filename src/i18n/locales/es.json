@@ -14,6 +14,7 @@
     "foldersLoadError": "No se pudieron cargar las carpetas supervisadas: {{error}}",
     "recentActions": "Acciones recientes",
     "noActions": "Sin acciones aún",
+    "recentActionsReadFailed": "No se pudieron cargar las acciones recientes.",
     "weeklyStats": "Últimos 7 días",
     "undo": "Deshacer",
     "settings": "Configuración",

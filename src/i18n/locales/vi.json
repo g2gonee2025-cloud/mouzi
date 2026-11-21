@@ -20,6 +20,7 @@
     "foldersLoadError": "Không thể tải các thư mục được theo dõi: {{error}}",
     "recentActions": "Hoạt động gần đây",
     "noActions": "Chưa có hoạt động nào",
+    "recentActionsReadFailed": "Không thể tải các hoạt động gần đây.",
     "weeklyStats": "7 ngày qua",
     "undo": "Hoàn tác",
     "settings": "Cài đặt",

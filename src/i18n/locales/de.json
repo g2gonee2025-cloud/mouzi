@@ -14,6 +14,7 @@
     "foldersLoadError": "Überwachte Ordner konnten nicht geladen werden: {{error}}",
     "recentActions": "Letzte Aktionen",
     "noActions": "Keine Aktionen",
+    "recentActionsReadFailed": "Die letzten Aktionen konnten nicht geladen werden.",
     "weeklyStats": "Letzte 7 Tage",
     "undo": "Rückgängig",
     "settings": "Einstellungen",

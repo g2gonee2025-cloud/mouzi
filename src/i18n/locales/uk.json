@@ -14,6 +14,7 @@
     "foldersLoadError": "Не вдалося завантажити відстежувані папки: {{error}}",
     "recentActions": "Останні дії",
     "noActions": "Дій ще не було",
+    "recentActionsReadFailed": "Не вдалося завантажити нещодавні дії.",
     "weeklyStats": "Останні 7 днів",
     "undo": "Відновити",
     "settings": "Налаштування",

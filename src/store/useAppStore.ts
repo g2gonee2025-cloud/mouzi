@@ -142,7 +142,7 @@ type FolderRead =
   | { status: 'loading'; committedChange?: true }
   | { status: 'failed'; error: string; committedChange?: true };
 type PendingFile = [folder: string, name: string];
-type PendingReadStatus = 'loading' | 'ready' | 'failed';
+type ReadStatus = 'loading' | 'ready' | 'failed';
 
 export function pendingFilePath([folder, name]: PendingFile): string {
   return folder.replace(/[\\/]$/, '') + (folder.includes('\\') ? '\\' : '/') + name;
@@ -154,12 +154,14 @@ interface AppState {
   folders: WatchedFolder[];
   folderRead: FolderRead;
   logs: ActionLog[];
+  logsReadStatus: ReadStatus;
   historyCounts: HistoryCounts | null;
   stats: { file_type: string; count: number }[];
+  statsReadStatus: ReadStatus;
   settings: AppSettings | null;
   schedule: ScheduleSettings | null;
   pendingFiles: PendingFile[];
-  pendingReadStatus: PendingReadStatus;
+  pendingReadStatus: ReadStatus;
   selectedPendingPaths: ReadonlySet<string>;
   isLoading: boolean;
   actionRefreshErrors: ActionRefreshErrors;
@@ -177,7 +179,7 @@ interface AppState {
   setAutostart: (enabled: boolean) => Promise<void>;
   loadRules: (reportRefreshError?: boolean) => Promise<void>;
   loadFolders: (afterWrite?: boolean) => Promise<void>;
-  loadLogs: (reportActionWarning?: boolean) => Promise<void>;
+  loadLogs: (reportActionWarning?: boolean, options?: { refreshHistoryCounts?: boolean }) => Promise<void>;
   loadHistoryCounts: (reportActionWarning?: boolean) => Promise<HistoryCounts>;
   loadStats: (reportActionWarning?: boolean) => Promise<void>;
   refreshActionViews: () => Promise<void>;
@@ -244,8 +246,10 @@ export const useAppStore = create<AppState>((set, get) => ({
   folders: [],
   folderRead: { status: 'loading' },
   logs: [],
+  logsReadStatus: 'loading',
   historyCounts: null,
   stats: [],
+  statsReadStatus: 'loading',
   settings: null,
   schedule: null,
   pendingFiles: [],
@@ -327,19 +331,25 @@ export const useAppStore = create<AppState>((set, get) => ({
     }
   },
 
-  loadLogs: async (reportActionWarning = false) => {
+  loadLogs: async (reportActionWarning = false, { refreshHistoryCounts = true } = {}) => {
     const request = ++logsRequest;
+    set({ logsReadStatus: 'loading' });
     try {
       const logs = await invoke<ActionLog[]>('get_logs_cmd', { limit: 50 });
       if (request !== logsRequest) return;
-      set((state) => ({ logs, actionRefreshErrors: withActionRefreshError(state, 'history', null) }));
+      set((state) => ({ logs, logsReadStatus: 'ready', actionRefreshErrors: withActionRefreshError(state, 'history', null) }));
     } catch (error) {
-      if (reportActionWarning && request === logsRequest) {
-        set((state) => ({ actionRefreshErrors: withActionRefreshError(state, 'history', String(error)) }));
+      if (request === logsRequest) {
+        set((state) => ({
+          logsReadStatus: 'failed',
+          actionRefreshErrors: reportActionWarning
+            ? withActionRefreshError(state, 'history', String(error))
+            : state.actionRefreshErrors,
+        }));
       }
       throw error;
     }
-    await get().loadHistoryCounts(reportActionWarning);
+    if (refreshHistoryCounts) await get().loadHistoryCounts(reportActionWarning);
   },
 
   loadHistoryCounts: async (reportActionWarning = false) => {
@@ -360,17 +370,24 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   loadStats: async (reportActionWarning = false) => {
     const request = ++statsRequest;
+    set({ statsReadStatus: 'loading' });
     try {
       const raw = await invoke<[string, number][]>('get_stats_cmd');
       if (request === statsRequest) {
         set((state) => ({
           stats: raw.map(([file_type, count]) => ({ file_type, count })),
+          statsReadStatus: 'ready',
           actionRefreshErrors: withActionRefreshError(state, 'stats', null),
         }));
       }
     } catch (error) {
-      if (reportActionWarning && request === statsRequest) {
-        set((state) => ({ actionRefreshErrors: withActionRefreshError(state, 'stats', String(error)) }));
+      if (request === statsRequest) {
+        set((state) => ({
+          statsReadStatus: 'failed',
+          actionRefreshErrors: reportActionWarning
+            ? withActionRefreshError(state, 'stats', String(error))
+            : state.actionRefreshErrors,
+        }));
       }
       throw error;
     }

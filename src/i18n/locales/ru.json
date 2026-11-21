@@ -14,6 +14,7 @@
     "foldersLoadError": "Не удалось загрузить отслеживаемые папки: {{error}}",
     "recentActions": "Недавние действия",
     "noActions": "Пока нет действий",
+    "recentActionsReadFailed": "Не удалось загрузить недавние действия.",
     "weeklyStats": "Последние 7 дней",
     "undo": "Отменить",
     "settings": "Настройки",

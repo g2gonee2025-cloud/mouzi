@@ -14,6 +14,7 @@
     "foldersLoadError": "Nie udało się wczytać obserwowanych folderów: {{error}}",
     "recentActions": "Ostatnie akcje",
     "noActions": "Brak akcji",
+    "recentActionsReadFailed": "Nie udało się wczytać ostatnich działań.",
     "weeklyStats": "Ostatnie 7 dni",
     "undo": "Cofnij",
     "settings": "Ustawienia",

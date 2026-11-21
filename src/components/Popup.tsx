@@ -1,7 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { pendingFilePath, useAppStore } from "../store/useAppStore";
-import ActionRefreshWarnings from "./ActionRefreshWarnings";
 import {
   FolderOpen,
   FolderPlus,
@@ -38,7 +37,9 @@ export default function Popup() {
   const { t } = useTranslation();
   const {
     logs,
+    logsReadStatus,
     stats,
+    statsReadStatus,
     isLoading,
     loadLogs,
     loadStats,
@@ -63,6 +64,8 @@ export default function Popup() {
     destination_folder: string;
   } | null>(null);
   const [undoToast, setUndoToast] = useState<UndoNotice[] | null>(null);
+  const [undoPending, setUndoPending] = useState(false);
+  const undoInFlight = useRef(false);
 
   useEffect(() => {
     if (!toast) return;
@@ -170,11 +173,19 @@ export default function Popup() {
     }
   };
 
-  const handleOpenActionFolder = async (filePath: string | null) => {
-    if (!filePath) return;
+  const currentActivity = (id: number | undefined) => {
+    const { logs, logsReadStatus } = useAppStore.getState();
+    if (id !== undefined && logsReadStatus === "ready" && !undoInFlight.current) {
+      return logs.find((log) => log.id === id);
+    }
+  };
+
+  const handleOpenActionFolder = async (id: number | undefined) => {
+    const log = currentActivity(id);
+    if (!log || log.undone || !log.destination_path) return;
     setActionError(null);
     try {
-      await invoke("open_folder_cmd", { path: parentDir(filePath) });
+      await invoke("open_folder_cmd", { path: parentDir(log.destination_path) });
     } catch (error) {
       setActionError(String(error));
     }
@@ -189,6 +200,10 @@ export default function Popup() {
       setUndoToast([{ tone: "error", key: "undo.noId" }]);
       return;
     }
+    const log = currentActivity(id);
+    if (!log || !canRestoreLog(log)) return;
+    undoInFlight.current = true;
+    setUndoPending(true);
     try {
       setUndoToast(undoNotice(await undoAction(id)));
     } catch (e) {
@@ -196,6 +211,9 @@ export default function Popup() {
       setUndoToast([
         { tone: "error", key: "confirm.failed", values: { error: String(e) } },
       ]);
+    } finally {
+      undoInFlight.current = false;
+      setUndoPending(false);
     }
   };
 
@@ -259,7 +277,6 @@ export default function Popup() {
           </p>
         )}
         {actionError && <p role="alert" className="mt-2 break-words text-xs text-red-700 dark:text-red-300">{t("confirm.failed", { error: actionError })}</p>}
-        <ActionRefreshWarnings />
         {showPendingFiles && <div className="mt-2 space-y-2">
           <div className="max-h-24 space-y-1 overflow-auto text-xs">
             {pendingPaths.map(({ name, path, visibleFolder }) => (
@@ -287,11 +304,19 @@ export default function Popup() {
       </div>
 
       {/* Recent */}
-      <div className="flex-1 overflow-auto px-3">
-        <div className="text-xs font-semibold text-text-muted uppercase tracking-wider mb-2">
+      <section aria-label={t("popup.recentActions")} className="flex-1 overflow-auto px-3">
+        <h2 className="text-xs font-semibold text-text-muted uppercase tracking-wider mb-2">
           {t("popup.recentActions")}
-        </div>
-        {logs.length === 0 ? (
+        </h2>
+        {logsReadStatus === "loading" || undoPending ? (
+          <p role="status" className="text-xs text-text-muted">{t("common.loading")}</p>
+        ) : logsReadStatus === "failed" ? (
+          <div className="space-y-1 text-xs text-red-700 dark:text-red-300">
+            <p role="alert">{t("popup.recentActionsReadFailed")}</p>
+            <button type="button" onClick={() => loadLogs(false, { refreshHistoryCounts: false }).catch(console.error)}
+              className="underline">{t("common.retry")}</button>
+          </div>
+        ) : logs.length === 0 ? (
           <div className="flex flex-col items-center justify-center py-6 text-sm text-text-muted">
             <Inbox size={28} className="mb-2 opacity-60" />
             {t("popup.noActions")}
@@ -312,9 +337,9 @@ export default function Popup() {
                 <span className="text-text-muted truncate max-w-[80px]">
                   {log.file_type}
                 </span>
-                {!log.undone && log.id && log.destination_path && (
+                {!log.undone && !!log.id && log.destination_path && (
                   <button
-                    onClick={() => handleOpenActionFolder(log.destination_path)}
+                    onClick={() => handleOpenActionFolder(log.id)}
                     className="p-1 rounded hover:bg-border text-text-muted hover:text-text"
                     title={t("cleanup.openFolder")}
                     aria-label={t("cleanup.openFolder")}
@@ -336,14 +361,23 @@ export default function Popup() {
             ))}
           </div>
         )}
-      </div>
+      </section>
 
       {/* Stats */}
-      {stats.length > 0 && (
-        <div className="border-t border-border p-3">
-          <div className="text-xs font-semibold text-text-muted uppercase tracking-wider mb-2">
-            {t("popup.weeklyStats")}
+      <section aria-label={t("popup.weeklyStats")} className="border-t border-border p-3">
+        <h2 className="text-xs font-semibold text-text-muted uppercase tracking-wider mb-2">
+          {t("popup.weeklyStats")}
+        </h2>
+        {statsReadStatus === "loading" ? (
+          <p role="status" className="text-xs text-text-muted">{t("dashboard.activityLoading")}</p>
+        ) : statsReadStatus === "failed" ? (
+          <div className="space-y-1 text-xs text-red-700 dark:text-red-300">
+            <p role="alert">{t("dashboard.activityReadFailed")}</p>
+            <button type="button" onClick={() => loadStats().catch(console.error)} className="underline">{t("common.retry")}</button>
           </div>
+        ) : stats.length === 0 ? (
+          <p className="text-xs text-text-muted">{t("dashboard.noOrganized")}</p>
+        ) : (
           <div className="space-y-1.5">
             {stats.map((s) => {
               const pct = totalStats > 0 ? Math.round((s.count / totalStats) * 100) : 0;
@@ -361,8 +395,8 @@ export default function Popup() {
               );
             })}
           </div>
-        </div>
-      )}
+        )}
+      </section>
 
       {/* Clickable toast for auto-organized files */}
       {toast && (

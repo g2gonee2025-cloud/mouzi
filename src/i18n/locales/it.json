@@ -14,6 +14,7 @@
     "foldersLoadError": "Impossibile caricare le cartelle monitorate: {{error}}",
     "recentActions": "Azioni recenti",
     "noActions": "Nessuna azione",
+    "recentActionsReadFailed": "Impossibile caricare le azioni recenti.",
     "weeklyStats": "Ultimi 7 giorni",
     "undo": "Ripristina",
     "settings": "Impostazioni",

@@ -35,7 +35,7 @@ afterEach(() => {
 
 function renderActivity(locale: ActivityMessages) {
   messages = locale;
-  useAppStore.setState({ stats: activity, folderRead: { status: "ready" } });
+  useAppStore.setState({ stats: activity, statsReadStatus: "ready", folderRead: { status: "ready" } });
   const populated = renderToStaticMarkup(<ActivityTimeline data={activity} />);
   const empty = renderToStaticMarkup(<ActivityTimeline data={[]} />);
   const tray = renderToStaticMarkup(<Popup />);
@@ -57,7 +57,9 @@ it.each(Object.entries(locales))("renders a seven-day window in Dashboard and tr
   expect(empty).not.toContain("Friday invoices");
   expect(tray).toContain(trayHeading);
   expect(tray).toContain("Friday invoices");
-  expect(emptyTray).not.toContain(trayHeading);
+  expect(emptyTray).toContain(trayHeading);
+  expect(emptyTray).toContain(noActivity);
+  expect(emptyTray).not.toContain("Friday invoices");
   expect([heading, noActivity, trayHeading].every((label) => label.includes("7"))).toBe(true);
 });
 
@@ -65,5 +67,5 @@ it("names the elapsed window in the visible English labels", () => {
   const { populated, empty, tray } = renderActivity(locales["../i18n/locales/en.json"]);
   expect(populated).toContain(">Organized in the last 7 days</h3>");
   expect(empty).toContain(">No files organized in the last 7 days</div>");
-  expect(tray).toContain(">Last 7 days</div>");
+  expect(tray).toContain(">Last 7 days</h2>");
 });

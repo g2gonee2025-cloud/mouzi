@@ -14,6 +14,7 @@
     "foldersLoadError": "監視対象フォルダーを読み込めませんでした: {{error}}",
     "recentActions": "最近のアクション",
     "noActions": "まだアクションがありません",
+    "recentActionsReadFailed": "最近の操作を読み込めませんでした。",
     "weeklyStats": "過去7日間",
     "undo": "元に戻す",
     "settings": "設定",

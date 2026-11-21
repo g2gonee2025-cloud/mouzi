@@ -40,6 +40,7 @@ vi.mock("react-i18next", () => ({
 }));
 
 interface ElementProps {
+  "aria-label"?: string;
   children?: ReactNode;
   onClick?: () => Promise<void> | void;
   onChange?: (event: { target: { checked: boolean } }) => void;
@@ -94,13 +95,106 @@ function renderRecentActivity(destination: string | null, undoVerified = true, a
     destination_path: destination, action, file_name: "arrival.txt", file_type: "text", undone,
     undo_verified: undoVerified,
   };
-  useAppStore.setState({ logs: [log] });
+  useAppStore.setState({ logs: [log], logsReadStatus: "ready" });
   return renderRetainedPopup();
 }
 
 function recentButton(popup: ReactNode, title: string) {
   return findElement(popup, (element) => element.type === "button" && element.props.title === title);
 }
+
+function traySection(popup: ReactNode, name: string) {
+  return findElement(popup, (element) => element.type === "section" && element.props["aria-label"] === name);
+}
+
+it("reports pending activity and only shows both empty messages after verified replies", async () => {
+  let finishRecent!: (rows: unknown[]) => void;
+  let finishWeekly!: (rows: unknown[]) => void;
+  fixture.invoke.mockImplementation((command: string) => {
+    if (command === "get_logs_cmd") return new Promise(resolve => { finishRecent = resolve; });
+    if (command === "get_stats_cmd") return new Promise(resolve => { finishWeekly = resolve; });
+    return Promise.resolve({ total: 0, undoable: 0 });
+  });
+  const store = useAppStore.getState();
+  const recent = store.loadLogs(), weekly = store.loadStats();
+  const loading = renderRetainedPopup();
+  finishRecent([]);
+  await recent;
+  const partlyReady = renderRetainedPopup();
+  finishWeekly([]);
+  await weekly;
+  const empty = renderRetainedPopup();
+
+  expect(label(loading)).not.toContain(en.popup.noActions);
+  expect(label(traySection(loading, en.popup.recentActions))).toContain(en.common.loading);
+  expect(label(traySection(loading, en.popup.weeklyStats))).toContain(en.dashboard.activityLoading);
+  expect(label(traySection(partlyReady, en.popup.recentActions))).toContain(en.popup.noActions);
+  expect(label(traySection(partlyReady, en.popup.weeklyStats))).toContain(en.dashboard.activityLoading);
+  expect(label(traySection(empty, en.popup.weeklyStats))).toContain(en.dashboard.noOrganized);
+});
+
+it("disarms stale recent actions and retries only the failed Recent Actions read", async () => {
+  await loadFolderList([invoices]);
+  const initial = renderRecentActivity("C:/Fixture/Filed/arrival.txt");
+  fixture.invoke.mockResolvedValueOnce([["Documents", 1]]);
+  await useAppStore.getState().loadStats();
+  fixture.invoke.mockRejectedValueOnce(new Error("Recent read unavailable"));
+  await expect(useAppStore.getState().loadLogs()).rejects.toThrow("Recent read unavailable");
+  const failed = renderRetainedPopup();
+  fixture.invoke.mockClear();
+  await recentButton(initial, en.popup.undo)?.props.onClick?.();
+  await recentButton(initial, en.cleanup.openFolder)?.props.onClick?.();
+  expect(fixture.invoke).not.toHaveBeenCalled();
+  const section = traySection(failed, en.popup.recentActions);
+  expect(label(section)).toContain("Could not load recent actions.");
+  expect(label(section)).not.toContain("arrival.txt");
+  expect(label(section)).not.toContain(en.popup.noActions);
+  expect(label(traySection(failed, en.popup.weeklyStats))).toContain("Documents");
+  expect(findAction(failed, "Organize Now")).toBeTypeOf("function");
+
+  fixture.invoke.mockResolvedValueOnce([]);
+  await findAction(section, en.common.retry)?.();
+  expect(fixture.invoke.mock.calls).toEqual([["get_logs_cmd", { limit: 50 }]]);
+  expect(label(traySection(renderRetainedPopup(), en.popup.recentActions))).toContain(en.popup.noActions);
+});
+
+it("withholds stale weekly percentages and retries weekly data without disturbing recent actions", async () => {
+  renderRecentActivity("C:/Fixture/Filed/arrival.txt");
+  fixture.invoke.mockResolvedValueOnce([["Documents", 1]]);
+  await useAppStore.getState().loadStats();
+  fixture.invoke.mockRejectedValueOnce(new Error("Weekly read unavailable"));
+  await expect(useAppStore.getState().loadStats()).rejects.toThrow("Weekly read unavailable");
+  const failed = renderRetainedPopup();
+  const section = traySection(failed, en.popup.weeklyStats);
+  expect(label(section)).toContain(en.dashboard.activityReadFailed);
+  expect(label(section)).not.toContain("Documents");
+  expect(recentButton(failed, en.popup.undo)).toBeDefined();
+
+  fixture.invoke.mockClear().mockResolvedValueOnce([["Images", 1]]);
+  await findAction(section, en.common.retry)?.();
+  expect(fixture.invoke.mock.calls).toEqual([["get_stats_cmd"]]);
+  expect(label(traySection(renderRetainedPopup(), en.popup.weeklyStats))).toContain("Images");
+});
+
+it("keeps the committed Undo receipt with one inline warning per failed read and blocks a second Undo", async () => {
+  const popup = renderRecentActivity("C:/Fixture/Filed/arrival.txt");
+  const undo = recentButton(popup, en.popup.undo)?.props.onClick;
+  fixture.invoke.mockImplementation((command: string) => {
+    if (command === "undo_action_cmd") return Promise.resolve({ status: "ok", restoredTo: "C:/Fixture/arrival.txt" });
+    return Promise.reject(new Error("Post-Undo read unavailable"));
+  });
+  void undo?.();
+  void undo?.();
+  await vi.waitFor(() => expect(label(renderRetainedPopup())).toContain(en.undo.ok));
+  const result = renderRetainedPopup();
+  expect(fixture.invoke.mock.calls.filter(([command]) => command === "undo_action_cmd")).toHaveLength(1);
+  expect(recentButton(result, en.popup.undo)).toBeUndefined();
+  expect(recentButton(result, en.cleanup.openFolder)).toBeUndefined();
+  expect(label(traySection(result, en.popup.recentActions))).toContain("Could not load recent actions.");
+  expect(label(traySection(result, en.popup.weeklyStats))).toContain(en.dashboard.activityReadFailed);
+  expect(findElement(result, (element) => typeof element.type === "function" && element.type.name === "ActionRefreshWarnings"))
+    .toBeUndefined();
+});
 
 it.each([
   ["C:\\arrival.txt", "C:\\"],

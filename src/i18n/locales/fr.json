@@ -14,6 +14,7 @@
     "foldersLoadError": "Impossible de charger les dossiers surveillés : {{error}}",
     "recentActions": "Actions récentes",
     "noActions": "Aucune action",
+    "recentActionsReadFailed": "Impossible de charger les actions récentes.",
     "weeklyStats": "7 derniers jours",
     "undo": "Rétablir",
     "settings": "Paramètres",
