@@ -35,8 +35,14 @@ export const useReviewQueueStore = create<ReviewQueueState>((set, get) => ({
     const read = lastRequestRead.then(async () => {
       const paths = await invoke<string[] | null>("take_review_request_cmd");
       if (!Array.isArray(paths)) return;
-      const advance = previous && previous.status !== "applying" && previous.presented && get().applyReceipt === previous;
-      set({ requestedPaths: paths, hasUnopenedRequest: true, ...(advance ? { applyReceipt: null } : {}) });
+      const request = { requestedPaths: paths, hasUnopenedRequest: true };
+      const receipt = get().applyReceipt;
+      if (receipt && receipt.status !== "applying" && receipt.presented) {
+        // A request started before presentation keeps this receipt until Refresh.
+        set({ ...request, applyReceipt: receipt === previous ? null : { ...receipt, presented: undefined } });
+      } else {
+        set(request);
+      }
     });
     lastRequestRead = read.catch(() => {});
     return read;
