@@ -567,20 +567,22 @@ pub struct SuggestionPolicyIssue {
 struct SuggestionPolicies {
     roots: HashMap<i64, (String, PathBuf)>,
     by_path: HashMap<PathBuf, Option<IgnorePatterns>>,
-    unavailable: Vec<safe_fs::UnavailableRootBoundary>,
+    nested: HashMap<PathBuf, Vec<safe_fs::WatchedRootBoundary>>,
     issues: Vec<SuggestionPolicyIssue>,
 }
 
 impl SuggestionPolicies {
     fn read(cancelled: impl Fn() -> bool) -> Result<Self, String> {
         let mut policies = Self::default();
+        let mut boundaries = Vec::new();
         for folder in db::get_suggestion_roots()? {
             if cancelled() { return Err("Suggestion request superseded".into()); }
             let root = Path::new(&folder.path);
             match safe_fs::guard_watched_root(root) {
-                Ok((canonical, identity, _guard)) => {
+                Ok((canonical, identity, guard)) => {
                     // Even inactive or replaced child roots bound a parent's
                     // scan ownership. Read rules only from an active, verified root.
+                    boundaries.push(safe_fs::WatchedRootBoundary::from_guarded_root(&canonical, &guard));
                     let patterns = if folder.active {
                         db::require_watch_identity(folder.identity.as_deref(), &identity.key())
                             .and_then(|()| IgnorePatterns::from_folder(&canonical.to_string_lossy()))
@@ -599,10 +601,17 @@ impl SuggestionPolicies {
                         .or_insert(patterns);
                 }
                 Err(error) => {
-                    policies.unavailable.extend(error.boundary);
+                    boundaries.extend(error.boundary);
                     if folder.active {
                         policies.issues.push(SuggestionPolicyIssue { root: folder.path, message: error.message });
                     }
+                }
+            }
+        }
+        for boundary in boundaries {
+            for ancestor in boundary.path.ancestors().skip(1) {
+                if policies.by_path.contains_key(ancestor) {
+                    policies.nested.entry(ancestor.to_path_buf()).or_default().push(boundary.clone());
                 }
             }
         }
@@ -622,7 +631,7 @@ impl SuggestionPolicies {
     }
 
     fn allows_path(&self, path: &Path, root: &Path, relative: &Path) -> bool {
-        if self.unavailable.iter().any(|boundary| boundary.contains_file(path)) {
+        if self.nested.get(root).is_some_and(|boundaries| boundaries.iter().any(|boundary| boundary.contains_file(root, path))) {
             return false;
         }
         let owner = path.ancestors().skip(1).find_map(|parent| self.by_path.get_key_value(parent));
@@ -1027,6 +1036,49 @@ mod tests {
     #[test]
     fn suggestion_policy_listing_preserves_unavailable_unicode_alias_boundary() {
         probe_unavailable_nested_root(db::FOLDER_MODE_MANUAL, "Été", "été");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn suggestion_policy_listing_keeps_present_case_aliases_under_the_registered_child() {
+        let mut fixture = SuggestionInventoryFixture::new();
+        let parent = fixture.directory.join("Parent");
+        fixture.register(&parent);
+        if !safe_fs::guard_directory(&parent).unwrap().has_ascii_case_aliases() { return; }
+        let original = fixture.put("Parent/Layer/Été/opaque-stale.r109probe");
+        let peer = fixture.put("Parent/opaque-peer.r109probe");
+        scan_suggestion_roots(&[&parent]);
+        fixture.register(original.parent().unwrap());
+
+        let transfer = fixture.directory.join("Renaming");
+        fs::rename(parent.join("Layer"), &transfer).unwrap();
+        fs::rename(&transfer, parent.join("layer")).unwrap();
+        let child = parent.join("layer/été");
+        fs::rename(parent.join("layer/Été"), &transfer).unwrap();
+        fs::rename(&transfer, &child).unwrap();
+        crate::ignore::save_mouziignore(child.to_str().unwrap(), &["opaque-stale.r109probe".into()]).unwrap();
+        let independent = child.join("Independent");
+        fixture.register(&independent);
+        let owned = fixture.put("Parent/layer/été/Independent/opaque-owned.r109probe");
+        scan_suggestion_roots(&[&independent]);
+
+        let check = |replaced| {
+            let model = RecordingModel::default();
+            let result = collect_inventory_suggestions(200, &model, &[], || false).unwrap();
+            assert_eq!(fixture.paths(&result), BTreeSet::from([peer.clone(), owned.clone()]));
+            assert!(!model.0.lock().unwrap().iter().any(|name| name == "opaque-stale.r109probe"));
+            assert_eq!(fixture.policy_issues(result).iter().any(|issue| {
+                issue["message"].as_str().is_some_and(|message| message.contains("different physical folder"))
+            }), replaced);
+        };
+        check(false);
+
+        // Retain the independently registered grandchild when its parent is replaced.
+        fs::rename(&independent, &transfer).unwrap();
+        fs::rename(&child, fixture.directory.join("PreviousChild")).unwrap();
+        fs::create_dir(&child).unwrap();
+        fs::rename(&transfer, &independent).unwrap();
+        check(true);
     }
 
     type FakeResponse = Result<TransportResponse, ProviderFailure>;

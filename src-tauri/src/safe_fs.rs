@@ -374,28 +374,50 @@ fn inspect_watched_root(path: &Path) -> Result<(PathBuf, FileIdentity), Director
 
 pub(crate) struct WatchedRootGuardError {
     pub message: String,
-    pub boundary: Option<UnavailableRootBoundary>,
+    pub boundary: Option<WatchedRootBoundary>,
 }
 
-pub(crate) struct UnavailableRootBoundary {
-    parent: PathBuf,
-    name: std::ffi::OsString,
+#[derive(Clone)]
+pub(crate) struct WatchedRootBoundary {
+    pub path: PathBuf,
     #[cfg(windows)]
-    case_insensitive: bool,
+    // One entry per containing directory, starting with the immediate parent.
+    case_insensitive: Vec<bool>,
 }
 
-impl UnavailableRootBoundary {
-    pub(crate) fn contains_file(&self, path: &Path) -> bool {
-        let Ok(relative) = path.strip_prefix(&self.parent) else { return false; };
-        let mut parts = relative.components();
-        let Some(Component::Normal(name)) = parts.next() else { return false; };
-        if parts.next().is_none() { return false; }
-        let matches = name == self.name.as_os_str();
-        // This recognizes aliases only to withhold an unavailable branch.
-        // It never supplies evidence of a directory's identity or authority.
+impl WatchedRootBoundary {
+    pub(crate) fn from_guarded_root(canonical: &Path, guard: &AncestorGuard) -> Self {
+        Self::new(canonical.to_path_buf(), &guard._files[1..])
+    }
+
+    fn new(path: PathBuf, _parents: &[File]) -> Self {
+        Self {
+            path,
+            #[cfg(windows)]
+            case_insensitive: _parents.iter().map(windows_fs::has_ascii_case_aliases).collect(),
+        }
+    }
+
+    pub(crate) fn contains_file(&self, root: &Path, file: &Path) -> bool {
+        let Ok(boundary) = self.path.strip_prefix(root) else { return false; };
+        let Ok(relative) = file.strip_prefix(root) else { return false; };
+        if boundary.as_os_str().is_empty() { return false; }
+        let mut components = relative.components();
         #[cfg(windows)]
-        let matches = matches || (self.case_insensitive && windows_fs::directory_alias_equal(name, &self.name));
-        matches
+        let mut insensitive = self.case_insensitive.iter().take(boundary.components().count()).rev();
+        for expected in boundary.components() {
+            let Some(actual) = components.next() else { return false; };
+            let matches = actual == expected;
+            // Aliases only exclude stale inventory under another registration.
+            // Positive ownership continues to require the registered identity.
+            #[cfg(windows)]
+            let matches = {
+                let allows_aliases = insensitive.next().copied().unwrap_or(false);
+                matches || (allows_aliases && windows_fs::directory_alias_equal(actual.as_os_str(), expected.as_os_str()))
+            };
+            if !matches { return false; }
+        }
+        components.next().is_some()
     }
 }
 
@@ -417,7 +439,7 @@ pub(crate) fn guard_watched_root(path: &Path) -> Result<(PathBuf, FileIdentity, 
     })
 }
 
-fn unavailable_root_boundary(unavailable: &Path) -> Option<UnavailableRootBoundary> {
+fn unavailable_root_boundary(unavailable: &Path) -> Option<WatchedRootBoundary> {
     for branch in unavailable.ancestors() {
         let parent = branch.parent()?;
         let name = branch.file_name()?;
@@ -425,12 +447,7 @@ fn unavailable_root_boundary(unavailable: &Path) -> Option<UnavailableRootBounda
         let canonical = std::fs::canonicalize(parent).ok()?;
         let identity = identity_from_handle(guard._files.first()?).ok()?;
         if file_identity(&canonical).ok()? != identity { return None; }
-        return Some(UnavailableRootBoundary {
-            parent: canonical,
-            name: name.to_os_string(),
-            #[cfg(windows)]
-            case_insensitive: guard.has_ascii_case_aliases(),
-        });
+        return Some(WatchedRootBoundary::new(canonical.join(name), &guard._files));
     }
     None
 }
