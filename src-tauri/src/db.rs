@@ -1693,18 +1693,23 @@ fn inventory_paths_for_spelling(conn:&Connection,path:&str)->SqliteResult<Vec<St
 
 fn remove_inventory_path_on(conn:&Connection,path:&str)->SqliteResult<()> {
     for path in inventory_paths_for_spelling(conn,path)? {
-        conn.execute("DELETE FROM hash_cache WHERE path=?1",[&path])?;
-        conn.execute("DELETE FROM dismissed_suggestions WHERE path=?1",[&path])?;
-        conn.execute("DELETE FROM category_overrides WHERE path=?1",[&path])?;
-        conn.execute("DELETE FROM inventory_fingerprints WHERE path=?1",[&path])?;
-        let previous_root: Option<String> = conn.query_row(
-            "SELECT root_path FROM file_inventory WHERE path=?1", [&path], |row| row.get(0),
-        ).optional()?;
-        if let Some(root) = previous_root {
-            retire_inventory_root_scan(conn, &root)?;
-        }
-        conn.execute("DELETE FROM file_inventory WHERE path=?1",[&path])?;
+        remove_inventory_entry_on(conn, &path)?;
     }
+    Ok(())
+}
+
+fn remove_inventory_entry_on(conn: &Connection, path: &str) -> SqliteResult<()> {
+    conn.execute("DELETE FROM hash_cache WHERE path=?1", [path])?;
+    conn.execute("DELETE FROM dismissed_suggestions WHERE path=?1", [path])?;
+    conn.execute("DELETE FROM category_overrides WHERE path=?1", [path])?;
+    conn.execute("DELETE FROM inventory_fingerprints WHERE path=?1", [path])?;
+    let previous_root: Option<String> = conn.query_row(
+        "SELECT root_path FROM file_inventory WHERE path=?1", [path], |row| row.get(0),
+    ).optional()?;
+    if let Some(root) = previous_root {
+        retire_inventory_root_scan(conn, &root)?;
+    }
+    conn.execute("DELETE FROM file_inventory WHERE path=?1", [path])?;
     Ok(())
 }
 
@@ -1769,12 +1774,19 @@ fn prepare_move(source:&str, destination:&str)->Result<PreparedMove,String> {
 }
 
 fn reconcile_move_on(conn:&Connection,old:&str,prepared:&PreparedMove,category:Option<&str>)->SqliteResult<()> {
+    let sources = inventory_paths_for_spelling(conn, old)?;
+    reconcile_move_entries_on(conn, &sources, prepared, category)
+}
+
+fn reconcile_move_entries_on(conn: &Connection, sources: &[String], prepared: &PreparedMove, category: Option<&str>) -> SqliteResult<()> {
     let mut previous_category=None;
-    for path in inventory_paths_for_spelling(conn,old)? {
-        previous_category=conn.query_row("SELECT category FROM category_overrides WHERE path=?1",[&path],|r|r.get::<_,String>(0)).optional()?;
+    for path in sources {
+        previous_category=conn.query_row("SELECT category FROM category_overrides WHERE path=?1",[path],|r|r.get::<_,String>(0)).optional()?;
         if previous_category.is_some(){break;}
     }
-    remove_inventory_path_on(conn,old)?;
+    for path in sources {
+        remove_inventory_entry_on(conn, path)?;
+    }
     // Also clear a prior destination row/cache (including its different spelling).
     remove_inventory_path_on(conn,&prepared.destination)?;
     invalidate_inventory_scans(conn, prepared.inventory_scope.as_ref())?;
@@ -1925,8 +1937,13 @@ fn observe_undo_output(id: i64, actual: &str, identity: Option<&str>, observatio
     Ok(())
 }
 
-pub fn finalize_undo_intent(id: i64, action_log_id: i64, old: &str, new: &str, expected: &str) -> Result<(), String> {
-    let path = std::path::Path::new(new);
+pub fn finalize_undo_intent(
+    id: i64, action_log_id: i64, recorded_path: &str, moved: &crate::safe_fs::MoveResult,
+) -> Result<(), String> {
+    let expected = moved.identity.key();
+    let new = moved.destination.to_string_lossy();
+    let inventory_source = moved.source.to_string_lossy();
+    let path = &moved.destination;
     let _ancestors = crate::safe_fs::guard_directory(path.parent().ok_or("Restore path has no parent")?)?;
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
@@ -1948,32 +1965,54 @@ pub fn finalize_undo_intent(id: i64, action_log_id: i64, old: &str, new: &str, e
             return Err("Restored file contents changed before history finalization".into());
         }
     }
-    let prepared = prepare_move(old, new)?;
+    let prepared = prepare_move(&inventory_source, &new)?;
     if prepared.identity != expected {
         return Err("Restored file was replaced before history finalization".into());
     }
     let mut conn = lock_db()?;
     let tx = conn.transaction().map_err(|error| error.to_string())?;
-    let changed = tx.execute(
+    let original_identity: String = tx.query_row(
         "UPDATE operation_intents SET completed_at=?2,status='completed'
          WHERE id=?1 AND status='pending' AND undo_action_log_id=?3 AND source_path=?4
-         AND actual_destination=?5 AND undo_observed_identity=?6 AND undo_observation='restored'",
-        params![id, Utc::now().to_rfc3339(), action_log_id, old, new, expected],
-    ).map_err(|error| error.to_string())?;
-    if changed != 1 { return Err("Undo recovery record is unavailable".into()); }
+         AND actual_destination=?5 AND undo_observed_identity=?6 AND undo_observation='restored'
+         RETURNING undo_expected_identity",
+        params![id, Utc::now().to_rfc3339(), action_log_id, recorded_path, &new, expected],
+        |row| row.get(0),
+    ).optional().map_err(|error| error.to_string())?.ok_or("Undo recovery record is unavailable")?;
     let accepted: bool = tx.query_row("SELECT action='accept' FROM action_logs WHERE id=?1 AND undone=0", [action_log_id], |row| row.get(0))
         .map_err(|error| error.to_string())?;
     tx.execute("UPDATE action_logs SET undone=1 WHERE id=?1", [action_log_id]).map_err(|error| error.to_string())?;
     if let Some(fingerprint) = fingerprint {
-        tx.execute("DELETE FROM processed_files WHERE path=?1", [old]).map_err(|error| error.to_string())?;
+        tx.execute("DELETE FROM processed_files WHERE path=?1", [recorded_path]).map_err(|error| error.to_string())?;
         tx.execute("INSERT INTO processed_files(path,fingerprint,restored) VALUES(?1,?2,1)
             ON CONFLICT(path) DO UPDATE SET fingerprint=excluded.fingerprint,restored=1",
             params![prepared.destination,fingerprint]).map_err(|error| error.to_string())?;
     }
-    if accepted {
-        for path in inventory_paths_for_spelling(&tx,old).map_err(|e|e.to_string())? { tx.execute("DELETE FROM category_overrides WHERE path=?1",[path]).map_err(|e|e.to_string())?; }
+    // The mover measured its actual source before moving it. Include the
+    // historical spelling too, for a snapshot that predates a spelling change.
+    let mut sources = inventory_paths_for_spelling(&tx, &inventory_source).map_err(|error| error.to_string())?;
+    if inventory_source != recorded_path {
+        for path in inventory_paths_for_spelling(&tx, recorded_path).map_err(|error| error.to_string())? {
+            if !sources.contains(&path) { sources.push(path); }
+        }
     }
-    reconcile_move_on(&tx,old,&prepared,None).map_err(|e|e.to_string())?;tx.commit().map_err(|e|e.to_string())
+    let mut removed_sources = Vec::new();
+    for path in sources {
+        let identity: Option<String> = tx.query_row(
+            "SELECT identity FROM inventory_fingerprints WHERE path=?1", [&path], |row| row.get(0),
+        ).optional().map_err(|error| error.to_string())?;
+        // A scan can publish a replacement at the old path after the move.
+        if identity.as_deref().is_some_and(|identity| identity != original_identity.as_str()) { continue; }
+        // Accepted suggestions revert to the original category. For other
+        // moves, transfer only an override that belongs to the restored file.
+        tx.execute(
+            "DELETE FROM category_overrides WHERE path=?1 AND (?2 OR identity<>?3)",
+            params![&path, accepted, &original_identity],
+        ).map_err(|error| error.to_string())?;
+        removed_sources.push(path);
+    }
+    reconcile_move_entries_on(&tx, &removed_sources, &prepared, None).map_err(|error| error.to_string())?;
+    tx.commit().map_err(|error| error.to_string())
 }
 
 #[derive(Debug,Clone)]

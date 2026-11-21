@@ -528,7 +528,7 @@ fn finish_undo(target: &UndoTarget, ignored_files: &IgnoredFiles) -> Result<Undo
     let resulting_identity = moved.identity.key();
     let status = if moved.renamed { "collision" } else { "ok" };
     let finalized = observe_undo_restore(intent, &actual, &resulting_identity)
-        .and_then(|()| finalize_undo_intent(intent, target.id, dest, &actual, &resulting_identity));
+        .and_then(|()| finalize_undo_intent(intent, target.id, dest, &moved));
     Ok(match finalized {
         Ok(()) => UndoResult {
             status: status.into(),
@@ -2510,6 +2510,11 @@ mod undo_tests {
         let scan = crate::scan::scan_roots(&[root.to_owned()], |_| {});
         assert_eq!(scan[0].status, "complete", "{:?}", scan[0].error);
         assert_eq!((scan[0].files, scan[0].bytes), (2, 14));
+        let other_file = crate::safe_fs::file_identity(Path::new(&control_dest)).unwrap().key();
+        lock_db().unwrap().execute(
+            "INSERT INTO category_overrides(path,identity,size,mtime_ns,category) VALUES(?1,?2,7,'0','Code')",
+            rusqlite::params![&dest, other_file],
+        ).unwrap();
         let inventory = || get_inventory_files("size", None, Some(root), None, 10).unwrap()
             .into_iter().map(|row| (row.path, row.size)).collect::<BTreeMap<_, _>>();
         let renamed = renamed.to_str().unwrap().to_owned();
@@ -2523,7 +2528,43 @@ mod undo_tests {
         assert_eq!(fs::read(&source).unwrap(), b"payload");
         assert_eq!(fs::read(&control_source).unwrap(), b"payload");
         assert!(!Path::new(&renamed).exists());
+        assert!(get_inventory_files("size", Some("Code"), Some(root), None, 10).unwrap().is_empty());
         assert_eq!(inventory(), BTreeMap::from([(source, 7), (control_source, 7)]));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn undo_preserves_a_replacement_indexed_before_finalization() {
+        use std::collections::BTreeMap;
+        use std::fs;
+
+        let fixture = UndoFixture::new("inventory_replacement");
+        let root = fixture.root().to_str().unwrap();
+        struct Registration(i64);
+        impl Drop for Registration {
+            fn drop(&mut self) { let _ = remove_watched_folder(self.0); }
+        }
+        let _registered = Registration(register_watched_folder(root, FOLDER_MODE_MANUAL, false).unwrap());
+        let (source, dest) = stage(fixture.root(), "report.undocheck");
+        let input_identity = crate::safe_fs::file_identity(Path::new(&dest)).unwrap();
+        let id = insert_log("2026-01-01T00:00:00Z", &source, Some(&dest));
+        let intent = begin_undo_intent(id, &dest, &source, &input_identity.key()).unwrap();
+        let moved = crate::safe_fs::move_file_checked_expected(Path::new(&dest), Path::new(&source), &input_identity).unwrap();
+        observe_undo_restore(intent, &source, &moved.identity.key()).unwrap();
+
+        fs::write(&dest, b"replacement").unwrap();
+        assert_ne!(crate::safe_fs::file_identity(Path::new(&dest)).unwrap(), input_identity);
+        let scan = crate::scan::scan_roots(&[root.to_owned()], |_| {});
+        assert_eq!(scan[0].status, "complete", "{:?}", scan[0].error);
+        assert_eq!((scan[0].files, scan[0].bytes), (2, 18));
+        finalize_undo_intent(intent, id, &dest, &moved).unwrap();
+
+        assert_eq!(undone_of(&source), 1);
+        assert_eq!(fs::read(&source).unwrap(), b"payload");
+        assert_eq!(fs::read(&dest).unwrap(), b"replacement");
+        let inventory = get_inventory_files("size", None, Some(root), None, 10).unwrap()
+            .into_iter().map(|row| (row.path, row.size)).collect::<BTreeMap<_, _>>();
+        assert_eq!(inventory, BTreeMap::from([(source, 7), (dest, 11)]));
     }
 
     #[test]
@@ -2841,7 +2882,7 @@ mod undo_tests {
         let rescued = fixture.root().join("rescued.undocheck");
         std::fs::rename(actual, &rescued).unwrap();
         std::fs::write(actual, b"replacement").unwrap();
-        let error = finalize_undo_intent(intent, id, &dest, actual, &moved.identity.key()).unwrap_err();
+        let error = finalize_undo_intent(intent, id, &dest, &moved).unwrap_err();
         assert!(error.contains("replaced"));
         let pending = pending_undos().unwrap();
         assert_eq!((pending[0].id, pending[0].observed.as_deref()), (intent, Some(actual)));
@@ -2875,7 +2916,10 @@ mod undo_tests {
         assert_eq!(pending[0].observed.as_deref(), actual.to_str());
         assert_eq!(pending[0].observed_identity.as_deref(), Some(retained_identity.key().as_str()));
         assert!(pending[0].retained_message.as_deref().unwrap().contains("Verified copy"));
-        assert!(finalize_undo_intent(intent, id, &dest, actual.to_str().unwrap(), &retained_identity.key()).is_err());
+        let retained = crate::safe_fs::MoveResult {
+            source: PathBuf::from(&dest), destination: actual, identity: retained_identity, renamed: true,
+        };
+        assert!(finalize_undo_intent(intent, id, &dest, &retained).is_err());
         let retry = undo_action_with(id, &ignored).unwrap();
         assert_eq!(retry.status, "failed");
         assert!(retry.message.unwrap().contains(receipt.as_str()));
