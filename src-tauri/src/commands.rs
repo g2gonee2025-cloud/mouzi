@@ -1006,24 +1006,45 @@ pub fn is_autostart_enabled_cmd(app: AppHandle) -> Result<bool, String> {
     app.autolaunch().is_enabled().map_err(|e| e.to_string())
 }
 
-fn registered_ignore_root(folder_path: &str) -> Result<(PathBuf, crate::safe_fs::AncestorGuard), String> {
-    let root = crate::safe_fs::validate_root(Path::new(folder_path))?;
-    let guard = crate::safe_fs::guard_directory(&root)?;
-    let identity = crate::safe_fs::file_identity(&root)?;
-    if !get_watched_folders().map_err(|e| e.to_string())?.iter().any(|folder| {
-        crate::safe_fs::validate_root(Path::new(&folder.path)).ok()
-            .and_then(|path| crate::safe_fs::file_identity(&path).ok()).as_ref() == Some(&identity)
-    }) {
-        return Err("Folder is no longer registered".into());
+fn with_registered_ignore_root<T>(
+    folder_path: &str,
+    use_root: impl FnOnce(&str) -> Result<T, String>,
+) -> Result<T, String> {
+    let requested = Path::new(folder_path);
+    let root = crate::safe_fs::validate_root(requested)?;
+    let _guard = crate::safe_fs::guard_directory(requested)?;
+    let identity = crate::safe_fs::file_identity(requested)?;
+    if crate::safe_fs::file_identity(&root)? != identity {
+        return Err("Watched folder changed while opening Ignore settings".into());
     }
-    Ok((root, guard))
+
+    let folders = get_watched_folders().map_err(|error| error.to_string())?;
+    let registration = folders.iter().find(|folder| folder.path == folder_path).or_else(|| {
+        folders.iter().find(|folder| {
+            crate::safe_fs::validate_root(Path::new(&folder.path)).ok()
+                .and_then(|path| crate::safe_fs::file_identity(&path).ok()).as_ref() == Some(&identity)
+        })
+    }).ok_or("Folder is no longer registered")?;
+    let id = registration.id.ok_or("Watched folder has no identifier")?;
+    verify_watch_identity(id, &registration.path, &identity.key(), false)?;
+    use_root(&root.to_string_lossy())
 }
 
 #[tauri::command(async)]
 pub fn load_mouziignore_cmd(folder_path: String, state: tauri::State<AppState>) -> Result<Vec<String>, String> {
     let _operation = state.ignored_files.with_operation();
-    let (root, _guard) = registered_ignore_root(&folder_path)?;
-    load_mouziignore(&root.to_string_lossy())
+    with_registered_ignore_root(&folder_path, load_mouziignore)
+}
+
+fn save_registered_ignore(
+    folder_path: &str,
+    patterns: &[String],
+    expected_patterns: Option<&[String]>,
+) -> Result<Option<IgnoreSaveOutcome>, String> {
+    with_registered_ignore_root(folder_path, |root| match expected_patterns {
+        Some(expected) => save_mouziignore_checked(root, expected, patterns).map(Some),
+        None => save_mouziignore(root, patterns).map(|()| None),
+    })
 }
 
 #[tauri::command(async)]
@@ -1031,13 +1052,98 @@ pub fn save_mouziignore_cmd(
     app: AppHandle, folder_path: String, patterns: Vec<String>, expected_patterns: Option<Vec<String>>,
 ) -> Result<Option<IgnoreSaveOutcome>, String> {
     with_configuration(&app, || {
-        let (root, _guard) = registered_ignore_root(&folder_path)?;
-        let root = root.to_string_lossy();
-        match expected_patterns {
-            Some(expected) => save_mouziignore_checked(&root, &expected, &patterns).map(Some),
-            None => save_mouziignore(&root, &patterns).map(|()| None),
-        }
+        save_registered_ignore(&folder_path, &patterns, expected_patterns.as_deref())
     })
+}
+
+#[cfg(test)]
+mod ignore_editor_tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn ignore_editor_requires_a_saved_physical_binding() {
+        let _serial = serialise_test_db();
+        init_test_db();
+
+        struct Fixture {
+            directory: PathBuf,
+            registrations: Vec<i64>,
+        }
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                for id in &self.registrations {
+                    let _ = remove_watched_folder(*id);
+                }
+                let _ = fs::remove_dir_all(&self.directory);
+            }
+        }
+        let directory = fs::canonicalize(std::env::temp_dir()).unwrap()
+            .join(format!("mouzi-ignore-binding-{}", crate::operations::new_run_id()));
+        fs::create_dir(&directory).unwrap();
+        let mut fixture = Fixture { directory, registrations: Vec::new() };
+        let root = fixture.directory.join("primary");
+        let peer = fixture.directory.join("paused sibling");
+        for path in [&root, &peer] {
+            fs::create_dir(path).unwrap();
+        }
+        let primary_path = root.to_str().unwrap();
+        let peer_path = peer.to_str().unwrap();
+        let primary_id = register_watched_folder(primary_path, FOLDER_MODE_MANUAL, false).unwrap();
+        fixture.registrations.push(primary_id);
+        let peer_id = register_watched_folder(peer_path, FOLDER_MODE_PAUSED, false).unwrap();
+        fixture.registrations.push(peer_id);
+
+        let primary_ignore = root.join(".mouziignore");
+        let peer_ignore = peer.join(".mouziignore");
+        let primary_original = b"# original primary\nexisting.tmp\n";
+        let peer_original = b"# independent sibling\npeer.tmp\n";
+        fs::write(&primary_ignore, primary_original).unwrap();
+        fs::write(&peer_ignore, peer_original).unwrap();
+        let baseline = with_registered_ignore_root(primary_path, load_mouziignore).unwrap();
+        assert_eq!(baseline, ["existing.tmp"]);
+        let draft = vec!["existing.tmp".into(), "unsaved.tmp".into()];
+
+        // Exercise the persisted identity decision while both physical fixture
+        // roots stay in place. Only these test-owned registration rows change.
+        for (binding, reason) in [
+            (Some("synthetic unrelated identity"), "different physical folder"),
+            (None, "no saved folder identity"),
+        ] {
+            lock_db().unwrap().execute(
+                "UPDATE watched_folders SET watch_identity=?1 WHERE id=?2",
+                rusqlite::params![binding, primary_id],
+            ).unwrap();
+            let read = with_registered_ignore_root(primary_path, load_mouziignore).unwrap_err();
+            assert!(read.contains(reason), "{read}");
+            let write = save_registered_ignore(primary_path, &draft, Some(&baseline)).unwrap_err();
+            assert!(write.contains(reason), "{write}");
+            let unchecked = save_registered_ignore(primary_path, &draft, None).unwrap_err();
+            assert!(unchecked.contains(reason), "{unchecked}");
+            assert_eq!(fs::read(&primary_ignore).unwrap(), primary_original);
+            assert_eq!(fs::read(&peer_ignore).unwrap(), peer_original);
+            let stored: Option<String> = lock_db().unwrap().query_row(
+                "SELECT watch_identity FROM watched_folders WHERE id=?1", [primary_id], |row| row.get(0),
+            ).unwrap();
+            assert_eq!(stored.as_deref(), binding);
+        }
+
+        // Re-adding the original folder is the existing explicit recovery for
+        // an older registration that has not bound its identity yet.
+        assert_eq!(register_watched_folder(primary_path, FOLDER_MODE_MANUAL, false).unwrap(), primary_id);
+        let outcome = save_registered_ignore(primary_path, &draft, Some(&baseline)).unwrap();
+        assert!(matches!(outcome, Some(IgnoreSaveOutcome::Saved { patterns }) if patterns == draft));
+        assert_eq!(with_registered_ignore_root(primary_path, load_mouziignore).unwrap(), draft);
+        assert_eq!(fs::read(&primary_ignore).unwrap(), b"# original primary\nexisting.tmp\nunsaved.tmp\n");
+
+        assert_eq!(with_registered_ignore_root(peer_path, load_mouziignore).unwrap(), ["peer.tmp"]);
+        lock_db().unwrap().execute("UPDATE watched_folders SET enabled=0 WHERE id=?1", [peer_id]).unwrap();
+        assert_eq!(fs::read(&peer_ignore).unwrap(), peer_original);
+        let peer_draft = vec!["peer.tmp".into(), "other.tmp".into()];
+        assert!(save_registered_ignore(peer_path, &peer_draft, None).unwrap().is_none());
+        assert_eq!(with_registered_ignore_root(peer_path, load_mouziignore).unwrap(), peer_draft);
+        assert_eq!(with_registered_ignore_root(primary_path, load_mouziignore).unwrap(), draft);
+    }
 }
 
 #[tauri::command]
