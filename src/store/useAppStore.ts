@@ -135,7 +135,10 @@ export interface ArchiveImportState {
 }
 
 type ActionRefreshErrors = Record<'history' | 'historyCounts' | 'stats', string | null>;
-type FolderRead = { status: 'loading' | 'ready' } | { status: 'failed'; error: string };
+type FolderRead =
+  | { status: 'ready' }
+  | { status: 'loading'; committedChange?: true }
+  | { status: 'failed'; error: string; committedChange?: true };
 type PendingFile = [folder: string, name: string];
 type PendingReadStatus = 'loading' | 'ready' | 'failed';
 
@@ -171,7 +174,7 @@ interface AppState {
   saveSettings: (settings: PreferencesPatch) => Promise<void>;
   setAutostart: (enabled: boolean) => Promise<void>;
   loadRules: (reportRefreshError?: boolean) => Promise<void>;
-  loadFolders: () => Promise<void>;
+  loadFolders: (afterWrite?: boolean) => Promise<void>;
   loadLogs: (reportActionWarning?: boolean) => Promise<void>;
   loadHistoryCounts: (reportActionWarning?: boolean) => Promise<HistoryCounts>;
   loadStats: (reportActionWarning?: boolean) => Promise<void>;
@@ -182,6 +185,7 @@ interface AppState {
   addFolder: (path: string, mode: string, onlyNew?: boolean) => Promise<number>;
   removeFolder: (id: number) => Promise<void>;
   updateFolderMode: (id: number, mode: string) => Promise<void>;
+  setFolderOnlyNew: (id: number, enabled: boolean) => Promise<void>;
   addRule: (rule: Rule) => Promise<void>;
   updateRule: (rule: Rule) => Promise<void>;
   deleteRule: (id: number) => Promise<void>;
@@ -306,14 +310,17 @@ export const useAppStore = create<AppState>((set, get) => ({
     }
   },
 
-  loadFolders: async () => {
+  loadFolders: async (afterWrite = false) => {
     const request = ++foldersRequest;
-    set({ folderRead: { status: 'loading' } });
+    const { folderRead } = get();
+    const committed = afterWrite || (folderRead.status !== 'ready' && folderRead.committedChange);
+    const pending = committed ? { committedChange: true as const } : {};
+    set({ folderRead: { status: 'loading', ...pending } });
     try {
       const folders = await invoke<WatchedFolder[]>('get_folders_cmd');
       if (request === foldersRequest) set({ folders, folderRead: { status: 'ready' } });
     } catch (error) {
-      if (request === foldersRequest) set({ folderRead: { status: 'failed', error: String(error) } });
+      if (request === foldersRequest) set({ folderRead: { status: 'failed', error: String(error), ...pending } });
       throw error;
     }
   },
@@ -397,34 +404,24 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   addFolder: async (path, mode, onlyNew = false) => {
-    try {
-      const id = await invoke<number>('add_folder_cmd', { path, mode, onlyNew });
-      await get().loadFolders();
-      return id;
-    } catch (e) {
-      console.error('addFolder failed:', e);
-      throw e;
-    }
+    const id = await invoke<number>('add_folder_cmd', { path, mode, onlyNew });
+    await get().loadFolders(true).catch(() => {});
+    return id;
   },
 
   removeFolder: async (id) => {
-    try {
-      await invoke('remove_folder_cmd', { id });
-      await get().loadFolders();
-    } catch (e) {
-      console.error('removeFolder failed:', e);
-      throw e;
-    }
+    await invoke('remove_folder_cmd', { id });
+    await get().loadFolders(true).catch(() => {});
   },
 
   updateFolderMode: async (id, mode) => {
-    try {
-      await invoke('update_folder_mode_cmd', { id, mode });
-      await get().loadFolders();
-    } catch (e) {
-      console.error('updateFolderMode failed:', e);
-      throw e;
-    }
+    await invoke('update_folder_mode_cmd', { id, mode });
+    await get().loadFolders(true).catch(() => {});
+  },
+
+  setFolderOnlyNew: async (id, enabled) => {
+    await invoke('set_only_new_cmd', { id, enabled });
+    await get().loadFolders(true).catch(() => {});
   },
 
   addRule: async (rule) => {

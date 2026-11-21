@@ -43,7 +43,10 @@
       "modeSilent": "静默（自动）",
       "modeManual": "手动（仅收集）",
       "modePaused": "已暂停",
-      "modeDesc": "选择 Mouzi 处理此文件夹中文件的方式。"
+      "modeDesc": "选择 Mouzi 处理此文件夹中文件的方式。",
+      "loadError": "无法加载监控文件夹。",
+      "savedRefreshError": "文件夹更改已保存。无法刷新监控文件夹列表。",
+      "removeChanged": "请关闭此提示，然后检查当前的监控文件夹列表。"
     },
     "archive": {
       "title": "导入归档文件",

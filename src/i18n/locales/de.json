@@ -43,7 +43,10 @@
       "modeSilent": "Leise (Auto)",
       "modeManual": "Manuell (nur sammeln)",
       "modePaused": "Pausiert",
-      "modeDesc": "Wähle, wie Mouzi Dateien in diesem Ordner behandelt."
+      "modeDesc": "Wähle, wie Mouzi Dateien in diesem Ordner behandelt.",
+      "loadError": "Die überwachten Ordner konnten nicht geladen werden.",
+      "savedRefreshError": "Ordneränderung gespeichert. Die Liste der überwachten Ordner konnte nicht aktualisiert werden.",
+      "removeChanged": "Schließe diese Meldung und prüfe die aktuelle Liste der überwachten Ordner."
     },
     "archive": {
       "title": "Archiv importieren",

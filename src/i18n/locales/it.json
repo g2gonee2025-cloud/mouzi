@@ -43,7 +43,10 @@
       "modeSilent": "Silenzioso (auto)",
       "modeManual": "Manuale (solo raccolta)",
       "modePaused": "In pausa",
-      "modeDesc": "Scegli come Mouzi gestisce i file in questa cartella."
+      "modeDesc": "Scegli come Mouzi gestisce i file in questa cartella.",
+      "loadError": "Impossibile caricare le cartelle monitorate.",
+      "savedRefreshError": "Modifica alla cartella salvata. Impossibile aggiornare l’elenco delle cartelle monitorate.",
+      "removeChanged": "Chiudi questa finestra e controlla l’elenco attuale delle cartelle monitorate."
     },
     "archive": {
       "title": "Importa archivio",

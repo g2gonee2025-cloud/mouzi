@@ -43,7 +43,10 @@
       "modeSilent": "Silencieux (auto)",
       "modeManual": "Manuel (collecte uniquement)",
       "modePaused": "En pause",
-      "modeDesc": "Choisissez comment Mouzi gère les fichiers dans ce dossier."
+      "modeDesc": "Choisissez comment Mouzi gère les fichiers dans ce dossier.",
+      "loadError": "Impossible de charger les dossiers surveillés.",
+      "savedRefreshError": "Modification du dossier enregistrée. Impossible d’actualiser la liste des dossiers surveillés.",
+      "removeChanged": "Fermez cette fenêtre et vérifiez la liste actuelle des dossiers surveillés."
     },
     "archive": {
       "title": "Importer une archive",

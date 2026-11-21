@@ -49,7 +49,10 @@
       "modeSilent": "Tự động (ngầm)",
       "modeManual": "Thủ công (chỉ thu thập)",
       "modePaused": "Tạm dừng",
-      "modeDesc": "Chọn cách Mouzi xử lý các tệp trong thư mục này."
+      "modeDesc": "Chọn cách Mouzi xử lý các tệp trong thư mục này.",
+      "loadError": "Không thể tải các thư mục đang theo dõi.",
+      "savedRefreshError": "Đã lưu thay đổi cho thư mục. Không thể làm mới danh sách thư mục đang theo dõi.",
+      "removeChanged": "Hãy đóng thông báo này và kiểm tra danh sách thư mục đang theo dõi hiện tại."
     },
     "archive": {
       "title": "Nhập kho lưu trữ",

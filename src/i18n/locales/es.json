@@ -43,7 +43,10 @@
       "modeSilent": "Silencioso (auto)",
       "modeManual": "Manual (solo recolectar)",
       "modePaused": "Pausado",
-      "modeDesc": "Elige cómo Mouzi maneja los archivos en esta carpeta."
+      "modeDesc": "Elige cómo Mouzi maneja los archivos en esta carpeta.",
+      "loadError": "No se pudieron cargar las carpetas supervisadas.",
+      "savedRefreshError": "Se guardó el cambio. No se pudo actualizar la lista de carpetas supervisadas.",
+      "removeChanged": "Cierra este aviso y comprueba la lista de carpetas supervisadas."
     },
     "rules": {
       "title": "Reglas",

@@ -1,7 +1,7 @@
 import { Children, isValidElement, type ReactElement, type ReactNode } from "react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import Settings from "../components/Settings";
-import { useAppStore, type AppSettings, type Rule, type ScheduleSettings } from "../store/useAppStore";
+import { useAppStore, type AppSettings, type Rule, type ScheduleSettings, type WatchedFolder } from "../store/useAppStore";
 
 const harness = vi.hoisted(() => ({
   invoke: vi.fn(),
@@ -179,6 +179,155 @@ function disposeIgnoreEffects() {
 afterEach(() => {
   disposeIgnoreEffects();
   vi.useRealTimers();
+});
+
+const watchedFixture: WatchedFolder = { id: 23, path: "C:/Fixture/Existing", mode: "manual", enabled: true, only_new: false };
+const addFolderField = () => field("settings.folders.placeholder");
+const folderMode: Match = (node) => node.type === "select" && node.props["aria-label"] === `${watchedFixture.path}: settings.folders.mode`;
+const removeFolder: Match = ({ props }) => props["aria-label"] === `confirm.op.removeFolder: ${watchedFixture.path}`;
+const folderConfirmation: Match = ({ props }) => props.title === "confirm.op.removeFolder" && !!props.onConfirm;
+const alert: Match = ({ props }) => props.role === "alert";
+
+function openWatchedFolders() {
+  useAppStore.setState({ folders: [watchedFixture], folderRead: { status: "ready" } });
+  click(requireElement(({ props }) => props.label === "settings.folders.title"));
+}
+
+it("clears a committed add draft and reloads the canonical registered path only on a successful read", async () => {
+  openWatchedFolders();
+  const canonical: WatchedFolder = { id: 42, path: "C:/Fixture/Added", mode: "manual", enabled: true, only_new: true };
+  const typed = "c:/fixture/Added/";
+  change(addFolderField(), { value: typed });
+  change(checkbox("beta.onlyNew"), { checked: true });
+  harness.invoke.mockResolvedValueOnce(canonical.id).mockRejectedValueOnce(new Error("Fixture list unavailable"))
+    .mockRejectedValueOnce(new Error("Retry still unavailable")).mockResolvedValueOnce([watchedFixture, canonical]);
+  await click(requireElement(button("settings.folders.add")));
+
+  expect(addFolderField().props.value).toBe("");
+  expect(checkbox("beta.onlyNew").props.checked).toBe(false);
+  expect(text(requireElement(alert))).toContain("settings.folders.savedRefreshError");
+  expect(text(requireElement(alert))).toContain("Fixture list unavailable");
+  expect(text(editor())).not.toContain(canonical.path);
+  expect(find(editor(), folderMode)).toBeUndefined();
+
+  await click(requireElement(button("common.retry")));
+  expect(text(requireElement(alert))).toContain("settings.folders.savedRefreshError");
+  expect(text(requireElement(alert))).toContain("Retry still unavailable");
+  expect(text(requireElement(alert))).not.toContain("Fixture list unavailable");
+  await click(requireElement(button("common.retry")));
+  expect(find(editor(), alert)).toBeUndefined();
+  expect(text(editor())).toContain(canonical.path);
+  expect(text(editor())).not.toContain(typed);
+  expect(harness.invoke.mock.calls).toEqual([
+    ["add_folder_cmd", { path: typed, mode: "manual", onlyNew: true }],
+    ["get_folders_cmd"],
+    ["get_folders_cmd"],
+    ["get_folders_cmd"],
+  ]);
+});
+
+it.each(["remove", "mode", "only-new"])("reports a saved %s independently from a failed folder-list read", async (action) => {
+  openWatchedFolders();
+  harness.invoke.mockResolvedValueOnce(undefined).mockRejectedValueOnce(new Error("Fixture list unavailable"));
+  let command: string;
+  let updated: WatchedFolder | null;
+  if (action === "remove") {
+    command = "remove_folder_cmd";
+    updated = null;
+    click(requireElement(removeFolder));
+    const confirmation = requireElement(folderConfirmation);
+    await expect(confirmation.props.onConfirm!()).resolves.toBeUndefined();
+    confirmation.props.onClose!();
+    expect(find(editor(), folderConfirmation)).toBeUndefined();
+  } else if (action === "mode") {
+    command = "update_folder_mode_cmd";
+    updated = { ...watchedFixture, mode: "paused" };
+    change(requireElement(folderMode), { value: "paused" });
+  } else {
+    command = "set_only_new_cmd";
+    updated = { ...watchedFixture, only_new: true };
+    const row = requireElement((node) => node.type === "div" && Children.toArray(node.props.children)
+      .some((child) => isValidElement<Props>(child) && removeFolder(child)));
+    change(requireElement((node) => node.type === "input" && node.props.type === "checkbox", row), { checked: true });
+  }
+  await settle();
+
+  expect(text(requireElement(alert))).toContain("settings.folders.savedRefreshError");
+  expect(find(editor(), folderMode)).toBeUndefined();
+  expect(find(editor(), removeFolder)).toBeUndefined();
+  harness.invoke.mockResolvedValueOnce(updated ? [updated] : []);
+  await click(requireElement(button("common.retry")));
+  expect(useAppStore.getState().folders).toEqual(updated ? [updated] : []);
+  expect(find(editor(), alert)).toBeUndefined();
+  expect(harness.invoke.mock.calls.map(([name]) => name)).toEqual([command, "get_folders_cmd", "get_folders_cmd"]);
+});
+
+it("keeps the draft and only the write error when the native add itself fails", async () => {
+  openWatchedFolders();
+  change(addFolderField(), { value: "C:/Fixture/Unregistered" });
+  harness.invoke.mockRejectedValueOnce(new Error("Fixture write rejected"));
+  await click(requireElement(button("settings.folders.add")));
+  expect(addFolderField().props.value).toBe("C:/Fixture/Unregistered");
+  expect(text(requireElement(alert))).toContain("Fixture write rejected");
+  expect(find(editor(), button("common.retry"))).toBeUndefined();
+  expect(find(editor(), folderMode)).toBeDefined();
+  expect(harness.invoke.mock.calls.map(([name]) => name)).toEqual(["add_folder_cmd"]);
+});
+
+it("withholds rows while reading and labels an ordinary read failure separately from a committed write", async () => {
+  openWatchedFolders();
+  let rejectRead!: (reason: Error) => void;
+  harness.invoke.mockReturnValueOnce(new Promise((_resolve, reject) => { rejectRead = reject; }));
+  const read = useAppStore.getState().loadFolders();
+  const loading = editor();
+  rejectRead(new Error("Fixture refresh failure"));
+  await expect(read).rejects.toThrow("Fixture refresh failure");
+  expect(text(loading)).toContain("common.loading");
+  expect(find(loading, folderMode)).toBeUndefined();
+  expect(find(loading, removeFolder)).toBeUndefined();
+
+  expect(text(requireElement(alert))).toContain("settings.folders.loadError");
+  expect(text(requireElement(alert))).toContain("Fixture refresh failure");
+  expect(find(editor(), removeFolder)).toBeUndefined();
+  harness.invoke.mockResolvedValueOnce([watchedFixture]);
+  await click(requireElement(button("common.retry")));
+  expect(find(editor(), alert)).toBeUndefined();
+  expect(find(editor(), folderMode)).toBeDefined();
+
+  harness.invoke.mockRejectedValueOnce(new Error("Later read fails"));
+  await expect(useAppStore.getState().loadFolders()).rejects.toThrow("Later read fails");
+  expect(text(requireElement(alert))).toContain("settings.folders.loadError");
+  expect(text(requireElement(alert))).toContain("Later read fails");
+});
+
+it("does not let a captured folder mode or remove confirmation act after the list becomes unverified", async () => {
+  openWatchedFolders();
+  const capturedMode = requireElement(folderMode);
+  click(requireElement(removeFolder));
+  const confirmation = requireElement(folderConfirmation);
+  harness.invoke.mockRejectedValueOnce(new Error("Fixture list unavailable"));
+  await expect(useAppStore.getState().loadFolders()).rejects.toThrow("Fixture list unavailable");
+  harness.invoke.mockClear().mockResolvedValue([]);
+  change(capturedMode, { value: "paused" });
+  await expect(confirmation.props.onConfirm!()).rejects.toThrow("settings.folders.removeChanged");
+  await settle();
+  expect(harness.invoke).not.toHaveBeenCalled();
+});
+
+it("does not let a late failed post-write read replace a newer verified list", async () => {
+  openWatchedFolders();
+  let failOld!: (reason: Error) => void;
+  const olderRead = new Promise((_resolve, reject) => { failOld = reject; });
+  harness.invoke.mockResolvedValueOnce(undefined).mockReturnValueOnce(olderRead);
+  const modeChange = useAppStore.getState().updateFolderMode(watchedFixture.id!, "paused");
+  await settle();
+  const committed = { ...watchedFixture, mode: "paused" };
+  harness.invoke.mockResolvedValueOnce([committed]);
+  await useAppStore.getState().loadFolders();
+  failOld(new Error("Superseded fixture read failure"));
+  await expect(modeChange).resolves.toBeUndefined();
+  expect(find(editor(), alert)).toBeUndefined();
+  expect(requireElement(folderMode).props.value).toBe("paused");
 });
 
 const scheduleFixture: AppSettings = {

@@ -43,7 +43,10 @@
       "modeSilent": "Silent (auto)",
       "modeManual": "Manual (collect only)",
       "modePaused": "Paused",
-      "modeDesc": "Choose how Mouzi handles files in this folder."
+      "modeDesc": "Choose how Mouzi handles files in this folder.",
+      "loadError": "Could not load watched folders.",
+      "savedRefreshError": "Folder change saved. Could not refresh the watched folders list.",
+      "removeChanged": "Close this prompt and check the current watched folders list."
     },
     "archive": {
       "title": "Import archive",

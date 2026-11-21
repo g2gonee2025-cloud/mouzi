@@ -43,7 +43,10 @@
       "modeSilent": "Cichy (auto)",
       "modeManual": "Ręczny (tylko zbieraj)",
       "modePaused": "Wstrzymany",
-      "modeDesc": "Wybierz, jak Mouzi ma obsługiwać pliki w tym folderze."
+      "modeDesc": "Wybierz, jak Mouzi ma obsługiwać pliki w tym folderze.",
+      "loadError": "Nie udało się wczytać obserwowanych folderów.",
+      "savedRefreshError": "Zapisano zmianę folderu. Nie udało się odświeżyć listy obserwowanych folderów.",
+      "removeChanged": "Zamknij to okno i sprawdź aktualną listę obserwowanych folderów."
     },
     "archive": {
       "title": "Importuj archiwum",

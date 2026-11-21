@@ -117,6 +117,12 @@ function activeScheduleDefaults({ values, clearedTimes }: ScheduleDraft): Schedu
   return filled;
 }
 
+function verifiedFolderId(folder: WatchedFolder): number | undefined {
+  const { folderRead, folders } = useAppStore.getState();
+  if (folderRead.status !== "ready") return undefined;
+  return folders.find((item) => item.id === folder.id && item.path === folder.path)?.id;
+}
+
 type SchedulerRun = {
   id: number;
   status: "claimed" | "running" | "completed" | "failed" | "interrupted";
@@ -202,6 +208,7 @@ export default function Settings() {
     addFolder,
     removeFolder,
     updateFolderMode,
+    setFolderOnlyNew,
     addRule,
     updateRule,
     deleteRule,
@@ -264,7 +271,7 @@ export default function Settings() {
   }, [undoToast]);
 
   useEffect(() => {
-    Promise.all([loadRules(), loadFolders(), loadLogs(), getSchedule()])
+    Promise.all([loadRules(), loadFolders().catch(() => {}), loadLogs(), getSchedule()])
       .catch((e) => setWriteError(String(e)));
   }, [loadRules, loadFolders, loadLogs, getSchedule]);
 
@@ -378,7 +385,8 @@ export default function Settings() {
   };
 
   const askRemoveFolder = (folder: WatchedFolder, opener: HTMLButtonElement) => {
-    if (folder.id === undefined) return;
+    const id = verifiedFolderId(folder);
+    if (id === undefined) return;
     setPending({
       title: t("confirm.op.removeFolder"),
       count: 1,
@@ -386,7 +394,10 @@ export default function Settings() {
       note: t("confirm.note.removeFolder"),
       opener,
       focusFallback: () => sectionHeading.current,
-      onConfirm: () => removeFolder(folder.id!),
+      onConfirm: async () => {
+        if (verifiedFolderId(folder) !== id) throw new Error(t("settings.folders.removeChanged"));
+        await removeFolder(id);
+      },
     });
   };
 
@@ -622,8 +633,20 @@ export default function Settings() {
               {t("beta.onlyNew")}
             </label>
             <ArchiveImportPanel />
+            {folderRead.status === "loading" && <p role="status" className="text-xs text-text-muted">{t("common.loading")}</p>}
+            {folderRead.status === "failed" && (
+              <div className="space-y-2 rounded-lg border border-red-200 dark:border-red-800 p-3 text-sm text-red-700 dark:text-red-400">
+                <div role="alert">
+                  <p>{t(folderRead.committedChange ? "settings.folders.savedRefreshError" : "settings.folders.loadError")}</p>
+                  <p className="break-words">{folderRead.error}</p>
+                </div>
+                <button type="button" className="underline" onClick={() => loadFolders().catch(() => {})}>
+                  {t("common.retry")}
+                </button>
+              </div>
+            )}
             <div className="space-y-2">
-              {folders.map((f) => (
+              {folderRead.status === "ready" && folders.map((f) => (
                 <div
                   key={f.id}
                   className="flex items-center justify-between rounded-lg border border-border px-4 py-3 gap-3"
@@ -640,7 +663,11 @@ export default function Settings() {
                       <select
                         aria-label={`${f.path}: ${t("settings.folders.mode")}`}
                         value={f.mode || "silent"}
-                        onChange={(e) => { if (f.id !== undefined) void runWrite(() => updateFolderMode(f.id!, e.target.value)); }}
+                        onChange={(e) => {
+                          const id = verifiedFolderId(f);
+                          const mode = e.target.value;
+                          if (id !== undefined) void runWrite(() => updateFolderMode(id, mode));
+                        }}
                         className="appearance-none w-full max-w-xs rounded-md border border-border bg-surface px-2 py-1.5 text-sm outline-none focus:border-primary"
                       >
                         <option value="silent">{t("settings.folders.modeSilent")}</option>
@@ -653,11 +680,9 @@ export default function Settings() {
                       </p>
                       <label className="mt-2 flex items-center gap-2 text-sm">
                         <input type="checkbox" checked={f.only_new ?? false} onChange={(event) => {
+                          const id = verifiedFolderId(f);
                           const enabled = event.target.checked;
-                          if (f.id !== undefined) void runWrite(async () => {
-                            await invoke("set_only_new_cmd", { id: f.id, enabled });
-                            await loadFolders();
-                          });
+                          if (id !== undefined) void runWrite(() => setFolderOnlyNew(id, enabled));
                         }} />
                         {t("beta.onlyNew")}
                       </label>
