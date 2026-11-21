@@ -49,6 +49,7 @@ mod windows_fs {
         fn GetFileInformationByHandle(handle: *mut c_void, info: *mut ByHandleInfo) -> i32;
         fn SetFileInformationByHandle(handle: *mut c_void, class: i32, info: *const c_void, size: u32) -> i32;
         fn GetDriveTypeW(root: *const u16) -> u32;
+        fn CompareStringOrdinal(left: *const u16, left_len: i32, right: *const u16, right_len: i32, ignore_case: i32) -> i32;
     }
 
     pub(super) fn drive_type(drive: u8) -> u32 {
@@ -107,6 +108,17 @@ mod windows_fs {
             )
         };
         ok != 0 && flags == 0
+    }
+
+    pub(super) fn directory_alias_equal(left: &std::ffi::OsStr, right: &std::ffi::OsStr) -> bool {
+        let left: Vec<_> = left.encode_wide().collect();
+        let right: Vec<_> = right.encode_wide().collect();
+        let (Ok(left_len), Ok(right_len)) = (i32::try_from(left.len()), i32::try_from(right.len())) else {
+            return false;
+        };
+        const CSTR_EQUAL: i32 = 2;
+        let order = unsafe { CompareStringOrdinal(left.as_ptr(), left_len, right.as_ptr(), right_len, 1) };
+        order == CSTR_EQUAL
     }
 
     pub(super) fn links(file: &File) -> io::Result<u64> {
@@ -368,7 +380,8 @@ pub(crate) struct WatchedRootGuardError {
 pub(crate) struct UnavailableRootBoundary {
     parent: PathBuf,
     name: std::ffi::OsString,
-    ascii_case_aliases: bool,
+    #[cfg(windows)]
+    case_insensitive: bool,
 }
 
 impl UnavailableRootBoundary {
@@ -376,8 +389,13 @@ impl UnavailableRootBoundary {
         let Ok(relative) = path.strip_prefix(&self.parent) else { return false; };
         let mut parts = relative.components();
         let Some(Component::Normal(name)) = parts.next() else { return false; };
-        parts.next().is_some() && (name == self.name.as_os_str()
-            || (self.ascii_case_aliases && name.as_encoded_bytes().eq_ignore_ascii_case(self.name.as_encoded_bytes())))
+        if parts.next().is_none() { return false; }
+        let matches = name == self.name.as_os_str();
+        // This recognizes aliases only to withhold an unavailable branch.
+        // It never supplies evidence of a directory's identity or authority.
+        #[cfg(windows)]
+        let matches = matches || (self.case_insensitive && windows_fs::directory_alias_equal(name, &self.name));
+        matches
     }
 }
 
@@ -410,7 +428,8 @@ fn unavailable_root_boundary(unavailable: &Path) -> Option<UnavailableRootBounda
         return Some(UnavailableRootBoundary {
             parent: canonical,
             name: name.to_os_string(),
-            ascii_case_aliases: guard.has_ascii_case_aliases(),
+            #[cfg(windows)]
+            case_insensitive: guard.has_ascii_case_aliases(),
         });
     }
     None
