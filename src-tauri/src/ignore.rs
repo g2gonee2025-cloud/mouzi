@@ -66,6 +66,7 @@ pub fn load_mouziignore(folder_path: &str) -> Result<Vec<String>, String> {
         format!("Unable to read ignore protection file {}: {error}", path.display())
     })?;
 
+    let content = content.strip_prefix('\u{feff}').unwrap_or(&content);
     Ok(content
         .lines()
         .map(|l| {
