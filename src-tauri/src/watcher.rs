@@ -1193,7 +1193,7 @@ mod tests {
         fs::OpenOptions::new().write(true).open(&source).unwrap()
             .set_modified(SystemTime::now() - age).unwrap();
         let settings = get_watched_folders().unwrap().into_iter().find(|entry| entry.id == Some(folder)).unwrap();
-        let root = Arc::new(WatchedRoot::capture_unattended(&settings, false).unwrap());
+        let root = Arc::new(WatchedRoot::capture_registered(&settings, false).unwrap());
         let suppression = Arc::new(SuppressionSet::new());
         let watcher = FolderWatcher::new(suppression.clone());
         enqueue_path(&source, EnqueueSource::Notification, &root, &watcher.pending,
