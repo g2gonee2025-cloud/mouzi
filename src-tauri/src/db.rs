@@ -1172,10 +1172,20 @@ pub fn get_undoable_logs() -> SqliteResult<Vec<(i64, String, Option<String>, Opt
 
 pub fn get_weekly_stats() -> SqliteResult<Vec<(String, i64)>> {
     let conn = sqlite_lock()?;
+    get_weekly_stats_on(&conn, "now")
+}
+
+fn get_weekly_stats_on(conn: &Connection, clock: &str) -> SqliteResult<Vec<(String, i64)>> {
+    // SQLite resolves "now" consistently throughout a statement. The same
+    // SQLite parser compares each saved timestamp by its instant.
     let mut stmt = conn.prepare(
-        "SELECT file_type, COUNT(*) FROM action_logs WHERE julianday(timestamp) > julianday('now', '-7 days') AND undone = 0 GROUP BY file_type"
+        "SELECT file_type, COUNT(*) FROM action_logs
+         WHERE julianday(timestamp) > julianday(?1, '-7 days')
+           AND julianday(timestamp) <= julianday(?1)
+           AND undone = 0
+         GROUP BY file_type",
     )?;
-    let stats = stmt.query_map([], |row| {
+    let stats = stmt.query_map([clock], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
     })?
     .collect::<SqliteResult<Vec<_>>>()?;
@@ -3876,6 +3886,32 @@ mod tests {
         let _recent=LogRow{id:recent,table:"action_logs",remove:remove_action_log};let _old=LogRow{id:old,table:"action_logs",remove:remove_action_log};
         let stats=get_weekly_stats().unwrap();assert_eq!(stats.iter().find(|(category,_)|category=="week-test-category").unwrap().1,1);
         let counts=history_counts().unwrap();assert_eq!(counts.total,before.total+2);assert_eq!(counts.undoable,before.undoable);
+    }
+
+    #[test]
+    fn weekly_activity_excludes_future_rows_and_compares_exact_instants() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+        let clock = "2026-11-21T08:00:00.500Z";
+        for (timestamp, file_type, undone) in [
+            ("2026-11-21T03:00:00.500-05:00", "Documents", false),
+            ("2026-11-14T12:00:00.501+04:00", "Documents", false),
+            ("2026-11-21T12:00:00.501+04:00", "Documents", false),
+            ("2026-11-28T08:00:00.500Z", "Future only", false),
+            ("2026-11-14T03:00:00.500-05:00", "Exact lower cutoff", false),
+            ("2026-11-14T08:00:00.499Z", "Older", false),
+            ("2026-11-20T08:00:00Z", "Undone", true),
+            ("not-a-date", "Invalid", false),
+        ] {
+            conn.execute(
+                "INSERT INTO action_logs (timestamp, file_type, undone, source_path, action, file_name)
+                 VALUES (?1, ?2, ?3, '/fixture/report.txt', 'move', 'report.txt')",
+                params![timestamp, file_type, undone],
+            ).unwrap();
+        }
+        assert_eq!(get_weekly_stats_on(&conn, clock).unwrap(), vec![("Documents".to_owned(), 2)]);
+        let history_rows: i64 = conn.query_row("SELECT COUNT(*) FROM action_logs", [], |row| row.get(0)).unwrap();
+        assert_eq!(history_rows, 8);
     }
 
     #[test]
