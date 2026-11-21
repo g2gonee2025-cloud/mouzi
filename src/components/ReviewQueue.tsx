@@ -6,7 +6,12 @@ import { useAppStore } from '../store/useAppStore';
 import ConfirmDialog, { type ConfirmRequest } from './cleanup/ConfirmDialog';
 
 interface Entry { id: string; selectionKey?: string; source: string; destination: string | null; rule: string; action: string; size: number; warning: boolean; error: string | null }
-interface Preview { id: string; entries: Entry[]; unavailableRoots?: string[] }
+interface Preview {
+  id: string;
+  entries: Entry[];
+  unavailableRoots?: string[];
+  blockedRoots?: { root: string; error: string }[];
+}
 
 function isOrdinaryProposal(entry: Entry) {
   return !entry.error && !entry.warning && entry.action !== 'delete';
@@ -101,6 +106,7 @@ export default function ReviewQueue({ paths }: { paths: string[] | null }) {
     else next.add(id);
     choose(next);
   };
+  const hasOmissions = !!(preview?.unavailableRoots?.length || preview?.blockedRoots?.length);
   return <section className="space-y-4" aria-busy={busy}>
     <div className="flex flex-wrap justify-between items-center gap-3"><h2 ref={heading} tabIndex={-1} className="text-lg font-semibold">{t('beta.review')}</h2><button className={buttonClass} onClick={refresh} disabled={busy}>{t('beta.refresh')}</button></div>
     <p className="text-sm text-text-muted">{t('beta.previewHelp')}</p>
@@ -108,11 +114,15 @@ export default function ReviewQueue({ paths }: { paths: string[] | null }) {
     {error && <p role="alert" className="text-sm text-red-700 dark:text-red-300">{error}</p>}
     <Results results={results} />
     {preview && <>
-      {!!preview.unavailableRoots?.length && (
+      {hasOmissions && (
         <div role="status" className="space-y-1 text-sm text-amber-800 dark:text-amber-200">
           <p>{t('beta.unavailableFolders')}</p>
           <ul className="list-disc space-y-1 pl-5">
-            {preview.unavailableRoots.map(path => <li key={path} className="break-all">{path}</li>)}
+            {preview.unavailableRoots?.map(path => <li key={path} className="break-all">{path}</li>)}
+            {preview.blockedRoots?.map(({ root, error }) => <li key={root} className="break-words">
+              <p>{root}</p>
+              <p>{errorText(error)}</p>
+            </li>)}
           </ul>
         </div>
       )}
@@ -121,7 +131,7 @@ export default function ReviewQueue({ paths }: { paths: string[] | null }) {
         <button className={buttonClass} disabled={busy} onClick={() => choose(new Set())}>{t('beta.clearSelection')}</button>
         <span className="text-sm">{t('beta.selected', { count: selected.size })}</span>
       </div>
-      {!preview.entries.length && !preview.unavailableRoots?.length && <p className="py-8 text-text-muted">{t('beta.empty')}</p>}
+      {!preview.entries.length && !hasOmissions && <p className="py-8 text-text-muted">{t('beta.empty')}</p>}
       <div className="space-y-2">{preview.entries.map(entry => <div key={entry.id} className="rounded-lg border border-border p-3">
         <label className="flex gap-3 items-start"><input type="checkbox" className="mt-1" checked={selected.has(entry.id)} disabled={busy || !!entry.error} onChange={() => toggle(entry.id)} />
           <span className="min-w-0 text-sm break-all"><span className="block font-medium">{entry.source}</span><span className="block mt-1">{entry.rule} · {t(`beta.${entry.action}`)} · {entry.size.toLocaleString()} B</span>{entry.destination && <span className="block text-text-muted">{entry.destination}</span>}</span>
