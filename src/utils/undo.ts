@@ -1,8 +1,12 @@
 import type { ActionLog, UndoAllResult, UndoResult, UndoStatus } from "../store/useAppStore";
 
+export function isRestorableAction(action: string) {
+  return ["move", "rename", "accept"].includes(action);
+}
+
 export function canRestoreLog(log: ActionLog) {
   return log.id !== undefined && !log.undone && log.undo_verified === true
-    && !!log.destination_path && ["move", "rename", "accept"].includes(log.action);
+    && !!log.destination_path && isRestorableAction(log.action);
 }
 
 /** `success` confirms that the file is back at its original path. */

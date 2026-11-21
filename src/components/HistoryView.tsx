@@ -4,7 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import { useTranslation } from "react-i18next";
 import { type OrganizationLog, type UndoResult, useAppStore } from "../store/useAppStore";
 import { parentDir } from "../utils/paths";
-import { canRestoreLog as canRestore, UNDO_TONE_CLASS, undoNotice } from "../utils/undo";
+import { canRestoreLog as canRestore, isRestorableAction, UNDO_TONE_CLASS, undoNotice } from "../utils/undo";
 import { buttonClass, fieldClass, primaryClass, errorText } from "./BetaControls";
 import ConfirmDialog, { type ConfirmRequest } from "./cleanup/ConfirmDialog";
 
@@ -100,6 +100,14 @@ export default function HistoryView() {
       else next.add(id);
       return next;
     });
+  }
+
+  function openRecordedFolder(log: OrganizationLog) {
+    if (!log.destination_path) return;
+    // A restored file can receive a suffix, but it goes back to the original folder.
+    const file = log.undone && isRestorableAction(log.action) ? log.source_path : log.destination_path;
+    void invoke("open_folder_cmd", { path: parentDir(file), directoryOnly: true })
+      .catch((cause) => setError(errorText(cause)));
   }
 
   function askRestore(opener: HTMLButtonElement) {
@@ -209,8 +217,7 @@ export default function HistoryView() {
           </span>
         </label>
         {log.destination_path && <button type="button" className="shrink-0 self-start text-xs text-primary"
-          onClick={() => void invoke("open_folder_cmd", { path: parentDir(log.destination_path!) })
-            .catch((cause) => setError(errorText(cause)))}>{t("cleanup.openFolder")}</button>}
+          onClick={() => openRecordedFolder(log)}>{t("cleanup.openFolder")}</button>}
       </div>)}
     </section>)}
     {logs.length > limit && <button className={buttonClass} onClick={() => setLimit(limit + 100)}>{t("beta.more")}</button>}

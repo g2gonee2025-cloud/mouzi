@@ -290,12 +290,20 @@ it("ignores a late failure after a newer read confirms the current query", async
   expect(find(history(), button("common.retry"))).toBeUndefined();
 });
 
+it("keeps Open folder hidden when a saved restored row has no recorded destination", async () => {
+  mock.invoke.mockResolvedValueOnce([{ ...first, destination_path: null, undone: true }]);
+  await mount();
+  expect(text(history())).toContain(first.file_name);
+  expect(find(history(), button("cleanup.openFolder"))).toBeUndefined();
+});
+
 it("keeps an Open folder failure separate from the confirmed History query", async () => {
   mock.invoke.mockResolvedValueOnce([first]).mockRejectedValueOnce("Folder is unavailable");
   await mount();
   click(requireElement(button("cleanup.openFolder")));
   await settle();
   expect(text(history())).toContain("Folder is unavailable");
+  expect(mock.invoke).toHaveBeenLastCalledWith("open_folder_cmd", { path: "C:/Fixture/Sorted", directoryOnly: true });
   expect(find(history(), button("common.retry"))).toBeUndefined();
   expect(requireElement(checkbox).props.disabled).toBe(false);
 });

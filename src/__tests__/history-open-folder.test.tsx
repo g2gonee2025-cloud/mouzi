@@ -145,22 +145,48 @@ it("retries the same history cursor and lets refresh supersede an in-flight olde
 });
 
 const timestamp = "2026-11-20T12:00:00Z";
+const savedOrganization: OrganizationLog = {
+  id: 1, timestamp, source_path: "C:\\Watched\\receipt.pdf", destination_path: "\\\\?\\C:\\receipt.pdf",
+  action: "move", file_name: "receipt.pdf", file_type: "PDFs", undone: false,
+  run_id: "1", trigger: "manual", file_extension: "pdf", file_size: 8,
+  fingerprint: null, undo_verified: true,
+};
 
 it("opens the containing drive root from a canonical destination saved in History", async () => {
-  const saved: OrganizationLog = {
-    id: 1, timestamp, source_path: "C:\\Watched\\receipt.pdf", destination_path: "\\\\?\\C:\\receipt.pdf",
-    action: "move", file_name: "receipt.pdf", file_type: "PDFs", undone: false,
-    run_id: "1", trigger: "manual", file_extension: "pdf", file_size: 8,
-    fingerprint: null, undo_verified: true,
-  };
-  mocks.invoke.mockResolvedValueOnce([saved]).mockResolvedValueOnce(undefined);
+  mocks.invoke.mockResolvedValueOnce([savedOrganization]).mockResolvedValueOnce(undefined);
 
   await clickSavedFolder(HistoryView);
 
   expect(mocks.invoke).toHaveBeenNthCalledWith(1, "history_cmd", {
     filter: { query: "", rule: "", extension: "", from: "", to: "", run_id: "" },
   });
-  expect(mocks.invoke).toHaveBeenNthCalledWith(2, "open_folder_cmd", { path: "\\\\?\\C:\\" });
+  expect(mocks.invoke).toHaveBeenNthCalledWith(2, "open_folder_cmd", { path: "\\\\?\\C:\\", directoryOnly: true });
+});
+
+it.each([
+  ["move", "C:\\Watched\\receipt.pdf", "C:\\Watched", true],
+  ["rename", "\\\\?\\C:\\receipt.pdf", "\\\\?\\C:\\", false],
+  ["accept", "\\\\server\\share\\incoming\\receipt.pdf", "\\\\server\\share\\incoming", true],
+  ["move", "/receipt.pdf", "/", true],
+])("opens the source directory from a saved restored %s at %s", async (action, source, parent, verified) => {
+  const saved: OrganizationLog = {
+    ...savedOrganization, action, source_path: source, destination_path: "C:/Organized/receipt.pdf",
+    undone: true, undo_verified: verified,
+  };
+  mocks.invoke.mockResolvedValueOnce([saved]).mockResolvedValueOnce(undefined);
+
+  await clickSavedFolder(HistoryView);
+
+  expect(mocks.invoke).toHaveBeenNthCalledWith(2, "open_folder_cmd", { path: parent, directoryOnly: true });
+});
+
+it("keeps the saved destination for an undone entry outside supported restore actions", async () => {
+  mocks.invoke.mockResolvedValueOnce([{ ...savedOrganization, action: "legacy", undone: true }])
+    .mockResolvedValueOnce(undefined);
+
+  await clickSavedFolder(HistoryView);
+
+  expect(mocks.invoke).toHaveBeenNthCalledWith(2, "open_folder_cmd", { path: "\\\\?\\C:\\", directoryOnly: true });
 });
 
 it.each([
