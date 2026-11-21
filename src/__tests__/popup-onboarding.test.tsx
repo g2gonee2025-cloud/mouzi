@@ -167,6 +167,34 @@ async function publishPendingFiles(...names: string[]) {
   await useAppStore.getState().getPendingFiles();
 }
 
+function reviewQueue(popup: ReactNode) {
+  return findElement(popup, (element) => element.type === "button" && label(element).startsWith("Review queue ("));
+}
+
+function deferredPendingFiles() {
+  let resolve!: (rows: [string, string][]) => void;
+  let reject!: (error: Error) => void;
+  const result = new Promise<[string, string][]>((yes, no) => { resolve = yes; reject = no; });
+  return { result, resolve, reject };
+}
+
+it("distinguishes a first queue check from a successful empty list", async () => {
+  await loadFolderList([invoices]);
+  const first = deferredPendingFiles();
+  fixture.invoke.mockReturnValueOnce(first.result);
+  const read = useAppStore.getState().getPendingFiles();
+  const checking = renderRetainedPopup();
+  expect(label(checking)).toContain("Checking for waiting files…");
+  expect(label(checking)).not.toContain("No files are waiting.");
+  expect(reviewQueue(checking)).toBeUndefined();
+  first.resolve([]);
+  await read;
+  const empty = renderRetainedPopup();
+  expect(label(empty)).toContain("No files are waiting.");
+  expect(label(empty)).not.toContain("Checking for waiting files…");
+  expect(findAction(empty, "Organize Now")).toBeTypeOf("function");
+});
+
 it("forgets a selected pending path after an empty snapshot even if it returns before rendering", async () => {
   await loadFolderList([invoices]);
   await publishPendingFiles("arrival.txt");
@@ -180,7 +208,7 @@ it("forgets a selected pending path after an empty snapshot even if it returns b
   pendingCheckbox(returned, "chosen.txt").onChange?.({ target: { checked: true } });
 
   fixture.invoke.mockClear().mockResolvedValueOnce(undefined);
-  const review = findElement(renderRetainedPopup(), (element) => element.type === "button" && label(element).startsWith("Review queue ("));
+  const review = reviewQueue(renderRetainedPopup());
   expect(review?.props.disabled).toBe(false);
   await review?.props.onClick?.();
   expect(fixture.invoke.mock.calls).toEqual([["show_review_cmd", { paths: [`${invoices.path}/chosen.txt`] }]]);
@@ -200,15 +228,119 @@ it("keeps only continuously present selections across reorder, a new arrival, an
   } finally {
     reporter.mockRestore();
   }
-  expect(pendingCheckbox(renderRetainedPopup(), "retained.txt").checked).toBe(true);
-  expect(pendingCheckbox(renderRetainedPopup(), "removed.txt").checked).toBe(true);
-
   await publishPendingFiles("retained.txt", "new.txt");
   await publishPendingFiles("new.txt", "removed.txt", "retained.txt");
   const refreshed = renderRetainedPopup();
   expect(pendingCheckbox(refreshed, "retained.txt").checked).toBe(true);
   expect(pendingCheckbox(refreshed, "new.txt").checked).toBe(false);
   expect(pendingCheckbox(refreshed, "removed.txt").checked).toBe(false);
+});
+
+it("blocks an old Review queue click when the current queue read has failed", async () => {
+  await loadFolderList([invoices]);
+  await publishPendingFiles("arrival.txt");
+  pendingCheckbox(renderRetainedPopup(), "arrival.txt").onChange?.({ target: { checked: true } });
+  const review = reviewQueue(renderRetainedPopup());
+  expect(review?.props.disabled).toBe(false);
+  const reporter = vi.spyOn(console, "error").mockImplementation(() => {});
+  try {
+    fixture.invoke.mockRejectedValueOnce(new Error("Fixture queue read failed"));
+    await useAppStore.getState().getPendingFiles();
+    fixture.invoke.mockClear();
+    await review?.props.onClick?.();
+    expect(fixture.invoke).not.toHaveBeenCalled();
+  } finally {
+    reporter.mockRestore();
+  }
+});
+
+it("shows a dedicated queue retry and only passes positively revalidated selected paths", async () => {
+  await loadFolderList([invoices]);
+  await publishPendingFiles("left.txt", "retained.txt", "other.txt");
+  const original = renderRetainedPopup();
+  pendingCheckbox(original, "left.txt").onChange?.({ target: { checked: true } });
+  pendingCheckbox(original, "retained.txt").onChange?.({ target: { checked: true } });
+  const reporter = vi.spyOn(console, "error").mockImplementation(() => {});
+  try {
+    fixture.invoke.mockRejectedValueOnce(new Error("Fixture queue read failed"));
+    await useAppStore.getState().getPendingFiles();
+    const failed = renderRetainedPopup();
+    expect(label(findElement(failed, (element) => element.props.role === "alert"))).toContain("Could not check for waiting files.");
+    expect(label(failed)).not.toContain("No files are waiting.");
+    expect(label(failed)).not.toContain("retained.txt");
+    expect(reviewQueue(failed)).toBeUndefined();
+    expect(findAction(failed, "Organize Now")).toBeTypeOf("function");
+    expect(findAction(failed, "Open Downloads")).toBeTypeOf("function");
+
+    pendingCheckbox(original, "other.txt").onChange?.({ target: { checked: true } });
+    fixture.invoke.mockClear().mockResolvedValueOnce([[invoices.path, "retained.txt"], [invoices.path, "other.txt"], [invoices.path, "new.txt"]]);
+    const retry = findAction(failed, "Retry");
+    expect(retry).toBeTypeOf("function");
+    await retry?.();
+    expect(fixture.invoke.mock.calls).toEqual([["get_pending_files_cmd"]]);
+
+    const recovered = renderRetainedPopup();
+    expect(label(recovered)).not.toContain("Could not check for waiting files.");
+    expect(label(recovered)).not.toContain("left.txt");
+    expect(pendingCheckbox(recovered, "retained.txt").checked).toBe(true);
+    expect(pendingCheckbox(recovered, "other.txt").checked).toBe(false);
+    expect(pendingCheckbox(recovered, "new.txt").checked).toBe(false);
+    fixture.invoke.mockClear().mockResolvedValueOnce(undefined);
+    await reviewQueue(recovered)?.props.onClick?.();
+    expect(fixture.invoke.mock.calls).toEqual([["show_review_cmd", { paths: [`${invoices.path}/retained.txt`] }]]);
+  } finally {
+    reporter.mockRestore();
+  }
+});
+
+it("keeps healthy selection during overlapping polls and ignores an older rejected read", async () => {
+  await loadFolderList([invoices]);
+  await publishPendingFiles("retained.txt");
+  pendingCheckbox(renderRetainedPopup(), "retained.txt").onChange?.({ target: { checked: true } });
+  const old = deferredPendingFiles();
+  const latest = deferredPendingFiles();
+  fixture.invoke.mockReturnValueOnce(old.result).mockReturnValueOnce(latest.result);
+  const oldRead = useAppStore.getState().getPendingFiles();
+  const latestRead = useAppStore.getState().getPendingFiles();
+  const pending = renderRetainedPopup();
+  expect(reviewQueue(pending)?.props.disabled).toBe(false);
+  expect(pendingCheckbox(pending, "retained.txt").checked).toBe(true);
+  expect(label(pending)).not.toContain("Checking for waiting files…");
+  latest.resolve([[invoices.path, "new.txt"], [invoices.path, "retained.txt"]]);
+  await latestRead;
+
+  const reporter = vi.spyOn(console, "error").mockImplementation(() => {});
+  try {
+    old.reject(new Error("Older read failed"));
+    await oldRead;
+  } finally {
+    reporter.mockRestore();
+  }
+  const ready = renderRetainedPopup();
+  expect(label(ready)).not.toContain("Could not check for waiting files.");
+  expect(pendingCheckbox(ready, "retained.txt").checked).toBe(true);
+  expect(pendingCheckbox(ready, "new.txt").checked).toBe(false);
+});
+
+it("keeps a newer queue error after an older read finally succeeds", async () => {
+  await loadFolderList([invoices]);
+  await publishPendingFiles("last-known.txt");
+  const older = deferredPendingFiles();
+  fixture.invoke.mockReturnValueOnce(older.result);
+  const oldRead = useAppStore.getState().getPendingFiles();
+  const reporter = vi.spyOn(console, "error").mockImplementation(() => {});
+  try {
+    fixture.invoke.mockRejectedValueOnce(new Error("Current read failed"));
+    await useAppStore.getState().getPendingFiles();
+    older.resolve([[invoices.path, "superseded.txt"]]);
+    await oldRead;
+  } finally {
+    reporter.mockRestore();
+  }
+  const failed = renderRetainedPopup();
+  expect(label(failed)).toContain("Could not check for waiting files.");
+  expect(label(failed)).not.toContain("superseded.txt");
+  expect(label(failed)).not.toContain("last-known.txt");
 });
 
 it("takes a confirmed zero-folder popup directly to Watched Folders", async () => {
@@ -235,7 +367,7 @@ it("organizes after a watched folder is configured", async () => {
 });
 
 it("waits for a folder read and offers Retry when the read fails", async () => {
-  useAppStore.setState({ pendingFiles: [["C:/Fixture/Invoices", "stale.pdf"]] });
+  await publishPendingFiles("stale.pdf");
   const loading = Popup();
   expect(label(loading)).toContain("Loading…");
   expect(findAction(loading, "Add a watched folder")).toBeUndefined();

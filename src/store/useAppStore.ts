@@ -137,6 +137,7 @@ export interface ArchiveImportState {
 type ActionRefreshErrors = Record<'history' | 'historyCounts' | 'stats', string | null>;
 type FolderRead = { status: 'loading' | 'ready' } | { status: 'failed'; error: string };
 type PendingFile = [folder: string, name: string];
+type PendingReadStatus = 'loading' | 'ready' | 'failed';
 
 export function pendingFilePath([folder, name]: PendingFile): string {
   return folder.replace(/[\\/]$/, '') + (folder.includes('\\') ? '\\' : '/') + name;
@@ -153,6 +154,7 @@ interface AppState {
   settings: AppSettings | null;
   schedule: ScheduleSettings | null;
   pendingFiles: PendingFile[];
+  pendingReadStatus: PendingReadStatus;
   selectedPendingPaths: ReadonlySet<string>;
   isLoading: boolean;
   actionRefreshErrors: ActionRefreshErrors;
@@ -241,6 +243,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   settings: null,
   schedule: null,
   pendingFiles: [],
+  pendingReadStatus: 'loading',
   selectedPendingPaths: new Set(),
   isLoading: false,
   actionRefreshErrors: noActionRefreshErrors,
@@ -453,20 +456,26 @@ export const useAppStore = create<AppState>((set, get) => ({
       const pendingFiles = await invoke<PendingFile[]>('get_pending_files_cmd');
       if (request === pendingRequest) {
         // Reconcile every published snapshot, including updates React batches together.
+        const snapshot = { pendingFiles, pendingReadStatus: 'ready' as const };
         set(({ selectedPendingPaths }) => {
-          if (selectedPendingPaths.size === 0) return { pendingFiles };
+          if (selectedPendingPaths.size === 0) return snapshot;
           const listed = new Set(pendingFiles.map(pendingFilePath));
           const retained = new Set([...selectedPendingPaths].filter((path) => listed.has(path)));
-          return { pendingFiles, selectedPendingPaths: retained };
+          return { ...snapshot, selectedPendingPaths: retained };
         });
       }
-    } catch (e) {
-      console.error('getPendingFiles failed:', e);
+    } catch (error) {
+      if (request !== pendingRequest) return;
+      // Keep the user's selection for reconciliation on the next successful read.
+      set({ pendingReadStatus: 'failed' });
+      console.error('getPendingFiles failed:', error);
     }
   },
 
   setPendingFileSelected: (path, checked) => {
-    set(({ pendingFiles, selectedPendingPaths }) => {
+    set((state) => {
+      const { pendingFiles, pendingReadStatus, selectedPendingPaths } = state;
+      if (pendingReadStatus !== 'ready') return state;
       const selection = new Set(selectedPendingPaths);
       if (!checked) selection.delete(path);
       else if (pendingFiles.some((file) => pendingFilePath(file) === path)) selection.add(path);

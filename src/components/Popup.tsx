@@ -47,6 +47,7 @@ export default function Popup() {
     folders,
     folderRead,
     pendingFiles,
+    pendingReadStatus,
     getPendingFiles,
     selectedPendingPaths,
     setPendingFileSelected,
@@ -144,7 +145,8 @@ export default function Popup() {
     path: pendingFilePath(file),
   }));
   const reviewSelection = () => {
-    const { pendingFiles, selectedPendingPaths } = useAppStore.getState();
+    const { folders, folderRead, pendingFiles, pendingReadStatus, selectedPendingPaths } = useAppStore.getState();
+    if (pendingReadStatus !== "ready" || folderRead.status !== "ready" || folders.length === 0) return;
     const paths = pendingFiles.map(pendingFilePath).filter((path) => selectedPendingPaths.has(path));
     if (paths.length) void openReview(paths);
   };
@@ -190,7 +192,8 @@ export default function Popup() {
 
   const totalStats = stats.reduce((sum, s) => sum + s.count, 0);
   const hasFolders = folders.length > 0;
-  const showPendingFiles = folderRead.status === "ready" && hasFolders && pendingPaths.length > 0;
+  const showQueue = folderRead.status === "ready" && hasFolders;
+  const showPendingFiles = showQueue && pendingReadStatus === "ready" && pendingPaths.length > 0;
 
   return (
     <div className="flex h-full flex-col bg-surface text-text border border-border overflow-hidden">
@@ -232,10 +235,19 @@ export default function Popup() {
             <button type="button" onClick={() => loadFolders().catch(console.error)} className="underline">{t("common.retry")}</button>
           </div>
         )}
-        {showPendingFiles && (
-          <div className="text-center text-xs text-text-muted">
-            {t("popup.pendingFiles", { count: pendingFiles.length })}
+        {showQueue && pendingReadStatus === "loading" && (
+          <p role="status" className="text-center text-xs text-text-muted">{t("popup.pendingFilesLoading")}</p>
+        )}
+        {showQueue && pendingReadStatus === "failed" && (
+          <div className="space-y-1 text-xs text-red-700 dark:text-red-300">
+            <p role="alert">{t("popup.pendingFilesLoadError")}</p>
+            <button type="button" onClick={() => getPendingFiles()} className="underline">{t("common.retry")}</button>
           </div>
+        )}
+        {showQueue && pendingReadStatus === "ready" && (
+          <p className="text-center text-xs text-text-muted">
+            {showPendingFiles ? t("popup.pendingFiles", { count: pendingFiles.length }) : t("popup.pendingFilesEmpty")}
+          </p>
         )}
         {actionError && <p role="alert" className="mt-2 break-words text-xs text-red-700 dark:text-red-300">{t("confirm.failed", { error: actionError })}</p>}
         <ActionRefreshWarnings />
