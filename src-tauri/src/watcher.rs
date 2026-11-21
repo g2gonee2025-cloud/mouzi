@@ -633,9 +633,9 @@ impl FolderWatcher {
             self.pending_manual.update_count(&manual);
             arrivals
         };
+        let grace = Duration::from_secs(settings.grace_period_seconds.max(2) as u64);
         for (path, ticket) in arrivals {
-            let item = pending_item(&path, root, ticket,
-                Duration::from_secs(settings.grace_period_seconds.max(2) as u64));
+            let item = pending_item(&path, root, ticket, grace);
             let mut pending = self.pending.lock().unwrap_or_else(|error| error.into_inner());
             if !item.ticket.is_current() || self.suppression.is_suppressed(&path, Instant::now()) { continue; }
             pending.retain(|previous| !same_path(&previous.path, &path));
@@ -703,10 +703,10 @@ fn enqueue_path(path: &Path, source: EnqueueSource, root: &Arc<WatchedRoot>, pen
         && (is_folder_auto_mode(&folder.mode) || is_folder_manual_mode(&folder.mode)))
         else { return Ok(()); };
     let _guard = root.guard_physical()?;
-    let ticket = suppression.ticket(path);
     if !path.is_file() || should_ignore_file(path) || suppression.is_suppressed(path, Instant::now())
         || is_file_ignored_by_mouziignore(path)? { return Ok(()); }
     if path_is_baselined(path, folder)? { return Ok(()); }
+    let ticket = suppression.ticket(path);
     if crate::operations::already_processed(path).map_err(|error| match error {
         ProcessedCheckError::File(message) => EnqueueError::Entry(message),
         ProcessedCheckError::Database(error) => EnqueueError::Root(error.to_string()),

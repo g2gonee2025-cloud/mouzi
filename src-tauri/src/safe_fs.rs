@@ -1777,9 +1777,18 @@ mod tests {
         let (parent, guards) = prepare_destination_parent(&destination).unwrap();
         let destination = parent.join("destination.bin");
         let mut handle = open_guard(&source, false, true).unwrap();
+        let competitor = file_identity(&destination).unwrap();
+        let attempts = std::cell::Cell::new(0);
+        let fence = |path: &Path, identity: &FileIdentity| -> Box<dyn FnOnce(bool)> {
+            assert_eq!(path, destination);
+            assert_ne!(*identity, competitor);
+            attempts.set(attempts.get() + 1);
+            Box::new(|_| panic!("a rejected publication must not commit"))
+        };
         let result = copy_verified(&mut handle, &source, &destination, &guards[0], |_, _| {
             panic!("collision must not request source removal")
-        }, None).unwrap();
+        }, Some(&fence)).unwrap();
+        assert_eq!(attempts.get(), 1);
         assert!(result.is_none());
         assert_eq!(fs::read(&source).unwrap(), b"source");
         assert_eq!(fs::read(&destination).unwrap(), b"competitor");
@@ -1797,14 +1806,26 @@ mod tests {
         let (parent, guards) = prepare_destination_parent(&destination).unwrap();
         let destination = parent.join("destination.bin");
         let mut handle = open_guard(&source, false, true).unwrap();
+        let source_identity = file_identity(&source).unwrap();
+        let recorded = std::cell::RefCell::new(None);
+        let fence = |path: &Path, identity: &FileIdentity| -> Box<dyn FnOnce(bool) + '_> {
+            assert_eq!(path, destination);
+            assert_ne!(*identity, source_identity);
+            let identity = identity.clone();
+            let recorded = &recorded;
+            Box::new(move |source_moved| {
+                *recorded.borrow_mut() = Some((identity, source_moved));
+            })
+        };
         let error = copy_verified(&mut handle, &source, &destination, &guards[0], |_, _| {
             Err("injected source removal failure".into())
-        }, None).unwrap_err();
+        }, Some(&fence)).unwrap_err();
         let MoveFailure::RetainedOutput {
             path, identity: Some(identity), verified: true, source_preserved: true, ..
         } = error else { panic!("Unexpected result: {error}") };
         assert_eq!(path, destination);
         assert_eq!(identity, file_identity(&destination).unwrap());
+        assert_eq!(recorded.into_inner(), Some((identity, false)));
         assert_eq!(fs::read(&source).unwrap(), b"source");
         assert_eq!(fs::read(&destination).unwrap(), b"source");
         assert_eq!(fs::read_dir(&root).unwrap().count(), 2);

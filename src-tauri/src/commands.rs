@@ -2519,14 +2519,21 @@ mod undo_tests {
              WHEN OLD.id={id} AND NEW.undone=1
              BEGIN SELECT RAISE(ABORT,'fixture history write failed'); END;"
         )).unwrap();
-        let batch = undo_all_with(&ignored_files(), &[id]);
+        let ignored = ignored_files();
+        let occupant = ignored.ticket(Path::new(&original));
+        let actual_path = Path::new(&original).with_file_name("receipt_0.undocheck");
+        let output = ignored.ticket(&actual_path);
+        let batch = undo_all_with(&ignored, &[id]);
         lock_db().unwrap().execute_batch("DROP TRIGGER interrupt_undo_history").unwrap();
 
         let batch = batch.unwrap();
         assert_eq!(batch.results.len(), 1);
         let result = &batch.results[0];
         let actual = result.restored_to.as_deref().unwrap();
-        assert_ne!(actual, original);
+        assert_eq!(Path::new(actual), actual_path);
+        assert!(occupant.is_current());
+        assert!(!output.is_current());
+        assert!(ignored.is_suppressed(&actual_path, Instant::now()));
         assert_eq!(std::fs::read(actual).unwrap(), b"payload");
         assert_eq!(std::fs::read(&original).unwrap(), b"existing occupant");
         assert!(!Path::new(&organized).exists());
@@ -3076,6 +3083,73 @@ mod undo_tests {
 
     /// Pins the frontend contract: one result per input row, in the order the
     /// batch query returned them, with the four status values unchanged.
+    #[test]
+    fn undo_selected_and_single_guard_only_the_actual_collision_winner() {
+        for selected in [false, true] {
+            let fixture = UndoFixture::new(if selected { "selected_collision" } else { "single_collision" });
+            let ignored = ignored_files();
+            let (source, dest) = stage(fixture.root(), "occupied.undocheck");
+            let source = Path::new(&source);
+            let actual = source.with_file_name("occupied_0.undocheck");
+            let id = insert_log("2026-01-01T00:00:00Z", source.to_str().unwrap(), Some(&dest));
+            std::fs::write(source, b"unrelated original occupant").unwrap();
+            let occupant = ignored.ticket(source);
+            let output = ignored.ticket(&actual);
+            let at_publication = Arc::new(Mutex::new(Vec::new()));
+            let _observer = ObserverReset(snapshot_guard_on_first_move(&ignored, &at_publication));
+            let outcome = if selected {
+                let mut results = undo_selected_with(vec![id, id], &ignored);
+                assert_eq!(results.len(), 1);
+                assert_eq!(results[0].id, id);
+                results.remove(0).outcome
+            } else {
+                undo_action_with(id, &ignored).unwrap()
+            };
+            assert_eq!(outcome.status, "collision");
+            assert_eq!(outcome.restored_to.as_deref(), actual.to_str());
+            let guarded = at_publication.lock().unwrap();
+            assert!(!guarded.contains(&crate::suppress::key(source)));
+            assert!(guarded.contains(&crate::suppress::key(&actual)));
+            assert!(occupant.is_current());
+            assert!(!output.is_current());
+            assert!(!ignored.is_suppressed(source, Instant::now()));
+            assert!(ignored.is_suppressed(&actual, Instant::now()));
+            assert_eq!(std::fs::read(source).unwrap(), b"unrelated original occupant");
+            assert_eq!(std::fs::read(&actual).unwrap(), b"payload");
+
+            let held = source.with_file_name("held-restored.undocheck");
+            std::fs::rename(&actual, &held).unwrap();
+            std::fs::write(&actual, b"later arrival at restored name").unwrap();
+            assert!(!ignored.is_suppressed(&actual, Instant::now()));
+            assert!(ignored.ticket(&actual).is_current());
+            assert_eq!(std::fs::read(held).unwrap(), b"payload");
+        }
+    }
+
+    #[test]
+    fn undo_content_refusal_preserves_both_unrelated_tickets() {
+        let fixture = UndoFixture::new("changed_payload");
+        let ignored = ignored_files();
+        let (source, dest) = stage(fixture.root(), "changed.undocheck");
+        let id = insert_log("2026-01-01T00:00:00Z", &source, Some(&dest));
+        let digest = blake3::hash(b"payload");
+        lock_db().unwrap().execute(
+            "UPDATE action_logs SET fingerprint=?1 WHERE id=?2",
+            rusqlite::params![format!("blake3:{digest}"), id],
+        ).unwrap();
+        std::fs::write(&source, b"unrelated original occupant").unwrap();
+        std::fs::write(&dest, b"changed content at arranged name").unwrap();
+        let tickets = [&source, &dest].map(|path| ignored.ticket(Path::new(path)));
+        let outcome = undo_action_with(id, &ignored).unwrap();
+        assert_eq!(outcome.status, "failed", "{outcome:?}");
+        assert!(outcome.restored_to.is_none());
+        assert!(tickets.iter().all(|ticket| ticket.is_current()));
+        assert!(ignored.guarded_keys().is_empty());
+        assert_eq!(std::fs::read(&source).unwrap(), b"unrelated original occupant");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"changed content at arranged name");
+        assert_eq!(undone_of(&source), 0);
+    }
+
     #[test]
     fn undo_queue_keeps_reused_manual_arrivals_and_cancels_actual_restores() {
         let fixture = UndoFixture::new("queue_occupants");

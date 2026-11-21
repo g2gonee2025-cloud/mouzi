@@ -161,25 +161,25 @@ impl SuppressionSet {
     }
 
     pub fn ticket(&self, path: &Path) -> CancellationTicket {
+        let path = key(path);
         let mut inner = self.entries();
-        inner.generations.retain(|_, generation| generation.strong_count() > 0);
-        let generation = inner.generations.entry(key(path))
-            .or_insert_with(Weak::new)
-            .upgrade()
-            .unwrap_or_else(|| {
-                let generation = Arc::new(AtomicU64::new(0));
-                inner.generations.insert(key(path), Arc::downgrade(&generation));
-                generation
-            });
+        let weak = inner.generations.entry(path).or_default();
+        let generation = weak.upgrade().unwrap_or_else(|| {
+            let generation = Arc::new(AtomicU64::new(0));
+            *weak = Arc::downgrade(&generation);
+            generation
+        });
         let expected = generation.load(Ordering::Acquire);
         CancellationTicket { generation, expected }
     }
 
-    /// Call while holding `with_operation`, before restoring an Undo path.
+    /// Retires earlier tickets when a watched path receives a new generation.
     pub fn invalidate(&self, paths: &[PathBuf]) {
+        if paths.is_empty() { return; }
+        let keys = paths.iter().map(|path| key(path)).collect::<Vec<_>>();
         let mut inner = self.entries();
-        for path in paths {
-            if let Some(generation) = inner.generations.get(&key(path)).and_then(Weak::upgrade) {
+        for key in keys {
+            if let Some(generation) = inner.generations.get(&key).and_then(Weak::upgrade) {
                 generation.fetch_add(1, Ordering::AcqRel);
             }
         }
@@ -278,6 +278,7 @@ impl SuppressionSet {
     /// precisely the guards that are still needed, and would do so silently.
     pub fn sweep(&self, now: Instant) -> usize {
         let mut inner = self.entries();
+        inner.generations.retain(|_, generation| generation.strong_count() > 0);
         let before = inner.entries.len();
         inner.entries.retain(|_, entry| now < entry.expires_at);
         let mut removed = before - inner.entries.len();
