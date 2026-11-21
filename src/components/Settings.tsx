@@ -40,6 +40,16 @@ type Tab = "folders" | "rules" | "review" | "history" | "ignore" | "general" | "
 type GraceUnit = "seconds" | "minutes" | "hours";
 type GraceDraft = { value: string; unit: GraceUnit };
 
+const MIN_RULE_PRIORITY = -2_147_483_648;
+const MAX_RULE_PRIORITY = 2_147_483_647;
+
+function parseRulePriority(draft: string): number | null {
+  const text = draft.trim();
+  if (!/^[+-]?\d+$/.test(text)) return null;
+  const value = Number(text);
+  return value >= MIN_RULE_PRIORITY && value <= MAX_RULE_PRIORITY ? value : null;
+}
+
 const MAX_GRACE_SECONDS = 7 * 24 * 60 * 60;
 const GRACE_STEPS = [
   0, 30, 60, 300, 900, 1800, 3600, 7200, 21600, 43200, 86400, 172800, MAX_GRACE_SECONDS,
@@ -228,7 +238,9 @@ export default function Settings() {
   const [reviewPaths, setReviewPaths] = useState<string[] | null>(null);
   const [editingRule, setEditingRule] = useState<Rule | null>(null);
   const [ruleExtensionsInput, setRuleExtensionsInput] = useState<string | null>(null);
+  const [rulePriorityDraft, setRulePriorityDraft] = useState("");
   const [ruleSizeDraft, setRuleSizeDraft] = useState<RuleSizeDraft>({ min_size: "", max_size: "" });
+  const rulePriority = parseRulePriority(rulePriorityDraft);
   const sizeBounds = ruleSizeBounds(ruleSizeDraft);
   const folderPaths = new Map(folders.map((folder) => [folder.id, folder.path]));
   const missingRuleFolder = !!editingRule?.folder_id && !folderPaths.has(editingRule.folder_id);
@@ -366,6 +378,7 @@ export default function Settings() {
   const beginRuleEdit = (rule: Rule) => {
     setEditingRule(rule);
     setRuleExtensionsInput(null);
+    setRulePriorityDraft(String(rule.priority));
     setRuleSizeDraft({
       min_size: String(rule.options?.min_size ?? ""),
       max_size: String(rule.options?.max_size ?? ""),
@@ -373,9 +386,10 @@ export default function Settings() {
   };
 
   const handleSaveRule = async () => {
-    if (!editingRule || !ruleScopeReady || !sizeBounds) return;
+    if (!editingRule || !ruleScopeReady || !sizeBounds || rulePriority === null) return;
     const rule: Rule = {
       ...editingRule,
+      priority: rulePriority,
       ...(ruleExtensionsInput === null ? {} : {
         extensions: ruleExtensionsInput.split(",").map((extension) => extension.trim()),
       }),
@@ -853,13 +867,18 @@ export default function Settings() {
                     <label className="text-xs font-medium text-text-muted">{t("settings.rules.priority")}</label>
                     <input
                       aria-label={t("settings.rules.priority")}
-                      type="number"
-                      value={editingRule.priority}
-                      onChange={(e) =>
-                        setEditingRule({ ...editingRule, priority: parseInt(e.target.value) || 0 })
-                      }
+                      aria-invalid={rulePriority === null}
+                      aria-describedby={rulePriority === null ? "rule-priority-error" : undefined}
+                      type="text"
+                      value={rulePriorityDraft}
+                      onChange={(e) => setRulePriorityDraft(e.target.value)}
                       className="mt-1 w-full rounded-md border border-border bg-surface px-2 py-1.5 text-sm outline-none focus:border-primary"
                     />
+                    {rulePriority === null && (
+                      <p id="rule-priority-error" role="alert" className="mt-1 text-xs text-red-700 dark:text-red-300">
+                        {t("settings.rules.priorityInvalid", { min: MIN_RULE_PRIORITY, max: MAX_RULE_PRIORITY })}
+                      </p>
+                    )}
                   </div>
                 </div>
                 <div className="grid grid-cols-2 gap-3">
@@ -914,7 +933,7 @@ export default function Settings() {
                 <div className="flex gap-2">
                   <button
                     onClick={handleSaveRule}
-                    disabled={!ruleScopeReady || !sizeBounds}
+                    disabled={!ruleScopeReady || !sizeBounds || rulePriority === null}
                     className="flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-on-primary hover:bg-primary-hover disabled:opacity-50"
                   >
                     <Save size={14} />

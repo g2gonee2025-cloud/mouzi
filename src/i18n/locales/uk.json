@@ -76,6 +76,7 @@
       "destination": "Цільова тека",
       "pattern": "Шаблон назви",
       "priority": "Пріоритет",
+      "priorityInvalid": "Введіть ціле число від {{min}} до {{max}}.",
       "action": "Дія",
       "enabled": "Увімкнено",
       "export": "Експортувати правила",

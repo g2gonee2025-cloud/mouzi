@@ -76,6 +76,7 @@
       "destination": "Destination",
       "pattern": "Pattern",
       "priority": "Priorité",
+      "priorityInvalid": "Saisissez un nombre entier compris entre {{min}} et {{max}}.",
       "action": "Action",
       "enabled": "Activée",
       "export": "Exporter les règles",

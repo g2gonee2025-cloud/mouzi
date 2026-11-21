@@ -76,6 +76,7 @@
       "destination": "Папка назначения",
       "pattern": "Pattern",
       "priority": "Приоритет",
+      "priorityInvalid": "Введите целое число от {{min}} до {{max}}.",
       "action": "Действие",
       "enabled": "Включено",
       "export": "Экспорт правил",

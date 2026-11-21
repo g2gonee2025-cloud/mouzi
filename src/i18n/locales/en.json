@@ -76,6 +76,7 @@
       "destination": "Destination",
       "pattern": "Pattern",
       "priority": "Priority",
+      "priorityInvalid": "Enter a whole number from {{min}} to {{max}}.",
       "action": "Action",
       "enabled": "Enabled",
       "export": "Export Rules",

@@ -76,6 +76,7 @@
       "destination": "移動先",
       "pattern": "パターン",
       "priority": "優先順位",
+      "priorityInvalid": "{{min}} から {{max}} までの整数を入力してください。",
       "action": "アクション",
       "enabled": "有効",
       "export": "ルールをエクスポート",

@@ -59,6 +59,7 @@
       "destination": "Destino",
       "pattern": "Patrón",
       "priority": "Prioridad",
+      "priorityInvalid": "Introduce un número entero entre {{min}} y {{max}}.",
       "action": "Acción",
       "enabled": "Activado",
       "export": "Exportar reglas",

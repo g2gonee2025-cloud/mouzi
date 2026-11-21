@@ -76,6 +76,7 @@
       "destination": "Destinazione",
       "pattern": "Pattern (regex)",
       "priority": "Priorità",
+      "priorityInvalid": "Inserisci un numero intero compreso tra {{min}} e {{max}}.",
       "action": "Azione",
       "enabled": "Abilitata",
       "export": "Esporta regole",

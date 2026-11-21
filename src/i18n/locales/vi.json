@@ -82,6 +82,7 @@
       "destination": "Đích đến",
       "pattern": "Mẫu",
       "priority": "Độ ưu tiên",
+      "priorityInvalid": "Nhập một số nguyên từ {{min}} đến {{max}}.",
       "action": "Hành động",
       "enabled": "Kích hoạt",
       "export": "Xuất quy tắc",

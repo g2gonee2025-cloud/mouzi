@@ -602,6 +602,70 @@ it("keeps both a same-row toggle and other changes from the open draft", async (
   expect(checkbox("settings.rules.enabled").props.checked).toBe(false);
 });
 
+it.each(["", "-", "1.75", "2e2", "-2147483649", "2147483648"])(
+  "keeps invalid priority %j and prevents saving any field",
+  async (raw) => {
+    edit("Invoices");
+    change(field("settings.rules.name"), { value: "Unsaved name" });
+    change(field("settings.rules.priority"), { value: raw });
+
+    await submit();
+
+    expect(harness.invoke).not.toHaveBeenCalledWith("update_rule_cmd", expect.anything());
+    expect(db.get(1)).toEqual(invoice);
+    expect(db.get(2)).toEqual(receipts);
+    expect(field("settings.rules.name").props.value).toBe("Unsaved name");
+    expect(String(field("settings.rules.priority").props.value)).toBe(raw);
+    expect(field("settings.rules.priority").props["aria-invalid"]).toBe(true);
+    expect(text(requireElement(({ props }) => props.role === "alert"))).toBe("settings.rules.priorityInvalid");
+    expect(requireElement(button("settings.rules.save")).props.disabled).toBe(true);
+  },
+);
+
+it.each([
+  { value: -2147483648, raw: "-2147483648" },
+  { value: -12, raw: "-12" },
+  { value: 0, raw: "0" },
+  { value: 42, raw: "+0042" },
+  { value: 2147483647, raw: "2147483647" },
+])(
+  "saves whole priority $value exactly and reopens with the saved value",
+  async ({ value, raw }) => {
+    edit("Invoices");
+    change(field("settings.rules.priority"), { value: "1.75" });
+    change(field("settings.rules.priority"), { value: raw });
+    expect(String(field("settings.rules.priority").props.value)).toBe(raw);
+    expect(requireElement(button("settings.rules.save")).props.disabled).toBe(false);
+
+    await submit();
+
+    expect(db.get(1)).toEqual({ ...invoice, priority: value });
+    expect(db.get(2)).toEqual(receipts);
+    edit("Invoices");
+    expect(String(field("settings.rules.priority").props.value)).toBe(String(value));
+  },
+);
+
+it("resets a canceled priority draft and preserves the default priority on create", async () => {
+  edit("Invoices");
+  change(field("settings.rules.priority"), { value: "" });
+  click(requireElement(button("common.cancel")));
+  edit("Invoices");
+  expect(String(field("settings.rules.priority").props.value)).toBe(String(invoice.priority));
+  expect(db.get(1)).toEqual(invoice);
+  click(requireElement(button("common.cancel")));
+
+  click(requireElement(button("settings.rules.add")));
+  expect(String(field("settings.rules.priority").props.value)).toBe("0");
+  change(field("settings.rules.name"), { value: "New fixture rule" });
+  change(field("settings.rules.extensions"), { value: "fixture" });
+  change(field("settings.rules.destination"), { value: "Filed" });
+  await submit();
+
+  expect(harness.invoke).toHaveBeenCalledWith("add_rule_cmd", { rule: expect.objectContaining({ priority: 0 }) });
+  expect(db.get(1)).toEqual(invoice);
+});
+
 it("honors a later editor enable change and saves a different row independently", async () => {
   edit("Invoices");
   toggle("Invoices");

@@ -76,6 +76,7 @@
       "destination": "Ziel",
       "pattern": "Pattern",
       "priority": "Priorität",
+      "priorityInvalid": "Geben Sie eine ganze Zahl zwischen {{min}} und {{max}} ein.",
       "action": "Aktion",
       "enabled": "Aktiviert",
       "export": "Regeln exportieren",

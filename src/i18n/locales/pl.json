@@ -76,6 +76,7 @@
       "destination": "Cel",
       "pattern": "Wzorzec (regex)",
       "priority": "Priorytet",
+      "priorityInvalid": "Wpisz liczbę całkowitą od {{min}} do {{max}}.",
       "action": "Akcja",
       "enabled": "Włączona",
       "export": "Eksportuj reguły",
