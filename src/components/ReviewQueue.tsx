@@ -11,6 +11,7 @@ interface Preview {
   entries: Entry[];
   unavailableRoots?: string[];
   blockedRoots?: { root: string; error: string }[];
+  deferredFiles?: { source: string; error: string }[];
 }
 
 function isOrdinaryProposal(entry: Entry) {
@@ -124,6 +125,7 @@ export default function ReviewQueue() {
     choose(next);
   };
   const hasOmissions = !!(preview?.unavailableRoots?.length || preview?.blockedRoots?.length);
+  const hasDeferredFiles = !!preview?.deferredFiles?.length;
   const hasEntries = !!preview?.entries.length;
   const visibleError = receipt?.status === 'failed' ? errorText(receipt.error) : error;
   return <section className="flex min-h-0 flex-1 flex-col gap-3" aria-busy={busy}>
@@ -162,7 +164,15 @@ export default function ReviewQueue() {
             </ul>
           </div>
         )}
-        {!hasEntries && !hasOmissions && <p className="py-8 text-text-muted">{t('beta.empty')}</p>}
+        {hasDeferredFiles && (
+          <ul role="status" className="space-y-2 text-sm text-amber-800 dark:text-amber-200">
+            {preview.deferredFiles?.map(({ source, error }) => <li key={source} className="break-all">
+              <p>{source}</p>
+              <p>{errorText(error)}</p>
+            </li>)}
+          </ul>
+        )}
+        {!hasEntries && !hasOmissions && !hasDeferredFiles && <p className="py-8 text-text-muted">{t('beta.empty')}</p>}
         <div className="space-y-2">{preview.entries.map(entry => <div key={entry.id} className="rounded-lg border border-border p-3">
           <label className="flex gap-3 items-start"><input type="checkbox" className="mt-1" checked={selected.has(entry.id)} disabled={busy || !!entry.error} onChange={() => toggle(entry.id)} />
             <span className="min-w-0 text-sm break-all"><span className="block font-medium">{entry.source}</span><span className="block mt-1">{entry.rule} · {t(`beta.${entry.action}`)} · {entry.size.toLocaleString()} B</span>{entry.destination && <span className="block text-text-muted">{entry.destination}</span>}</span>

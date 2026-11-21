@@ -72,6 +72,22 @@ mod windows_fs {
         options.open(path)
     }
 
+    pub(super) fn open_metadata_after_sharing_denial(path: &Path) -> io::Result<File> {
+        const ERROR_SHARING_VIOLATION: i32 = 32;
+        const ERROR_LOCK_VIOLATION: i32 = 33;
+        match open(path, false, false) {
+            Err(error) if matches!(error.raw_os_error(), Some(ERROR_SHARING_VIOLATION | ERROR_LOCK_VIOLATION)) => {
+                OpenOptions::new()
+                    .access_mode(0x80) // FILE_READ_ATTRIBUTES, with no content access
+                    .share_mode(1 | 2 | 4)
+                    .custom_flags(0x02000000 | 0x00200000)
+                    .open(path)
+            }
+            Err(error) => Err(error),
+            Ok(_) => Err(io::Error::other("The file is no longer locked")),
+        }
+    }
+
     pub(super) fn identity(file: &File) -> io::Result<FileIdentity> {
         let mut info = FileIdInfo { volume: 0, id: [0; 16] };
         let ok = unsafe { GetFileInformationByHandleEx(file.as_raw_handle(), 18, &mut info as *mut _ as *mut c_void, std::mem::size_of::<FileIdInfo>() as u32) };
@@ -434,6 +450,14 @@ pub struct ValidatedDirectory {
     pub metadata: Metadata, ancestors: AncestorGuard,
 }
 
+pub(crate) struct LockedReviewFile {
+    pub canonical_path: PathBuf,
+    pub identity: FileIdentity,
+    pub owning_root: PathBuf,
+    pub metadata: Metadata,
+    _ancestors: AncestorGuard,
+}
+
 impl ValidatedFile { pub fn into_parent_guard(self) -> AncestorGuard { self.ancestors } }
 impl ValidatedDirectory { pub fn into_parent_guard(self) -> AncestorGuard { self.ancestors } }
 
@@ -450,7 +474,12 @@ impl RootScope {
             .map(|root| root.path.to_string_lossy().into_owned()).collect()
     }
 
-    fn validate(&self, path: &Path, directory: bool) -> Result<(PathBuf, FileIdentity, File, Metadata, AncestorGuard, PathBuf), String> {
+    fn validate(
+        &self,
+        path: &Path,
+        directory: bool,
+        open_target: impl FnOnce(&Path, bool) -> io::Result<File>,
+    ) -> Result<(PathBuf, FileIdentity, File, Metadata, AncestorGuard, PathBuf), String> {
         if !path.is_absolute() || has_dot_component(path) { return Err("Target must be an absolute path without dot segments".into()); }
         #[cfg(windows)]
         if has_stream_syntax(path) { return Err("Alternate data streams are not eligible targets".into()); }
@@ -458,7 +487,7 @@ impl RootScope {
         let ancestors = pin_ancestry(parent)?;
         let metadata = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
         if is_link(&metadata) || if directory { !metadata.is_dir() } else { !metadata.is_file() } { return Err("Target has the wrong type or is a link".into()); }
-        let file = open_guard(path, directory, false).map_err(|e| e.to_string())?;
+        let file = open_target(path, directory).map_err(|e| e.to_string())?;
         let metadata = file.metadata().map_err(|e| e.to_string())?;
         if is_link(&metadata) || if directory { !metadata.is_dir() } else { !metadata.is_file() } { return Err("Target changed type".into()); }
         let identity = identity_from_handle(&file)?;
@@ -486,14 +515,30 @@ impl RootScope {
     }
 
     pub fn validate_file(&self, path: &Path) -> Result<ValidatedFile, String> {
-        let (canonical_path, identity, file, metadata, ancestors, owning_root) = self.validate(path, false)?;
+        let (canonical_path, identity, file, metadata, ancestors, owning_root) =
+            self.validate(path, false, |path, directory| open_guard(path, directory, false))?;
         let link_count = link_count(&file)?;
         Ok(ValidatedFile { canonical_path, identity, file, link_count, metadata, ancestors, owning_root })
     }
 
     pub fn validate_dir(&self, path: &Path) -> Result<ValidatedDirectory, String> {
-        let (canonical_path, identity, file, metadata, ancestors, owning_root) = self.validate(path, true)?;
+        let (canonical_path, identity, file, metadata, ancestors, owning_root) =
+            self.validate(path, true, |path, directory| open_guard(path, directory, false))?;
         Ok(ValidatedDirectory { canonical_path, identity, file, metadata, ancestors, owning_root })
+    }
+
+    pub(crate) fn locked_review_file(&self, _path: &Path) -> Option<LockedReviewFile> {
+        #[cfg(windows)]
+        {
+            let (canonical_path, identity, _, metadata, ancestors, owning_root) = self.validate(
+                _path,
+                false,
+                |path, _| windows_fs::open_metadata_after_sharing_denial(path),
+            ).ok()?;
+            Some(LockedReviewFile { canonical_path, identity, owning_root, metadata, _ancestors: ancestors })
+        }
+        #[cfg(not(windows))]
+        None
     }
 }
 

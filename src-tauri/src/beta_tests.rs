@@ -307,6 +307,52 @@ fn review_reports_a_writer_held_file_until_it_can_be_previewed() {
     assert_eq!(db::get_organization_logs().unwrap().len(), history_before);
 }
 
+#[cfg(windows)]
+#[test]
+fn review_defers_an_unreadable_header_without_claiming_a_rule_and_respects_scope() {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let mut fixture = Fixture::new();
+    let mut rule = fixture.rule();
+    rule.extensions.push("pdf".into());
+    let mut ignore = rule.clone();
+    ignore.action = "ignore".into();
+    ignore.pattern = Some("^protected(?:[.]txt)?$".into());
+    fixture.add(&ignore);
+    fixture.add(&rule);
+    let header = fixture.write("inferred", "%PDF-1.7\nordinary test payload");
+    let protected = fixture.write("protected", "%PDF-1.7\nprotected payload");
+    let protected_named = fixture.write("protected.txt", "protected payload");
+    fs::create_dir(fixture.root.join("Sorted")).unwrap();
+    let already_filed = fixture.write("Sorted/already-filed.txt", "already sorted");
+    let writers: Vec<_> = [&header, &protected, &protected_named, &already_filed].into_iter().map(|path| {
+        fs::OpenOptions::new().write(true).share_mode(1).open(path).unwrap()
+    }).collect();
+
+    let preview = fixture.preview(&[&header, &protected, &protected_named, &already_filed]);
+    op::discard(&preview.id);
+    assert!(preview.entries.is_empty());
+    assert_eq!(serde_json::to_value(&preview).unwrap()["deferredFiles"], serde_json::json!([{
+        "source": header,
+        "error": "preview.locked",
+    }]));
+
+    db::update_folder_mode(fixture.folder, "paused").unwrap();
+    let paused = fixture.preview(&[&header]);
+    op::discard(&paused.id);
+    assert!(paused.entries.is_empty());
+    assert!(serde_json::to_value(&paused).unwrap().get("deferredFiles").is_none());
+    db::update_folder_mode(fixture.folder, "manual").unwrap();
+    drop(writers);
+
+    let refreshed = fixture.preview(&[&header, &protected, &protected_named]);
+    op::discard(&refreshed.id);
+    assert_eq!(refreshed.entries.len(), 1);
+    assert_eq!(Path::new(&refreshed.entries[0].source), header);
+    assert_eq!(refreshed.entries[0].rule, rule.name);
+    assert!(refreshed.entries[0].error.is_none());
+}
+
 #[test]
 fn apply_uses_only_the_selected_entries_and_rechecks_the_review() {
     let mut f = Fixture::new();

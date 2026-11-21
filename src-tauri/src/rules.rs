@@ -142,15 +142,20 @@ pub fn scan_file(path: &Path) -> Option<FileInfo> {
 }
 
 pub(crate) fn describe_file(path: &Path, metadata: &fs::Metadata) -> Option<FileInfo> {
+    let mut info = describe_file_from_metadata(path, metadata)?;
+    if info.extension.is_empty() {
+        info.extension = extension_from_header(path).unwrap_or_default();
+    }
+    Some(info)
+}
+
+pub(crate) fn describe_file_from_metadata(path: &Path, metadata: &fs::Metadata) -> Option<FileInfo> {
     let name = path.file_name()?.to_string_lossy().to_string();
-    let mut extension = path
+    let extension = path
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_lowercase();
-    if extension.is_empty() {
-        extension = extension_from_header(path).unwrap_or_default();
-    }
     Some(FileInfo {
         path: path.to_path_buf(),
         name,
