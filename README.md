@@ -108,6 +108,8 @@ npm run tauri dev
 
 Debug builds use `cc.mouzi.dev`, the product name Mouzi Development, and `%APPDATA%\mouzi\mouzi-dev\data`. They never register Windows autostart. An absolute `MOUZI_DATA_DIR` override can select another isolated fixture profile; production data and its descendants are rejected. Existing development folders still refer to real files, so choose disposable folders for GUI testing.
 
+On Windows, close Mouzi and run `npm run test:windows-ui` to build the Debug app and exercise it with disposable files and a fresh database and WebView2 profile. Passing runs remove their temporary files. Failed runs print the directory containing the report and any screenshots. Use `npm run test:windows-ui -- --report path/to/result.json` to keep a JSON receipt at a new path.
+
 Release builds retain `cc.mouzi.app` and `%APPDATA%\mouzi\mouzi\data\mouzi.db`, shared with baseline Mouzi. Side-by-side release installation and graceful installer upgrades still need a separate distribution decision. Quit both apps and preserve the full data directory, including import data and database journals, before an upgrade or migration. This repair has not run a live-profile migration.
 
 `MOUZI-AUDIT.md` and `.omo/` retain historical audit notes and plans.

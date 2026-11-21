@@ -13,7 +13,8 @@
     "tauri": "tauri",
     "start": "tauri dev",
     "test": "vitest run src",
-    "test:release-contracts": "node --test tests/*.test.mjs"
+    "test:release-contracts": "node --test tests/*.test.mjs",
+    "test:windows-ui": "node tests/windows-ui.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",
@@ -36,6 +37,7 @@
     "@types/react-dom": "^19.1.6",
     "@vitejs/plugin-react": "^4.6.0",
     "autoprefixer": "^10.5.0",
+    "playwright-core": "1.62.1",
     "postcss": "^8.5.14",
     "tailwindcss": "^4.3.0",
     "typescript": "~5.8.3",
