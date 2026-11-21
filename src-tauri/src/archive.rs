@@ -65,7 +65,7 @@ enum ImportStatus { Idle, Running, Completed, Failed }
 #[serde(rename_all = "camelCase")]
 enum ImportPhase { Extracting, Sorting }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ArchiveImportReceipt {
     pub extracted_count: Option<usize>,
@@ -74,7 +74,7 @@ pub(crate) struct ArchiveImportReceipt {
     pub issue: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PreviousArchiveImport {
     source_name: String,
@@ -116,17 +116,131 @@ impl ArchiveImportSnapshot {
 struct ImportState {
     snapshot: ArchiveImportSnapshot,
     cancellation: Option<Arc<AtomicBool>>,
+    persist_terminal: bool,
+    terminal_save_failed: bool,
+}
+
+impl ImportState {
+    fn visible_snapshot(&self) -> ArchiveImportSnapshot {
+        let mut snapshot = self.snapshot.clone();
+        if self.terminal_save_failed {
+            // A later successful save can retain this receipt. Keep the live
+            // storage warning out of the receipt and its original diagnostic.
+            let diagnostic = match snapshot.result.as_mut() {
+                Some(receipt) => &mut receipt.issue,
+                None => &mut snapshot.error,
+            };
+            note_archive_result_not_saved(diagnostic.get_or_insert_with(String::new));
+        }
+        snapshot
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SavedArchiveImport {
+    source_name: String,
+    outcome: SavedArchiveOutcome,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+enum SavedArchiveOutcome {
+    Receipt(ArchiveImportReceipt),
+    Failed { error: String, previous_receipt: Option<PreviousArchiveImport> },
+}
+
+impl SavedArchiveImport {
+    fn save(snapshot: &ArchiveImportSnapshot) -> Result<(), String> {
+        let source_name = snapshot.source_name.as_ref().ok_or("Archive result has no source name")?;
+        if source_name.len() > crate::db::MAX_ARCHIVE_TERMINAL_BYTES {
+            return Err("Archive source name is too large to save".into());
+        }
+        let outcome = match snapshot.status {
+            ImportStatus::Completed => SavedArchiveOutcome::Receipt(
+                snapshot.result.clone().ok_or("Completed archive result has no receipt")?,
+            ),
+            ImportStatus::Failed => SavedArchiveOutcome::Failed {
+                error: snapshot.error.clone().ok_or("Failed archive result has no diagnostic")?,
+                previous_receipt: snapshot.previous_receipt.clone(),
+            },
+            _ => return Err("Only terminal archive results may be saved".into()),
+        };
+        let payload = serde_json::to_vec(&Self { source_name: source_name.clone(), outcome })
+            .map_err(|error| error.to_string())?;
+        crate::db::save_archive_import_terminal(&payload)
+    }
+
+    fn read(payload: &[u8], profile: &Path) -> Result<ArchiveImportSnapshot, String> {
+        let saved: Self = serde_json::from_slice(payload)
+            .map_err(|error| format!("Malformed saved archive result: {error}"))?;
+        let mut snapshot = ArchiveImportSnapshot {
+            revision: 1,
+            source_name: Some(saved.source_name),
+            ..ArchiveImportSnapshot::IDLE
+        };
+        let archive_root = profile.join("archive-imports");
+        match saved.outcome {
+            SavedArchiveOutcome::Receipt(receipt) => {
+                receipt.validate_saved_path(&archive_root)?;
+                snapshot.files = receipt.extracted_count.unwrap_or_default();
+                snapshot.status = ImportStatus::Completed;
+                snapshot.result = Some(receipt);
+            }
+            SavedArchiveOutcome::Failed { error, previous_receipt } => {
+                if let Some(previous) = &previous_receipt {
+                    previous.receipt.validate_saved_path(&archive_root)?;
+                }
+                snapshot.status = ImportStatus::Failed;
+                snapshot.previous_receipt = previous_receipt;
+                snapshot.error = Some(error);
+            }
+        }
+        Ok(snapshot)
+    }
+}
+
+impl ArchiveImportReceipt {
+    fn validate_saved_path(&self, archive_root: &Path) -> Result<(), String> {
+        let staging = Path::new(&self.staging_path);
+        if !staging.is_absolute() || staging.parent() != Some(archive_root)
+            || !matches!(staging.components().next_back(), Some(Component::Normal(_)))
+        {
+            return Err("Malformed saved archive result: staging path is outside this profile".into());
+        }
+        if self.extracted_count.is_none() && self.issue.is_none() {
+            return Err("Malformed saved archive result: missing extraction count and diagnostic".into());
+        }
+        Ok(())
+    }
 }
 
 pub(crate) struct ImportLifecycle(Mutex<ImportState>);
 
 impl ImportLifecycle {
     const fn new() -> Self {
-        Self(Mutex::new(ImportState { snapshot: ArchiveImportSnapshot::IDLE, cancellation: None }))
+        Self(Mutex::new(ImportState {
+            snapshot: ArchiveImportSnapshot::IDLE,
+            cancellation: None,
+            persist_terminal: false,
+            terminal_save_failed: false,
+        }))
+    }
+
+    pub(crate) fn restore_terminal(&self, profile: &Path) -> Result<(), String> {
+        let mut state = self.0.lock().map_err(|_| "Archive job lock failed")?;
+        if state.snapshot.status != ImportStatus::Idle || state.persist_terminal {
+            return Ok(());
+        }
+        state.persist_terminal = true;
+        if let Some(payload) = crate::db::load_archive_import_terminal()? {
+            state.snapshot = SavedArchiveImport::read(&payload, profile)?;
+        }
+        Ok(())
     }
 
     pub(crate) fn snapshot(&self) -> Result<ArchiveImportSnapshot, String> {
-        self.0.lock().map(|state| state.snapshot.clone()).map_err(|_| "Archive job lock failed".into())
+        self.0.lock().map(|state| state.visible_snapshot()).map_err(|_| "Archive job lock failed".into())
     }
 
     pub(crate) fn start<'a>(&'a self, source: &Path, publish: &'a dyn Fn(&ArchiveImportSnapshot)) -> Result<ImportJob<'a>, String> {
@@ -149,6 +263,7 @@ impl ImportLifecycle {
                 ..ArchiveImportSnapshot::IDLE
             };
             state.cancellation = Some(cancelled.clone());
+            state.terminal_save_failed = false;
             state.snapshot.clone()
         };
         let job = ImportJob { lifecycle: self, id: snapshot.revision, cancelled, publish };
@@ -174,7 +289,7 @@ impl ImportLifecycle {
             return Ok(None);
         }
         state.snapshot.revision += 1;
-        Ok(Some(state.snapshot.clone()))
+        Ok(Some(state.visible_snapshot()))
     }
 }
 
@@ -202,7 +317,9 @@ impl ImportJob<'_> {
         });
     }
 
-    pub(crate) fn finish(&self, outcome: Result<ArchiveImportReceipt, &str>) {
+    /// Report a storage failure separately from the import's actual outcome.
+    pub(crate) fn finish(&self, outcome: Result<ArchiveImportReceipt, &str>) -> bool {
+        let mut save_failed = false;
         self.change(|state| {
             state.cancellation = None;
             state.snapshot.phase = None;
@@ -220,8 +337,18 @@ impl ImportJob<'_> {
                     state.snapshot.error = Some(compact_import_issue(error));
                 }
             }
+            // Keep the active job serialized through its one terminal write.
+            // A later import cannot start and commit while this one is saving.
+            if state.persist_terminal {
+                if let Err(error) = SavedArchiveImport::save(&state.snapshot) {
+                    log::warn!("Cannot save the archive import result: {error}");
+                    state.terminal_save_failed = true;
+                    save_failed = true;
+                }
+            }
             true
         });
+        save_failed
     }
 
     fn change(&self, change: impl FnOnce(&mut ImportState) -> bool) {
@@ -235,6 +362,16 @@ impl Drop for ImportJob<'_> {
     fn drop(&mut self) {
         self.finish(Err("Archive import stopped before reporting its result"));
     }
+}
+
+pub(crate) fn note_archive_result_not_saved(message: &mut String) {
+    if !message.is_empty() {
+        if !message.ends_with(['.', '!', '?', '…']) {
+            message.push('.');
+        }
+        message.push(' ');
+    }
+    message.push_str("This archive result could not be saved for the next launch.");
 }
 
 pub(crate) fn compact_import_issue(issue: &str) -> String {
@@ -1294,6 +1431,158 @@ mod tests {
     use zip::write::FileOptions;
 
     static TEST_DIR_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    fn reset_saved_archive_results() -> std::sync::MutexGuard<'static, ()> {
+        let guard = crate::db::serialise_test_db();
+        crate::db::init_test_db();
+        crate::db::lock_db().unwrap().execute("DELETE FROM archive_import_terminal", []).unwrap();
+        guard
+    }
+
+    fn reopen_archive_lifecycle(profile: &Path) -> ImportLifecycle {
+        let lifecycle = ImportLifecycle::new();
+        lifecycle.restore_terminal(profile).unwrap();
+        lifecycle
+    }
+
+    #[test]
+    fn terminal_archive_result_survives_a_fresh_lifecycle_with_exact_partial_receipt() {
+        let _guard = reset_saved_archive_results();
+        let profile = test_dir("restart-partial");
+        let staging = profile.join("archive-imports/import-12-34-0");
+        let result = ArchiveImportReceipt {
+            extracted_count: Some(2),
+            sorted_count: 1,
+            staging_path: staging.to_string_lossy().into_owned(),
+            issue: Some("Archive sorting was cancelled".into()),
+        };
+        let publish = |_: &ArchiveImportSnapshot| {};
+        let lifecycle = reopen_archive_lifecycle(&profile);
+        assert_eq!(lifecycle.snapshot().unwrap(), ArchiveImportSnapshot::IDLE);
+        let job = lifecycle.start(Path::new("partial.zip"), &publish).unwrap();
+        job.finish(Ok(result.clone()));
+        drop(job);
+        drop(lifecycle);
+
+        let reopened = reopen_archive_lifecycle(&profile).snapshot().unwrap();
+        fs::remove_dir(&profile).unwrap();
+        assert_eq!(reopened.status, ImportStatus::Completed);
+        assert_eq!(reopened.source_name.as_deref(), Some("partial.zip"));
+        assert_eq!(reopened.result, Some(result));
+        assert_eq!((reopened.previous_receipt, reopened.error, reopened.phase), (None, None, None));
+    }
+
+    #[test]
+    fn terminal_archive_result_keeps_previous_receipt_beyond_a_no_receipt_failure() {
+        let _guard = reset_saved_archive_results();
+        let profile = test_dir("restart-failed");
+        let first = ArchiveImportReceipt {
+            extracted_count: Some(3),
+            sorted_count: 2,
+            staging_path: profile.join("archive-imports/import-21-43-0").to_string_lossy().into_owned(),
+            issue: None,
+        };
+        let publish = |_: &ArchiveImportSnapshot| {};
+        let lifecycle = reopen_archive_lifecycle(&profile);
+        let old_job = lifecycle.start(Path::new("first.zip"), &publish).unwrap();
+        old_job.finish(Ok(first.clone()));
+        lifecycle.start(Path::new("failed.gz"), &publish).unwrap().finish(Err("Unsupported archive format"));
+        old_job.finish(Err("Stale completion from the old job"));
+        drop(old_job);
+        drop(lifecycle);
+
+        let reopened = reopen_archive_lifecycle(&profile).snapshot().unwrap();
+        fs::remove_dir(&profile).unwrap();
+        assert_eq!(reopened.status, ImportStatus::Failed);
+        assert_eq!(reopened.source_name.as_deref(), Some("failed.gz"));
+        assert_eq!(reopened.error.as_deref(), Some("Unsupported archive format"));
+        assert_eq!(reopened.result, None);
+        assert_eq!(reopened.previous_receipt, Some(PreviousArchiveImport { source_name: "first.zip".into(), receipt: first }));
+    }
+
+    #[test]
+    fn terminal_archive_result_ignores_malformed_rows_and_saves_later_failures() {
+        let _guard = reset_saved_archive_results();
+        let profile = test_dir("restart-malformed");
+        let outside_receipt = serde_json::json!({
+            "source_name": "other.zip",
+            "outcome": { "Receipt": {
+                "extractedCount": 1, "sortedCount": 1, "issue": null,
+                "stagingPath": profile.join("other-profile/import-1-1-0").to_string_lossy(),
+            }}
+        });
+        for payload in [b"invalid json".to_vec(), serde_json::to_vec(&outside_receipt).unwrap()] {
+            crate::db::save_archive_import_terminal(&payload).unwrap();
+            let fresh = ImportLifecycle::new();
+            let error = fresh.restore_terminal(&profile).unwrap_err();
+            assert!(error.starts_with("Malformed saved archive result:"));
+            assert_eq!(fresh.snapshot().unwrap(), ArchiveImportSnapshot::IDLE);
+        }
+        let last_bad = crate::db::load_archive_import_terminal().unwrap().unwrap();
+        assert!(crate::db::save_archive_import_terminal(&[]).is_err());
+        assert!(crate::db::save_archive_import_terminal(&vec![0; crate::db::MAX_ARCHIVE_TERMINAL_BYTES + 1]).is_err());
+        assert!(crate::db::lock_db().unwrap().execute(
+            "UPDATE archive_import_terminal SET payload=zeroblob(?1)",
+            [crate::db::MAX_ARCHIVE_TERMINAL_BYTES as i64 + 1],
+        ).is_err());
+        assert_eq!(crate::db::load_archive_import_terminal().unwrap(), Some(last_bad));
+
+        let writable = ImportLifecycle::new();
+        assert!(writable.restore_terminal(&profile).is_err());
+        let publish = |_: &ArchiveImportSnapshot| {};
+        assert!(!writable.start(Path::new("first-failure.gz"), &publish).unwrap().finish(Err("Unsupported archive format")));
+        let reopened = reopen_archive_lifecycle(&profile).snapshot().unwrap();
+        fs::remove_dir(&profile).unwrap();
+        assert_eq!(reopened.status, ImportStatus::Failed);
+        assert_eq!(reopened.source_name.as_deref(), Some("first-failure.gz"));
+        assert_eq!(reopened.error.as_deref(), Some("Unsupported archive format"));
+        assert!(reopened.result.is_none() && reopened.previous_receipt.is_none());
+    }
+
+    #[test]
+    fn terminal_archive_result_reports_failed_save_without_relabeling_the_import() {
+        let _guard = reset_saved_archive_results();
+        let profile = test_dir("restart-write-failed");
+        let good = ArchiveImportReceipt {
+            extracted_count: Some(4),
+            sorted_count: 3,
+            staging_path: profile.join("archive-imports/import-1-2-0").to_string_lossy().into_owned(),
+            issue: None,
+        };
+        let publish = |_: &ArchiveImportSnapshot| {};
+        let lifecycle = reopen_archive_lifecycle(&profile);
+        assert!(!lifecycle.start(Path::new("kept.zip"), &publish).unwrap().finish(Ok(good.clone())));
+        let staged = profile.join("archive-imports/import-1-3-0").to_string_lossy().into_owned();
+        let later = ArchiveImportReceipt {
+            staging_path: staged,
+            issue: Some("Archive sorting was cancelled".into()),
+            ..good.clone()
+        };
+        crate::db::lock_db().unwrap().execute_batch(
+            "CREATE TEMP TRIGGER deny_archive_result_save BEFORE UPDATE ON archive_import_terminal
+             BEGIN SELECT RAISE(ABORT, 'fixture storage failure'); END;"
+        ).unwrap();
+        let save_failed = lifecycle.start(Path::new("newer.zip"), &publish).unwrap().finish(Ok(later.clone()));
+        crate::db::lock_db().unwrap().execute_batch("DROP TRIGGER deny_archive_result_save").unwrap();
+        let live = lifecycle.snapshot().unwrap();
+        let reopened = reopen_archive_lifecycle(&profile).snapshot().unwrap();
+        let follow_up = lifecycle.start(Path::new("follow-up.gz"), &publish).unwrap();
+        assert!(!follow_up.finish(Err("Unsupported archive format")));
+        let recovered = reopen_archive_lifecycle(&profile).snapshot().unwrap();
+        fs::remove_dir(&profile).unwrap();
+
+        assert!(save_failed);
+        assert_eq!(live.status, ImportStatus::Completed);
+        assert_eq!(live.source_name.as_deref(), Some("newer.zip"));
+        let live_receipt = live.result.unwrap();
+        assert_eq!(live_receipt.issue.as_deref(), Some("Archive sorting was cancelled. This archive result could not be saved for the next launch."));
+        assert_eq!(ArchiveImportReceipt { issue: later.issue.clone(), ..live_receipt }, later);
+        assert_eq!(reopened.source_name.as_deref(), Some("kept.zip"));
+        assert_eq!(reopened.result, Some(good));
+        assert_eq!(recovered.source_name.as_deref(), Some("follow-up.gz"));
+        assert_eq!(recovered.error.as_deref(), Some("Unsupported archive format"));
+        assert_eq!(recovered.previous_receipt, Some(PreviousArchiveImport { source_name: "newer.zip".into(), receipt: later }));
+    }
 
     #[test]
     fn archive_import_state_preserves_progress_and_partial_receipt_across_reads() {

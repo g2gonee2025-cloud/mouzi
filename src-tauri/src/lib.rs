@@ -134,6 +134,9 @@ pub fn run() {
             let data_dir = application_data_dir()?;
             std::fs::create_dir_all(&data_dir)?;
             init_db(data_dir.clone()).map_err(|e| format!("Failed to initialize database: {e}"))?;
+            if let Err(error) = archive::IMPORT.restore_terminal(&data_dir) {
+                log::warn!("Cannot restore the last archive import: {error}");
+            }
             archive::recover_pending_imports(&data_dir);
 
             // Initialize default rules on first run

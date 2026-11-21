@@ -444,6 +444,10 @@ fn initialize_schema(conn: &Connection) -> SqliteResult<()> {
             requested_destination TEXT, actual_destination TEXT,
             status TEXT NOT NULL DEFAULT 'pending', message TEXT, cleanup_id INTEGER
         );
+        CREATE TABLE IF NOT EXISTS archive_import_terminal (
+            id INTEGER PRIMARY KEY CHECK(id=1),
+            payload BLOB NOT NULL CHECK(typeof(payload)='blob' AND length(payload) BETWEEN 1 AND 131072)
+        );
         CREATE TABLE IF NOT EXISTS accepted_suggestion_feedback (
             id INTEGER PRIMARY KEY AUTOINCREMENT, action_log_id INTEGER NOT NULL,
             file_name TEXT NOT NULL, category TEXT NOT NULL
@@ -1646,6 +1650,37 @@ pub(crate) fn pending_archive_imports() -> SqliteResult<Vec<(i64, String, String
     let pending = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
         .collect();
     pending
+}
+
+pub(crate) const MAX_ARCHIVE_TERMINAL_BYTES: usize = 128 * 1024;
+
+pub(crate) fn load_archive_import_terminal() -> Result<Option<Vec<u8>>, String> {
+    let payload: Option<Option<Vec<u8>>> = lock_db()?
+        .query_row(
+            "SELECT CASE WHEN typeof(payload)='blob' AND length(payload) BETWEEN 1 AND ?1 THEN payload END
+             FROM archive_import_terminal WHERE id=1",
+            [MAX_ARCHIVE_TERMINAL_BYTES as i64],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| format!("Cannot read the saved archive result: {error}"))?;
+    match payload {
+        None => Ok(None),
+        Some(Some(payload)) => Ok(Some(payload)),
+        Some(None) => Err("Malformed saved archive result: invalid payload size or type".into()),
+    }
+}
+
+pub(crate) fn save_archive_import_terminal(payload: &[u8]) -> Result<(), String> {
+    if payload.is_empty() || payload.len() > MAX_ARCHIVE_TERMINAL_BYTES {
+        return Err("Archive result is outside the saved payload size limit".into());
+    }
+    lock_db()?.execute(
+        "INSERT INTO archive_import_terminal(id, payload) VALUES(1, ?1)
+         ON CONFLICT(id) DO UPDATE SET payload=excluded.payload",
+        [payload],
+    ).map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 pub fn finalize_operation_intent(id:i64,status:&str,actual_destination:Option<&str>,message:Option<&str>)->SqliteResult<()> {

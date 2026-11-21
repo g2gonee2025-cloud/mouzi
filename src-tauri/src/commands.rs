@@ -786,13 +786,20 @@ pub fn import_archive_cmd(app: AppHandle, path: String, state: tauri::State<AppS
         let _ = app.emit(ARCHIVE_IMPORT_STATE_CHANGED, snapshot);
     };
     let job = crate::archive::IMPORT.start(Path::new(&path), &publish)?;
-    let result = run_archive_import(&app, &path, &state.ignored_files, &job);
-    job.finish(result.as_ref().map(|summary| crate::archive::ArchiveImportReceipt {
+    let mut result = run_archive_import(&app, &path, &state.ignored_files, &job);
+    let save_failed = job.finish(result.as_ref().map(|summary| crate::archive::ArchiveImportReceipt {
         extracted_count: summary.extracted_count,
         sorted_count: summary.sorted_count,
         staging_path: summary.staging_path.clone(),
         issue: summary.issue.as_deref().map(crate::archive::compact_import_issue),
     }).map_err(String::as_str));
+    if save_failed {
+        let diagnostic = match &mut result {
+            Ok(summary) => summary.issue.get_or_insert_with(String::new),
+            Err(error) => error,
+        };
+        crate::archive::note_archive_result_not_saved(diagnostic);
+    }
     result
 }
 
