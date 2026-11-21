@@ -356,6 +356,8 @@
     "noIndexedFiles": "Nessun file è indicizzato nelle cartelle osservate.",
     "refreshingFiles": "Aggiornamento dei risultati…",
     "filesShown": "File mostrati · {{shown}}",
+    "resultsPage": "Pagina {{page}} · File visualizzati: {{shown}}",
+    "searchChanged": "L’indice dei file è cambiato. Aggiorna la vista per ripetere la ricerca.",
     "limitedFiles": "Sono mostrati i primi {{shown}} risultati. Restringi la ricerca.",
     "clearFilter": "Rimuovi il filtro {{name}}",
     "scanConnectionFailed": "Impossibile ricevere gli aggiornamenti della scansione. Riprova prima di avviare una scansione.",

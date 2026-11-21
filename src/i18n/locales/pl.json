@@ -356,6 +356,8 @@
     "noIndexedFiles": "W monitorowanych folderach nie ma zindeksowanych plików.",
     "refreshingFiles": "Aktualizowanie wyników…",
     "filesShown": "Wyświetlone pliki · {{shown}}",
+    "resultsPage": "Strona {{page}} · Liczba wyświetlonych plików: {{shown}}",
+    "searchChanged": "Indeks plików uległ zmianie. Odśwież widok, aby powtórzyć wyszukiwanie.",
     "limitedFiles": "Wyświetlono pierwsze wyniki ({{shown}}). Zawęź wyszukiwanie.",
     "clearFilter": "Usuń filtr {{name}}",
     "scanConnectionFailed": "Nie można odbierać informacji o postępie skanowania. Spróbuj ponownie przed rozpoczęciem skanowania.",

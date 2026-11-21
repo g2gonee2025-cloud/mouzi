@@ -350,6 +350,8 @@
     "noIndexedFiles": "监控文件夹中没有已建立索引的文件。",
     "refreshingFiles": "正在更新结果…",
     "filesShown": "已显示 {{shown}} 个文件",
+    "resultsPage": "第 {{page}} 页 · 已显示 {{shown}} 个文件",
+    "searchChanged": "文件索引已更改。请刷新后重新搜索。",
     "limitedFiles": "显示前 {{shown}} 条结果，请缩小搜索范围。",
     "clearFilter": "清除“{{name}}”筛选",
     "scanConnectionFailed": "无法接收扫描进度。请重试后再开始扫描。",

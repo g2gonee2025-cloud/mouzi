@@ -356,6 +356,8 @@
     "noIndexedFiles": "Chưa có tệp nào được lập chỉ mục trong các thư mục theo dõi.",
     "refreshingFiles": "Đang cập nhật kết quả…",
     "filesShown": "Số tệp hiển thị · {{shown}}",
+    "resultsPage": "Trang {{page}} · Số tệp hiển thị: {{shown}}",
+    "searchChanged": "Chỉ mục tệp đã thay đổi. Hãy làm mới để tìm kiếm lại.",
     "limitedFiles": "Đang hiển thị {{shown}} kết quả đầu tiên. Hãy thu hẹp tìm kiếm.",
     "clearFilter": "Bỏ bộ lọc {{name}}",
     "scanConnectionFailed": "Không thể nhận cập nhật tiến độ quét. Hãy thử lại trước khi bắt đầu quét.",

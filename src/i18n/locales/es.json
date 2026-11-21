@@ -356,6 +356,8 @@
     "noIndexedFiles": "No hay archivos indexados en tus carpetas vigiladas.",
     "refreshingFiles": "Actualizando resultados…",
     "filesShown": "Archivos mostrados · {{shown}}",
+    "resultsPage": "Página {{page}} · Archivos mostrados: {{shown}}",
+    "searchChanged": "El índice de archivos ha cambiado. Actualiza la vista para volver a realizar la búsqueda.",
     "limitedFiles": "Se muestran las primeras {{shown}} coincidencias. Acota la búsqueda.",
     "clearFilter": "Quitar el filtro {{name}}",
     "scanConnectionFailed": "No se pudo conectar con las actualizaciones del escaneo. Inténtalo de nuevo antes de iniciar un escaneo.",

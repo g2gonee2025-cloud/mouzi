@@ -350,6 +350,8 @@
     "noIndexedFiles": "監視フォルダ内にインデックス済みのファイルがありません。",
     "refreshingFiles": "検索結果を更新中…",
     "filesShown": "表示中のファイル · {{shown}} 件",
+    "resultsPage": "{{page}} ページ · 表示件数：{{shown}} 件",
+    "searchChanged": "ファイルのインデックスが変更されました。表示を更新して検索し直してください。",
     "limitedFiles": "最初の {{shown}} 件を表示しています。検索条件を絞り込んでください。",
     "clearFilter": "{{name}} フィルターを解除",
     "scanConnectionFailed": "スキャンの更新情報を受信できません。スキャンを開始する前に再試行してください。",

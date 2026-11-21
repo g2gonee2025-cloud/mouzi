@@ -354,6 +354,8 @@
     "noIndexedFiles": "In deinen überwachten Ordnern sind keine Dateien indexiert.",
     "refreshingFiles": "Ergebnisse werden aktualisiert…",
     "filesShown": "Angezeigte Dateien · {{shown}}",
+    "resultsPage": "Seite {{page}} · Angezeigte Dateien: {{shown}}",
+    "searchChanged": "Der Dateiindex hat sich geändert. Aktualisiere die Ansicht, um die Suche neu zu starten.",
     "limitedFiles": "Die ersten {{shown}} Treffer werden angezeigt. Grenze die Suche ein.",
     "clearFilter": "Filter {{name}} entfernen",
     "scanConnectionFailed": "Die Verbindung zu den Scan-Updates ist fehlgeschlagen. Versuche es erneut, bevor du einen Scan startest.",

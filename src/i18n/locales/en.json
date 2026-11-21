@@ -354,6 +354,8 @@
     "noIndexedFiles": "No files are indexed in your watched folders.",
     "refreshingFiles": "Updating results…",
     "filesShown": "Files shown · {{shown}}",
+    "resultsPage": "Page {{page}} · Files shown: {{shown}}",
+    "searchChanged": "The file index changed. Refresh to restart the search.",
     "limitedFiles": "Showing the first {{shown}} matches. Narrow your search.",
     "clearFilter": "Clear {{name}} filter",
     "scanConnectionFailed": "Could not connect to scan updates. Retry before starting a scan.",
