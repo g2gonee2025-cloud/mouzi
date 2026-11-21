@@ -40,7 +40,7 @@ export default function FileBrowser({
   onClearCategory,
   onClearRoot,
 }: FileBrowserProps) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const [view, setView] = useState<InventoryBrowserView>();
   const [copied, setCopied] = useState<string | null>(null);
   const [revealError, setRevealError] = useState<string | null>(null);
@@ -119,14 +119,15 @@ export default function FileBrowser({
   };
 
   const isEmpty = !loading && !error && files.length === 0;
-  const shown = files.length.toLocaleString();
+  const locale = i18n.resolvedLanguage ?? i18n.language;
+  const shown = files.length.toLocaleString(locale);
   const status = loading
     ? t(files.length ? "dashboard.refreshingFiles" : "dashboard.loadingFiles")
     : isEmpty
       ? t(totalFiles === 0 ? "dashboard.noIndexedFiles" : "dashboard.noFiles")
       : filtered && !error
         ? showPager
-          ? t("dashboard.resultsPage", { shown, page: (page + 1).toLocaleString() })
+          ? t("dashboard.resultsPage", { shown, page: (page + 1).toLocaleString(locale) })
           : t("dashboard.filesShown", { shown })
         : "";
 

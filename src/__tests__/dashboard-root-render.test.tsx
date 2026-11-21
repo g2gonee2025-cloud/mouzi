@@ -45,6 +45,7 @@ vi.mock("react", async (importOriginal) => {
 
 vi.mock("react-i18next", () => ({
   useTranslation: () => ({
+    i18n: { language: "en" },
     t: (key: string, values?: { date?: string; name?: string; path?: string }) => {
       if (key === "dashboard.rootLastScan") return en.dashboard.rootLastScan.replace("{{date}}", values?.date ?? "{{date}}");
       if (key === "dashboard.clearFilter") return en.dashboard.clearFilter.replace("{{name}}", values?.name ?? "{{name}}");
