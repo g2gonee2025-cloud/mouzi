@@ -243,4 +243,25 @@ describe("local AI diagnostics", () => {
     expect(html).not.toContain("suggestions.localAiModelMissing");
     expect(html).not.toContain("suggestions.localAiUnreachable");
   });
+
+  it("distinguishes a failed generation while keeping independent results usable", async () => {
+    const classified: Suggestion = { ...receipt, source: "ollama" };
+    const refresh = useSuggestionsStore.getState().loadSuggestions;
+    mocks.invoke.mockResolvedValueOnce({
+      suggestions: [invoice, classified], localAiStatus: "generationFailed",
+    });
+    await refresh();
+    const { html } = renderScreen();
+    expect.soft(html).toContain("suggestions.localAiGenerationFailed");
+    expect.soft(html).not.toContain("suggestions.localAiUnreachable");
+    expect(html).not.toContain("suggestions.localAiModelMissing");
+    expect(html).toContain("invoice.unrecognized");
+    expect(html).toContain("receipt.unrecognized");
+    expect(html).toContain("suggestions.source.ollama");
+    expect(html).not.toMatch(/<button disabled=""[^>]+aria-label="suggestions.accept"/);
+
+    nextLookup([classified], null);
+    await refresh();
+    expect(renderScreen().html).not.toContain("suggestions.localAiGenerationFailed");
+  });
 });

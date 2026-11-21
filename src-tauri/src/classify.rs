@@ -732,6 +732,62 @@ mod tests {
     }
 
     #[test]
+    fn generation_failure_does_not_hide_healthy_suggestions_in_the_same_lookup() {
+        for failed_first in [true, false] {
+            let gate = SuggestionGate::new();
+            let session = advance(&gate);
+            let failure = Err(ProviderFailure::Response("HTTP 500: fixture-only server detail".into()));
+            let success = response(r#"{"response":"{\"category\":\"Images\"}"}"#);
+            let mut replies = vec![response(r#"{"models":[{"name":"test"}]}"#)];
+            if failed_first { replies.extend([failure, success]); }
+            else { replies.extend([success, failure]); }
+            let (provider, transport) = fake_provider(replies, session);
+            let result = collect_fixture(&provider, &["one.xyz", "photo.jpg", "two.xyz"]);
+            assert_eq!(result.suggestions.len(), 2);
+            assert_eq!(result.suggestions[0].filename, "photo.jpg");
+            assert_eq!(result.suggestions[0].source, PredictionSource::Heuristic);
+            assert_eq!(result.suggestions[1].filename, if failed_first { "two.xyz" } else { "one.xyz" });
+            assert_eq!(result.suggestions[1].source, PredictionSource::Ollama);
+            let calls = transport.calls.lock().unwrap();
+            assert_eq!(calls.iter().map(|call| call.0).collect::<Vec<_>>(), [Endpoint::Tags, Endpoint::Generate, Endpoint::Generate]);
+            assert!(calls.iter().all(|call| call.2 <= MODEL_TIMEOUT));
+            let wire = serde_json::to_value(result).unwrap();
+            assert_eq!(wire["localAiStatus"], "generationFailed");
+            assert!(!wire.to_string().contains("fixture-only server detail"));
+        }
+    }
+
+    #[test]
+    fn settled_generation_success_clears_older_cached_failure_in_the_same_model() {
+        let gate = SuggestionGate::new();
+        let (mut provider, transport) = fake_provider(vec![
+            response(r#"{"models":[{"name":"test"}]}"#),
+            Err(ProviderFailure::Response("HTTP 500".into())),
+            response(r#"{"response":"{\"category\":\"Other\"}"}"#),
+        ], advance(&gate));
+        let initial = collect_fixture(&provider, &["one.xyz"]);
+        let initial_wire = serde_json::to_value(initial).unwrap();
+        assert_eq!(transport.calls.lock().unwrap().len(), 2);
+
+        provider.session = advance(&gate);
+        let repeated_wire = serde_json::to_value(collect_fixture(&provider, &["one.xyz"])).unwrap();
+        assert_eq!(transport.calls.lock().unwrap().len(), 2);
+
+        provider.session = advance(&gate);
+        provider.advance_candidate_cursor("");
+        let recovered = collect_fixture(&provider, &["one.xyz", "two.xyz"]);
+        assert_eq!(transport.calls.lock().unwrap().len(), 3);
+        assert!(recovered.suggestions.is_empty());
+        assert_eq!(recovered.local_ai_status, None);
+        provider.session = advance(&gate);
+        assert_eq!(collect_fixture(&provider, &["one.xyz"]).local_ai_status, None);
+        assert_eq!(transport.calls.lock().unwrap().len(), 3);
+
+        assert_eq!(initial_wire["localAiStatus"], "generationFailed");
+        assert_eq!(repeated_wire["localAiStatus"], "generationFailed");
+    }
+
+    #[test]
     fn malformed_model_list_and_no_prediction_are_not_connectivity_diagnostics() {
         let gate = SuggestionGate::new();
         let session = advance(&gate);
