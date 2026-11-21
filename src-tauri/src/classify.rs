@@ -1,12 +1,12 @@
 //! Filename classification, explicit acceptance learning, and opt-in local inference.
 //! No classification source is allowed to supply a destination path.
 
-use crate::{categories, db};
+use crate::{categories, db, ignore::IgnorePatterns, safe_fs};
 use once_cell::sync::Lazy;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -554,6 +554,74 @@ pub enum LocalAiStatus { ModelMissing, Unreachable, GenerationFailed }
 pub struct SuggestionsWithStatus {
     pub suggestions: Vec<Suggestion>,
     pub local_ai_status: Option<LocalAiStatus>,
+    pub policy_issues: Vec<SuggestionPolicyIssue>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SuggestionPolicyIssue {
+    pub root: String,
+    pub message: String,
+}
+
+#[derive(Default)]
+struct SuggestionPolicies {
+    roots: HashMap<i64, (String, PathBuf)>,
+    by_path: HashMap<PathBuf, Option<IgnorePatterns>>,
+    issues: Vec<SuggestionPolicyIssue>,
+}
+
+impl SuggestionPolicies {
+    fn read(cancelled: impl Fn() -> bool) -> Result<Self, String> {
+        let mut policies = Self::default();
+        for folder in db::get_suggestion_roots()? {
+            if cancelled() { return Err("Suggestion request superseded".into()); }
+            let root = Path::new(&folder.path);
+            match safe_fs::guard_watched_root(root) {
+                Ok((canonical, identity, _guard)) => {
+                    // Even inactive or replaced child roots bound a parent's
+                    // scan ownership. Read rules only from an active, verified root.
+                    let patterns = if folder.active {
+                        db::require_watch_identity(folder.identity.as_deref(), &identity.key())
+                            .and_then(|()| IgnorePatterns::from_folder(&canonical.to_string_lossy()))
+                            .map_err(|message| policies.issues.push(SuggestionPolicyIssue {
+                                root: folder.path.clone(), message,
+                            }))
+                            .ok()
+                    } else {
+                        None
+                    };
+                    if patterns.is_some() {
+                        policies.roots.insert(folder.id, (folder.path, canonical.clone()));
+                    }
+                    policies.by_path.entry(canonical)
+                        .and_modify(|stored| *stored = None)
+                        .or_insert(patterns);
+                }
+                Err(message) if folder.active => {
+                    policies.issues.push(SuggestionPolicyIssue { root: folder.path, message });
+                }
+                Err(_) => {}
+            }
+        }
+        Ok(policies)
+    }
+
+    fn allows(&self, candidate: &db::SuggestionCandidate) -> bool {
+        let Some((registered, root)) = self.roots.get(&candidate.root_id) else { return false; };
+        let path = Path::new(&candidate.path);
+        if let Ok(relative) = path.strip_prefix(root) {
+            return self.allows_path(path, root, relative);
+        }
+        // Inventory moves can retain the registered spelling. Resolve only
+        // this already verified alias and keep the relative spelling exact.
+        let Ok(relative) = path.strip_prefix(registered) else { return false; };
+        self.allows_path(&root.join(relative), root, relative)
+    }
+
+    fn allows_path(&self, path: &Path, root: &Path, relative: &Path) -> bool {
+        let owner = path.ancestors().skip(1).find_map(|parent| self.by_path.get_key_value(parent));
+        matches!(owner, Some((owner, Some(patterns))) if owner == root && !patterns.ignores_inventory_path(relative))
+    }
 }
 
 fn better_prediction(best: &mut Option<Prediction>, candidate: Prediction) {
@@ -579,7 +647,13 @@ fn filename_prediction(filename: &str, hints: &[LearnedHint]) -> Option<Predicti
 }
 
 pub fn get_suggestions(limit: usize) -> Result<Vec<Suggestion>, String> {
-    get_suggestions_with_status(limit).map(|result| result.suggestions)
+    let result = get_suggestions_with_status(limit)?;
+    if result.suggestions.is_empty() && !result.policy_issues.is_empty() {
+        return Err(result.policy_issues.into_iter().map(|issue| {
+            format!("{}: {}", issue.root, issue.message)
+        }).collect::<Vec<_>>().join("\n"));
+    }
+    Ok(result.suggestions)
 }
 
 pub fn get_suggestions_with_status(limit: usize) -> Result<SuggestionsWithStatus, String> {
@@ -597,12 +671,20 @@ pub fn get_suggestions_with_status(limit: usize) -> Result<SuggestionsWithStatus
 fn collect_inventory_suggestions(
     limit: usize, provider: &dyn AiProvider, hints: &[LearnedHint], cancelled: impl Fn() -> bool,
 ) -> Result<SuggestionsWithStatus, String> {
-    collect_suggestions(limit, provider, hints, |after| db::get_suggestion_candidates_page(PAGE_SIZE, after), cancelled, REQUEST_BUDGET)
+    if limit == 0 { return Ok(SuggestionsWithStatus::default()); }
+    let policies = SuggestionPolicies::read(&cancelled)?;
+    let mut result = collect_suggestions(
+        limit, provider, hints, |after| db::get_suggestion_candidates_page(PAGE_SIZE, after),
+        |candidate| policies.allows(candidate), cancelled, REQUEST_BUDGET,
+    )?;
+    result.policy_issues = policies.issues;
+    Ok(result)
 }
 
 fn collect_suggestions(
     limit: usize, provider: &dyn AiProvider, hints: &[LearnedHint],
     mut page: impl FnMut(Option<&str>) -> Result<Vec<db::SuggestionCandidate>, String>,
+    eligible: impl Fn(&db::SuggestionCandidate) -> bool,
     cancelled: impl Fn() -> bool, budget: Duration,
 ) -> Result<SuggestionsWithStatus, String> {
     if limit == 0 { return Ok(SuggestionsWithStatus::default()); }
@@ -617,6 +699,7 @@ fn collect_suggestions(
         let next = files.last().map(|file| file.path.clone()).unwrap();
         if cursor.as_ref().is_some_and(|old| next <= *old) { return Err("Suggestion candidate cursor did not advance".into()); }
         for file in files {
+            if !eligible(&file) { continue; }
             let filename = Path::new(&file.path).file_name().and_then(|v| v.to_str()).unwrap_or(&file.path).to_string();
             let best = filename_prediction(&filename, hints);
             candidates.push((file, filename, best));
@@ -675,7 +758,7 @@ fn collect_suggestions(
     } else {
         None
     };
-    Ok(SuggestionsWithStatus { suggestions, local_ai_status })
+    Ok(SuggestionsWithStatus { suggestions, local_ai_status, policy_issues: Vec::new() })
 }
 
 #[cfg(test)]
@@ -683,7 +766,6 @@ mod tests {
     use super::*;
     use std::collections::VecDeque;
     use std::fs;
-    use std::path::PathBuf;
 
     struct SuggestionInventoryFixture {
         _serial: MutexGuard<'static, ()>,
@@ -720,6 +802,14 @@ mod tests {
         fn paths(&self, response: &SuggestionsWithStatus) -> BTreeSet<PathBuf> {
             response.suggestions.iter().map(|file| PathBuf::from(&file.path))
                 .filter(|path| path.starts_with(&self.directory)).collect()
+        }
+
+        fn policy_issues(&self, response: SuggestionsWithStatus) -> Vec<serde_json::Value> {
+            let wire = serde_json::to_value(response).unwrap();
+            assert!(wire["localAiStatus"].is_null());
+            wire["policyIssues"].as_array().unwrap().iter().filter(|issue| {
+                issue["root"].as_str().is_some_and(|root| Path::new(root).starts_with(&self.directory))
+            }).cloned().collect()
         }
     }
 
@@ -781,17 +871,16 @@ mod tests {
 
         let partial = fixture.lookup();
         assert_eq!(fixture.paths(&partial), BTreeSet::from([healthy_file.clone()]));
-        let payload = serde_json::to_value(partial).unwrap();
-        let issue = &payload["policyIssues"][0];
+        let issues = fixture.policy_issues(partial);
+        assert_eq!(issues.len(), 1);
+        let issue = &issues[0];
         assert_eq!(issue["root"], broken.to_str().unwrap());
         assert!(issue["message"].as_str().unwrap().contains("Unable to read ignore protection file"));
-        assert_eq!(payload["policyIssues"].as_array().unwrap().len(), 1);
-        assert!(payload["localAiStatus"].is_null());
 
         fs::remove_file(broken.join(".mouziignore")).unwrap();
         let repaired = fixture.lookup();
         assert_eq!(fixture.paths(&repaired), BTreeSet::from([broken_first, broken_second, healthy_file]));
-        assert_eq!(serde_json::to_value(repaired).unwrap()["policyIssues"], serde_json::json!([]));
+        assert!(fixture.policy_issues(repaired).is_empty());
     }
 
     #[test]
@@ -839,8 +928,9 @@ mod tests {
 
         let result = fixture.lookup();
         assert_eq!(fixture.paths(&result), BTreeSet::from([independent]));
-        let payload = serde_json::to_value(result).unwrap();
-        let issue = &payload["policyIssues"][0];
+        let issues = fixture.policy_issues(result);
+        assert_eq!(issues.len(), 1);
+        let issue = &issues[0];
         assert_eq!(issue["root"], replaced.to_str().unwrap());
         assert!(issue["message"].as_str().unwrap().contains("different physical folder"));
         assert_eq!(fs::read(&old).unwrap(), b"different fixture-only payload");
@@ -895,9 +985,10 @@ mod tests {
                     path: format!("fixture/{filename}"),
                     category: "Other".into(),
                     version: db::SuggestionVersion { identity: (*filename).into(), size: "1".into(), mtime_ns: "0".into() },
+                    root_id: 0,
                 }).collect()
             })
-        }, || false, REQUEST_BUDGET).unwrap()
+        }, |_| true, || false, REQUEST_BUDGET).unwrap()
     }
 
     #[test]

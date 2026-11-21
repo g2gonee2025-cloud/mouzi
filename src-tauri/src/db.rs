@@ -966,6 +966,10 @@ pub(crate) fn verify_watch_identity(id: i64, path: &str, identity: &str, allow_l
         params![id, path],
         |row| row.get(0),
     ).map_err(|error| error.to_string())?;
+    require_watch_identity(expected.as_deref(), identity)
+}
+
+pub(crate) fn require_watch_identity(expected: Option<&str>, identity: &str) -> Result<(), String> {
     match expected {
         Some(expected) if expected == identity => Ok(()),
         Some(_) => Err("A different physical folder is at this location. Reconnect the original, or remove this registration and add the new folder.".into()),
@@ -2943,6 +2947,28 @@ pub(crate) struct SuggestionCandidate {
     pub path: String,
     pub category: String,
     pub version: SuggestionVersion,
+    pub root_id: i64,
+}
+
+pub(crate) struct SuggestionRoot {
+    pub id: i64,
+    pub path: String,
+    pub active: bool,
+    pub identity: Option<String>,
+}
+
+pub(crate) fn get_suggestion_roots() -> Result<Vec<SuggestionRoot>, String> {
+    let conn = lock_db()?;
+    let mut stmt = conn.prepare(
+        "SELECT id, path, enabled=1 AND mode<>'paused', watch_identity FROM watched_folders ORDER BY id",
+    ).map_err(|error| error.to_string())?;
+    let roots = stmt.query_map([], |row| Ok(SuggestionRoot {
+        id: row.get(0)?,
+        path: row.get(1)?,
+        active: row.get(2)?,
+        identity: row.get(3)?,
+    })).map_err(|error| error.to_string())?;
+    roots.collect::<SqliteResult<Vec<_>>>().map_err(|error| error.to_string())
 }
 
 /// Dismiss the listed version if it is still a suggestion candidate.
@@ -2983,7 +3009,7 @@ pub fn reset_dismissed_suggestions()->SqliteResult<()> {
 pub(crate) fn get_suggestion_candidates_page(limit: i64, after: Option<&str>) -> Result<Vec<SuggestionCandidate>, String> {
     let conn = lock_db()?;
     let mut stmt = conn.prepare(
-        "SELECT i.path,i.category,f.identity,CAST(f.size AS TEXT) AS size_text,f.mtime_ns
+        "SELECT i.path,i.category,f.identity,CAST(f.size AS TEXT) AS size_text,f.mtime_ns,w.id
          FROM file_inventory i
          JOIN watched_folders w ON w.path=i.root_path AND w.enabled=1 AND w.mode<>'paused'
          JOIN inventory_fingerprints f ON f.path=i.path
@@ -2996,6 +3022,7 @@ pub(crate) fn get_suggestion_candidates_page(limit: i64, after: Option<&str>) ->
         path: row.get(0)?,
         category: row.get(1)?,
         version: SuggestionVersion { identity: row.get(2)?, size: row.get(3)?, mtime_ns: row.get(4)? },
+        root_id: row.get(5)?,
     })).map_err(|error| error.to_string())?;
     candidates.collect::<SqliteResult<Vec<_>>>().map_err(|error| error.to_string())
 }

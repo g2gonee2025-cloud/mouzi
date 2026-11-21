@@ -340,6 +340,15 @@ pub fn validate_root(path: &Path) -> Result<PathBuf, String> {
 }
 
 fn inspect_watched_root(path: &Path) -> Result<(PathBuf, FileIdentity), DirectoryPinError<'_>> {
+    let (canonical, identity, _) = pin_watched_root(path)?;
+    Ok((canonical, identity))
+}
+
+pub(crate) fn guard_watched_root(path: &Path) -> Result<(PathBuf, FileIdentity, AncestorGuard), String> {
+    pin_watched_root(path).map_err(|error| error.to_string())
+}
+
+fn pin_watched_root(path: &Path) -> Result<(PathBuf, FileIdentity, AncestorGuard), DirectoryPinError<'_>> {
     if !path.is_absolute() || has_dot_component(path) {
         return Err(DirectoryPinError::Unsafe("Choose an absolute folder without dot segments".into()));
     }
@@ -355,7 +364,7 @@ fn inspect_watched_root(path: &Path) -> Result<(PathBuf, FileIdentity), Director
     if identity != file_identity(&canonical).map_err(DirectoryPinError::Unsafe)? {
         return Err(DirectoryPinError::Unsafe("Folder identity changed during validation".into()));
     }
-    Ok((canonical, identity))
+    Ok((canonical, identity, AncestorGuard { _files: guards }))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
