@@ -243,14 +243,33 @@ describe("undoAllNotices", () => {
     ]);
   });
 
-  it("mentions renamed files without lowering the restored headline", () => {
-    const notices = undoAllNotices(all([result("collision"), result("ok")]));
-    expect(notices[0].values).toEqual({ count: 2 });
-    expect(notices[1]).toEqual({
-      tone: "warning",
-      key: "undo.allCollision",
-      values: { count: 1 },
-    });
+  it("names each actual collision path without listing ordinary successful paths", () => {
+    const first = "C:/Downloads/first_0.pdf";
+    const second = "C:/Downloads/second_1.pdf";
+    expect(undoAllNotices(all([
+      result("collision", { restoredTo: first }),
+      result("ok", { restoredTo: "C:/Downloads/ordinary.pdf" }),
+      result("collision", { restoredTo: second }),
+    ]))).toEqual([
+      { tone: "success", key: "undo.allRestored", values: { count: 3 } },
+      { tone: "warning", key: "undo.allCollision", values: { count: 2 } },
+      { tone: "success", key: "undo.restoredTo", values: { path: first } },
+      { tone: "success", key: "undo.restoredTo", values: { path: second } },
+    ]);
+  });
+
+  it("shows an exact restore path only once without dropping pending reasons or inventing paths", () => {
+    const path = "C:/Downloads/report_0.pdf";
+    const reason = "Undo recovery record 42 remains pending.";
+    const notices = undoAllNotices(all([
+      result("collision", { restoredTo: path }),
+      result("collision"),
+      result("restored_pending", { restoredTo: path, message: reason }),
+      result("missing", { restoredTo: "C:/Downloads/missing.pdf" }),
+    ]));
+    expect(notices.filter(({ key }) => key === "undo.restoredTo").map(({ values }) => values?.path)).toEqual([path]);
+    expect(notices).toContainEqual({ tone: "warning", key: "undo.reason", values: { message: reason } });
+    expect(notices).toContainEqual({ tone: "error", key: "undo.allMissing", values: { count: 1 } });
   });
 
   it("omits the restored line when nothing was restored", () => {

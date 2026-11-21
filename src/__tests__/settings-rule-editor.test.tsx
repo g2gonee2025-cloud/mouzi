@@ -2,7 +2,7 @@ import { Children, isValidElement, type ReactElement, type ReactNode } from "rea
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import Settings from "../components/Settings";
 import { RuleConditions } from "../components/BetaControls";
-import { defaultRuleOptions, useAppStore, type AppSettings, type Rule, type ScheduleSettings, type WatchedFolder } from "../store/useAppStore";
+import { defaultRuleOptions, useAppStore, type AppSettings, type Rule, type ScheduleSettings, type UndoResult, type WatchedFolder } from "../store/useAppStore";
 
 const harness = vi.hoisted(() => ({
   invoke: vi.fn(),
@@ -29,6 +29,7 @@ vi.mock("react-i18next", async () => {
         if (key === "settings.scheduler.runCounts") return `${key} ${values?.organized}/${values?.errors}/${values?.deferred}`;
         if (key === "settings.scheduler.pendingRecovery") return `${key} ${values?.count}`;
         if (key === "settings.scheduler.readError") return `${key} ${values?.error}`;
+        if (key === "undo.restoredTo") return english.undo.restoredTo.replace("{{path}}", String(values?.path ?? ""));
         if (key === "beta.onlyNewOnAdd" || key === "beta.onlyNewForPath") {
           const label = folderLabels[key.slice("beta.".length)];
           if (typeof label === "string") return label.replace("{{path}}", String(values?.path ?? ""));
@@ -564,6 +565,62 @@ const scheduleFixture: AppSettings = {
   schedule_enabled: true, schedule_times_per_day: 2, schedule_time_1: "21:17", schedule_time_2: "23:19",
   schedule_time_3: null, schedule_time_4: null,
 };
+
+it("keeps a bulk collision path available past the routine timeout until dismissed", async () => {
+  vi.useFakeTimers();
+  harness.slots.length = 0;
+  const original = "C:/Fixture/report.pdf";
+  const actual = "C:/Fixture/report_0.pdf";
+  let outcome: UndoResult = { status: "collision", restoredTo: actual, message: null };
+  harness.invoke.mockImplementation(async (command: string) => {
+    switch (command) {
+      case "preview_undo_all_cmd": return [{ id: 12, source: original }];
+      case "undo_all_cmd": return { count: 1, results: [outcome] };
+      case "get_settings_cmd": return scheduleFixture;
+      case "get_history_counts_cmd": return { total: 1, undoable: 1 };
+      case "get_rules_cmd":
+      case "get_folders_cmd":
+      case "get_logs_cmd":
+      case "get_stats_cmd": return [];
+      case "take_review_request_cmd":
+      case "take_add_folder_request_cmd": return null;
+      case "get_watcher_issues_cmd": return {};
+      case "explorer_integration_status_cmd": return [false, false];
+      default: throw new Error(`Unexpected fixture command ${command}`);
+    }
+  });
+  const renderSettings = () => renderWithEffects(editor);
+  const receipt = (node: ReactNode) => find(node, (element) => element.props.role === "status" &&
+    text(element).includes("undo.allRestored"));
+  click(requireElement(({ props }) => props.label === "settings.history.title", renderSettings()));
+  await vi.advanceTimersByTimeAsync(0);
+
+  const restoreAll = async () => {
+    click(requireElement(button("settings.history.revertAll"), renderSettings()));
+    await vi.advanceTimersByTimeAsync(0);
+    const dialog = requireElement(({ props }) => props.title === "confirm.op.undoAll", renderSettings());
+    await dialog.props.onConfirm!();
+    dialog.props.onClose!();
+    return renderSettings();
+  };
+  const first = await restoreAll();
+  expect(harness.invoke).toHaveBeenCalledWith("undo_all_cmd", { reviewedIds: [12] });
+  expect.soft(text(receipt(first))).toContain(`Now at ${actual}`);
+  expect(text(receipt(first))).toContain("undo.allCollision");
+
+  await vi.advanceTimersByTimeAsync(8_001);
+  const afterTimeout = renderSettings();
+  expect.soft(text(receipt(afterTimeout))).toContain(`Now at ${actual}`);
+  click(requireElement(button("common.dismiss"), afterTimeout));
+  expect(receipt(renderSettings())).toBeUndefined();
+
+  outcome = { status: "ok", restoredTo: original, message: null };
+  const routine = await restoreAll();
+  expect(text(receipt(routine))).toContain("undo.allRestored");
+  expect(text(receipt(routine))).not.toContain(original);
+  await vi.advanceTimersByTimeAsync(8_001);
+  expect(receipt(renderSettings())).toBeUndefined();
+});
 
 function openScheduler(patch: Partial<AppSettings> = {}) {
   let persisted = { ...scheduleFixture, ...patch };
@@ -1244,10 +1301,14 @@ function ignoreEditor() {
 }
 
 function renderEffectfulChild(child: Element) {
+  return renderWithEffects(() => (child.type as (props: Props) => ReactNode)(child.props));
+}
+
+function renderWithEffects(render: () => ReactNode) {
   const effects: (() => void)[] = [];
   harness.effects = effects;
   try {
-    return (child.type as (props: Props) => ReactNode)(child.props);
+    return render();
   } finally {
     harness.effects = null;
     effects.forEach((run) => run());
