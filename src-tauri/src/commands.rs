@@ -2140,6 +2140,28 @@ fn require_indexed_suggestion(path: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn check_suggestion_exclusions(
+    file: &crate::safe_fs::ValidatedFile,
+    policies: &mut HashMap<PathBuf, crate::ignore::IgnorePatterns>,
+) -> Result<(), String> {
+    let relative = file.canonical_path.strip_prefix(&file.owning_root)
+        .map_err(|_| "Cannot match suggestion exclusions relative to its owning folder")?;
+    let patterns = match policies.entry(file.owning_root.clone()) {
+        std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            entry.insert(crate::ignore::IgnorePatterns::from_folder(&file.owning_root.to_string_lossy())?)
+        }
+    };
+    if patterns.ignores_inventory_path(relative) {
+        return Err(format!(
+            "{} is excluded by {}.",
+            file.canonical_path.display(),
+            file.owning_root.join(".mouziignore").display(),
+        ));
+    }
+    Ok(())
+}
+
 fn prepare_suggestion_review(
     requests: Vec<SuggestionRequest>,
     create_rule: bool,
@@ -2164,6 +2186,7 @@ fn prepare_suggestion_review(
     let mut sources = HashSet::new();
     let mut destinations = HashSet::new();
     let mut proposed_rules = HashMap::new();
+    let mut policies = HashMap::new();
 
     for SuggestionRequest { path, suggested_category } in requests {
         preparation.check()?;
@@ -2173,6 +2196,7 @@ fn prepare_suggestion_review(
         require_indexed_suggestion(&path)?;
         let source = Path::new(&path);
         let mut validated = scope.validate_file(source)?;
+        check_suggestion_exclusions(&validated, &mut policies)?;
         if !sources.insert(validated.identity.clone()) {
             return Err("The same physical file appears more than once in the suggestion review".into());
         }
@@ -2230,6 +2254,9 @@ fn prepare_suggestion_review(
     {
         return Err("Suggestion configuration changed; preview again".into());
     }
+    // A Settings save can take the operation gate while we hash. Reread
+    // each owning policy before publishing any of the prepared plans.
+    policies.clear();
     for plan in &reviewed {
         preparation.check()?;
         require_indexed_suggestion(&plan.preview.path)?;
@@ -2240,6 +2267,7 @@ fn prepare_suggestion_review(
         {
             return Err("Suggestion file or owning folder changed; preview again".into());
         }
+        check_suggestion_exclusions(&file, &mut policies)?;
         let destination = Path::new(&plan.preview.destination);
         let (ancestor, identity, _guard) = crate::operations::destination_guard(destination)?;
         if ancestor != plan.destination_ancestor || identity != plan.destination_identity
@@ -2347,6 +2375,7 @@ fn accept_reviewed_suggestion(plan_id: &str, suppression: &IgnoredFiles) -> Resu
     let scope = crate::safe_fs::eligible_scope(&folders)?;
     let path = Path::new(&plan.preview.path);
     let mut validated = scope.validate_file(path)?;
+    check_suggestion_exclusions(&validated, &mut HashMap::new())?;
     if validated.owning_root != plan.root || crate::safe_fs::file_identity(&plan.root)? != plan.root_identity
         || validated.identity != plan.identity || live_suggestion_content(path, &mut validated, || Ok(()))?.digest != plan.content.digest
     {
