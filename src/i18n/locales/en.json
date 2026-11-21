@@ -512,7 +512,8 @@
     "alreadyFiled": "Already filed; category saved",
     "localAiModelMissing": "Ollama is missing the selected model. Install it or choose an installed model under Settings → General. If a refresh still shows this message, refresh again in a minute.",
     "localAiUnreachable": "Ollama is unreachable. Start Ollama and refresh. If the message persists, refresh again in a minute.",
-    "localAiGenerationFailed": "Ollama could not finish a request with the selected model. Check that the model works in Ollama or choose another in Settings → General. After fixing the issue, wait a minute and refresh Suggestions."
+    "localAiGenerationFailed": "Ollama could not finish a request with the selected model. Check that the model works in Ollama or choose another in Settings → General. After fixing the issue, wait a minute and refresh Suggestions.",
+    "policyReadIncomplete": "Suggestions skipped these folders because their exclusions could not be checked. Check the details and refresh after fixing the problem."
   },
   "confirm": {
     "impactItems": "{{count}} item",

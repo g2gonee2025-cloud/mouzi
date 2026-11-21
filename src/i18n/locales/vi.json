@@ -514,7 +514,8 @@
     "alreadyFiled": "Đã sắp xếp; đã lưu danh mục",
     "localAiModelMissing": "Ollama thiếu mô hình đã chọn. Hãy cài đặt mô hình đó hoặc chọn một mô hình đã cài đặt trong Cài đặt → Chung. Nếu vẫn thấy thông báo sau khi làm mới, hãy làm mới đề xuất lại sau một phút.",
     "localAiUnreachable": "Không thể kết nối với Ollama. Hãy khởi động Ollama và làm mới đề xuất. Nếu vẫn thấy thông báo, hãy làm mới lại sau một phút.",
-    "localAiGenerationFailed": "Ollama không thể hoàn tất một yêu cầu với mô hình đã chọn. Hãy kiểm tra xem mô hình có hoạt động trong Ollama không hoặc chọn mô hình khác trong Cài đặt → Chung. Sau khi khắc phục sự cố, hãy chờ một phút rồi làm mới đề xuất."
+    "localAiGenerationFailed": "Ollama không thể hoàn tất một yêu cầu với mô hình đã chọn. Hãy kiểm tra xem mô hình có hoạt động trong Ollama không hoặc chọn mô hình khác trong Cài đặt → Chung. Sau khi khắc phục sự cố, hãy chờ một phút rồi làm mới đề xuất.",
+    "policyReadIncomplete": "Các thư mục này đã bị bỏ qua khi tạo đề xuất vì không thể kiểm tra quy tắc loại trừ. Hãy xem chi tiết, khắc phục sự cố rồi làm mới đề xuất."
   },
   "confirm": {
     "impactItems": "{{count}} mục",
