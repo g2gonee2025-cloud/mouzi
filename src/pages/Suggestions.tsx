@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { navigateHash } from "../utils/paths";
-import { useSuggestionsStore, distinctSuggestionRules, type Suggestion } from "../store/useSuggestionsStore";
+import { useSuggestionsStore, distinctSuggestionRules, isMovedWithWarning, type Suggestion } from "../store/useSuggestionsStore";
 import {
   Sparkles,
   ChevronLeft,
@@ -218,44 +218,27 @@ export default function Suggestions() {
               </button>
             </div>
             <div className="space-y-1 max-h-40 overflow-auto">
-              {results.map((r, i) => (
-                <div
-                  key={i}
-                  className="text-xs flex items-center gap-2"
-                >
-                  <span
-                    className={`w-2 h-2 rounded-full shrink-0 ${
-                      r.status === "ok"
-                        ? "bg-green-500"
-                        : r.status === "missing"
-                          ? "bg-yellow-500"
-                          : "bg-red-500"
-                    }`}
-                  />
-                  <span className="truncate">{r.path}</span>
-                  {r.dest && r.dest !== r.path && (
-                    <span className="text-text-muted truncate">
-                      → {r.dest}
-                    </span>
-                  )}
-                  {r.status === "ok" && (
-                    <span className="text-green-600 dark:text-green-400 shrink-0">
-                      {t(r.dest === r.path ? "suggestions.alreadyFiled" : "suggestions.accepted")}
-                    </span>
-                  )}
-                  {r.status === "missing" && (
-                    <span className="text-yellow-600 dark:text-yellow-400 shrink-0">
-                      {t("suggestions.missing")}
-                    </span>
-                  )}
-                  {(r.status === "failed" || r.status === "partial") && (
-                    <span className="text-red-600 dark:text-red-400 shrink-0">
-                      {t("suggestions.failed")}: {r.message}
-                    </span>
-                  )}
-                  {r.status === "ok" && r.message && <span className="text-text-muted">{r.message}</span>}
-                </div>
-              ))}
+              {results.map((r, i) => {
+                const labels = {
+                  ok: r.dest === r.path ? "suggestions.alreadyFiled" : "suggestions.accepted",
+                  missing: "suggestions.missing",
+                  failed: "suggestions.failed",
+                  partial: isMovedWithWarning(r) ? "suggestions.movedWithWarning" : "suggestions.moveNeedsReview",
+                };
+                const color = r.status === "ok" ? "text-green-600 dark:text-green-400"
+                  : r.status === "failed" ? "text-red-600 dark:text-red-400"
+                  : "text-yellow-600 dark:text-yellow-400";
+                return (
+                  <div key={i} className="border-b border-border py-1 last:border-0 text-xs">
+                    <p className="break-all">{r.path}</p>
+                    {r.dest && r.dest !== r.path && (
+                      <p className="text-text-muted break-all">→ {r.dest}</p>
+                    )}
+                    <p className={`font-medium ${color}`}>{t(labels[r.status])}</p>
+                    {r.message && <p className="text-text-muted break-words">{r.message}</p>}
+                  </div>
+                );
+              })}
             </div>
           </div>
         )}

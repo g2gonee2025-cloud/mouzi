@@ -28,6 +28,11 @@ export interface AcceptOutcome {
   message: string | null;
   dest: string | null;
 }
+
+export function isMovedWithWarning(outcome: AcceptOutcome): boolean {
+  return outcome.status === "partial" && !!outcome.dest && outcome.dest !== outcome.path;
+}
+
 export interface SuggestionRulePreview {
   extension: string | null;
   destination: string;
@@ -146,20 +151,18 @@ export const useSuggestionsStore = create<SuggestionsState>((set, get) => ({
     preview.clear();
     ++loadGeneration;
     set({ busy: true, preparedPlans: null, error: null, dismissChanged: false });
-    const errors: string[] = [];
     try {
       for (const plan of plans) {
         let outcome: AcceptOutcome;
         try { outcome = await invoke<AcceptOutcome>("accept_suggestion_cmd", { planId: plan.planId }); }
         catch (error) { outcome = { path: plan.path, status: "failed", message: String(error), dest: null }; }
-        if (outcome.status === "failed" || outcome.status === "partial") errors.push(outcome.message ?? outcome.status);
-        const finished = outcome.status === "ok" || outcome.status === "missing" || (outcome.status === "partial" && outcome.dest !== null);
+        const finished = outcome.status === "ok" || outcome.status === "missing" || isMovedWithWarning(outcome);
         set((state) => ({
           suggestions: finished ? state.suggestions.filter((s) => s.path !== plan.path) : state.suggestions,
           results: (state.results ?? []).concat(outcome),
         }));
       }
-    } finally { set({ busy: false, error: errors.length ? errors.join("\n") : null }); }
+    } finally { set({ busy: false }); }
   },
   dismissSuggestions: async (captured) => {
     const state = get();
