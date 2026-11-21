@@ -22,7 +22,7 @@ import UnavailableCleanupRoots from "./UnavailableCleanupRoots";
 export default function DuplicatesTab() {
   const { t } = useTranslation();
   const store = useCleanupStore();
-  const [selected, setSelected] = useState<Record<string, string>>({});
+  const selected = store.duplicateKeepers;
   const [showResults, setShowResults] = useState(false);
   const { pending, reviewNeedsSearch, clearReviewNotice, openReview } = useCleanupConfirmation(() => setShowResults(true));
   const findButton = useRef<HTMLButtonElement>(null);
@@ -46,16 +46,12 @@ export default function DuplicatesTab() {
   // disagreed the dialog would quote one number and the backend act on another.
   const handleFind = () => {
     clearReviewNotice();
-    if (useCleanupStore.getState().duplicates === null) setSelected({});
     return store.findDuplicates();
   };
 
-  const handleKeep = (hash: string, path: string) => {
-    setSelected((prev) => ({ ...prev, [hash]: path }));
-  };
-
   const handleConfirm = async (opener: HTMLButtonElement) => {
-    if (actions.length === 0 || useCleanupStore.getState().duplicates !== store.duplicates) return;
+    const current = useCleanupStore.getState();
+    if (actions.length === 0 || current.duplicates !== store.duplicates || current.duplicateKeepers !== selected) return;
     await openReview(actions, {
       title: t("confirm.op.trashDuplicates"),
       notice: "trash",
@@ -141,7 +137,7 @@ export default function DuplicatesTab() {
                 key={g.hash}
                 group={g}
                 keepPath={resolveKeeper(g, selected)}
-                onKeep={handleKeep}
+                onKeep={(path) => store.keepDuplicate(g, path)}
               />
             ))}
           </div>
@@ -160,7 +156,7 @@ function DuplicateGroupCard({
 }: {
   group: DuplicateGroup;
   keepPath: string | undefined;
-  onKeep: (hash: string, path: string) => void;
+  onKeep: (path: string) => void;
 }) {
   const { t } = useTranslation();
   const hashShort = group.hash.slice(0, 12);
@@ -194,7 +190,7 @@ function DuplicateGroupCard({
                 type="button"
                 aria-label={t("cleanup.keepFile", { path: f.path })}
                 aria-pressed={isKept}
-                onClick={() => onKeep(group.hash, f.path)}
+                onClick={() => onKeep(f.path)}
                 className={`shrink-0 w-4 h-4 rounded-full border-2 flex items-center justify-center transition-colors ${
                   isKept
                     ? "border-green-500 bg-green-500"

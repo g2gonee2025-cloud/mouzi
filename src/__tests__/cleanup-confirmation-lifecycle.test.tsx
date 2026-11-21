@@ -5,8 +5,9 @@ import DuplicatesTab from "../components/cleanup/DuplicatesTab";
 import EmptyDirsTab from "../components/cleanup/EmptyDirsTab";
 import FileListTab from "../components/cleanup/FileListTab";
 import ResultsPanel from "../components/cleanup/ResultsPanel";
+import Cleanup from "../pages/Cleanup";
 import { useCleanupStore } from "../store/useCleanupStore";
-import type { CleanupOutcome, CleanupRequest } from "../utils/cleanup";
+import type { CleanupOutcome, CleanupRequest, DuplicateGroup } from "../utils/cleanup";
 
 const mock = vi.hoisted(() => ({
   invoke: vi.fn(),
@@ -16,7 +17,9 @@ const mock = vi.hoisted(() => ({
   layout: [] as Array<() => void>,
 }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke: mock.invoke }));
-vi.mock("react-i18next", () => ({ useTranslation: () => ({ t: (key: string) => key }) }));
+vi.mock("react-i18next", () => ({ useTranslation: () => ({
+  t: (key: string, options?: { path?: string }) => options?.path ? key + ": " + options.path : key,
+}) }));
 vi.mock("../components/cleanup/ConfirmDialog", () => ({ default: () => null }));
 vi.mock("../components/cleanup/ResultsPanel", () => ({ default: () => null }));
 vi.mock("../store/useCleanupStore", async (importOriginal) => {
@@ -37,7 +40,7 @@ vi.mock("react", async (importOriginal) => {
     ...actual,
     useRef: (current: unknown) => mock.slots[claim({ current })],
     useState: (initial: unknown) => {
-      const slot = claim(initial);
+      const slot = claim(typeof initial === "function" ? initial() : initial);
       return [mock.slots[slot], (value: unknown) => {
         mock.slots[slot] = typeof value === "function" ? value(mock.slots[slot]) : value;
       }];
@@ -52,6 +55,7 @@ vi.mock("react", async (importOriginal) => {
       });
     },
     useCallback: (fn: unknown) => fn,
+    useEffect: () => {},
     useMemo: (fn: () => unknown) => fn(),
     useId: () => "fixture-threshold",
   };
@@ -68,6 +72,9 @@ type Props = Partial<ConfirmDialogProps> & {
   value?: string | number;
   onChange?: (event?: { target: { value: string } }) => void;
   results?: CleanupOutcome[];
+  group?: DuplicateGroup;
+  "aria-label"?: string;
+  "aria-pressed"?: boolean;
 };
 type Element = ReactElement<Props>;
 const findLabel: Record<Tab, string> = {
@@ -143,6 +150,117 @@ beforeEach(() => {
 });
 
 afterEach(() => mock.effects.forEach(({ stop }) => stop?.()));
+
+function duplicateCard(hash = "fixture-content") {
+  const card = find(render("duplicates"), (node) => node.props.group?.hash === hash)!;
+  const draw = card.type as (props: Props) => ReactNode;
+  return draw(card.props);
+}
+
+function shownKeeper(hash = "fixture-content") {
+  const keeper = find(duplicateCard(hash), (node) => node.type === "button" && node.props["aria-pressed"] === true);
+  return keeper?.props["aria-label"]?.slice("cleanup.keepFile: ".length);
+}
+
+function chooseCopy(hash = "fixture-content", path = copy.path) {
+  find(duplicateCard(hash), (node) => node.props["aria-label"] === "cleanup.keepFile: " + path)!
+    .props.onClick!({ currentTarget: opener });
+}
+
+function closeTab() {
+  mock.effects.forEach(({ stop }) => stop?.());
+  mock.effects.clear();
+  mock.slots.length = 0;
+}
+
+it("keeps the explicitly chosen copy when switching Cleanup tabs and canceling review", async () => {
+  const shellSlots: unknown[] = [];
+  function navigate(label: string, component: typeof DuplicatesTab | typeof FileListTab) {
+    const tabSlots = mock.slots;
+    mock.slots = shellSlots;
+    try {
+      mock.cursor = 0;
+      find(Cleanup(), button(label))!.props.onClick!({ currentTarget: opener });
+      mock.cursor = 0;
+      expect(find(Cleanup(), (node) => node.type === component)).toBeDefined();
+    } finally {
+      mock.slots = tabSlots;
+    }
+    closeTab();
+  }
+  expect(shownKeeper()).toBe(report.path);
+  chooseCopy();
+  expect(shownKeeper()).toBe(copy.path);
+
+  navigate("cleanup.tabs.large", FileListTab);
+  render("large");
+  navigate("cleanup.tabs.duplicates", DuplicatesTab);
+  expect(shownKeeper()).toBe(copy.path);
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const review = await open("duplicates");
+    expect(mock.invoke.mock.lastCall).toEqual(["prepare_cleanup_cmd", {
+      actions: [{ kind: "trash_duplicate", path: report.path, keepPath: copy.path }],
+    }]);
+    expect(review.preview).toEqual([report.path]);
+    review.onClose!();
+    expect(dialog(render("duplicates"))).toBeUndefined();
+    expect(shownKeeper()).toBe(copy.path);
+  }
+  expect(sent()).toEqual([]);
+});
+
+it("retains only a valid explicit keeper on a repeat search and clears it after invalidation", async () => {
+  const hash = "fixture-content";
+  const member = (name: string) => ({ ...report, path: "C:/Fixture/" + name });
+  const extra = member("extra.txt");
+  const third = member("third.txt");
+  const otherGroup = { hash: "new-content", files: [third, member("fourth.txt")] };
+  chooseCopy();
+  mock.invoke.mockResolvedValueOnce([{ hash, files: [report, extra, copy] }, otherGroup]);
+  await useCleanupStore.getState().findDuplicates();
+  expect(shownKeeper()).toBe(copy.path);
+  expect(shownKeeper("new-content")).toBe(third.path);
+
+  const displacedGroup = { hash: "new-content", files: [third, copy] };
+  mock.invoke.mockResolvedValueOnce([{ hash, files: [extra, report] }, displacedGroup]);
+  await useCleanupStore.getState().findDuplicates();
+  expect(shownKeeper()).toBe(extra.path);
+  expect(shownKeeper("new-content")).toBe(third.path);
+  chooseCopy(hash, report.path);
+  useCleanupStore.getState().invalidateFileCandidates();
+  expect(useCleanupStore.getState().duplicates).toBe(null);
+  mock.invoke.mockResolvedValueOnce([{ hash, files: [extra, report] }]);
+  await useCleanupStore.getState().findDuplicates();
+  expect(shownKeeper()).toBe(extra.path);
+  expect(sent()).toEqual([]);
+});
+
+it("prepares ordered victims from the current choices for more than one group", async () => {
+  const third = { ...report, path: "C:/Fixture/third.txt" };
+  const smaller = { path: "C:/Fixture/smaller.txt", size: 25, mtime: 1 };
+  const smallerCopy = { ...smaller, path: "C:/Fixture/smaller-copy.txt" };
+  mock.invoke.mockResolvedValueOnce([
+    { hash: "smaller", files: [smaller, smallerCopy] },
+    { hash: "fixture-content", files: [report, copy, third] },
+  ]);
+  await useCleanupStore.getState().findDuplicates();
+  const oldConfirm = find(render("duplicates"), button("cleanup.confirm"))!;
+  chooseCopy();
+  oldConfirm.props.onClick!({ currentTarget: opener });
+  await settle();
+  expect(mock.invoke.mock.calls.map(([command]) => command)).toEqual(["find_duplicates_cmd"]);
+
+  const review = await open("duplicates");
+  expect(mock.invoke.mock.lastCall).toEqual(["prepare_cleanup_cmd", { actions: [
+    { kind: "trash_duplicate", path: report.path, keepPath: copy.path },
+    { kind: "trash_duplicate", path: third.path, keepPath: copy.path },
+    { kind: "trash_duplicate", path: smallerCopy.path, keepPath: smaller.path },
+  ] }]);
+  expect(review.preview).toEqual([report.path, third.path, smallerCopy.path]);
+  review.onClose!();
+  expect(sent()).toEqual([]);
+});
+
 
 it.each<Tab>(["duplicates", "large", "stale", "empty"])("retires an invalidated %s dialog and fences its stale Confirm callback", async (tab) => {
   const previous = await open(tab);
