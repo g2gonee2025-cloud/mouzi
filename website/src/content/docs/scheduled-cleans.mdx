@@ -7,23 +7,23 @@ platforms: [windows, linux]
 updated: 2026-09-27
 ---
 
-The scheduler organizes files at selected local times while Mouzi is running. It is useful when you prefer batches over processing each arrival.
+The scheduler runs at selected local times while Mouzi is running. Each run adds an extra pass over files already in eligible watched folders.
 
 ## Configure a schedule
 
-Open **Settings → Schedule**, enable scheduled organization and choose from one to four times per day. Times use the computer's local clock.
+Open **Settings → General** and scroll to **Scheduler**. Turn on **Enable scheduled organization**, choose one to four times per day and select **Save**. Times use the computer's local clock.
 
 Mouzi checks the schedule approximately once a minute. A run may therefore begin shortly after the displayed minute rather than at the exact second.
 
 ## Which folders run
 
-Scheduled runs process **Silent** folders only. Manual, Suggest and Paused folders are skipped. Suggest always requires approval in the review queue.
+Scheduled runs check enabled **Silent** folders. Silent folders still organize eligible arrivals after the configured grace period, even when a schedule is enabled.
 
-If you want a folder organized only when you choose, keep it in Manual mode and use Organize now yourself. If you want automatic batches, use Silent mode with a schedule.
+Scheduled runs skip **Manual**, **Suggest** and **Paused** folders. For a Manual folder, use **Organize Now** to review and approve files when you choose. Suggest also requires approval.
 
 ## Grace period and safety
 
-A scheduled run bypasses the grace period, just like pressing Organize now. It still applies:
+In public Mouzi 0.2.1, a scheduled pass bypasses the grace period. The same applies to operations you approve through **Organize Now**. Both still observe these safeguards:
 
 - built-in file exclusions
 - the folder's `.mouziignore`
