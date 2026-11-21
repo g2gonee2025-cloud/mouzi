@@ -138,10 +138,11 @@ it("clears only inventory file rows and lets the Empty folders finder and Histor
   const directory = deferred<{ candidates: string[]; unavailableRoots: string[] }>();
   const history = deferred<{ entries: []; nextCursor: null }>();
   const receipt = [{ path: "C:/Fixture/finished.bin", status: "ok" }] as const;
+  const receipts = { trash_large: { planId: "cleanup:finished", outcomes: [...receipt], error: null } };
   useCleanupStore.setState({
     duplicates: [{ hash: "hash", files: [oldFile, newFile] }],
     staleFiles: { days: 28, files: [oldFile] },
-    results: [...receipt],
+    receipts,
     unavailableRoots: { duplicates: ["D:/Old duplicate scope"], staleFiles: ["D:/Old stale scope"] },
   });
   ipc.invoke.mockReturnValueOnce(directory.promise).mockReturnValueOnce(history.promise);
@@ -151,14 +152,14 @@ it("clears only inventory file rows and lets the Empty folders finder and Histor
   publish("complete");
 
   expect(useCleanupStore.getState()).toMatchObject({
-    duplicates: null, staleFiles: { days: 28, files: null }, loading: true, historyLoading: true, results: receipt,
+    duplicates: null, staleFiles: { days: 28, files: null }, loading: true, historyLoading: true, receipts,
   });
   directory.resolve({ candidates: ["C:/Fixture/empty"], unavailableRoots: ["Z:/Empty scope"] });
   history.resolve({ entries: [], nextCursor: null });
   await Promise.all([emptySearch, historyLoad]);
 
   expect(useCleanupStore.getState()).toMatchObject({
-    loading: false, historyLoading: false, history: [], emptyDirs: ["C:/Fixture/empty"], results: receipt,
+    loading: false, historyLoading: false, history: [], emptyDirs: ["C:/Fixture/empty"], receipts,
   });
   expect(useCleanupStore.getState().unavailableRoots).toEqual({ emptyDirs: ["Z:/Empty scope"] });
 });
@@ -193,5 +194,9 @@ it("preserves the exact requested plan and partial receipt across successful pub
   await executing;
 
   expect(ipc.invoke).toHaveBeenCalledWith("execute_cleanup_cmd", { planId: plan.planId });
-  expect(useCleanupStore.getState()).toMatchObject({ busy: false, results: outcomes, largeFiles: { minBytes, files: null } });
+  expect(useCleanupStore.getState()).toMatchObject({
+    busy: false,
+    receipts: { trash_large: { planId: plan.planId, outcomes, error: null } },
+    largeFiles: { minBytes, files: null },
+  });
 });

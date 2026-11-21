@@ -75,13 +75,14 @@ export default function FileListTab({
   const thresholdId = useId();
   const [draftThreshold, setDraftThreshold] = useState<string | null>(null);
   const [checked, setChecked] = useState<Set<string>>(new Set());
-  const [showResults, setShowResults] = useState(false);
-  const { pending, reviewNeedsSearch, clearReviewNotice, openReview } = useCleanupConfirmation(() => setShowResults(true));
+  const { pending, reviewNeedsSearch, clearReviewNotice, openReview } = useCleanupConfirmation();
   const findButton = useRef<HTMLButtonElement>(null);
   const resultsHeading = useRef<HTMLHeadingElement>(null);
 
   const isBytes = kind === "large";
   const finderKey = isBytes ? "largeFiles" : "staleFiles";
+  const cleanupKind = isBytes ? "trash_large" : "trash_stale";
+  const receipt = store.receipts[cleanupKind];
   const search = store[finderKey];
   const searchedCriterion = search && ("minBytes" in search ? search.minBytes : search.days);
   const savedThreshold = search && ("minBytes" in search
@@ -107,7 +108,6 @@ export default function FileListTab({
       store.findStaleFiles(criterion);
     }
     setChecked(new Set());
-    setShowResults(false);
   };
 
   const toggle = useCallback((path: string) => {
@@ -142,12 +142,6 @@ export default function FileListTab({
     });
   };
 
-  const handleResultsDone = () => {
-    setShowResults(false);
-    store.clearResults();
-    handleFind();
-  };
-
   const handleOpen = async (path: string) => {
     try {
       await invoke("open_folder_cmd", { path });
@@ -156,13 +150,15 @@ export default function FileListTab({
     }
   };
 
-  if (showResults && store.results) {
+  if (receipt && !pending) {
     return (
       <ResultsPanel
         headingRef={resultsHeading}
-        results={store.results}
-        onDone={handleResultsDone}
-        error={store.error}
+        results={receipt.outcomes}
+        onDone={() => {
+          if (store.dismissReceipt(cleanupKind, receipt.planId)) handleFind();
+        }}
+        error={receipt.error}
       />
     );
   }

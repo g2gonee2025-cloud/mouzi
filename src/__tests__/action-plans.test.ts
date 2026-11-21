@@ -13,7 +13,7 @@ function deferred<T>() { let resolve!: (value: T) => void; const promise = new P
 
 beforeEach(() => {
   ipc.invoke.mockReset();
-  useCleanupStore.setState({ duplicates: null, largeFiles: null, staleFiles: null, emptyDirs: null, unavailableRoots: {}, loading: false, busy: false, preparedPlan: null, results: null, error: null, history: null, historyLoading: false, historyError: null });
+  useCleanupStore.setState(useCleanupStore.getInitialState(), true);
   useSuggestionsStore.setState({ suggestions: [], loading: false, busy: false, error: null, preparedPlans: null, results: null });
 });
 
@@ -27,9 +27,9 @@ it("previews cleanup criteria and executes only the reviewed backend token", asy
   await useCleanupStore.getState().executeCleanup(reviewed.planId);
   expect(ipc.invoke).toHaveBeenCalledWith("execute_cleanup_cmd", { planId: "cleanup:reviewed" });
   expect(useCleanupStore.getState().largeFiles).toEqual({ minBytes: 100, files: [row("b")] });
-  expect(useCleanupStore.getState().results?.[1].message).toBe("File changed");
+  expect(useCleanupStore.getState().receipts.trash_large?.outcomes[1].message).toBe("File changed");
   useCleanupStore.getState().invalidateCandidates();
-  expect(useCleanupStore.getState().results).toHaveLength(2);
+  expect(useCleanupStore.getState().receipts.trash_large?.outcomes).toHaveLength(2);
 });
 
 it("discards a late finder and refuses a preview invalidated during preparation", async () => {
@@ -118,7 +118,7 @@ it("retains confirmed cleanup results after the preview owner leaves", async () 
   expect(useCleanupStore.getState()).toMatchObject({ busy: true, preparedPlan: null });
   executing.resolve([{ path: "a", status: "ok" }]);
   await execution;
-  expect(useCleanupStore.getState().results).toEqual([{ path: "a", status: "ok" }]);
+  expect(useCleanupStore.getState().receipts.trash_large?.outcomes).toEqual([{ path: "a", status: "ok" }]);
 });
 
 it("executes frozen suggestion plans even if a later list is substituted", async () => {

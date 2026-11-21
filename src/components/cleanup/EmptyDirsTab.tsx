@@ -12,8 +12,8 @@ export default function EmptyDirsTab() {
   const { t } = useTranslation();
   const store = useCleanupStore();
   const [checked, setChecked] = useState<Set<string>>(new Set());
-  const [showResults, setShowResults] = useState(false);
-  const { pending, reviewNeedsSearch, clearReviewNotice, openReview } = useCleanupConfirmation(() => setShowResults(true));
+  const receipt = store.receipts.remove_empty_dir;
+  const { pending, reviewNeedsSearch, clearReviewNotice, openReview } = useCleanupConfirmation();
   const findButton = useRef<HTMLButtonElement>(null);
   const resultsHeading = useRef<HTMLHeadingElement>(null);
 
@@ -21,7 +21,6 @@ export default function EmptyDirsTab() {
     clearReviewNotice();
     store.findEmptyDirs();
     setChecked(new Set());
-    setShowResults(false);
   };
 
   const toggle = useCallback((path: string) => {
@@ -57,22 +56,18 @@ export default function EmptyDirsTab() {
     });
   };
 
-  const handleResultsDone = () => {
-    setShowResults(false);
-    store.clearResults();
-    handleFind();
-  };
-
   const data = store.emptyDirs ?? [];
   const unavailableRoots = store.emptyDirs && store.unavailableRoots.emptyDirs;
 
-  if (showResults && store.results) {
+  if (receipt && !pending) {
     return (
       <ResultsPanel
         headingRef={resultsHeading}
-        results={store.results}
-        onDone={handleResultsDone}
-        error={store.error}
+        results={receipt.outcomes}
+        onDone={() => {
+          if (store.dismissReceipt("remove_empty_dir", receipt.planId)) handleFind();
+        }}
+        error={receipt.error}
       />
     );
   }

@@ -27,6 +27,14 @@ interface CleanupHistoryPage {
   nextCursor: CleanupHistoryCursor | null;
 }
 
+type CleanupKind = CleanupRequest["kind"];
+
+interface CleanupReceipt {
+  planId: string;
+  outcomes: CleanupOutcome[];
+  error: string | null;
+}
+
 interface CleanupState {
   inventoryReady: boolean | null;
   duplicates: DuplicateGroup[] | null;
@@ -39,7 +47,7 @@ interface CleanupState {
   error: string | null;
   busy: boolean;
   preparedPlan: CleanupPlan | null;
-  results: CleanupOutcome[] | null;
+  receipts: Partial<Record<CleanupKind, CleanupReceipt>>;
   history: CleanupLogEntry[] | null;
   historyCursor: CleanupHistoryCursor | null;
   historyLoading: boolean;
@@ -56,7 +64,7 @@ interface CleanupState {
   observeInventoryReadiness: () => () => void;
   loadHistory: () => Promise<void>;
   loadOlderHistory: () => Promise<void>;
-  clearResults: () => void;
+  dismissReceipt: (kind: CleanupKind, planId: string) => boolean;
   clearError: () => void;
 }
 
@@ -148,7 +156,7 @@ export const useCleanupStore = create<CleanupState>((set, get) => {
     inventoryReady: null,
     unavailableRoots: {},
     loading: false, error: null, busy: false, preparedPlan: null,
-    results: null, history: null, historyCursor: null, historyLoading: false, historyError: null,
+    receipts: {}, history: null, historyCursor: null, historyLoading: false, historyError: null,
     findDuplicates: () => find("duplicates", () => requestCandidates<DuplicateGroup>("find_duplicates_cmd")),
     keepDuplicate: (group, path) => set((state) => {
       if (!state.duplicates?.includes(group) || !group.files.some((file) => file.path === path)) return state;
@@ -164,7 +172,9 @@ export const useCleanupStore = create<CleanupState>((set, get) => {
     }, { days, files: null }),
     findEmptyDirs: () => find("emptyDirs", () => requestCandidates<string>("find_empty_dirs_cmd")),
     prepareCleanup: async (actions, owner) => {
-      if (!actions.length || get().busy || get().preparedPlan) throw new Error("Another cleanup is being reviewed or processed");
+      const kind = actions[0]?.kind;
+      const { busy, preparedPlan, receipts } = get();
+      if (!kind || busy || preparedPlan || receipts[kind]) throw new Error("Another cleanup is being reviewed or processed");
       const isCurrent = preview.begin(owner, () => set({ busy: false, preparedPlan: null }));
       const generation = ++candidatesGeneration;
       activeFinder = null;
@@ -185,8 +195,9 @@ export const useCleanupStore = create<CleanupState>((set, get) => {
       }
     },
     executeCleanup: async (planId) => {
-      const plan = get().preparedPlan;
-      if (!plan || plan.planId !== planId || get().busy) throw new Error("Cleanup preview changed; review again");
+      const { preparedPlan, busy, receipts } = get();
+      const kind = preparedPlan?.actions[0]?.kind;
+      if (!kind || preparedPlan?.planId !== planId || busy || receipts[kind]) throw new Error("Cleanup preview changed; review again");
       preview.clear();
       ++candidatesGeneration;
       set({ busy: true, preparedPlan: null, loading: false, error: null });
@@ -198,7 +209,7 @@ export const useCleanupStore = create<CleanupState>((set, get) => {
             ...group, files: group.files.filter((file) => !removed.has(file.path)),
           })).filter((group) => group.files.length > 1) ?? null;
           return {
-            results,
+            receipts: { ...state.receipts, [kind]: { planId, outcomes: results, error: null } },
             duplicates,
             duplicateKeepers: keepersIn(duplicates ?? [], state.duplicateKeepers),
             largeFiles: state.largeFiles && {
@@ -213,7 +224,9 @@ export const useCleanupStore = create<CleanupState>((set, get) => {
           };
         });
       } catch (error) {
-        set({ error: String(error) });
+        set((state) => ({
+          receipts: { ...state.receipts, [kind]: { planId, outcomes: [], error: String(error) } },
+        }));
         throw error;
       } finally {
         set({ busy: false });
@@ -283,7 +296,13 @@ export const useCleanupStore = create<CleanupState>((set, get) => {
     },
     loadHistory: () => readHistory(false),
     loadOlderHistory: () => readHistory(true),
-    clearResults: () => set({ results: null }),
+    dismissReceipt: (kind, planId) => {
+      if (get().receipts[kind]?.planId !== planId) return false;
+      const receipts = { ...get().receipts };
+      delete receipts[kind];
+      set({ receipts });
+      return true;
+    },
     clearError: () => set({ error: null }),
   };
 });

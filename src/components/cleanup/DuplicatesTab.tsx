@@ -1,4 +1,4 @@
-import { useState, useMemo, useRef } from "react";
+import { useMemo, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import { useCleanupStore } from "../../store/useCleanupStore";
 import {
@@ -23,8 +23,8 @@ export default function DuplicatesTab() {
   const { t } = useTranslation();
   const store = useCleanupStore();
   const selected = store.duplicateKeepers;
-  const [showResults, setShowResults] = useState(false);
-  const { pending, reviewNeedsSearch, clearReviewNotice, openReview } = useCleanupConfirmation(() => setShowResults(true));
+  const receipt = store.receipts.trash_duplicate;
+  const { pending, reviewNeedsSearch, clearReviewNotice, openReview } = useCleanupConfirmation();
   const findButton = useRef<HTMLButtonElement>(null);
   const resultsHeading = useRef<HTMLHeadingElement>(null);
 
@@ -60,20 +60,15 @@ export default function DuplicatesTab() {
     });
   };
 
-  // When results come back, refresh the list
-  const handleResultsDone = () => {
-    setShowResults(false);
-    store.clearResults();
-    void handleFind();
-  };
-
-  if (showResults && store.results) {
+  if (receipt && !pending) {
     return (
       <ResultsPanel
         headingRef={resultsHeading}
-        results={store.results}
-        onDone={handleResultsDone}
-        error={store.error}
+        results={receipt.outcomes}
+        onDone={() => {
+          if (store.dismissReceipt("trash_duplicate", receipt.planId)) void handleFind();
+        }}
+        error={receipt.error}
       />
     );
   }

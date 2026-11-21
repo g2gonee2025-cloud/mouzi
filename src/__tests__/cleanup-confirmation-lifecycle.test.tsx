@@ -323,7 +323,7 @@ it("preserves a dispatched confirmation through overlapping events and shows its
   expect(dialog(receipt)).toBeUndefined();
   expect(guidance(receipt)).toBeUndefined();
   expect(find(receipt, (node) => node.type === ResultsPanel)?.props.results).toEqual(outcomes);
-  expect(useCleanupStore.getState().results).toEqual(outcomes);
+  expect(useCleanupStore.getState().receipts.trash_large?.outcomes).toEqual(outcomes);
 });
 
 const receipt = (tab: Tab) => find(render(tab), (node) => node.type === ResultsPanel)?.props;

@@ -12,7 +12,7 @@ interface ActiveConfirmation {
   retire: () => void;
 }
 
-export function useCleanupConfirmation(showResults: () => void) {
+export function useCleanupConfirmation() {
   const beginPreview = usePreviewOwner();
   const preparedPlan = useCleanupStore((state) => state.preparedPlan);
   const [active, setActive] = useState<ActiveConfirmation | null>(null);
@@ -57,7 +57,6 @@ export function useCleanupConfirmation(showResults: () => void) {
             }
             dispatched.current = plan.planId;
             await store.executeCleanup(plan.planId);
-            showResults();
           },
           onClose: close,
         },
