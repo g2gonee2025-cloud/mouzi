@@ -238,6 +238,8 @@
     "results": "Résultats des opérations",
     "suggest": "Suggérer (approuver dans la file)",
     "onlyNew": "Traiter uniquement les nouveaux fichiers",
+    "onlyNewOnAdd": "Traiter uniquement les nouveaux fichiers lors de l’ajout d’un dossier",
+    "onlyNewForPath": "Traiter uniquement les nouveaux fichiers dans {{path}}",
     "onlyNewHelp": "Les noms de fichiers existants sont ignorés tant que cette option est activée, même après un redémarrage. Désactivez-la pour inclure les anciens fichiers. La réactiver enregistre un nouvel état initial.",
     "folderMode": "Mode du nouveau dossier",
     "pickFolder": "Choisir un dossier",

@@ -238,6 +238,8 @@
     "results": "Operation results",
     "suggest": "Suggest (approve in review queue)",
     "onlyNew": "Process only new files",
+    "onlyNewOnAdd": "Process only new files when adding a folder",
+    "onlyNewForPath": "Process only new files in {{path}}",
     "onlyNewHelp": "Existing filenames are skipped while this is enabled, including after restart. Disable it to include the backlog. Enabling it again creates a new baseline.",
     "folderMode": "Mode for the new folder",
     "pickFolder": "Choose folder",

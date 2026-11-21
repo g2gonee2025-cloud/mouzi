@@ -238,6 +238,8 @@
     "results": "Risultati delle operazioni",
     "suggest": "Suggerisci (approva nella coda)",
     "onlyNew": "Elabora solo i nuovi file",
+    "onlyNewOnAdd": "Elabora solo i nuovi file quando aggiungi una cartella",
+    "onlyNewForPath": "Elabora solo i nuovi file in {{path}}",
     "onlyNewHelp": "I nomi dei file esistenti vengono ignorati finché questa opzione è attiva, anche dopo un riavvio. Disattivala per includere i file precedenti. Riattivandola viene registrato un nuovo stato iniziale.",
     "folderMode": "Modalità della nuova cartella",
     "pickFolder": "Scegli cartella",

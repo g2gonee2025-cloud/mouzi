@@ -238,6 +238,8 @@
     "results": "Aktionsergebnisse",
     "suggest": "Vorschlagen (in der Warteschlange freigeben)",
     "onlyNew": "Nur neue Dateien verarbeiten",
+    "onlyNewOnAdd": "Nur neue Dateien verarbeiten, wenn ein Ordner hinzugefügt wird",
+    "onlyNewForPath": "Nur neue Dateien verarbeiten – Ordner {{path}}",
     "onlyNewHelp": "Vorhandene Dateinamen werden übersprungen, solange diese Option aktiv ist, auch nach einem Neustart. Deaktiviere sie, um bisherige Dateien einzubeziehen. Erneutes Aktivieren erfasst den aktuellen Bestand neu.",
     "folderMode": "Modus für den neuen Ordner",
     "pickFolder": "Ordner auswählen",

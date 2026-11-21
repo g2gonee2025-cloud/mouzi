@@ -238,6 +238,8 @@
     "results": "Wyniki operacji",
     "suggest": "Proponuj (zatwierdzanie w kolejce)",
     "onlyNew": "Przetwarzaj tylko nowe pliki",
+    "onlyNewOnAdd": "Przetwarzaj tylko nowe pliki podczas dodawania folderu",
+    "onlyNewForPath": "Przetwarzaj tylko nowe pliki w folderze {{path}}",
     "onlyNewHelp": "Istniejące nazwy plików będą pomijane, również po restarcie. Wyłącz opcję, aby uwzględnić wcześniejsze pliki. Ponowne włączenie zapisuje nowy stan początkowy.",
     "folderMode": "Tryb nowego folderu",
     "pickFolder": "Wybierz folder",

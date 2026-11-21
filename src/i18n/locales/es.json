@@ -238,6 +238,8 @@
     "results": "Resultados de las operaciones",
     "suggest": "Sugerir (aprobar en la cola)",
     "onlyNew": "Procesar solo archivos nuevos",
+    "onlyNewOnAdd": "Procesar solo archivos nuevos al añadir una carpeta",
+    "onlyNewForPath": "Procesar solo archivos nuevos en {{path}}",
     "onlyNewHelp": "Los nombres existentes se omiten mientras esta opción esté activada, incluso tras reiniciar. Desactívala para incluir los archivos anteriores. Al reactivarla se registra un nuevo estado inicial.",
     "folderMode": "Modo de la nueva carpeta",
     "pickFolder": "Elegir carpeta",

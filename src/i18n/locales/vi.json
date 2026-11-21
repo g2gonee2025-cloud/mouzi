@@ -244,6 +244,8 @@
     "results": "Kết quả thao tác",
     "suggest": "Đề xuất (phê duyệt trong hàng đợi)",
     "onlyNew": "Chỉ xử lý tệp mới",
+    "onlyNewOnAdd": "Chỉ xử lý tệp mới khi thêm thư mục",
+    "onlyNewForPath": "Chỉ xử lý tệp mới trong {{path}}",
     "onlyNewHelp": "Các tên tệp hiện có sẽ được bỏ qua khi bật tùy chọn này, kể cả sau khi khởi động lại. Tắt để xử lý cả tệp cũ. Bật lại sẽ ghi nhận trạng thái ban đầu mới.",
     "folderMode": "Chế độ cho thư mục mới",
     "pickFolder": "Chọn thư mục",

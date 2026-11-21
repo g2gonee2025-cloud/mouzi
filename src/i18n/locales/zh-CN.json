@@ -238,6 +238,8 @@
     "results": "操作结果",
     "suggest": "建议（在队列中批准）",
     "onlyNew": "仅处理新文件",
+    "onlyNewOnAdd": "仅处理新文件（添加文件夹时）",
+    "onlyNewForPath": "仅处理新文件（文件夹：{{path}}）",
     "onlyNewHelp": "启用后会跳过已有文件名，重启后仍然有效。禁用可将原有文件纳入处理范围。再次启用会记录新的初始状态。",
     "folderMode": "新文件夹的模式",
     "pickFolder": "选择文件夹",

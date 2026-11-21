@@ -12,13 +12,22 @@ const harness = vi.hoisted(() => ({
   disposeEffects: new Set<() => void>(),
 }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke: harness.invoke }));
-vi.mock("react-i18next", () => ({
-  useTranslation: () => ({
-    t: (key: string, values?: { number?: number }) => key === "settings.scheduler.time"
-      ? `${key} ${values?.number}`
-      : key,
-  }),
-}));
+vi.mock("react-i18next", async () => {
+  const { default: english } = await import("../i18n/locales/en.json");
+  const folderLabels: Record<string, unknown> = english.beta;
+  return {
+    useTranslation: () => ({
+      t: (key: string, values?: { number?: number; path?: string }) => {
+        if (key === "settings.scheduler.time") return `${key} ${values?.number}`;
+        if (key === "beta.onlyNewOnAdd" || key === "beta.onlyNewForPath") {
+          const label = folderLabels[key.slice("beta.".length)];
+          if (typeof label === "string") return label.replace("{{path}}", values?.path ?? "");
+        }
+        return key;
+      },
+    }),
+  };
+});
 vi.mock("../i18n", () => ({
   default: { t: (key: string, options?: { defaultValue?: string }) => options?.defaultValue ?? key, language: "en" },
 }));
@@ -292,6 +301,41 @@ function openWatchedFolders() {
   useAppStore.setState({ folders: [watchedFixture], folderRead: { status: "ready" } });
   click(requireElement(({ props }) => props.label === "settings.folders.title"));
 }
+
+it("names the new-files-only checkbox for the add form and each exact watched folder", async () => {
+  openWatchedFolders();
+  const first = { ...watchedFixture, path: "C:/Home/Downloads" };
+  const second = { ...watchedFixture, id: 24, path: "C:/Work/Downloads" };
+  useAppStore.setState({ folders: [first, second] });
+
+  const onlyNew = (name: string) => {
+    const label = find(editor(), (node) => {
+      if (node.type !== "label" || text(node.props.children) !== "beta.onlyNew") return false;
+      const input = find(node.props.children, (child) => child.type === "input");
+      return (input?.props["aria-label"] ?? text(node.props.children)) === name;
+    });
+    expect(label, "Missing only-new checkbox named " + name).toBeDefined();
+    return requireElement((node) => node.type === "input" && node.props.type === "checkbox", label);
+  };
+
+  const newRegistration = onlyNew("Process only new files when adding a folder");
+  expect(onlyNew("Process only new files in C:/Home/Downloads").props.checked).toBe(false);
+  const workRegistration = onlyNew("Process only new files in C:/Work/Downloads");
+
+  change(newRegistration, { checked: true });
+  expect(onlyNew("Process only new files when adding a folder").props.checked).toBe(true);
+  expect(harness.invoke).not.toHaveBeenCalled();
+
+  harness.invoke.mockResolvedValueOnce(undefined).mockResolvedValueOnce([first, { ...second, only_new: true }]);
+  change(workRegistration, { checked: true });
+  await settle();
+  expect(harness.invoke.mock.calls).toEqual([
+    ["set_only_new_cmd", { id: 24, enabled: true }],
+    ["get_folders_cmd"],
+  ]);
+  expect(onlyNew("Process only new files in C:/Home/Downloads").props.checked).toBe(false);
+  expect(onlyNew("Process only new files in C:/Work/Downloads").props.checked).toBe(true);
+});
 
 it("clears a committed add draft and reloads the canonical registered path only on a successful read", async () => {
   openWatchedFolders();

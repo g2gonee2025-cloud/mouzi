@@ -641,7 +641,12 @@ export default function Settings() {
               </button>
             </div>
             <label className="flex items-center gap-2 text-sm">
-              <input type="checkbox" checked={newOnlyNew} onChange={(event) => setNewOnlyNew(event.target.checked)} />
+              <input
+                type="checkbox"
+                aria-label={t("beta.onlyNewOnAdd")}
+                checked={newOnlyNew}
+                onChange={(event) => setNewOnlyNew(event.target.checked)}
+              />
               {t("beta.onlyNew")}
             </label>
             <ArchiveImportPanel />
@@ -691,11 +696,16 @@ export default function Settings() {
                         {t("settings.folders.modeDesc")}
                       </p>
                       <label className="mt-2 flex items-center gap-2 text-sm">
-                        <input type="checkbox" checked={f.only_new ?? false} onChange={(event) => {
-                          const id = verifiedFolderId(f);
-                          const enabled = event.target.checked;
-                          if (id !== undefined) void runWrite(() => setFolderOnlyNew(id, enabled));
-                        }} />
+                        <input
+                          type="checkbox"
+                          aria-label={t("beta.onlyNewForPath", { path: f.path })}
+                          checked={f.only_new ?? false}
+                          onChange={(event) => {
+                            const id = verifiedFolderId(f);
+                            const enabled = event.target.checked;
+                            if (id !== undefined) void runWrite(() => setFolderOnlyNew(id, enabled));
+                          }}
+                        />
                         {t("beta.onlyNew")}
                       </label>
                     </div>
