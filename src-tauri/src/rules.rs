@@ -672,11 +672,12 @@ fn process_file(
     if rule.action == "delete" { return Err("File removal requires a verified recovery method".into()); }
     let requested = planned_destination(root, &file_info, &rule)?;
     let same_leaf = requested.file_name() == path.file_name();
+    // A relative destination can be based on another watched root only for a global rule.
     if same_path(path, &requested) || (rule.action == "move" && same_leaf && (
         requested.parent().is_some_and(|parent| path_is_already_filed(path, parent))
-        || folders.iter().filter(|folder| folder.enabled).any(|folder| {
+        || (rule.folder_id == 0 && folders.iter().filter(|folder| folder.enabled).any(|folder| {
             is_already_filed(Path::new(&folder.path), path, &file_info, &rule)
-        })))
+        }))))
     {
         return Ok(ProcessOutcome::Skipped);
     }
