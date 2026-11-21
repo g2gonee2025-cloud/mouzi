@@ -2372,6 +2372,12 @@ pub fn accept_suggestion_cmd(
 }
 
 fn accept_reviewed_suggestion(plan_id: &str, suppression: &IgnoredFiles) -> Result<AcceptOutcome, String> {
+    accept_reviewed_suggestion_with_hash_check(plan_id, suppression, || Ok(()))
+}
+
+fn accept_reviewed_suggestion_with_hash_check(
+    plan_id: &str, suppression: &IgnoredFiles, check_hash: impl FnMut() -> Result<(), String>,
+) -> Result<AcceptOutcome, String> {
     let plan = SUGGESTION_REVIEWS.lock().map_err(|_| "Suggestion plan store unavailable")?.plans.remove(plan_id)
         .ok_or("Suggestion preview expired or was already used; preview again")?;
     let _operation = suppression.with_operation();
@@ -2392,7 +2398,7 @@ fn accept_reviewed_suggestion(plan_id: &str, suppression: &IgnoredFiles) -> Resu
     let mut validated = scope.validate_file(path)?;
     check_suggestion_exclusions(&validated, &mut HashMap::new())?;
     if validated.owning_root != plan.root || crate::safe_fs::file_identity(&plan.root)? != plan.root_identity
-        || validated.identity != plan.identity || live_suggestion_content(path, &mut validated, || Ok(()))?.digest != plan.content.digest
+        || validated.identity != plan.identity || live_suggestion_content(path, &mut validated, check_hash)?.digest != plan.content.digest
     {
         return Err("Suggestion file or owning folder changed; preview again".into());
     }
@@ -2465,6 +2471,9 @@ fn accept_suggestion_validated_with(
     // the destination directory has the same shape `resolve_dest_dir` produces:
     // the category under the watched root.
     let dest_dir = validated_root.join(&suggested_category);
+    // An external editor can save exclusions during the confirmation hash.
+    // Read the policy again before accepting feedback, creating a rule or moving the file.
+    check_suggestion_exclusions(&validated, &mut HashMap::new())?;
     if let Some(src_parent) = canonical_source.parent() {
         if crate::safe_fs::directory_contains(src_parent, &dest_dir).unwrap_or(false) {
             // Already filed, so nothing moves and nothing is logged. The early
@@ -3976,6 +3985,45 @@ mod accept_tests {
         assert!(saved);
         assert_excluded_suggestion_untouched(&source, &fixture.root().join("Documents/report.xyz"), &identity);
         assert!(result.is_err_and(|error| error.contains(".mouziignore")));
+    }
+
+    #[test]
+    fn suggestion_live_exclusion_saved_during_confirmation_hash_blocks_move_and_feedback() {
+        let fixture = AcceptFixture::new("suggestion_ignore_during_confirmation");
+        let to_move = fixture.put("incoming.confirmcheck");
+        let filed = fixture.put("Documents/filed.confirmcheck");
+        index_fixture(&fixture);
+        let original_rules = get_rules().unwrap();
+        let policy = fixture.root().join(".mouziignore");
+
+        for source in [&to_move, &filed] {
+            let name = source.file_name().unwrap().to_str().unwrap();
+            let identity = crate::safe_fs::file_identity(source).unwrap();
+            let plan = prepare_suggestions(vec![suggestion_request(source, "Documents")], true).unwrap().remove(0);
+            let mut checks = 0;
+            let result = accept_reviewed_suggestion_with_hash_check(&plan.plan_id, &ignored_files(), || {
+                checks += 1;
+                if checks == 2 {
+                    // The first chunk has been read. A text editor can still save the policy.
+                    std::fs::write(&policy, name).unwrap();
+                }
+                Ok(())
+            });
+            assert!(checks >= 2);
+            assert!(result.is_err_and(|error| error.contains(".mouziignore") && error.contains(name)));
+            assert_eq!(std::fs::read(source).unwrap(), b"payload");
+            assert_eq!(crate::safe_fs::file_identity(source).unwrap(), identity);
+            if source == &to_move { assert!(!Path::new(&plan.destination).exists()); }
+            let records: (i64, i64, i64) = lock_db().unwrap().query_row(
+                "SELECT (SELECT count(*) FROM action_logs WHERE source_path=?1),
+                        (SELECT count(*) FROM operation_intents WHERE source_path=?1),
+                        (SELECT count(*) FROM accepted_suggestion_feedback WHERE file_name=?2)",
+                rusqlite::params![source.to_string_lossy().as_ref(), name],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            ).unwrap();
+            assert_eq!(records, (0, 0, 0));
+            assert_eq!(get_rules().unwrap(), original_rules);
+        }
     }
 
     #[test]
