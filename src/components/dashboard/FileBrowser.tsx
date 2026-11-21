@@ -58,6 +58,7 @@ export default function FileBrowser({
   const showRootPath = root !== null && rootsWithSharedNames(watchedRootPaths).has(root);
   const activeView = view?.scope === scope ? view : undefined;
   const files = filtered ? activeView?.rows ?? [] : sort === "size" ? initialLargest : initialRecent;
+  const filesWithSharedNames = rootsWithSharedNames(files.map(({ path }) => path));
   const loading = filtered && (activeView?.loading ?? true);
   const error = filtered ? activeView?.error : null;
 
@@ -222,8 +223,15 @@ export default function FileBrowser({
                   title={categoryLabel(file.category, t)}
                 />
                 <div className="min-w-0">
-                  <div className="text-sm text-text truncate">{fileName(file.path)}</div>
-                  <div className="text-[10px] text-text-muted truncate">{file.path}</div>
+                  <div className="text-sm text-text truncate" dir="auto">{fileName(file.path)}</div>
+                  <div
+                    className={"text-[10px] text-text-muted " +
+                      (filesWithSharedNames.has(file.path) ? "whitespace-pre-wrap wrap-anywhere" : "truncate")}
+                    dir="auto"
+                    title={file.path}
+                  >
+                    {file.path}
+                  </div>
                 </div>
               </div>
               <div className="flex items-center gap-2 shrink-0 ml-3">
@@ -234,9 +242,7 @@ export default function FileBrowser({
                 <button
                   type="button"
                   onClick={() => handleCopy(file.path)}
-                  aria-label={
-                    copied === file.path ? t("dashboard.copied") : t("dashboard.copyPath")
-                  }
+                  aria-label={`${t(copied === file.path ? "dashboard.copied" : "dashboard.copyPath")}: ${file.path}`}
                   className="inline-flex items-center justify-center w-6 h-6 shrink-0 rounded text-text-muted hover:text-text hover:bg-border opacity-0 group-hover:opacity-100 focus-visible:opacity-100 pointer-coarse:opacity-100 focus-visible:outline-2 focus-visible:outline-primary focus-visible:outline-offset-1 transition-opacity"
                   title={copied === file.path ? t("dashboard.copied") : t("dashboard.copyPath")}
                 >
@@ -245,7 +251,7 @@ export default function FileBrowser({
                 <button
                   type="button"
                   onClick={() => handleReveal(file.path)}
-                  aria-label={t("dashboard.openFolder")}
+                  aria-label={`${t("dashboard.openFolder")}: ${file.path}`}
                   className="inline-flex items-center justify-center w-6 h-6 shrink-0 rounded text-text-muted hover:text-text hover:bg-border opacity-0 group-hover:opacity-100 focus-visible:opacity-100 pointer-coarse:opacity-100 focus-visible:outline-2 focus-visible:outline-primary focus-visible:outline-offset-1 transition-opacity"
                   title={t("dashboard.openFolder")}
                 >

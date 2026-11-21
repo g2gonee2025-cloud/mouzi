@@ -196,6 +196,38 @@ beforeEach(() => {
 
 afterEach(() => vi.unstubAllGlobals());
 
+function fileBrowserTree(files: InventoryFile[], sort: "size" | "mtime" = "size") {
+  let tree: ReactNode;
+  function CaptureBrowser() {
+    tree = FileBrowser({
+      ...DEFAULT_DASHBOARD_VIEW,
+      sort,
+      initialLargest: files,
+      initialRecent: [...files].reverse(),
+      watchedRootPaths: [...new Set(files.map(({ rootPath }) => rootPath))],
+      totalFiles: files.length,
+      revision: 1,
+      onSort: vi.fn(),
+      onQuery: vi.fn(),
+      onClearCategory: vi.fn(),
+      onClearRoot: vi.fn(),
+    });
+    return tree;
+  }
+
+  renderToStaticMarkup(<CaptureBrowser />);
+  return tree;
+}
+
+function duplicateNameFiles() {
+  const common = "Shared Project Documents ".repeat(8);
+  return [
+    { path: "C:\\" + common + "\\Personal\\Inbox\\Q & A\\report.txt", rootPath: "C:\\Personal", size: 100, mtime: 1, category: "Documents" },
+    { path: "D:/" + common + "/Team/Inbox/Q & A/REPORT.TXT", rootPath: "D:/Team", size: 100, mtime: 1, category: "Documents" },
+    { path: "D:/" + common + "/Team/notes α.txt", rootPath: "D:/Team", size: 100, mtime: 1, category: "Documents" },
+  ];
+}
+
 describe("dashboard entry points", () => {
   it("guides a user with no watched folders to Settings", () => {
     const html = renderDashboard([]);
@@ -406,36 +438,47 @@ describe("dashboard entry points", () => {
     expect(renderDashboard([root])).not.toContain("dashboard.scanInactiveRoots");
   });
 
-  it("reveals the exact file represented by the row", async () => {
-    const path = "C:\\work\\quarterly report.txt";
-    let reveal: (() => Promise<void>) | undefined;
-    function capture(node: ReactNode) {
-      Children.forEach(node, (child) => {
-        if (!isValidElement<{ children?: ReactNode; "aria-label"?: string; onClick?: () => Promise<void> }>(child)) return;
-        if (child.props["aria-label"] === "dashboard.openFolder") reveal = child.props.onClick;
-        capture(child.props.children);
-      });
+  it("wraps exact paths for same-named files while keeping distinct results compact after sorting or narrowing", () => {
+    const files = duplicateNameFiles();
+    const pathClasses = (tree: ReactNode, file: InventoryFile) =>
+      findElement<{ className?: string; children?: ReactNode }>(tree,
+        (element) => element.type === "div" && element.props.children === file.path)?.props.className;
+
+    for (const sort of ["size", "mtime"] as const) {
+      const tree = fileBrowserTree(files, sort);
+      for (const file of files.slice(0, 2)) {
+        expect(pathClasses(tree, file), file.path).toContain("wrap-anywhere");
+        expect(pathClasses(tree, file)).not.toContain("truncate");
+      }
+      expect(pathClasses(tree, files[2])).toContain("truncate");
     }
-    function CaptureBrowser() {
-      const browser = FileBrowser({
-        ...DEFAULT_DASHBOARD_VIEW,
-        initialLargest: [{ path, rootPath: "C:\\work", size: 2, mtime: 1, category: "Other" }],
-        initialRecent: [],
-        watchedRootPaths: ["C:\\work"],
-        totalFiles: 1,
-        revision: 1,
-        onSort: vi.fn(),
-        onQuery: vi.fn(),
-        onClearCategory: vi.fn(),
-        onClearRoot: vi.fn(),
-      });
-      capture(browser);
-      return browser;
+    expect(pathClasses(fileBrowserTree([files[0]]), files[0])).toContain("truncate");
+  });
+
+  it("identifies copy and reveal actions by the exact path they dispatch", async () => {
+    const files = duplicateNameFiles();
+    const browser = fileBrowserTree(files, "mtime");
+    const action = (name: string) => findElement<{ "aria-label"?: string; onClick?: () => Promise<void> }>(browser,
+      (element) => element.type === "button" && element.props["aria-label"] === name)?.props.onClick;
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    vi.stubGlobal("navigator", { clipboard: { writeText } });
+    mock.revealItemInDir.mockClear();
+    vi.useFakeTimers();
+    try {
+      for (const file of files) {
+        const copy = action("dashboard.copyPath: " + file.path);
+        const reveal = action("dashboard.openFolder: " + file.path);
+        expect(copy, file.path).toBeTypeOf("function");
+        expect(reveal, file.path).toBeTypeOf("function");
+        await copy!();
+        await reveal!();
+      }
+      expect(writeText.mock.calls).toEqual(files.map(({ path }) => [path]));
+      expect(mock.revealItemInDir.mock.calls).toEqual(files.map(({ path }) => [path]));
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
     }
-    renderToStaticMarkup(<CaptureBrowser />);
-    expect(reveal).toBeTypeOf("function");
-    await reveal!();
-    expect(mock.revealItemInDir).toHaveBeenCalledExactlyOnceWith(path);
   });
 
   it("renders supplied view options and excludes a root missing from the current scope", () => {
