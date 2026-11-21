@@ -913,7 +913,7 @@ export default function Settings() {
                       onChange={(e) =>
                         setEditingRule({
                           ...editingRule,
-                          pattern: e.target.value.trim() === "" ? null : e.target.value,
+                          pattern: e.target.value === "" ? null : e.target.value,
                         })
                       }
                       placeholder="(?i)report.*\.pdf"
