@@ -8,6 +8,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 const IGNORE_FILE: &str = ".mouziignore";
 const IGNORE_HEADER: &str = "# Mouzi ignore rules\n# https://mouzi.cc/docs\n\n";
 
+#[cfg(windows)]
+mod windows_save;
+
 fn is_regular_file(metadata: &Metadata) -> bool {
     #[cfg(windows)]
     {
@@ -238,13 +241,18 @@ fn edit_ignore_document(document: &str, patterns: &[String]) -> String {
 fn write_ignore_document(
     path: &Path, existing: Option<File>, original: Option<&str>, content: &str,
 ) -> Result<bool, String> {
-    // Stage the full replacement before publishing it. Never truncate a path
-    // supplied by the filesystem, even when the checked leaf is regular.
-    static NEXT_STAGE: AtomicU64 = AtomicU64::new(0);
-    let serial = NEXT_STAGE.fetch_add(1, Ordering::Relaxed);
     let destination = std::path::absolute(path).map_err(|error| error.to_string())?;
     let parent = destination.parent().ok_or("Ignore protection file has no parent directory")?;
     let _parent_guard = crate::safe_fs::guard_directory(parent)?;
+    #[cfg(windows)]
+    if let Some(previous) = existing {
+        // Canonicalizing the guarded parent also supplies the extended-length Windows path.
+        let parent = fs::canonicalize(parent).map_err(|error| error.to_string())?;
+        return windows_save::replace(&parent.join(IGNORE_FILE), previous, original, content);
+    }
+
+    static NEXT_STAGE: AtomicU64 = AtomicU64::new(0);
+    let serial = NEXT_STAGE.fetch_add(1, Ordering::Relaxed);
     let stage = destination.with_file_name(format!("{IGNORE_FILE}.{}.{serial}.tmp", std::process::id()));
     let mut file = crate::safe_fs::create_guarded_staging_file(&stage)
         .map_err(|error| format!("Cannot stage ignore protection file: {error}"))?;
@@ -265,8 +273,6 @@ fn write_ignore_document(
                 return Ok(false);
             }
         }
-        // Windows denies edits through staging. Replacing an existing name requires
-        // releasing its read guards, so an external edit during the final rename is still possible.
         drop(current);
         drop(previous);
         drop(file);
@@ -350,7 +356,60 @@ mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn temporary_folder() -> std::path::PathBuf {
+    #[cfg(windows)]
+    std::thread_local! {
+        static COMPETING_SAVE: std::cell::Cell<Option<fn(&Path)>> = const { std::cell::Cell::new(None) };
+    }
+
+    #[cfg(windows)]
+    pub(super) fn run_competing_save(path: &Path) {
+        if let Some(save) = COMPETING_SAVE.take() { save(path); }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn checked_save_preserves_an_editor_save_during_publication() {
+        const ORIGINAL: &str = "original.tmp\n";
+        const EDITED: &str = "# editor added a comment\r\noriginal.tmp\r\n";
+        fn replace_with_same_bytes(path: &Path) {
+            let replacement = path.with_file_name("editor.tmp");
+            fs::write(&replacement, ORIGINAL).unwrap();
+            fs::rename(replacement, path).unwrap();
+        }
+        let cases: [(fn(&Path), &str); 2] = [
+            (|path| fs::write(path, EDITED).unwrap(), EDITED),
+            (replace_with_same_bytes, ORIGINAL),
+        ];
+        for (save, editor_bytes) in cases {
+            let folder = temporary_folder();
+            let path = folder.join(IGNORE_FILE);
+            fs::write(&path, ORIGINAL).unwrap();
+            COMPETING_SAVE.set(Some(save));
+            let result = save_mouziignore_checked(folder.to_str().unwrap(), &["original.tmp".into()], &["draft.tmp".into()]);
+            let actual = fs::read_to_string(&path).unwrap();
+            let entries = fs::read_dir(&folder).unwrap().count();
+            fs::remove_dir_all(&folder).unwrap();
+            assert_eq!(actual, editor_bytes);
+            assert!(matches!(result.unwrap(), IgnoreSaveOutcome::Conflict { patterns } if patterns == ["original.tmp"]));
+            assert_eq!(entries, 1);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unchecked_save_preserves_new_bytes_in_an_existing_file() {
+        let folder = temporary_folder();
+        let path = folder.join(IGNORE_FILE);
+        fs::write(&path, [0xff]).unwrap();
+        COMPETING_SAVE.set(Some(|file| fs::write(file, [0xfe]).unwrap()));
+        let result = save_mouziignore(folder.to_str().unwrap(), &["draft.tmp".into()]);
+        let bytes = fs::read(&path).unwrap();
+        fs::remove_dir_all(folder).unwrap();
+        assert!(result.unwrap_err().contains("changed during save"));
+        assert_eq!(bytes, [0xfe]);
+    }
+
+    pub(super) fn temporary_folder() -> std::path::PathBuf {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()

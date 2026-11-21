@@ -39,6 +39,8 @@ A folder's `.mouziignore` is a UTF-8 file and can begin with a byte-order mark. 
 
 In **Settings → Ignore**, each watched folder keeps its own draft while you switch folders or visit another Settings tab. Choose **Save .mouziignore** to write that folder's changes, including a pattern still in the text box.
 
+On Windows, Mouzi checks the existing file and commits the edit in one filesystem transaction. If another editor saves first, Settings reports the conflict and keeps the editor’s version on disk. Updating an existing file requires a local NTFS volume with file transactions available. On other volumes, edit the file directly in a text editor.
+
 ## Storage dashboard
 
 Inventory scans are recursive, independently of the deferred recursive organizer option. They skip links and junctions. The deepest registered root owns an overlapping subtree, including when that child root is paused. Completed root generations publish transactionally. Failed roots retain their last completed snapshot with stale/error metadata; empty configured roots remain visible.

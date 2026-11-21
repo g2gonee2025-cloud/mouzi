@@ -2351,6 +2351,7 @@ dependencies = [
  "thiserror 1.0.69",
  "trash",
  "ureq",
+ "windows-sys 0.61.2",
  "winreg 0.10.1",
  "zip 0.6.6",
 ]
