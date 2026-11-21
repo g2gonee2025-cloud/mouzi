@@ -444,6 +444,7 @@
   },
   "suggestions": {
     "title": "Suggestions",
+    "readFailed": "Could not load suggestions.",
     "hint": "AI-assisted organization for unclassified files. Run a scan first from the Dashboard.",
     "empty": "No suggestions right now.",
     "accept": "Accept",

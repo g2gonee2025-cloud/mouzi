@@ -446,6 +446,7 @@
   },
   "suggestions": {
     "title": "Sugerencias",
+    "readFailed": "No se pudieron cargar las sugerencias.",
     "hint": "Organización asistida por IA para archivos sin clasificar. Ejecuta un escaneo primero desde el Dashboard.",
     "empty": "No hay sugerencias en este momento.",
     "accept": "Aceptar",

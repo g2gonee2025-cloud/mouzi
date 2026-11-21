@@ -446,6 +446,7 @@
   },
   "suggestions": {
     "title": "Gợi ý",
+    "readFailed": "Không thể tải các gợi ý.",
     "hint": "Tổ chức tệp tin chưa phân loại với sự hỗ trợ của AI. Đầu tiên hãy chạy quét từ Dashboard.",
     "empty": "Không có gợi ý nào.",
     "accept": "Chấp nhận",

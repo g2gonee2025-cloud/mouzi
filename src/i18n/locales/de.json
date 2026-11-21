@@ -444,6 +444,7 @@
   },
   "suggestions": {
     "title": "Vorschläge",
+    "readFailed": "Vorschläge konnten nicht geladen werden.",
     "hint": "KI-gestützte Organisation für unklassifizierte Dateien. Führe zuerst einen Scan vom Dashboard aus.",
     "empty": "Aktuell keine Vorschläge.",
     "accept": "Akzeptieren",

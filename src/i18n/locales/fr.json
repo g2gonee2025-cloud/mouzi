@@ -446,6 +446,7 @@
   },
   "suggestions": {
     "title": "Suggestions",
+    "readFailed": "Impossible de charger les suggestions.",
     "hint": "Organisation assistée par IA pour les fichiers non classifiés. Lancez d'abord une analyse depuis le Dashboard.",
     "empty": "Aucune suggestion pour le moment.",
     "accept": "Accepter",

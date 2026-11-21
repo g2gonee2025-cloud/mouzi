@@ -446,6 +446,7 @@
   },
   "suggestions": {
     "title": "Sugestie",
+    "readFailed": "Nie udało się wczytać sugestii.",
     "hint": "Organizacja wspomagana AI dla niesklasyfikowanych plików. Najpierw uruchom skanowanie z Dashboardu.",
     "empty": "Brak sugestii.",
     "accept": "Akceptuj",
