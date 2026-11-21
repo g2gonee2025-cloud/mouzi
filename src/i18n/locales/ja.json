@@ -307,6 +307,8 @@
     "openFolder": "フォルダを開く",
     "organizedThisWeek": "過去7日間に整理したファイル",
     "noOrganized": "過去7日間に整理したファイルはありません",
+    "activityLoading": "整理の履歴を読み込んでいます…",
+    "activityReadFailed": "整理の履歴を読み込めませんでした。",
     "lead": "{{category}} · {{size}} の {{percent}}%",
     "leadEmpty": "スキャンしてファイルの内訳を表示",
     "scanNoRoots": "先に設定で監視フォルダを追加してください",

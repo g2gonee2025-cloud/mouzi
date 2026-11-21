@@ -307,6 +307,8 @@
     "openFolder": "Ordner öffnen",
     "organizedThisWeek": "In den letzten 7 Tagen sortiert",
     "noOrganized": "In den letzten 7 Tagen wurden keine Dateien sortiert",
+    "activityLoading": "Organisationsaktivität wird geladen…",
+    "activityReadFailed": "Die Organisationsaktivität konnte nicht geladen werden.",
     "lead": "{{category}} · {{percent}}% von {{size}}",
     "leadEmpty": "Starte einen Scan, um zu sehen, wo deine Dateien liegen",
     "scanNoRoots": "Füge zuerst einen überwachten Ordner in den Einstellungen hinzu",

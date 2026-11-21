@@ -63,6 +63,8 @@ export interface WeeklyStat {
   count: number;
 }
 
+export type ActivityReadStatus = "loading" | "ready" | "error";
+
 export interface ScanProgress {
   runId: string;
   rootCount: number;
@@ -110,6 +112,7 @@ interface DashboardState {
   statsReadRevision: number;
   statsSnapshotRevision: number;
   weeklyStats: WeeklyStat[];
+  activityReadStatus: ActivityReadStatus;
   isScanning: boolean;
   scanProgress: ScanProgress | null;
   completedRoots: ScanComplete[];
@@ -151,6 +154,7 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
   statsReadRevision: 0,
   statsSnapshotRevision: 0,
   weeklyStats: [],
+  activityReadStatus: "loading",
   isScanning: false,
   scanProgress: null,
   completedRoots: [],
@@ -184,14 +188,16 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
 
   loadWeeklyStats: async () => {
     const request = ++weeklyRequest;
+    set({ weeklyStats: [], activityReadStatus: "loading" });
     try {
       const raw = await invoke<[string, number][]>("get_stats_cmd");
       if (request !== weeklyRequest) return;
       set({
         weeklyStats: raw.map(([file_type, count]) => ({ file_type, count })),
+        activityReadStatus: "ready",
       });
     } catch {
-      // non-critical — weekly stats may be empty
+      if (request === weeklyRequest) set({ activityReadStatus: "error" });
     }
   },
 

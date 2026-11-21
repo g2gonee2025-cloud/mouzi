@@ -303,6 +303,8 @@
     "activityTimeline": "Organized in the last 7 days",
     "organizedThisWeek": "Organized in the last 7 days",
     "noOrganized": "No files organized in the last 7 days",
+    "activityLoading": "Loading organization activity…",
+    "activityReadFailed": "Could not load organization activity.",
     "largestFiles": "Largest",
     "recentFiles": "Recent",
     "noData": "Nothing indexed yet — run a scan",

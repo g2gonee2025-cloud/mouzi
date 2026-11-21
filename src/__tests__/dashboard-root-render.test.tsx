@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { Children, isValidElement, type EffectCallback, type ReactNode } from "react";
+import { Children, isValidElement, type ComponentProps, type EffectCallback, type ReactElement, type ReactNode } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import Dashboard from "../pages/Dashboard";
 import FileBrowser from "../components/dashboard/FileBrowser";
@@ -81,17 +81,52 @@ function dashboardStats(
 }
 
 function mountedDashboard(view = DEFAULT_DASHBOARD_VIEW) {
+  let tree: ReactNode;
   function CaptureDashboard() {
     mock.cursor = 0;
     mock.renderingDashboard = true;
     try {
-      return Dashboard({ view, setView: vi.fn() });
+      tree = Dashboard({ view, setView: vi.fn() });
+      return tree;
     } finally {
       mock.renderingDashboard = false;
     }
   }
   const html = renderToStaticMarkup(<CaptureDashboard />);
-  return { html, effects: mock.effects.splice(0) };
+  return { html, tree, effects: mock.effects.splice(0) };
+}
+
+function findElement<Props>(tree: ReactNode, matches: (element: ReactElement<Props>) => boolean): ReactElement<Props> | undefined {
+  for (const node of Children.toArray(tree)) {
+    if (!isValidElement<Props & { children?: ReactNode }>(node)) continue;
+    if (matches(node)) return node;
+    const nested = findElement(node.props.children, matches);
+    if (nested) return nested;
+  }
+}
+
+function clickActivityRetry(tree: ReactNode) {
+  const chart = findElement<ComponentProps<typeof ActivityTimeline>>(tree, (element) => element.type === ActivityTimeline);
+  if (!chart) throw new Error("Activity card is absent");
+  let click: (() => unknown) | undefined;
+  function CaptureActivity() {
+    const card = ActivityTimeline(chart!.props);
+    const retry = findElement<{ children: ReactNode; onClick?: () => unknown }>(
+      card, (element) => element.type === "button" && element.props.children === "common.retry",
+    );
+    click = retry?.props.onClick;
+    return card;
+  }
+  renderToStaticMarkup(<CaptureActivity />);
+  if (!click) throw new Error("Activity retry is absent");
+  click();
+}
+
+function deferredActivity() {
+  let resolve!: (rows: [string, number][]) => void;
+  let reject!: (error: Error) => void;
+  const result = new Promise<[string, number][]>((success, failure) => { resolve = success; reject = failure; });
+  return { result, resolve, reject };
 }
 
 function renderDashboard(
@@ -138,16 +173,85 @@ describe("dashboard entry points", () => {
     expect(html).not.toContain("dashboard.noFiles");
   });
 
-  it("shows activity from the store after the entry inventory read", () => {
-    useDashboardStore.setState({ weeklyStats: [{ file_type: "Friday invoices", count: 2 }] });
-    const html = renderDashboard([{ ...root, files: 1, bytes: 256 }]);
+  it("shows activity from the store after the entry inventory read", async () => {
+    renderDashboard([{ ...root, files: 1, bytes: 256 }]);
+    mock.invoke.mockResolvedValueOnce([["Friday invoices", 2]]);
+    await useDashboardStore.getState().loadWeeklyStats();
+    const html = mountedDashboard().html;
     expect(html).toContain("dashboard.organizedThisWeek");
     expect(html).toContain("Friday invoices");
     expect(html).toContain(">2<");
-    useDashboardStore.setState({ weeklyStats: [] });
+    mock.invoke.mockResolvedValueOnce([]);
+    await useDashboardStore.getState().loadWeeklyStats();
     const empty = mountedDashboard().html;
     expect(empty).toContain("dashboard.noOrganized");
     expect(empty).not.toContain("Friday invoices");
+  });
+
+  it("shows activity loading independently and reserves the empty message for a successful empty result", async () => {
+    renderDashboard([root]);
+    const result = deferredActivity();
+    mock.invoke.mockReturnValueOnce(result.result);
+    const read = useDashboardStore.getState().loadWeeklyStats();
+    const pending = mountedDashboard().html;
+    expect(pending).toContain('role="search"');
+    expect(pending).toContain("dashboard.activityLoading");
+    expect(pending).not.toContain("dashboard.noOrganized");
+    result.resolve([]);
+    await read;
+    const empty = mountedDashboard().html;
+    expect(empty).toContain("dashboard.noOrganized");
+    expect(empty).not.toContain("dashboard.activityLoading");
+  });
+
+  it("withholds previous activity on failure and retries only the activity read", async () => {
+    renderDashboard([root]);
+    mock.invoke.mockResolvedValueOnce([["Friday invoices", 2]]);
+    await useDashboardStore.getState().loadWeeklyStats();
+    expect(mountedDashboard().html).toContain("Friday invoices");
+    mock.invoke.mockRejectedValueOnce(new Error("Fixture activity read failed"));
+    await useDashboardStore.getState().loadWeeklyStats();
+    const failed = mountedDashboard();
+    expect(failed.html).toContain('role="search"');
+    expect(failed.html).toContain("dashboard.activityReadFailed");
+    expect(failed.html).not.toContain("dashboard.noOrganized");
+    expect(failed.html).not.toContain("Friday invoices");
+    mock.invoke.mockClear();
+    const retry = deferredActivity();
+    mock.invoke.mockReturnValueOnce(retry.result);
+    clickActivityRetry(failed.tree);
+    expect(mock.invoke).toHaveBeenCalledExactlyOnceWith("get_stats_cmd");
+    const retrying = mountedDashboard().html;
+    expect(retrying).toContain("dashboard.activityLoading");
+    expect(retrying).not.toContain("dashboard.activityReadFailed");
+    retry.resolve([["Monday receipts", 3]]);
+    await retry.result;
+    const recovered = mountedDashboard().html;
+    expect(recovered).toContain("Monday receipts");
+    expect(recovered).not.toContain("dashboard.activityReadFailed");
+    expect(recovered).not.toContain("Friday invoices");
+  });
+
+  it("ignores superseded activity successes and failures", async () => {
+    renderDashboard([root]);
+    const first = deferredActivity();
+    const second = deferredActivity();
+    const latest = deferredActivity();
+    mock.invoke.mockReturnValueOnce(first.result).mockReturnValueOnce(second.result).mockReturnValueOnce(latest.result);
+    const reads = [first, second, latest].map(() => useDashboardStore.getState().loadWeeklyStats());
+    second.reject(new Error("Superseded activity failure"));
+    await reads[1];
+    const pending = mountedDashboard().html;
+    expect(pending).toContain("dashboard.activityLoading");
+    expect(pending).not.toContain("dashboard.activityReadFailed");
+    latest.resolve([["Current activity", 4]]);
+    await reads[2];
+    first.resolve([["Superseded activity", 9]]);
+    await reads[0];
+    const ready = mountedDashboard().html;
+    expect(ready).toContain("Current activity");
+    expect(ready).not.toContain("Superseded activity");
+    expect(ready).not.toContain("dashboard.activityReadFailed");
   });
 
   it("warns above retained rows when reopening after a root failed outside the dashboard", () => {

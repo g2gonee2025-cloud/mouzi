@@ -307,6 +307,8 @@
     "openFolder": "Ouvrir le dossier",
     "organizedThisWeek": "Classés au cours des 7 derniers jours",
     "noOrganized": "Aucun fichier classé au cours des 7 derniers jours",
+    "activityLoading": "Chargement de l’activité de rangement…",
+    "activityReadFailed": "Impossible de charger l’activité de rangement.",
     "lead": "{{category}} · {{percent}}% de {{size}}",
     "leadEmpty": "Lancez une analyse pour voir où vivent vos fichiers",
     "scanNoRoots": "Ajoutez d’abord un dossier surveillé dans Réglages",

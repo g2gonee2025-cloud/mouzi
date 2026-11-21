@@ -303,6 +303,8 @@
     "activityTimeline": "过去 7 天的整理记录",
     "organizedThisWeek": "过去 7 天整理的文件",
     "noOrganized": "过去 7 天没有整理文件",
+    "activityLoading": "正在加载整理活动…",
+    "activityReadFailed": "无法加载整理活动。",
     "largestFiles": "按大小",
     "recentFiles": "按时间",
     "noData": "尚未建立索引，请先扫描",

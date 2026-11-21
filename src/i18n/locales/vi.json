@@ -313,6 +313,8 @@
     "openFolder": "Mở thư mục",
     "organizedThisWeek": "Đã sắp xếp trong 7 ngày qua",
     "noOrganized": "Không có tệp nào được sắp xếp trong 7 ngày qua",
+    "activityLoading": "Đang tải hoạt động sắp xếp…",
+    "activityReadFailed": "Không thể tải hoạt động sắp xếp.",
     "lead": "{{category}} · {{percent}}% của {{size}}",
     "leadEmpty": "Chạy quét để xem tệp đang nằm ở đâu",
     "scanNoRoots": "Hãy thêm thư mục theo dõi trong Cài đặt trước",

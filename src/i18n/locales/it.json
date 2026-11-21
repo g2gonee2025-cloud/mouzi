@@ -307,6 +307,8 @@
     "openFolder": "Apri cartella",
     "organizedThisWeek": "Organizzati negli ultimi 7 giorni",
     "noOrganized": "Nessun file organizzato negli ultimi 7 giorni",
+    "activityLoading": "Caricamento dell’attività di organizzazione…",
+    "activityReadFailed": "Impossibile caricare l’attività di organizzazione.",
     "lead": "{{category}} · {{percent}}% di {{size}}",
     "leadEmpty": "Esegui una scansione per vedere dove stanno i file",
     "scanNoRoots": "Aggiungi prima una cartella osservata in Impostazioni",

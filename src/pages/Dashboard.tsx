@@ -37,6 +37,8 @@ export default function Dashboard({ view, setView }: DashboardProps) {
     statsReadRevision,
     statsSnapshotRevision,
     weeklyStats,
+    activityReadStatus,
+    loadWeeklyStats,
     isLoading,
     isScanning,
     scanProgress,
@@ -335,7 +337,7 @@ export default function Dashboard({ view, setView }: DashboardProps) {
 
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
               <AgeHistogram data={stats!.ageBuckets ?? []} />
-              <ActivityTimeline data={weeklyStats} />
+              <ActivityTimeline data={weeklyStats} status={activityReadStatus} onRetry={loadWeeklyStats} />
             </div>
           </>
         )}

@@ -307,6 +307,8 @@
     "openFolder": "Abrir carpeta",
     "organizedThisWeek": "Organizados en los últimos 7 días",
     "noOrganized": "No se organizó ningún archivo en los últimos 7 días",
+    "activityLoading": "Cargando la actividad de organización…",
+    "activityReadFailed": "No se pudo cargar la actividad de organización.",
     "lead": "{{category}} · {{percent}}% de {{size}}",
     "leadEmpty": "Ejecuta un escaneo para ver dónde están tus archivos",
     "scanNoRoots": "Añade primero una carpeta vigilada en Ajustes",

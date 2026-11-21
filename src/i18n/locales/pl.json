@@ -307,6 +307,8 @@
     "openFolder": "Otwórz folder",
     "organizedThisWeek": "Posegregowane w ostatnich 7 dniach",
     "noOrganized": "W ostatnich 7 dniach nie posegregowano żadnych plików",
+    "activityLoading": "Wczytywanie aktywności porządkowania…",
+    "activityReadFailed": "Nie udało się wczytać aktywności porządkowania.",
     "lead": "{{category}} · {{percent}}% z {{size}}",
     "leadEmpty": "Uruchom skanowanie, aby zobaczyć, gdzie są pliki",
     "scanNoRoots": "Najpierw dodaj monitorowany folder w Ustawieniach",
