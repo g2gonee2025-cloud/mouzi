@@ -201,6 +201,7 @@ pub fn run() {
             set_only_new_cmd,
             show_review_cmd,
             show_folders_cmd,
+            tray::refresh_workspace_title_cmd,
             take_review_request_cmd,
             take_add_folder_request_cmd,
             explorer_integration_cmd,

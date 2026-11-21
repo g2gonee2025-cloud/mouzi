@@ -23,8 +23,8 @@ impl WindowAction {
             Self::Settings => show_settings_window(app),
             Self::WatchedFolders => show_watched_folders_window(app),
             Self::Dashboard => show_dashboard_window(app),
-            Self::Suggestions => show_app_window(app, "/#/suggestions", "suggestions_title"),
-            Self::Cleanup => show_app_window(app, "/#/cleanup", "cleanup_title"),
+            Self::Suggestions => show_app_window(app, "suggestions"),
+            Self::Cleanup => show_app_window(app, "cleanup"),
             Self::Review(paths) => return show_review_window(app, paths),
         }.map_err(|error| error.to_string())
     }
@@ -213,14 +213,38 @@ pub fn location_hash_script(hash: &str) -> String {
     format!("window.location.hash = '{safe}'")
 }
 
+fn workspace_title_key(route: &str) -> &'static str {
+    match route {
+        "settings" => "settings_title",
+        "dashboard" => "dashboard_title",
+        "cleanup" => "cleanup_title",
+        "suggestions" => "suggestions_title",
+        _ => "popup_title",
+    }
+}
+
+#[tauri::command]
+pub(crate) fn refresh_workspace_title_cmd(
+    window: tauri::WebviewWindow,
+    route: &str,
+    language: &str,
+) -> Result<(), String> {
+    if window.label() == "app" {
+        let catalog = TrayI18n::new(language);
+        window.set_title(catalog.get(workspace_title_key(route)))
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
 /// One workspace window for dashboard, cleanup, suggestions, and settings.
 /// The tray popup stays a separate compact flyout.
-/// `url` is a Tauri webview path (`/#/dashboard`); eval uses the fragment only.
-fn show_app_window(app: &AppHandle, url: &str, title_key: &str) -> tauri::Result<()> {
+fn show_app_window(app: &AppHandle, route: &str) -> tauri::Result<()> {
+    let url = format!("/#/{route}");
     let i18n = TrayI18n::new(&tray_lang(app));
-    let title = i18n.get(title_key);
+    let title = i18n.get(workspace_title_key(route));
     if let Some(window) = app.get_webview_window("app") {
-        window.eval(&location_hash_script(url))?;
+        window.eval(&location_hash_script(&url))?;
         window.set_title(title)?;
         window.show()?;
         return window.set_focus();
@@ -245,7 +269,7 @@ pub fn hide_app_window(app: &AppHandle) {
 }
 
 pub fn show_settings_window(app: &AppHandle) -> tauri::Result<()> {
-    show_app_window(app, "/#/settings", "settings_title")
+    show_app_window(app, "settings")
 }
 
 fn show_watched_folders_window(app: &AppHandle) -> tauri::Result<()> {
@@ -258,7 +282,7 @@ fn show_watched_folders_window(app: &AppHandle) -> tauri::Result<()> {
 }
 
 pub fn show_dashboard_window(app: &AppHandle) -> tauri::Result<()> {
-    show_app_window(app, "/#/dashboard", "dashboard_title")
+    show_app_window(app, "dashboard")
 }
 
 fn show_review_window(app: &AppHandle, paths: Vec<String>) -> Result<(), String> {

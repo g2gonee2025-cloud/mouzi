@@ -66,6 +66,13 @@ function App() {
     return () => { disposed = true; };
   }, [settings?.language]);
 
+  const language = settings?.language;
+  useEffect(() => {
+    if (language && getCurrentWindow().label === "app") {
+      void invoke("refresh_workspace_title_cmd", { route: hash, language }).catch(console.error);
+    }
+  }, [hash, language]);
+
   useEffect(() => {
     if (!settings) return;
     applyTheme(settings.theme);

@@ -17,6 +17,12 @@ impl TrayI18n {
                 strings.insert("tooltip_many_pending", "Mouzi – {} 个文件待处理");
                 strings.insert("popup_title", "Mouzi");
                 strings.insert("settings_title", "Mouzi 设置");
+                strings.insert("dashboard", "概览");
+                strings.insert("dashboard_title", "Mouzi 概览");
+                strings.insert("cleanup", "智能清理");
+                strings.insert("cleanup_title", "Mouzi 智能清理");
+                strings.insert("suggestions", "整理建议");
+                strings.insert("suggestions_title", "Mouzi 整理建议");
                 strings.insert("organized", "已整理 {} 个文件");
             }
             "pl" => {
@@ -195,5 +201,21 @@ impl TrayI18n {
 
     pub fn get<'a>(&self, key: &'a str) -> &'a str {
         self.strings.get(key).copied().unwrap_or(key)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TrayI18n;
+
+    #[test]
+    fn every_supported_language_supplies_the_native_menu_and_window_labels() {
+        let english = TrayI18n::new("en");
+        for language in ["de", "es", "fr", "it", "ja", "pl", "ru", "uk", "vi", "zh-CN"] {
+            let translated = TrayI18n::new(language);
+            for key in english.strings.keys() {
+                assert!(translated.strings.contains_key(key), "{language} is missing {key}");
+            }
+        }
     }
 }
