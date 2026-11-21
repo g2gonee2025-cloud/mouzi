@@ -1,4 +1,4 @@
-import { useMemo, useRef } from "react";
+import { useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useCleanupStore } from "../../store/useCleanupStore";
 import {
@@ -7,7 +7,8 @@ import {
 } from "../../utils/format";
 import { fileName, parentDir } from "../../utils/paths";
 import {
-  reclaimableBytes,
+  duplicateCopyCount,
+  DUPLICATE_REVIEW_LIMIT,
   sortGroups,
   buildDuplicateActions,
   resolveKeeper,
@@ -19,31 +20,64 @@ import ConfirmDialog from "./ConfirmDialog";
 import { useCleanupConfirmation } from "./useCleanupConfirmation";
 import UnavailableCleanupRoots from "./UnavailableCleanupRoots";
 
+const GROUPS_PER_PAGE = 12;
+const COPIES_PER_PAGE = 25;
+
+interface DuplicatePages {
+  results: DuplicateGroup[] | null;
+  groupPage: number;
+  copyPages: Record<string, number>;
+}
+
 export default function DuplicatesTab() {
   const { t } = useTranslation();
   const store = useCleanupStore();
   const selected = store.duplicateKeepers;
+  const victims = store.duplicateVictims;
   const receipt = store.receipts.trash_duplicate;
   const { pending, reviewNeedsSearch, clearReviewNotice, openReview } = useCleanupConfirmation();
   const findButton = useRef<HTMLButtonElement>(null);
   const resultsHeading = useRef<HTMLHeadingElement>(null);
+  const [savedPages, setPages] = useState<DuplicatePages>({ results: null, groupPage: 0, copyPages: {} });
 
   const groups = useMemo(
     () => (store.duplicates ? sortGroups(store.duplicates) : []),
     [store.duplicates],
   );
-  const reclaimable = useMemo(() => reclaimableBytes(groups), [groups]);
   const unavailableRoots = store.duplicates && store.unavailableRoots.duplicates;
+  const copyCount = useMemo(() => duplicateCopyCount(groups), [groups]);
+  const pages = savedPages.results === store.duplicates
+    ? savedPages
+    : { results: store.duplicates, groupPage: 0, copyPages: {} };
+  const groupPages = Math.ceil(groups.length / GROUPS_PER_PAGE);
+  const visibleGroups = groups.slice(pages.groupPage * GROUPS_PER_PAGE, (pages.groupPage + 1) * GROUPS_PER_PAGE);
+  const locked = store.busy || !!store.preparedPlan;
 
-  // The button count and the card badges are both derived from this, so what
-  // the user is told they are about to delete is what actually gets sent.
   const actions = useMemo(
-    () => buildDuplicateActions(groups, selected),
-    [groups, selected],
+    () => buildDuplicateActions(groups, selected, victims),
+    [groups, selected, victims],
   );
+  const selection = useMemo(() => {
+    const paths = new Set(actions.map(({ path }) => path));
+    const byGroup = new Map<string, { count: number; bytes: number }>();
+    let bytes = 0;
+    if (paths.size) {
+      for (const group of groups) {
+        let count = 0;
+        let groupBytes = 0;
+        for (const file of group.files) {
+          if (!paths.has(file.path)) continue;
+          count++;
+          groupBytes += file.size;
+        }
+        if (count) byGroup.set(group.hash, { count, bytes: groupBytes });
+        bytes += groupBytes;
+      }
+    }
+    return { paths, byGroup, bytes };
+  }, [actions, groups]);
+  const atLimit = actions.length >= DUPLICATE_REVIEW_LIMIT;
 
-  // Summed off `actions`, never off `reclaimableBytes(groups)`: if the two ever
-  // disagreed the dialog would quote one number and the backend act on another.
   const handleFind = () => {
     clearReviewNotice();
     return store.findDuplicates();
@@ -51,7 +85,8 @@ export default function DuplicatesTab() {
 
   const handleConfirm = async (opener: HTMLButtonElement) => {
     const current = useCleanupStore.getState();
-    if (actions.length === 0 || current.duplicates !== store.duplicates || current.duplicateKeepers !== selected) return;
+    if (actions.length === 0 || actions.length > DUPLICATE_REVIEW_LIMIT || current.duplicates !== store.duplicates
+        || current.duplicateKeepers !== selected || current.duplicateVictims !== victims) return;
     await openReview(actions, {
       title: t("confirm.op.trashDuplicates"),
       notice: "trash",
@@ -109,32 +144,57 @@ export default function DuplicatesTab() {
 
       {groups.length > 0 && (
         <>
-          <div className="flex items-center justify-between px-1">
-            <span className="text-xs text-text-muted">
-              {groups.length} {t("cleanup.groupCount")} &middot;{" "}
-              {t("cleanup.reclaimable", { size: formatBytes(reclaimable) })}
-            </span>
-            <button
-              onClick={(event) => void handleConfirm(event.currentTarget)}
-              disabled={store.busy || actions.length === 0}
-              className="flex items-center gap-1.5 rounded-md bg-red-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-red-700 disabled:opacity-50 transition-colors"
-            >
-              <Trash2 size={14} />
-              {store.busy
-                ? t("app.loading")
-                : t("cleanup.confirm", {
-                    count: actions.length,
-                  })}
-            </button>
+          <div className="flex flex-wrap items-center justify-between gap-2 px-1">
+            <div className="text-xs text-text-muted">
+              <span>{groups.length} {t("cleanup.groupCount")} &middot;{" "}</span>
+              <span aria-live="polite">{t("cleanup.duplicateSelection", { count: actions.length, size: formatBytes(selection.bytes) })}</span>
+              {copyCount > DUPLICATE_REVIEW_LIMIT && (
+                <p>{t("cleanup.duplicateSelectionLimit", { limit: DUPLICATE_REVIEW_LIMIT.toLocaleString() })}</p>
+              )}
+            </div>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => store.clearDuplicateVictims(store.duplicates)}
+                disabled={locked || actions.length === 0}
+                className="rounded-md px-2 py-1.5 text-xs text-text-muted hover:bg-border disabled:opacity-50"
+              >
+                {t("beta.clearSelection")}
+              </button>
+              <button
+                type="button"
+                onClick={(event) => void handleConfirm(event.currentTarget)}
+                disabled={locked || actions.length === 0 || actions.length > DUPLICATE_REVIEW_LIMIT}
+                className="flex items-center gap-1.5 rounded-md bg-red-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-red-700 disabled:opacity-50 transition-colors"
+              >
+                <Trash2 size={14} />
+                {store.busy ? t("app.loading") : t("cleanup.confirm", { count: actions.length })}
+              </button>
+            </div>
           </div>
 
+          {groupPages > 1 && (
+            <DuplicatePageNavigation
+              label={t("cleanup.duplicateGroupPages")}
+              page={pages.groupPage}
+              pages={groupPages}
+              onPage={(groupPage) => setPages({ ...pages, groupPage })}
+            />
+          )}
           <div className="space-y-2">
-            {groups.map((g) => (
+            {visibleGroups.map((g) => (
               <DuplicateGroupCard
                 key={g.hash}
                 group={g}
                 keepPath={resolveKeeper(g, selected)}
+                chosen={selection.paths}
+                amount={selection.byGroup.get(g.hash)}
+                locked={locked}
+                atLimit={atLimit}
+                page={pages.copyPages[g.hash] ?? 0}
+                onPage={(page) => setPages({ ...pages, copyPages: { ...pages.copyPages, [g.hash]: page } })}
                 onKeep={(path) => store.keepDuplicate(g, path)}
+                onChoose={(path) => store.toggleDuplicateVictim(g, path)}
               />
             ))}
           </div>
@@ -149,14 +209,30 @@ export default function DuplicatesTab() {
 function DuplicateGroupCard({
   group,
   keepPath,
+  chosen,
+  amount,
+  locked,
+  atLimit,
+  page,
+  onPage,
   onKeep,
+  onChoose,
 }: {
   group: DuplicateGroup;
   keepPath: string | undefined;
+  chosen: ReadonlySet<string>;
+  amount?: { count: number; bytes: number };
+  locked: boolean;
+  atLimit: boolean;
+  page: number;
+  onPage: (page: number) => void;
   onKeep: (path: string) => void;
+  onChoose: (path: string) => void;
 }) {
   const { t } = useTranslation();
   const hashShort = group.hash.slice(0, 12);
+  const copyPages = Math.ceil(group.files.length / COPIES_PER_PAGE);
+  const visibleFiles = group.files.slice(page * COPIES_PER_PAGE, (page + 1) * COPIES_PER_PAGE);
 
   return (
     <div className="rounded-lg border border-border bg-surface-dark p-3">
@@ -167,13 +243,17 @@ function DuplicateGroupCard({
         <span className="text-xs text-text-muted">
           {formatBytes(group.files[0].size)} &times; {group.files.length}
         </span>
-        <span className="text-xs text-red-500 ml-auto">
-          -{formatBytes(group.files[0].size * (group.files.length - 1))}
+        <span className="text-xs text-text-muted ml-auto">
+          {t("cleanup.duplicateSelection", { count: amount?.count ?? 0, size: formatBytes(amount?.bytes ?? 0) })}
         </span>
       </div>
+      {copyPages > 1 && (
+        <DuplicatePageNavigation label={t("cleanup.duplicateCopyPages")} page={page} pages={copyPages} onPage={onPage} />
+      )}
       <div className="space-y-1">
-        {group.files.map((f) => {
+        {visibleFiles.map((f) => {
           const isKept = f.path === keepPath;
+          const isChosen = chosen.has(f.path);
           return (
             <div
               key={f.path}
@@ -183,10 +263,19 @@ function DuplicateGroupCard({
                   : "hover:bg-surface"
               }`}
             >
+              <input
+                type="checkbox"
+                aria-label={t("cleanup.duplicateSelectFile", { path: f.path })}
+                checked={isChosen}
+                disabled={locked || isKept || (atLimit && !isChosen)}
+                onChange={() => onChoose(f.path)}
+                className="shrink-0 rounded border-border"
+              />
               <button
                 type="button"
                 aria-label={t("cleanup.keepFile", { path: f.path })}
                 aria-pressed={isKept}
+                disabled={locked}
                 onClick={() => onKeep(f.path)}
                 className={`shrink-0 w-4 h-4 rounded-full border-2 flex items-center justify-center transition-colors ${
                   isKept
@@ -213,5 +302,46 @@ function DuplicateGroupCard({
         })}
       </div>
     </div>
+  );
+}
+
+function DuplicatePageNavigation({ label, page, pages, onPage }: {
+  label: string;
+  page: number;
+  pages: number;
+  onPage: (page: number) => void;
+}) {
+  const { t } = useTranslation();
+  const buttonClass = "rounded-md px-2 py-1 hover:bg-border disabled:opacity-50";
+  return (
+    <form
+      aria-label={label}
+      className="flex flex-wrap items-center gap-2 px-1 py-1 text-xs text-text-muted"
+      onSubmit={(event) => {
+        event.preventDefault();
+        const target = Number(new FormData(event.currentTarget).get("page"));
+        if (Number.isInteger(target) && target >= 1 && target <= pages) onPage(target - 1);
+      }}
+    >
+      <button type="button" className={buttonClass} disabled={page === 0} onClick={() => onPage(page - 1)}>
+        {t("common.previousPage")}
+      </button>
+      <input
+        key={page}
+        name="page"
+        type="number"
+        aria-label={t("common.pageNumber")}
+        min={1}
+        max={pages}
+        defaultValue={page + 1}
+        required
+        className="w-20 rounded border border-border bg-surface px-2 py-1"
+      />
+      <span>{t("common.pageCount", { total: pages })}</span>
+      <button type="submit" className={buttonClass}>{t("common.goToPage")}</button>
+      <button type="button" className={buttonClass} disabled={page + 1 >= pages} onClick={() => onPage(page + 1)}>
+        {t("common.nextPage")}
+      </button>
+    </form>
   );
 }

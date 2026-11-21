@@ -2,6 +2,7 @@ import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { createPreviewSlot } from "./previewRequest";
+import { buildDuplicateActions, duplicateCopyCount, DUPLICATE_REVIEW_LIMIT, resolveKeeper } from "../utils/cleanup";
 import type { DuplicateGroup, CleanupFile, CleanupRequest, CleanupOutcome, CleanupPlan } from "../utils/cleanup";
 
 export interface CleanupLogEntry {
@@ -39,6 +40,7 @@ interface CleanupState {
   inventoryReady: boolean | null;
   duplicates: DuplicateGroup[] | null;
   duplicateKeepers: Record<string, string>;
+  duplicateVictims: ReadonlySet<string> | null;
   largeFiles: { files: CleanupFile[] | null; minBytes: number } | null;
   staleFiles: { files: CleanupFile[] | null; days: number } | null;
   emptyDirs: string[] | null;
@@ -54,6 +56,8 @@ interface CleanupState {
   historyError: string | null;
   findDuplicates: () => Promise<void>;
   keepDuplicate: (group: DuplicateGroup, path: string) => void;
+  toggleDuplicateVictim: (group: DuplicateGroup, path: string) => void;
+  clearDuplicateVictims: (groups: DuplicateGroup[] | null) => void;
   findLargeFiles: (minBytes: number) => Promise<void>;
   findStaleFiles: (days: number) => Promise<void>;
   findEmptyDirs: () => Promise<void>;
@@ -71,9 +75,9 @@ interface CleanupState {
 let candidatesGeneration = 0;
 let historyGeneration = 0;
 const HISTORY_PAGE_SIZE = 100;
-const emptyCandidates = { duplicates: null, duplicateKeepers: {}, largeFiles: null, staleFiles: null, emptyDirs: null };
+const emptyCandidates = { duplicates: null, duplicateKeepers: {}, duplicateVictims: null, largeFiles: null, staleFiles: null, emptyDirs: null };
 const inventoryEvents = ["scan-complete", "scan-finished", "folders-changed", "mutation-completed"];
-type FinderKey = keyof typeof emptyCandidates;
+type FinderKey = "duplicates" | "largeFiles" | "staleFiles" | "emptyDirs";
 type FinderResult<Candidates> = { candidates: Candidates; unavailableRoots: string[] };
 
 function keepersIn(groups: DuplicateGroup[], choices: Record<string, string>): Record<string, string> {
@@ -137,7 +141,7 @@ export const useCleanupStore = create<CleanupState>((set, get) => {
       loading: true,
       error: null,
       [key]: waiting ?? null,
-      ...(key === "duplicates" && { duplicateKeepers: {} }),
+      ...(key === "duplicates" && { duplicateKeepers: {}, duplicateVictims: null }),
       unavailableRoots: { ...state.unavailableRoots, [key]: [] },
     }));
     try {
@@ -169,7 +173,26 @@ export const useCleanupStore = create<CleanupState>((set, get) => {
     findDuplicates: () => find("duplicates", () => requestCandidates<DuplicateGroup>("find_duplicates_cmd")),
     keepDuplicate: (group, path) => set((state) => {
       if (!state.duplicates?.includes(group) || !group.files.some((file) => file.path === path)) return state;
-      return { duplicateKeepers: { ...state.duplicateKeepers, [group.hash]: path } };
+      const duplicateKeepers = { ...state.duplicateKeepers, [group.hash]: path };
+      if (!state.duplicateVictims?.has(path)) return { duplicateKeepers };
+      const duplicateVictims = new Set(state.duplicateVictims);
+      duplicateVictims.delete(path);
+      return { duplicateKeepers, duplicateVictims };
+    }),
+    toggleDuplicateVictim: (group, path) => set((state) => {
+      const { duplicates, duplicateKeepers, duplicateVictims } = state;
+      if (!duplicates?.includes(group) || path === resolveKeeper(group, duplicateKeepers)
+          || !group.files.some((file) => file.path === path)) return state;
+      const selected = new Set(duplicateVictims ?? buildDuplicateActions(duplicates, duplicateKeepers).map((action) => action.path));
+      if (!selected.delete(path)) {
+        if (selected.size >= DUPLICATE_REVIEW_LIMIT) return state;
+        selected.add(path);
+      }
+      return { duplicateVictims: selected };
+    }),
+    clearDuplicateVictims: (groups) => set((state) => {
+      if (!groups || state.duplicates !== groups) return state;
+      return { duplicateVictims: new Set() };
     }),
     findLargeFiles: (minBytes) => find("largeFiles", async () => {
       const { candidates: files, unavailableRoots } = await requestCandidates<CleanupFile>("find_large_files_cmd", { minBytes });
@@ -227,13 +250,24 @@ export const useCleanupStore = create<CleanupState>((set, get) => {
         const results = await invoke<CleanupOutcome[]>("execute_cleanup_cmd", { planId });
         const removed = new Set(results.filter((r) => r.status === "ok" || r.status === "permanently_deleted").map((r) => r.path));
         set((state) => {
-          const duplicates = state.duplicates?.map((group) => ({
+          const duplicates = removed.size === 0 ? state.duplicates : state.duplicates?.map((group) => ({
             ...group, files: group.files.filter((file) => !removed.has(file.path)),
           })).filter((group) => group.files.length > 1) ?? null;
+          const duplicateKeepers = keepersIn(duplicates ?? [], state.duplicateKeepers);
+          let duplicateVictims = state.duplicateVictims;
+          if (duplicates !== state.duplicates) {
+            if (duplicateVictims !== null) {
+              duplicateVictims = new Set(buildDuplicateActions(duplicates ?? [], duplicateKeepers, duplicateVictims)
+                .map((action) => action.path));
+            } else if (duplicateCopyCount(state.duplicates ?? []) > DUPLICATE_REVIEW_LIMIT) {
+              duplicateVictims = new Set();
+            }
+          }
           return {
             receipts: { ...state.receipts, [kind]: { planId, outcomes: results, error: null } },
             duplicates,
-            duplicateKeepers: keepersIn(duplicates ?? [], state.duplicateKeepers),
+            duplicateKeepers,
+            duplicateVictims,
             largeFiles: state.largeFiles && {
               ...state.largeFiles,
               files: state.largeFiles.files?.filter((file) => !removed.has(file.path)) ?? null,
@@ -281,6 +315,7 @@ export const useCleanupStore = create<CleanupState>((set, get) => {
         return {
           duplicates: null,
           duplicateKeepers: {},
+          duplicateVictims: null,
           largeFiles: largeFiles && { minBytes: largeFiles.minBytes, files: null },
           staleFiles: staleFiles && { days: staleFiles.days, files: null },
           unavailableRoots: emptyDirs === undefined ? {} : { emptyDirs },

@@ -12,6 +12,12 @@ export interface DuplicateGroup {
   files: DuplicateFile[];
 }
 
+export const DUPLICATE_REVIEW_LIMIT = 10_000;
+
+export function duplicateCopyCount(groups: readonly DuplicateGroup[]): number {
+  return groups.reduce((total, group) => total + Math.max(0, group.files.length - 1), 0);
+}
+
 export interface CleanupFile {
   path: string;
   size: number;
@@ -191,11 +197,9 @@ export function reclaimableBytes(groups: DuplicateGroup[]): number {
 
 /** Sort duplicate groups by reclaimable bytes descending. */
 export function sortGroups(groups: DuplicateGroup[]): DuplicateGroup[] {
-  return [...groups].sort((a, b) => {
-    const ra = a.files.slice(1).reduce((s, f) => s + f.size, 0);
-    const rb = b.files.slice(1).reduce((s, f) => s + f.size, 0);
-    return rb - ra;
-  });
+  return groups.map((group) => ({ group, bytes: reclaimableBytes([group]) }))
+    .sort((a, b) => b.bytes - a.bytes)
+    .map(({ group }) => group);
 }
 
 /** The copy a group keeps when the user has not chosen one explicitly. */
@@ -229,14 +233,16 @@ export function resolveKeeper(
 export function buildDuplicateActions(
   groups: DuplicateGroup[],
   keptByGroup: Readonly<Record<string, string | undefined>>,
+  selected: ReadonlySet<string> | null = null,
 ): CleanupRequest[] {
+  if (selected === null && duplicateCopyCount(groups) > DUPLICATE_REVIEW_LIMIT) return [];
   const actions: CleanupRequest[] = [];
   for (const g of groups) {
     const keepPath = resolveKeeper(g, keptByGroup);
     // No copy to keep means there is nothing safe to do for this group.
     if (keepPath === undefined) continue;
     for (const f of g.files) {
-      if (f.path !== keepPath) {
+      if (f.path !== keepPath && (selected === null || selected.has(f.path))) {
         actions.push({ kind: "trash_duplicate", path: f.path, keepPath });
       }
     }
