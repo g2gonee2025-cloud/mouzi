@@ -27,7 +27,9 @@ Rules can apply to all watched folders or to one folder. Conditions include exte
 
 Automatic and scheduled organization respect the grace period (300 seconds by default) and a minimum two-second settling interval. Explicit manual cleaning/import sorting bypasses the age grace period. Transient locks are retried with bounded backoff; exhausted retries require a later event or explicit action. Already filed outputs and queued work invalidated by Undo are skipped.
 
-A folder's `.mouziignore` supports exact names, directory names ending in `/`, and `*` wildcards. Missing protection files mean no extra patterns; unreadable protection files pause work with an error. Hidden/system and temporary download files are also skipped by the organizer.
+A folder's `.mouziignore` is a UTF-8 file and can begin with a byte-order mark. It supports exact names, directory names ending in `/`, and `*` wildcards. A missing file adds no exclusions. An unreadable file pauses work with an error. The organizer also skips hidden, system, and temporary download files.
+
+In **Settings → Ignore**, each watched folder keeps its own draft while you switch folders or visit another Settings tab. Choose **Save .mouziignore** to write that folder's changes, including a pattern still in the text box.
 
 ## Storage dashboard
 
