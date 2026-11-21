@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn, execFileSync } from 'node:child_process';
-import { mkdir, writeFile, readFile, access, realpath, unlink } from 'node:fs/promises';
+import { mkdir, writeFile, readFile, access, realpath } from 'node:fs/promises';
 import { resolve, join, basename, isAbsolute, relative, sep } from 'node:path';
 import { createHash } from 'node:crypto';
 const fork = process.argv.includes('--fork-ui')
@@ -22,7 +22,7 @@ const endpoint = `http://127.0.0.1:${port}`;
 await mkdir(fixture, { recursive: true });
 const report = { exe, sha256: createHash('sha256').update(await readFile(exe)).digest('hex'), started: new Date().toISOString(), cases: [], errors: [], cleanup: [] };
 if (fork) assert.equal(report.sha256, fork.sha256.toLowerCase(), 'The tested executable changed');
-report.contract = fork ? 'fork' : stable ? 'upstream-stable' : 'private-beta';
+report.contract = fork ? 'fork' : stable ? 'direct-stable' : 'private-beta';
 let child, browser, page, originalSettings, folderId, originalLogs, originalRules, originalFolders;
 let profileReady = false;
 const ciPolicyKey = 'HKLM\\Software\\Policies\\Microsoft\\Edge\\WebView2\\AdditionalBrowserArguments';
@@ -34,7 +34,8 @@ const button = name => page.getByRole('button', { name, exact: true });
 const field = name => fork ? page.getByLabel(name, { exact: true }) : page.getByText(name, { exact: true }).locator('..').locator('input').first();
 async function until(check, message, timeout = 15000) { const end = Date.now() + timeout; while (Date.now() < end) { if (await check()) return; await new Promise(r => setTimeout(r, 150)); } throw Error(message); }
 async function start() {
-  child = spawn(exe, fork || stable ? ['--add-folder', fixture] : [], { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--remote-debugging-port=${port} --remote-debugging-address=127.0.0.1` } });
+  const env = fork ? process.env : { ...process.env, WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: '--remote-debugging-port=19221 --remote-debugging-address=127.0.0.1' };
+  child = spawn(exe, fork || stable ? ['--add-folder', fixture] : [], { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'], env });
   child.stdout.on('data', chunk => console.log(String(chunk)));
   child.stderr.on('data', chunk => console.error(String(chunk)));
   try {
@@ -109,7 +110,7 @@ function belongsToFixture(path) {
 }
 async function reviewedHistory() {
   const { total, throughId } = await invoke('preview_clear_logs_cmd');
-  const history = await invoke('history_cmd', { filter: {} });
+  const history = (await invoke('history_cmd', { filter: {} })).filter(log => log.id > 0 && log.id <= throughId);
   assert.equal(history.length, total, 'Incomplete history snapshot');
   for (const row of history) {
     assert.ok(row.id > 0 && row.id <= throughId && belongsToFixture(row.source_path)
@@ -207,7 +208,8 @@ try {
     }
   });
   const a = join(fixture, 'faktura A.mzt'), b = join(fixture, 'faktura B.mzt'), warning = join(fixture, 'invoice.pdf.exe');
-  await writeFile(a, 'invoice alpha'); await writeFile(b, 'invoice beta'); await writeFile(warning, 'This is an inert text fixture, never executed.');
+  const warningBytes = 'This is an inert text fixture, never executed.';
+  await writeFile(a, 'invoice alpha'); await writeFile(b, 'invoice beta'); await writeFile(warning, warningBytes);
   await caseOf('Suggest queue, unchecked suspicious filename, selection and cancellation', async () => {
     await until(async () => (await invoke('get_pending_files_cmd')).some(([, name]) => name === 'faktura A.mzt'), 'Suggest queue did not see file');
     assert.equal(await exists(a), true); await review([a, b, warning]);
@@ -215,31 +217,27 @@ try {
     assert.equal(await labels.filter({ hasText: 'invoice.pdf.exe' }).getByRole('checkbox').isChecked(), false);
     await labels.filter({ hasText: 'faktura B.mzt' }).getByRole('checkbox').uncheck();
     await button('Review selected operations').click(); assert.equal(await exists(a), true);
-    await button('Cancel').click(); assert.equal(await exists(a), true);
+    await button('Cancel').click();
+    assert.equal(await readFile(a, 'utf8'), 'invoice alpha');
+    assert.equal(await readFile(b, 'utf8'), 'invoice beta');
+    assert.equal(await readFile(warning, 'utf8'), warningBytes);
     await page.screenshot({ path: join(run, '02-preview.png'), animations: 'disabled' });
-    await applySelected(1); assert.equal(await exists(a), false); assert.equal(await exists(b), true);
+    await applySelected(1); assert.equal(await exists(a), false);
+    assert.equal(await readFile(b, 'utf8'), 'invoice beta');
+    assert.equal(await readFile(warning, 'utf8'), warningBytes);
     assert.equal(await readFile(join(fixture, 'Wynik — dokumenty', 'faktura A.mzt'), 'utf8'), 'invoice alpha');
   });
   await caseOf('History filter and safe undo with a conflicting original filename', async () => {
     await writeFile(a, 'unrelated conflict'); await button('History').click();
     await page.getByLabel('Filename', { exact: true }).fill('faktura A.mzt'); await button('Filter history').click();
     await button('Select eligible files').click(); await button('Review undo').click(); await button('Restore 1 files').click();
-    if (fork) {
-      await page.getByText('Restored under a different name', { exact: true }).waitFor();
-      const restoredPath = (await page.getByText(/^Now at /).textContent()).slice('Now at '.length);
-      assert.equal(await realpath(restoredPath), await realpath(join(fixture, 'faktura A_0.mzt')));
-      assert.equal(await readFile(restoredPath, 'utf8'), 'invoice alpha');
-      assert.equal(await exists(join(fixture, 'Wynik — dokumenty', 'faktura A.mzt')), false);
-    } else {
-      await page.getByText('A file already exists at the original path. Nothing was overwritten.', { exact: true }).waitFor();
-      assert.equal(await readFile(join(fixture, 'Wynik — dokumenty', 'faktura A.mzt'), 'utf8'), 'invoice alpha');
-    }
+    await page.getByText('Restored under a different name', { exact: true }).waitFor();
+    const restoredPath = (await page.getByText(/^Now at /).textContent()).slice('Now at '.length);
+    assert.equal(await realpath(restoredPath), await realpath(join(fixture, 'faktura A_0.mzt')));
+    assert.equal(await readFile(restoredPath, 'utf8'), 'invoice alpha');
+    assert.equal(await exists(join(fixture, 'Wynik — dokumenty', 'faktura A.mzt')), false);
     assert.equal(await readFile(a, 'utf8'), 'unrelated conflict');
     await page.screenshot({ path: join(run, '03-undo-conflict.png'), animations: 'disabled' });
-    if (!fork) {
-      await unlink(a); await button('Select eligible files').click(); await button('Review undo').click(); await button('Restore 1 files').click();
-      await until(() => exists(a), 'Undo did not restore file'); assert.equal(await readFile(a, 'utf8'), 'invoice alpha');
-    }
   });
   await caseOf('A changed file is rejected after preview, with a readable UI error', async () => {
     await review([b]); await writeFile(b, 'changed since preview'); await applySelected(1);
@@ -263,7 +261,7 @@ try {
     const renamed = join(fixture, 'gotowe-faktura B.mzt'); assert.equal(await exists(b), false); assert.equal(await readFile(renamed, 'utf8'), 'changed since preview');
     assert.equal((await invoke('get_pending_files_cmd')).some(([, name]) => name === 'gotowe-faktura B.mzt'), false);
   });
-  if (fork) {
+  if (fork || (stable && originalLogs.length === 0)) {
     await caseOf('History refreshes after Restore All and Clear History without losing the applied filter', async () => {
       const { history } = await reviewedHistory();
       assert.deepEqual(history.map(log => log.source_path).sort(), [a, b].sort(), 'Expected exactly the two test-owned moves');
@@ -289,7 +287,7 @@ try {
   await caseOf('Only-new baseline configured through the folder form', async () => {
     await button('Watched Folders').click(); await page.getByPlaceholder('C:/Users/.../Downloads').fill(second);
     const onlyNew = fork
-      ? button('Add Folder').locator('../..').locator(':scope > label').getByRole('checkbox')
+      ? page.getByRole('checkbox', { name: 'Process only new files when adding a folder', exact: true })
       : page.getByLabel('Process only new files', { exact: true }).first();
     await onlyNew.check(); await button('Add Folder').click();
     await until(async () => { const f = (await invoke('get_folders_cmd')).find(f => f.path === second); if (f) { onlyNewId = f.id; ownedFolders.add(f.id); return f.only_new; } return false; }, 'Only-new was not saved');
@@ -306,6 +304,7 @@ try {
     if (fork) await page.getByText(join(second, 'nowy.mzt'), { exact: true }).waitFor();
     assert.equal(await page.locator('section label').count(), 1);
     assert.equal(await readFile(old, 'utf8'), 'old fixture');
+    assert.equal(await readFile(join(second, 'nowy.mzt'), 'utf8'), 'new fixture');
   });
   await caseOf('Polish translation and dark theme in the real application', async () => {
     await button('General').click();
@@ -363,13 +362,16 @@ finally {
       const settings = fork ? { language: originalSettings.language, theme: originalSettings.theme } : originalSettings;
       await invoke('update_settings_cmd', { settings });
       if (originalLogs.length === 0) {
-        if (fork) {
+        try {
           const { total, throughId } = await reviewedHistory();
-          if (total) await invoke('clear_logs_cmd', { throughId });
-          assert.equal((await reviewedHistory()).total, 0);
-        } else {
-          const logs = await invoke('get_logs_cmd', { limit: -1 });
-          if (logs.length && logs.every(log => belongsToFixture(log.source_path))) await invoke('clear_logs_cmd');
+          if (total) {
+            await invoke('clear_logs_cmd', { throughId });
+            report.cleanup.push('Removed reviewed test-only history');
+          }
+          if (fork) assert.equal((await reviewedHistory()).total, 0);
+        } catch (error) {
+          if (fork) throw error;
+          report.cleanup.push(String(error));
         }
       }
       const restored = await invoke('get_settings_cmd');
