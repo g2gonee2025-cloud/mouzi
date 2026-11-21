@@ -1101,6 +1101,97 @@ mod tests {
         }
     }
 
+    fn save_grace_period(seconds: i64) {
+        let saved = crate::db::update_preferences(&crate::db::PreferencesPatch {
+            grace_period_seconds: Some(seconds), ..Default::default()
+        }).unwrap();
+        assert_eq!(saved.grace_period_seconds, seconds);
+    }
+
+    fn with_queued_grace_fixture(
+        initial_grace: i64,
+        age: Duration,
+        check: impl FnOnce(&FolderWatcher, &Path, &Path, Instant),
+    ) {
+        use crate::db::{self, FOLDER_MODE_SILENT};
+        use std::fs;
+
+        let _serial = db::serialise_test_db();
+        db::init_test_db();
+        let mut fixture = RecoveryFixture::new();
+        let root_path = fs::canonicalize(fixture.root()).unwrap();
+        let folder = db::register_watched_folder(root_path.to_str().unwrap(), FOLDER_MODE_SILENT, false).unwrap();
+        fixture.id = Some(folder);
+        let rule = db::add_rule(&db::Rule {
+            name: "Silent grace fixture".into(), priority: i32::MIN, enabled: true,
+            extensions: vec!["mouziwatchgrace".into()], destination: "Filed".into(),
+            action: "move".into(), folder_id: folder, ..db::Rule::default()
+        }).unwrap();
+        let source = root_path.join("report.mouziwatchgrace");
+        let destination = root_path.join("Filed").join(source.file_name().unwrap());
+        struct Restore<'a> { rule: i64, grace: i64, source: &'a Path, destination: &'a Path }
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                use crate::db;
+                if let Ok(conn) = db::lock_db() {
+                    let source = self.source.to_str().unwrap();
+                    let destination = self.destination.to_str().unwrap();
+                    let _ = conn.execute("DELETE FROM action_logs WHERE source_path=?1", [source]);
+                    let _ = conn.execute("DELETE FROM operation_intents WHERE source_path=?1", [source]);
+                    let _ = conn.execute("DELETE FROM processed_files WHERE path IN (?1,?2)", [source, destination]);
+                }
+                let _ = db::delete_rule(self.rule);
+                let _ = db::update_preferences(&db::PreferencesPatch {
+                    grace_period_seconds: Some(self.grace), ..Default::default()
+                });
+            }
+        }
+        let _restore = Restore { rule, grace: get_settings().unwrap().grace_period_seconds, source: &source, destination: &destination };
+        save_grace_period(initial_grace);
+        fs::write(&source, b"Silent grace fixture").unwrap();
+        fs::OpenOptions::new().write(true).open(&source).unwrap()
+            .set_modified(SystemTime::now() - age).unwrap();
+        let settings = get_watched_folders().unwrap().into_iter().find(|entry| entry.id == Some(folder)).unwrap();
+        let root = Arc::new(WatchedRoot::capture_unattended(&settings, false).unwrap());
+        let suppression = Arc::new(SuppressionSet::new());
+        let watcher = FolderWatcher::new(suppression.clone());
+        enqueue_path(&source, EnqueueSource::Notification, &root, &watcher.pending,
+            &watcher.pending_manual, &suppression, None).unwrap();
+        assert_eq!(watcher.pending.lock().unwrap().len(), 1);
+        check(&watcher, &source, &destination, Instant::now());
+    }
+
+    #[test]
+    fn changed_silent_grace_preserves_a_file_past_the_failure_retry_budget() {
+        with_queued_grace_fixture(10, Duration::ZERO, |watcher, source, destination, queued| {
+            save_grace_period(360);
+            for second in [11, 15, 23, 39, 71, 131, 191, 251, 311, 330] {
+                assert_eq!(watcher.tick(queued + Duration::from_secs(second)).organized, 0);
+            }
+            let pending = watcher.pending.lock().unwrap();
+            assert_eq!(pending.len(), 1, "the unchanged file still has time left to settle");
+            assert_eq!(pending[0].attempts, 0, "waiting for grace does not spend failure retries");
+            assert_eq!(std::fs::read(source).unwrap(), b"Silent grace fixture");
+            assert!(!destination.exists());
+        });
+    }
+
+    #[test]
+    fn changed_silent_grace_moves_a_queued_file_on_the_shorter_deadline() {
+        with_queued_grace_fixture(10, Duration::from_secs(20), |watcher, source, destination, queued| {
+            save_grace_period(0);
+            assert_eq!(watcher.tick(queued + Duration::from_secs(1)).organized, 0);
+            assert!(source.is_file(), "the two-second minimum still applies");
+            let identity = crate::safe_fs::file_identity(source).unwrap();
+            let shortened = queued + Duration::from_secs(3);
+            assert_eq!(watcher.tick(shortened).organized, 1, "the current grace applies to queued work");
+            assert!(!source.exists());
+            assert_eq!(std::fs::read(destination).unwrap(), b"Silent grace fixture");
+            assert_eq!(crate::safe_fs::file_identity(destination).unwrap(), identity);
+            assert_eq!(watcher.tick(shortened + Duration::from_secs(10)).organized, 0);
+        });
+    }
+
     #[test]
     fn switching_to_silent_keeps_live_manual_work_without_reviving_cancelled_tickets() {
         use crate::db::{self, FOLDER_MODE_MANUAL, FOLDER_MODE_SILENT};
