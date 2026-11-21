@@ -231,6 +231,24 @@ mod tests {
     }
 
     #[test]
+    fn loads_utf8_ignore_files_with_a_signature() {
+        let folder = temporary_folder();
+        let file = folder.join(IGNORE_FILE);
+        let read = |document: &str| {
+            fs::write(&file, document).unwrap();
+            load_mouziignore(folder.to_str().unwrap()).unwrap()
+        };
+        let ordinary = read("résumé*.pdf\r\nlater\u{feff}name.txt\r\n");
+        let marked = read("\u{feff}résumé*.pdf\r\nlater\u{feff}name.txt\r\n");
+        let first_comment = read("\u{feff}# local notes\r\n*.draft\r\n");
+        fs::remove_dir_all(folder).unwrap();
+
+        assert_eq!(ordinary, ["résumé*.pdf", "later\u{feff}name.txt"]);
+        assert_eq!(marked, ordinary);
+        assert_eq!(first_comment, ["*.draft"]);
+    }
+
+    #[test]
     fn loads_inline_comments_and_escaped_hashes() {
         let folder = temporary_folder();
         fs::write(
