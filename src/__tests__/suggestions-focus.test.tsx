@@ -144,6 +144,56 @@ it("retains a committed receipt and its mutation error through a later lookup fa
   expect(recovered).toContain("A mutation could not be recorded");
 });
 
+it("labels mixed accept receipts with each actual outcome and shows each reason once", async () => {
+  const extra = (name: string): Suggestion => ({
+    ...invoice, path: `C:/Fixture/${name}.unrecognized`, filename: `${name}.unrecognized`,
+  });
+  const refused = extra("refused");
+  const filed = extra("already-filed");
+  const missing = extra("missing");
+  const selected = [invoice, receipt, refused, filed, missing];
+  const actual = "C:/Filed/actual-invoice.unrecognized";
+  const movedWarning = "File moved; future rule was not created";
+  const retainedWarning = "Output retained; inspect both locations";
+  const moveFailure = "Move refused before publication";
+  const distinctError = "Could not write the separate dismissal";
+  const store = useSuggestionsStore.getState();
+  mocks.invoke.mockResolvedValueOnce({ suggestions: selected, localAiStatus: null });
+  await store.loadSuggestions();
+  mocks.invoke.mockResolvedValueOnce("fixture-preparation").mockResolvedValueOnce(selected.map((card, i) => ({
+    planId: `fixture-${i}`, path: card.path, category: card.suggestedCategory,
+    destination: `C:/Proposed/${card.filename}`, size: 1, rule: null,
+  })));
+  const reviewed = await store.prepareSuggestions(selected, true);
+  mocks.invoke
+    .mockResolvedValueOnce({ path: invoice.path, status: "partial", dest: actual, message: movedWarning })
+    .mockResolvedValueOnce({ path: receipt.path, status: "partial", dest: null, message: retainedWarning })
+    .mockRejectedValueOnce(moveFailure)
+    .mockResolvedValueOnce({ path: filed.path, status: "ok", dest: filed.path, message: "Future rule saved" })
+    .mockResolvedValueOnce({ path: missing.path, status: "missing", dest: null, message: null });
+  await store.acceptAll(reviewed);
+
+  expect(useSuggestionsStore.getState().suggestions).toEqual([receipt, refused]);
+  expect(useSuggestionsStore.getState().results?.[0].dest).toBe(actual);
+  const { html } = renderScreen();
+  expect.soft(html).toContain(actual);
+  expect.soft(html.slice(html.indexOf(actual), html.indexOf(receipt.path))).toContain("suggestions.movedWithWarning");
+  expect.soft(html.slice(html.indexOf(receipt.path), html.indexOf(refused.path))).toContain("suggestions.moveNeedsReview");
+  expect.soft(html.split("suggestions.failed")).toHaveLength(2);
+  expect(html).toContain("suggestions.alreadyFiled");
+  expect(html).toContain("suggestions.missing");
+  for (const reason of [movedWarning, retainedWarning, moveFailure, "Future rule saved"]) {
+    expect.soft(html.split(reason)).toHaveLength(2);
+  }
+
+  mocks.invoke.mockRejectedValueOnce(distinctError);
+  await store.dismissSuggestions([receipt]);
+  const subsequent = renderScreen().html;
+  expect(subsequent.split(distinctError)).toHaveLength(2);
+  expect(subsequent.split(movedWarning)).toHaveLength(2);
+  expect(subsequent).toContain(actual);
+});
+
 describe("local AI diagnostics", () => {
   function nextLookup(suggestions: Suggestion[], localAiStatus: SuggestionsResponse["localAiStatus"]) {
     mocks.invoke.mockImplementationOnce(async (command: string) => {
