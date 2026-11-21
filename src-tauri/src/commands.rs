@@ -1778,13 +1778,21 @@ pub fn get_inventory_files_cmd(
     root: Option<String>,
     query: Option<String>,
     limit: Option<i64>,
+    revision: Option<i64>,
+    after: Option<String>,
 ) -> Result<Vec<InventoryFile>, String> {
     let sort = sort.unwrap_or_else(|| "size".into());
     let cat = category.as_deref().filter(|s| !s.is_empty());
     let root = root.as_deref().filter(|s| !s.is_empty());
     let query = query.as_deref().filter(|s| !s.is_empty());
     let limit = limit.unwrap_or(50).clamp(1, 200);
-    get_inventory_files(&sort, cat, root, query, limit).map_err(|e| e.to_string())
+    match revision {
+        Some(revision) => get_inventory_files_page(InventoryFilePage {
+            sort: &sort, category: cat, root, query, limit, revision, after: after.as_deref(),
+        }),
+        None if after.is_some() => Err("inventory.changed".into()),
+        None => get_inventory_files(&sort, cat, root, query, limit).map_err(|e| e.to_string()),
+    }
 }
 
 // ---------------------------------------------------------------------------

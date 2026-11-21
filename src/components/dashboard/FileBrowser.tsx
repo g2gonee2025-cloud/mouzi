@@ -6,10 +6,12 @@ import { Copy, ExternalLink, Search, X } from "lucide-react";
 import { formatBytes, formatTimestamp } from "../../utils/format";
 import { fileName } from "../../utils/paths";
 import {
-  categoryClass, categoryLabel, createInventoryBrowserLoader, inventoryBrowserScope, rootsWithSharedNames,
+  categoryClass, categoryLabel, createInventoryBrowserLoader, INVENTORY_CHANGED, inventoryBrowserScope, rootsWithSharedNames,
   type DashboardViewOptions, type InventoryBrowserView,
 } from "../../utils/dashboard";
-import type { InventoryFile } from "../../store/useDashboardStore";
+import { useDashboardStore, type InventoryFile } from "../../store/useDashboardStore";
+
+const EMPTY_FILES: InventoryFile[] = [];
 
 interface FileBrowserProps extends DashboardViewOptions {
   initialLargest: InventoryFile[];
@@ -54,18 +56,25 @@ export default function FileBrowser({
   const search = query.trim();
   const filtered = Boolean(search || category || root);
   const rootScope = JSON.stringify([...watchedRootPaths].sort());
-  const scope = inventoryBrowserScope({ sort, query: search, category, root, rootScope });
+  const scope = inventoryBrowserScope({ sort, query: search, category, root, rootScope, revision });
   const showRootPath = root !== null && rootsWithSharedNames(watchedRootPaths).has(root);
   const activeView = view?.scope === scope ? view : undefined;
   const files = filtered ? activeView?.rows ?? [] : sort === "size" ? initialLargest : initialRecent;
   const filesWithSharedNames = rootsWithSharedNames(files.map(({ path }) => path));
   const loading = filtered && (activeView?.loading ?? true);
   const error = filtered ? activeView?.error : null;
+  const page = activeView?.page ?? 0;
+  const hasNext = Boolean(activeView?.limited);
+  const showPager = filtered && (page > 0 || hasNext);
+  const largest = filtered ? EMPTY_FILES : initialLargest;
+  const recent = filtered ? EMPTY_FILES : initialRecent;
 
   useEffect(() => {
-    void loader.load({ sort, query: search, category, root, rootScope, initialLargest, initialRecent }, 200);
+    void loader.load({
+      sort, query: search, category, root, rootScope, revision, initialLargest: largest, initialRecent: recent,
+    }, 200);
     return loader.cancel;
-  }, [sort, search, category, root, rootScope, initialLargest, initialRecent, revision, loader]);
+  }, [sort, search, category, root, rootScope, largest, recent, revision, loader]);
 
   useEffect(() => {
     mounted.current = true;
@@ -116,7 +125,9 @@ export default function FileBrowser({
     : isEmpty
       ? t(totalFiles === 0 ? "dashboard.noIndexedFiles" : "dashboard.noFiles")
       : filtered && !error
-        ? t(activeView?.limited ? "dashboard.limitedFiles" : "dashboard.filesShown", { shown })
+        ? showPager
+          ? t("dashboard.resultsPage", { shown, page: (page + 1).toLocaleString() })
+          : t("dashboard.filesShown", { shown })
         : "";
 
   return (
@@ -204,14 +215,45 @@ export default function FileBrowser({
       >
         {status && <p className={isEmpty ? undefined : "mb-2"}>{status}</p>}
       </div>
-      {error && <div className="text-xs text-red-700 dark:text-red-400 mb-2" role="alert">{error}</div>}
+      {error === INVENTORY_CHANGED ? (
+        <div className="mb-2 flex flex-wrap items-center gap-2 text-xs">
+          <p className="text-red-700 dark:text-red-400" role="alert">{t("dashboard.searchChanged")}</p>
+          <button
+            type="button"
+            onClick={() => void useDashboardStore.getState().loadStats()}
+            className="rounded-md border border-border px-2.5 py-1 hover:bg-surface"
+          >
+            {t("dashboard.refresh")}
+          </button>
+        </div>
+      ) : error && <div className="text-xs text-red-700 dark:text-red-400 mb-2" role="alert">{error}</div>}
       {revealError && (
         <p className="mb-2 text-xs text-red-700 dark:text-red-400 break-words" role="alert">
           {t("dashboard.revealFailed", { file: revealError })}
         </p>
       )}
+      {showPager && (
+        <nav aria-label={t("dashboard.searchFiles")} className="mb-2 flex flex-wrap gap-2 text-xs">
+          <button
+            type="button"
+            onClick={() => void loader.navigate(-1)}
+            aria-disabled={loading || page === 0}
+            className="rounded-md border border-border px-2.5 py-1 hover:bg-surface aria-disabled:text-text-muted aria-disabled:cursor-default"
+          >
+            {t("common.previousPage")}
+          </button>
+          <button
+            type="button"
+            onClick={() => void loader.navigate(1)}
+            aria-disabled={loading || !hasNext}
+            className="rounded-md border border-border px-2.5 py-1 hover:bg-surface aria-disabled:text-text-muted aria-disabled:cursor-default"
+          >
+            {t("common.nextPage")}
+          </button>
+        </nav>
+      )}
       {files.length > 0 && (
-        <div className="space-y-0.5 max-h-[18rem] overflow-auto">
+        <div key={`${scope}:${page}`} className="space-y-0.5 max-h-[18rem] overflow-auto">
           {files.map((file) => (
             <div
               key={file.path}

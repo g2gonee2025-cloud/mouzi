@@ -2432,13 +2432,23 @@ fn register_inventory_search(conn: &Connection) -> SqliteResult<()> {
     )
 }
 
-fn inventory_files_sql(sort: &str, filtered: bool) -> String {
+const WATCHED_INVENTORY: &str = "i.root_path IN (SELECT path FROM watched_folders)";
+const INVENTORY_FILE_FILTERS: &str = "AND (?1 = '' OR i.category = ?1)
+                                     AND (?2 = '' OR i.root_path = ?2)
+                                     AND (?3 = '' OR mouzi_path_contains(i.path,?3))";
+
+fn inventory_files_sql(sort: &str, filtered: bool, after: bool) -> String {
     let recent = sort == "mtime";
     let columns = "i.path, i.size, i.mtime, i.category, i.root_path";
-    let watched = "i.root_path IN (SELECT path FROM watched_folders)";
-    let filters = "AND (?1 = '' OR i.category = ?1)
-                   AND (?2 = '' OR i.root_path = ?2)
-                   AND (?3 = '' OR mouzi_path_contains(i.path,?3))";
+    let watched = WATCHED_INVENTORY;
+    let filters = if filtered { INVENTORY_FILE_FILTERS } else { "" };
+    let boundary_filter = match (after, recent) {
+        (true, true) => "AND i.mtime <= ?5 AND (i.mtime < ?5 OR
+            (-COALESCE((SELECT CAST(substr(f.mtime_ns,-9) AS INTEGER)
+                        FROM inventory_fingerprints f WHERE f.path=i.path),0), i.path) > (-?6, ?7))",
+        (true, false) => "AND i.size <= ?5 AND (i.size < ?5 OR i.path > ?6)",
+        (false, _) => "",
+    };
     // Keep the indexed prefix for the snapshot; filtered searches may favor a root lookup.
     let index = if recent && !filtered { " INDEXED BY idx_file_inventory_mtime" } else { "" };
     let (join, order) = if recent {
@@ -2457,7 +2467,7 @@ fn inventory_files_sql(sort: &str, filtered: bool) -> String {
             "WITH coarse AS MATERIALIZED (
                  SELECT i.id, i.mtime
                  FROM file_inventory i
-                 WHERE {watched} {filters}
+                 WHERE {watched} {filters} {boundary_filter}
                  ORDER BY i.mtime DESC
                  LIMIT ?4
              ), boundary AS MATERIALIZED (
@@ -2466,17 +2476,17 @@ fn inventory_files_sql(sort: &str, filtered: bool) -> String {
                  SELECT id FROM coarse WHERE mtime IS NOT (SELECT mtime FROM boundary)
                  UNION ALL
                  SELECT i.id FROM file_inventory i INDEXED BY idx_file_inventory_mtime
-                 WHERE i.mtime = (SELECT mtime FROM boundary) AND {watched} {filters}
+                 WHERE i.mtime = (SELECT mtime FROM boundary) AND {watched} {filters} {boundary_filter}
              )
              SELECT {columns}
              FROM candidates c JOIN file_inventory i ON i.id = c.id{join}
              ORDER BY {order} LIMIT ?4"
         );
     }
-    let (filters, limit) = if filtered { (filters, "?4") } else { ("", "50") };
+    let limit = if filtered { "?4" } else { "50" };
     format!(
         "SELECT {columns} FROM file_inventory i{index}{join}
-         WHERE {watched} {filters}
+         WHERE {watched} {filters} {boundary_filter}
          ORDER BY {order}
          LIMIT {limit}"
     )
@@ -2493,7 +2503,7 @@ fn get_inventory_files_on(
     let cat = category.unwrap_or("");
     let root_path = root.unwrap_or("");
     let q = query.unwrap_or("").trim();
-    query_inventory_files(conn, &inventory_files_sql(sort, true), params![cat, root_path, q, limit.max(0)])
+    query_inventory_files(conn, &inventory_files_sql(sort, true, false), params![cat, root_path, q, limit.max(0)])
 }
 
 fn query_inventory_files(conn: &Connection, sql: &str, bindings: impl rusqlite::Params) -> SqliteResult<Vec<InventoryFile>> {
@@ -2563,6 +2573,13 @@ pub fn get_age_buckets() -> SqliteResult<Vec<AgeBucket>> {
     get_age_buckets_on(&conn, now_epoch())
 }
 
+// An extended Windows path fits within 32,767 UTF-16 code units.
+const MAX_INVENTORY_PATH_CHARS: usize = 32_767;
+
+fn oversized_inventory_path(value: &str) -> bool {
+    value.chars().nth(MAX_INVENTORY_PATH_CHARS).is_some()
+}
+
 pub fn get_inventory_files(
     sort: &str,
     category: Option<&str>,
@@ -2570,15 +2587,65 @@ pub fn get_inventory_files(
     query: Option<&str>,
     limit: i64,
 ) -> SqliteResult<Vec<InventoryFile>> {
-    // An extended Windows path fits within 32,767 UTF-16 code units.
-    // A longer literal cannot match, so skip regex compilation and the DB lock.
-    const MAX_QUERY_CHARS: usize = 32_767;
     let query = query.map(str::trim);
-    if query.is_some_and(|text| text.chars().nth(MAX_QUERY_CHARS).is_some()) {
+    // A longer literal cannot match, so skip regex compilation and the DB lock.
+    if query.is_some_and(oversized_inventory_path) {
         return Ok(Vec::new());
     }
     let conn = sqlite_lock()?;
     get_inventory_files_on(&conn, sort, category, root, query, limit)
+}
+
+pub(crate) struct InventoryFilePage<'a> {
+    pub sort: &'a str,
+    pub category: Option<&'a str>,
+    pub root: Option<&'a str>,
+    pub query: Option<&'a str>,
+    pub limit: i64,
+    pub revision: i64,
+    pub after: Option<&'a str>,
+}
+
+pub(crate) fn get_inventory_files_page(page: InventoryFilePage<'_>) -> Result<Vec<InventoryFile>, String> {
+    if page.revision < 0 || page.after.is_some_and(|path| path.is_empty() || oversized_inventory_path(path)) {
+        return Err("inventory.changed".into());
+    }
+    if page.query.map(str::trim).is_some_and(oversized_inventory_path) {
+        return Ok(Vec::new());
+    }
+    let mut conn = sqlite_lock().map_err(|error| error.to_string())?;
+    let read = conn.transaction().map_err(|error| error.to_string())?;
+    let rows = get_inventory_files_page_on(&read, page)?;
+    read.commit().map_err(|error| error.to_string())?;
+    Ok(rows)
+}
+
+fn get_inventory_files_page_on(conn: &Connection, page: InventoryFilePage<'_>) -> Result<Vec<InventoryFile>, String> {
+    if inventory_revision(conn).map_err(|error| error.to_string())? != page.revision {
+        return Err("inventory.changed".into());
+    }
+    let Some(after) = page.after else {
+        return get_inventory_files_on(conn, page.sort, page.category, page.root, page.query, page.limit)
+            .map_err(|error| error.to_string());
+    };
+    let category = page.category.unwrap_or("");
+    let root = page.root.unwrap_or("");
+    let query = page.query.unwrap_or("").trim();
+    // The native reader supplies the precise sort key from the same revision.
+    // Continuations must belong to the currently filtered inventory.
+    let (size, seconds, fraction): (i64, i64, i64) = conn.query_row(
+        &format!("SELECT i.size, i.mtime, COALESCE(CAST(substr(f.mtime_ns,-9) AS INTEGER),0)
+                  FROM file_inventory i LEFT JOIN inventory_fingerprints f ON f.path=i.path
+                  WHERE i.path=?4 AND {WATCHED_INVENTORY} {INVENTORY_FILE_FILTERS}"),
+        params![category, root, query, after],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    ).optional().map_err(|error| error.to_string())?.ok_or("inventory.changed")?;
+    let sql = inventory_files_sql(page.sort, true, true);
+    if page.sort == "mtime" {
+        query_inventory_files(conn, &sql, params![category, root, query, page.limit, seconds, fraction, after])
+    } else {
+        query_inventory_files(conn, &sql, params![category, root, query, page.limit, size, after])
+    }.map_err(|error| error.to_string())
 }
 
 pub fn get_dashboard_snapshot() -> SqliteResult<DashboardSnapshot> {
@@ -2639,7 +2706,7 @@ pub fn get_dashboard_snapshot() -> SqliteResult<DashboardSnapshot> {
 }
 
 fn get_snapshot_files_on(conn: &Connection, sort: &str) -> SqliteResult<Vec<InventoryFile>> {
-    query_inventory_files(conn, &inventory_files_sql(sort, false), [])
+    query_inventory_files(conn, &inventory_files_sql(sort, false, false), [])
 }
 
 #[derive(Debug,Clone)]
@@ -3502,6 +3569,46 @@ mod tests {
     }
 
     #[test]
+    fn inventory_pagination_keeps_exact_filtered_order_and_revision() {
+        let conn = mem_conn_with_inventory();
+        let root = "/imports";
+        conn.execute_batch("INSERT INTO watched_folders(path,mode) VALUES('/imports','manual'),('/another','manual')").unwrap();
+        let second = 1_795_176_000;
+        let expected = (0..171)
+            .map(|index| add_recent_fixture(&conn, root, &format!("receipt-{index:03}.txt"), 5, second, Some(index / 3)))
+            .collect::<Vec<_>>();
+        let other_root = add_recent_fixture(&conn, "/another", "receipt-other.txt", 50, second + 1, Some(1));
+        let other_category = add_recent_fixture(&conn, root, "receipt-image.jpg", 50, second + 1, Some(1));
+        conn.execute("UPDATE file_inventory SET category='Images' WHERE path=?1", [&other_category]).unwrap();
+        add_recent_fixture(&conn, root, "different.txt", 50, second + 1, Some(1));
+        let revision = inventory_revision(&conn).unwrap();
+        for sort in ["size", "mtime"] {
+            let expected = if sort == "size" {
+                expected.clone()
+            } else {
+                expected.chunks(3).rev().flatten().cloned().collect()
+            };
+            let page = |after| InventoryFilePage {
+                sort, category: Some("Documents"), root: Some(root), query: Some("RECEIPT"),
+                limit: 81, revision, after,
+            };
+            let paths = |rows: Vec<InventoryFile>| rows.into_iter().map(|file| file.path).collect::<Vec<_>>();
+            let legacy = get_inventory_files_on(&conn, sort, Some("Documents"), Some(root), Some("RECEIPT"), 81).unwrap();
+            assert_eq!(paths(legacy), expected[..81]);
+            for (after, start, end) in [(None, 0, 81), (Some(expected[79].as_str()), 80, 161), (Some(expected[159].as_str()), 160, 171)] {
+                let rows = get_inventory_files_page_on(&conn, page(after)).unwrap();
+                assert_eq!(paths(rows), expected[start..end]);
+            }
+            for after in [other_root.as_str(), other_category.as_str(), ""] {
+                assert_eq!(get_inventory_files_page_on(&conn, page(Some(after))).err().as_deref(), Some("inventory.changed"));
+            }
+            conn.execute("UPDATE inventory_state SET revision=revision+1 WHERE id=1", []).unwrap();
+            assert_eq!(get_inventory_files_page_on(&conn, page(None)).err().as_deref(), Some("inventory.changed"));
+            conn.execute("UPDATE inventory_state SET revision=?1 WHERE id=1", [revision]).unwrap();
+        }
+    }
+
+    #[test]
     fn preference_patch_preserves_concurrent_schedule_and_returns_revision() {
         let conn=mem_conn_with_inventory();
         let first=get_settings_on(&conn).unwrap();assert!(!first.autostart);assert!(!first.local_ai_enabled);assert_eq!(first.local_ai_model,"llama3.2");
@@ -3749,7 +3856,7 @@ mod tests {
 
             let mut metrics = Vec::new();
             for arm in 0..2 {
-                let sql = if arm == 0 { baseline_sql(search.sort) } else { inventory_files_sql(search.sort, true) };
+                let sql = if arm == 0 { baseline_sql(search.sort) } else { inventory_files_sql(search.sort, true, false) };
                 let implementation = implementations[arm];
                 let plan = connections[arm].prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap()
                     .query_map(bindings, |row| row.get::<_, String>(3)).unwrap()

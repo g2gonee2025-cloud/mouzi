@@ -12,7 +12,7 @@ function deferred<T>() {
 const file = (path: string): InventoryFile => ({ path, size: 1, mtime: 1, category: "Other", rootPath: "C:/work" });
 const request = {
   sort: "size" as const, category: null, root: null, rootScope: "C:/work",
-  query: "old", initialLargest: [file("initial")], initialRecent: [],
+  query: "old", revision: 4, initialLargest: [file("initial")], initialRecent: [],
 };
 
 describe("inventory browser response ordering", () => {
@@ -125,6 +125,63 @@ describe("inventory browser response ordering", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("reaches every match in bounded pages and returns using the same scope and revision", async () => {
+    const all = Array.from({ length: 171 }, (_, i) => file("receipt-" + String(i + 1).padStart(3, "0") + ".txt"));
+    const update = vi.fn();
+    const fetchRows = vi.fn(async ({ after }: { after?: string }) => {
+      const at = after === undefined ? 0 : all.findIndex((row) => row.path === after) + 1;
+      return all.slice(at, at + 81);
+    });
+    const loader = createInventoryBrowserLoader(fetchRows, update);
+    const read = () => update.mock.lastCall?.[0];
+    await loader.load(request);
+    expect(read().rows).toEqual(all.slice(0, 80));
+    expect(loader.navigate).toBeTypeOf("function");
+    const pages = [read().rows];
+    for (const page of [1, 2]) {
+      await loader.navigate(1);
+      expect(read()).toMatchObject({ page, rows: all.slice(page * 80, (page + 1) * 80), loading: false });
+      pages.push(read().rows);
+    }
+    expect(pages.flat()).toEqual(all);
+    expect(read().limited).toBe(false);
+    await loader.navigate(1);
+    expect(fetchRows).toHaveBeenCalledTimes(3);
+    expect(fetchRows.mock.calls.map(([query]) => query)).toEqual([
+      { sort: "size", query: "old", category: "", root: "", limit: 81, revision: 4 },
+      { sort: "size", query: "old", category: "", root: "", limit: 81, revision: 4, after: all[79].path },
+      { sort: "size", query: "old", category: "", root: "", limit: 81, revision: 4, after: all[159].path },
+    ]);
+    await loader.navigate(-1);
+    expect(read()).toMatchObject({ page: 1, rows: all.slice(80, 160), limited: true });
+    await loader.navigate(-1);
+    expect(read()).toMatchObject({ page: 0, rows: all.slice(0, 80), limited: true });
+  });
+
+  it("retires an async page on a new revision and suppresses a native stale-page rejection", async () => {
+    const old = deferred<InventoryFile[]>();
+    const first = Array.from({ length: 81 }, (_, i) => file("old-" + i));
+    const current = Array.from({ length: 81 }, (_, i) => file("current-" + i));
+    const update = vi.fn();
+    const fetchRows = vi.fn()
+      .mockResolvedValueOnce(first)
+      .mockReturnValueOnce(old.promise)
+      .mockResolvedValueOnce(current)
+      .mockRejectedValueOnce("inventory.changed");
+    const loader = createInventoryBrowserLoader(fetchRows, update);
+    await loader.load(request);
+    expect(loader.navigate).toBeTypeOf("function");
+    const obsolete = loader.navigate(1);
+    await loader.load({ ...request, revision: 5 });
+    old.resolve([file("obsolete")]);
+    await obsolete;
+    expect(update).toHaveBeenLastCalledWith(expect.objectContaining({ page: 0, rows: current.slice(0, 80) }));
+    expect(fetchRows).toHaveBeenLastCalledWith(expect.objectContaining({ revision: 5 }));
+    expect(fetchRows.mock.lastCall?.[0]).not.toHaveProperty("after");
+    await loader.navigate(1);
+    expect(update).toHaveBeenLastCalledWith(expect.objectContaining({ page: 0, rows: [], limited: false, error: "inventory.changed" }));
   });
 
   it.each([INVENTORY_MATCH_LIMIT, INVENTORY_MATCH_LIMIT + 1])("shows at most 80 out of %i matches", async (count) => {
