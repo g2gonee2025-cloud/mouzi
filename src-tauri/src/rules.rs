@@ -475,7 +475,7 @@ impl WatchedRoot {
         Ok(Self { id, path, identity, watch_active: AtomicBool::new(true) })
     }
 
-    pub(crate) fn capture_unattended(folder: &WatchedFolder, allow_legacy: bool) -> Result<Self, String> {
+    pub(crate) fn capture_registered(folder: &WatchedFolder, allow_legacy: bool) -> Result<Self, String> {
         let root = Self::capture(folder)?;
         let _guard = root.guard_physical()?;
         crate::db::verify_watch_identity(root.id, &folder.path, &root.identity.key(), allow_legacy)?;
@@ -614,7 +614,7 @@ fn process_file(
                 folder.enabled && crate::db::is_folder_auto_mode(&folder.mode)
                     && same_path(Path::new(&folder.path), root)
             }) else { return Ok(ProcessOutcome::Skipped); };
-            let watched = WatchedRoot::capture_unattended(folder, false)?;
+            let watched = WatchedRoot::capture_registered(folder, false)?;
             // The compatibility spelling match only locates the registration.
             // Containment and destination planning must use that physical root.
             (Path::new(&folder.path), Some(watched.guard_physical()?))
@@ -762,7 +762,7 @@ pub fn manual_scan_folder_with_suppression(folder: &str, suppression: &Suppressi
     let folders = get_watched_folders().map_err(|error| error.to_string())?;
     let folder = folders.iter().find(|candidate| candidate.path == folder)
         .ok_or("Folder is no longer an eligible watched root")?;
-    scan_watched_manual_folder(&WatchedManualRoot::capture(folder)?, suppression)
+    scan_watched_manual_folder(&WatchedManualRoot::capture_registered(folder, false)?, suppression)
 }
 
 pub(crate) fn scan_watched_manual_folder(root: &WatchedManualRoot, suppression: &SuppressionSet)
@@ -1086,7 +1086,7 @@ mod tests {
 
         db::update_folder_mode(inbox_id, db::FOLDER_MODE_SILENT).unwrap();
         let row = get_watched_folders().unwrap().into_iter().find(|row| row.id == Some(inbox_id)).unwrap();
-        let authority = WatchedRoot::capture_unattended(&row, false).unwrap();
+        let authority = WatchedRoot::capture_registered(&row, false).unwrap();
         let process = |file: &Path, suppression: &SuppressionSet| {
             process_watched_file(file, &authority, suppression, &suppression.ticket(file), None).unwrap()
         };

@@ -367,7 +367,7 @@ fn perform_scheduled_clean(
     // replaced and acquire authority partway through this run.
     let mut roots = Vec::new();
     for folder in folders.iter().filter(|folder| folder.enabled && is_folder_auto_mode(&folder.mode)) {
-        match WatchedRoot::capture_unattended(folder, false) {
+        match WatchedRoot::capture_registered(folder, false) {
             Ok(root) => roots.push(root),
             Err(error) => progress.record_error(format!("{}: {error}", folder.path)),
         }

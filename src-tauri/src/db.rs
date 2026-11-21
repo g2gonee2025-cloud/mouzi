@@ -92,6 +92,9 @@ pub struct Rule {
 pub struct WatchedFolder {
     pub id: Option<i64>,
     pub path: String,
+    /// The registration's stored physical identity. Only the database supplies it.
+    #[serde(skip)]
+    pub(crate) watch_identity: Option<String>,
     pub enabled: bool,
     /// One of: "silent" (real-time auto-organize), "manual" (collect only),
     /// "paused" (do not watch).
@@ -735,7 +738,7 @@ pub fn delete_rule(id: i64) -> SqliteResult<()> {
 
 pub fn get_watched_folders() -> SqliteResult<Vec<WatchedFolder>> {
     let conn = sqlite_lock()?;
-    let mut stmt = conn.prepare("SELECT id, path, enabled, mode, only_new FROM watched_folders")?;
+    let mut stmt = conn.prepare("SELECT id, path, enabled, mode, only_new, watch_identity FROM watched_folders")?;
     let folders = stmt.query_map([], |row| {
         Ok(WatchedFolder {
             id: row.get(0)?,
@@ -743,6 +746,7 @@ pub fn get_watched_folders() -> SqliteResult<Vec<WatchedFolder>> {
             enabled: row.get::<_, i32>(2)? != 0,
             mode: row.get(3)?,
             only_new: row.get(4)?,
+            watch_identity: row.get(5)?,
         })
     })?
     .collect::<SqliteResult<Vec<_>>>()?;

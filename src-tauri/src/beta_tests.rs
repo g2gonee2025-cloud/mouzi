@@ -49,7 +49,7 @@ struct RegisteredFolder(i64);
 
 impl RegisteredFolder {
     fn manual(path: &Path) -> Self {
-        Self(db::add_watched_folder(path.to_str().unwrap(), "manual").unwrap())
+        Self(db::register_watched_folder(path.to_str().unwrap(), "manual", false).unwrap())
     }
 }
 
@@ -65,7 +65,7 @@ impl Fixture {
         db::init_test_db();
         let root = std::env::temp_dir().join(format!("mouzi-organization-test-{}", op::new_run_id()));
         fs::create_dir(&root).unwrap();
-        let folder = db::add_watched_folder(root.to_str().unwrap(), "manual").unwrap();
+        let folder = db::register_watched_folder(root.to_str().unwrap(), "manual", false).unwrap();
         Self { root, folder, rules: Vec::new(), suppression: Arc::new(SuppressionSet::new()), _db: guard }
     }
 
@@ -190,7 +190,7 @@ fn scoped_rule_conditions_and_normalized_extensions_survive_storage() {
 
     let other = f.root.join("Other");
     fs::create_dir(&other).unwrap();
-    let other_id = db::add_watched_folder(other.to_str().unwrap(), "manual").unwrap();
+    let other_id = db::register_watched_folder(other.to_str().unwrap(), "manual", false).unwrap();
     let folders = db::get_watched_folders().unwrap();
     assert!(rules::matching_rule_in_root(&info, Some(&other), &folders, &[stored]).is_none());
     db::remove_watched_folder(other_id).unwrap();
@@ -366,7 +366,7 @@ fn unavailable_sibling_is_reported_and_healthy_operations_work() {
     fixture.add(&rule);
     let source = fixture.write("healthy.txt", "healthy file");
     let sibling = fixture.root.with_extension("unavailable");
-    let _unavailable = RegisteredFolder::manual(&sibling);
+    let _unavailable = RegisteredFolder(db::add_watched_folder(sibling.to_str().unwrap(), "manual").unwrap());
 
     let preview = op::preview(None, &fixture.suppression).unwrap();
     assert!(preview.unavailable_roots.iter().any(|path| Path::new(path) == sibling.as_path()));
@@ -376,6 +376,47 @@ fn unavailable_sibling_is_reported_and_healthy_operations_work() {
     assert_eq!(fs::read(fixture.root.join("Sorted/healthy.txt")).unwrap(), b"healthy file");
     assert!(!source.exists());
     assert!(!sibling.exists());
+}
+
+#[test]
+fn manual_review_skips_replaced_and_unbound_nested_roots_until_registered_identity_returns() {
+    let mut fixture = Fixture::new();
+    fixture.add(&db::Rule { folder_id: 0, ..fixture.rule() });
+    let healthy = fixture.write("healthy.txt", "healthy");
+    let registered = fixture.root.join("registered");
+    let parked = fixture.root.join("disconnected");
+    fs::create_dir(&registered).unwrap();
+    let _folder = RegisteredFolder::manual(&registered);
+    let candidate = fixture.write("registered/candidate.txt", "original");
+    let legacy = fixture.root.join("legacy");
+    fs::create_dir(&legacy).unwrap();
+    let _older = RegisteredFolder(db::add_watched_folder(legacy.to_str().unwrap(), "manual").unwrap());
+    let old_candidate = fixture.write("legacy/legacy.txt", "legacy");
+
+    let review = |expect_original: bool, expect_legacy: bool| {
+        let plan = fixture.preview(&[&healthy, &candidate, &old_candidate]);
+        let contains = |path: &Path| plan.entries.iter().any(|entry| Path::new(&entry.source) == path && entry.error.is_none());
+        assert!(contains(&healthy));
+        assert_eq!(contains(&candidate), expect_original);
+        assert_eq!(contains(&old_candidate), expect_legacy);
+        assert_eq!(plan.unavailable_roots.contains(&registered.to_string_lossy().into_owned()), !expect_original);
+        assert_eq!(plan.unavailable_roots.contains(&legacy.to_string_lossy().into_owned()), !expect_legacy);
+        op::discard(&plan.id);
+    };
+    fs::rename(&registered, &parked).unwrap();
+    review(false, false);
+    fs::create_dir(&registered).unwrap();
+    fs::write(&candidate, "replacement").unwrap();
+    review(false, false);
+    assert!(rules::manual_scan_folder_with_suppression(registered.to_str().unwrap(), &fixture.suppression)
+        .unwrap_err().contains("different physical folder"));
+    assert_eq!(fs::read(&candidate).unwrap(), b"replacement");
+    fs::rename(&registered, fixture.root.join("replacement")).unwrap();
+    fs::rename(&parked, &registered).unwrap();
+    review(true, false);
+    db::register_watched_folder(legacy.to_str().unwrap(), "manual", false).unwrap();
+    review(true, true);
+    assert_eq!(fs::read(&candidate).unwrap(), b"original");
 }
 
 #[test]

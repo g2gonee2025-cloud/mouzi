@@ -440,7 +440,7 @@ impl FolderWatcher {
             watch.mode.clone_from(&folder.mode);
             return Ok(watch.root.clone());
         }
-        let root = Arc::new(WatchedRoot::capture_unattended(folder, allow_legacy)?);
+        let root = Arc::new(WatchedRoot::capture_registered(folder, allow_legacy)?);
         if self.watchers.values().any(|watch| watch.root.same_physical_root(&root)) {
             return Err("This physical folder already has a watcher under another registration".into());
         }
@@ -837,7 +837,7 @@ mod tests {
         let cancellation = watcher.lock().unwrap().queue_cancellation();
         let root = Arc::new(WatchedRoot::capture(&WatchedFolder {
             id: Some(1), path: std::env::temp_dir().canonicalize().unwrap().to_string_lossy().into_owned(),
-            mode: crate::db::FOLDER_MODE_SILENT.into(), enabled: true, only_new: false,
+            mode: crate::db::FOLDER_MODE_SILENT.into(), enabled: true, watch_identity: None, only_new: false,
         }).unwrap());
         let reviewed = root.path.join("reviewed.undocheck");
         let later = root.path.join("later.undocheck");
@@ -883,7 +883,7 @@ mod tests {
         let root = Arc::new(WatchedRoot::capture(&WatchedFolder {
             id: Some(1), path: root.to_string_lossy().into_owned(), enabled: true,
             mode: crate::db::FOLDER_MODE_SILENT.into(),
-            only_new: false,
+            watch_identity: None, only_new: false,
         }).unwrap());
         let mut pending = PendingFile { path: path.clone(), root,
             scheduled: now, attempts: 0, ticket: suppression.ticket(&path), identity: None, fingerprint: None };
@@ -1010,7 +1010,7 @@ mod tests {
         let fixture = RecoveryFixture::new();
         let folder = WatchedFolder {
             id: Some(1), path: fixture.root().to_string_lossy().into_owned(),
-            enabled: true, mode: crate::db::FOLDER_MODE_MANUAL.into(), only_new: false,
+            enabled: true, mode: crate::db::FOLDER_MODE_MANUAL.into(), watch_identity: None, only_new: false,
         };
         let root = Arc::new(WatchedRoot::capture(&folder).unwrap());
         let child = root.path.join("child");
@@ -1047,7 +1047,7 @@ mod tests {
         let fixture = RecoveryFixture::new();
         let folder = WatchedFolder {
             id: Some(1), path: fixture.root().to_string_lossy().into_owned(),
-            enabled: true, mode: crate::db::FOLDER_MODE_MANUAL.into(), only_new: false,
+            enabled: true, mode: crate::db::FOLDER_MODE_MANUAL.into(), watch_identity: None, only_new: false,
         };
         let root = Arc::new(WatchedRoot::capture(&folder).unwrap());
         let watcher = FolderWatcher::new(Arc::new(SuppressionSet::new()));
@@ -1316,7 +1316,7 @@ mod tests {
         let path = fs::canonicalize(fixture.root()).unwrap();
         fixture.id = Some(db::register_watched_folder(path.to_str().unwrap(), FOLDER_MODE_SILENT, false).unwrap());
         let folder = get_watched_folders().unwrap().into_iter().find(|folder| folder.id == fixture.id).unwrap();
-        let root = Arc::new(WatchedRoot::capture_unattended(&folder, false).unwrap());
+        let root = Arc::new(WatchedRoot::capture_registered(&folder, false).unwrap());
         let watcher = FolderWatcher::new(Arc::new(SuppressionSet::new()));
         let name = OsString::from("grace.txt");
         let file = root.path.join(&name);
@@ -1376,7 +1376,7 @@ mod tests {
         assert!(watcher.issues()[configured].contains("no saved folder identity"));
         assert!(!watcher.watchers.contains_key(configured));
         watcher.reconcile_watches_for_folders(folders, Instant::now(), true, true).unwrap();
-        assert!(WatchedRoot::capture_unattended(&row, false).is_ok());
+        assert!(WatchedRoot::capture_registered(&row, false).is_ok());
     }
 
     #[test]
@@ -1459,7 +1459,7 @@ mod tests {
         let row = get_watched_folders().unwrap().into_iter().find(|folder| folder.id == Some(folder_id)).unwrap();
         let suppression = Arc::new(SuppressionSet::new());
         let watcher = FolderWatcher::new(suppression.clone());
-        let root = Arc::new(WatchedRoot::capture_unattended(&row, false).unwrap());
+        let root = Arc::new(WatchedRoot::capture_registered(&row, false).unwrap());
         let (sender, receiver) = mpsc::channel();
         let native = register_root_watch(&root, move |event: Result<Event, notify::Error>| {
             let _ = sender.send(event);
@@ -1540,7 +1540,7 @@ mod tests {
         assert_eq!(crate::safe_fs::file_identity(&source).ok(), paused.identity);
         assert!(process_watched_file(&source, &root, &suppression, &paused.ticket,
             paused.identity.as_ref()).unwrap_err().contains("changed identity"));
-        assert!(WatchedRoot::capture_unattended(&row, false).err().unwrap().contains("different physical folder"));
+        assert!(WatchedRoot::capture_registered(&row, false).err().unwrap().contains("different physical folder"));
         assert!(register_root_watch(&root, |_: Result<Event, notify::Error>| {}).is_err());
         assert_eq!(fs::read(&source).unwrap(), b"keep when paused");
 

@@ -794,7 +794,7 @@ mod tests {
         }
 
         fn register(&self) {
-            db::add_watched_folder(&self.0.to_string_lossy(), "manual").unwrap();
+            db::register_watched_folder(&self.0.to_string_lossy(), "manual", false).unwrap();
         }
 
         fn file(&self, name: &str, contents: &[u8]) -> String {
@@ -896,7 +896,7 @@ mod tests {
         let tree = TestTree::new();
         let offline = tree.0.join("offline");
         fs::create_dir(&offline).unwrap();
-        let offline_id = db::add_watched_folder(&offline.to_string_lossy(), db::FOLDER_MODE_MANUAL).unwrap();
+        let offline_id = db::register_watched_folder(&offline.to_string_lossy(), db::FOLDER_MODE_MANUAL, false).unwrap();
         fs::rename(&offline, tree.0.join("retained")).unwrap();
         let unavailable = find_empty_dirs();
 
@@ -905,7 +905,7 @@ mod tests {
         db::update_folder_mode(offline_id, db::FOLDER_MODE_MANUAL).unwrap();
         let online = tree.0.join("online");
         fs::create_dir_all(online.join("empty")).unwrap();
-        let online_id = db::add_watched_folder(&online.to_string_lossy(), db::FOLDER_MODE_MANUAL).unwrap();
+        let online_id = db::register_watched_folder(&online.to_string_lossy(), db::FOLDER_MODE_MANUAL, false).unwrap();
         let mixed = find_empty_dirs();
         db::remove_watched_folder(online_id).unwrap();
         db::remove_watched_folder(offline_id).unwrap();
@@ -920,7 +920,7 @@ mod tests {
         let _guard = db::serialise_test_db();
         init();
         let tree = TestTree::new();
-        let online_id = db::add_watched_folder(&tree.0.to_string_lossy(), db::FOLDER_MODE_MANUAL).unwrap();
+        let online_id = db::register_watched_folder(&tree.0.to_string_lossy(), db::FOLDER_MODE_MANUAL, false).unwrap();
         let a = tree.file("a.txt", b"same");
         let b = tree.file("b.txt", b"same");
         let offline = tree.0.join("offline");
@@ -928,7 +928,7 @@ mod tests {
         let empty = tree.0.join("empty");
         fs::create_dir(&offline).unwrap();
         fs::create_dir(&empty).unwrap();
-        let offline_id = db::add_watched_folder(&offline.to_string_lossy(), db::FOLDER_MODE_MANUAL).unwrap();
+        let offline_id = db::register_watched_folder(&offline.to_string_lossy(), db::FOLDER_MODE_MANUAL, false).unwrap();
         let paused_id = db::add_watched_folder(&paused.to_string_lossy(), db::FOLDER_MODE_PAUSED).unwrap();
         let offline_match = tree.file("offline/other.txt", b"same");
         tree.inventory(&[&a, &b, &offline_match]);
@@ -967,7 +967,7 @@ mod tests {
             tree.inventory(&[&a, &b]);
             let nested = tree.0.join("nested");
             fs::create_dir(&nested).unwrap();
-            db::add_watched_folder(&nested.to_string_lossy(), db::FOLDER_MODE_MANUAL).unwrap();
+            db::register_watched_folder(&nested.to_string_lossy(), db::FOLDER_MODE_MANUAL, false).unwrap();
 
             let result = find_duplicates_with(|scope| {
                 fs::rename(&nested, tree.0.join("original")).unwrap();
@@ -983,14 +983,44 @@ mod tests {
             );
             let refreshed = find_duplicates().unwrap();
             assert_eq!(refreshed.candidates()[0].files.len(), 2);
-            match refreshed {
-                FinderResult::Complete(_) => assert!(replace),
-                FinderResult::Partial { unavailable_roots, .. } => {
-                    assert!(!replace);
-                    assert_eq!(unavailable_roots, [nested.to_string_lossy().into_owned()]);
-                }
-            }
+            let FinderResult::Partial { unavailable_roots, .. } = refreshed else {
+                panic!("Both a missing root and a replacement leave this registration unavailable");
+            };
+            assert_eq!(unavailable_roots, [nested.to_string_lossy().into_owned()]);
         }
+    }
+
+    #[test]
+    fn fresh_cleanup_review_excludes_a_replaced_nested_root_and_accepts_the_returned_original() {
+        let _guard = db::serialise_test_db();
+        init();
+        let tree = TestTree::new();
+        tree.register();
+        let healthy = tree.0.join("healthy-empty");
+        let nested = tree.0.join("registered");
+        let candidate = nested.join("empty");
+        let parked = tree.0.join("disconnected");
+        fs::create_dir(&healthy).unwrap();
+        fs::create_dir_all(&candidate).unwrap();
+        db::register_watched_folder(nested.to_str().unwrap(), db::FOLDER_MODE_MANUAL, false).unwrap();
+
+        let review = |expect_original| {
+            let found = find_empty_dirs().unwrap();
+            assert!(found.candidates().contains(&healthy.to_string_lossy().into_owned()));
+            assert_eq!(found.candidates().contains(&candidate.to_string_lossy().into_owned()), expect_original);
+            let healthy_plan = prepare_cleanup(&[directory(healthy.to_str().unwrap())]).unwrap();
+            discard_cleanup_plan(&healthy_plan.plan_id).unwrap();
+            let nested_plan = prepare_cleanup(&[directory(candidate.to_str().unwrap())]);
+            assert_eq!(nested_plan.is_ok(), expect_original);
+            if let Ok(plan) = nested_plan { discard_cleanup_plan(&plan.plan_id).unwrap(); }
+        };
+        fs::rename(&nested, &parked).unwrap();
+        review(false);
+        fs::create_dir_all(&candidate).unwrap();
+        review(false);
+        fs::rename(&nested, tree.0.join("replacement")).unwrap();
+        fs::rename(&parked, &nested).unwrap();
+        review(true);
     }
 
     #[test]
@@ -1006,7 +1036,7 @@ mod tests {
             let nested = tree.0.join("nested");
             let disconnected = tree.0.join("disconnected");
             fs::create_dir(&nested).unwrap();
-            db::add_watched_folder(&nested.to_string_lossy(), mode).unwrap();
+            db::register_watched_folder(&nested.to_string_lossy(), mode, false).unwrap();
             fs::rename(&nested, &disconnected).unwrap();
 
             let starting = find_duplicates().unwrap();
@@ -1035,7 +1065,7 @@ mod tests {
         let _guard = db::serialise_test_db();
         init();
         let tree = TestTree::new();
-        let id = db::add_watched_folder(&tree.0.to_string_lossy(), db::FOLDER_MODE_MANUAL).unwrap();
+        let id = db::register_watched_folder(&tree.0.to_string_lossy(), db::FOLDER_MODE_MANUAL, false).unwrap();
         let a = tree.file("a.txt", b"duplicate");
         let b = tree.file("b.txt", b"duplicate");
         tree.inventory(&[&a, &b]);
@@ -1157,7 +1187,7 @@ mod tests {
         init();
         let tree = TestTree::new();
         let root = tree.0.to_string_lossy().into_owned();
-        let folder_id = db::add_watched_folder(&root, db::FOLDER_MODE_MANUAL).unwrap();
+        let folder_id = db::register_watched_folder(&root, db::FOLDER_MODE_MANUAL, false).unwrap();
 
         assert!(!crate::commands::has_cleanup_inventory_cmd().unwrap());
         let before_scan = (
@@ -1243,7 +1273,7 @@ mod tests {
         tree.register();
         let nested = tree.0.join("nested");
         fs::create_dir(&nested).unwrap();
-        db::add_watched_folder(&nested.to_string_lossy(), "paused").unwrap();
+        db::register_watched_folder(&nested.to_string_lossy(), "paused", false).unwrap();
         let path = tree.file("nested/a.txt", b"same");
         tree.inventory(&[&path]);
         assert!(find_large_files(1).unwrap().candidates().is_empty());
@@ -1375,7 +1405,7 @@ mod tests {
         let tree = TestTree::new();
         let watched = tree.0.join("watched");
         fs::create_dir(&watched).unwrap();
-        db::add_watched_folder(&watched.to_string_lossy(), "manual").unwrap();
+        db::register_watched_folder(&watched.to_string_lossy(), "manual", false).unwrap();
         let path = watched.join("a.txt").to_string_lossy().into_owned();
         fs::write(&path, b"same").unwrap();
         let row = db::InventoryRow { path: path.clone(), size: 4, mtime: modified_epoch(fs::metadata(&path).unwrap().modified().unwrap()), category: "Other".into() };

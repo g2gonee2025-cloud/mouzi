@@ -744,7 +744,7 @@ pub fn scan_folder_cmd(app: AppHandle, path: String, state: tauri::State<AppStat
         folder.enabled && !is_folder_paused_mode(&folder.mode)
             && crate::safe_fs::file_identity(Path::new(&folder.path)).ok().as_ref() == Some(&identity)
     }).ok_or("Folder is no longer an eligible watched root")?;
-    let authority = WatchedManualRoot::capture(&eligible)?;
+    let authority = WatchedManualRoot::capture_registered(&eligible, false)?;
     let results = scan_watched_manual_folder(&authority, &state.ignored_files);
     let _ = app.emit("mutation-completed", ());
     results
@@ -754,11 +754,18 @@ pub fn scan_folder_cmd(app: AppHandle, path: String, state: tauri::State<AppStat
 pub fn clean_now_cmd(app: AppHandle, state: tauri::State<AppState>) -> Result<Vec<(String, String, String)>, String> {
     let folders = get_watched_folders().map_err(|e| e.to_string())?;
     let authorities = folders.iter().filter(|f| f.enabled && !is_folder_paused_mode(&f.mode))
-        .map(WatchedManualRoot::capture).collect::<Vec<_>>();
+        .map(|folder| (&folder.path, WatchedManualRoot::capture_registered(folder, false))).collect::<Vec<_>>();
     let results = (|| {
         let mut results = Vec::new();
-        for authority in authorities {
-            results.extend(scan_watched_manual_folder(&authority?, &state.ignored_files)?);
+        let mut unavailable = Vec::new();
+        for (path, authority) in authorities {
+            match authority {
+                Ok(root) => results.extend(scan_watched_manual_folder(&root, &state.ignored_files)?),
+                Err(error) => unavailable.push(format!("{path}: {error}")),
+            }
+        }
+        if !unavailable.is_empty() {
+            return Err(format!("Organized {} file(s). {}", results.len(), unavailable.join("; ")));
         }
         Ok(results)
     })();
@@ -1564,6 +1571,7 @@ mod rule_transfer_tests {
         WatchedFolder {
             id: Some(id),
             path: path.to_str().unwrap().into(),
+            watch_identity: None,
             enabled: true,
             mode: FOLDER_MODE_MANUAL.into(),
             only_new: false,
@@ -2405,7 +2413,7 @@ fn accept_suggestion_validated_with(
     }
 
     let validated_root = crate::safe_fs::validate_root(root)?;
-    let trusted_scope = crate::safe_fs::eligible_scope(&[WatchedFolder { id: None, path: validated_root.to_string_lossy().into_owned(), enabled: true, mode: FOLDER_MODE_MANUAL.into(), only_new: false }])?;
+    let trusted_scope = crate::safe_fs::eligible_scope(&[WatchedFolder { id: None, path: validated_root.to_string_lossy().into_owned(), watch_identity: None, enabled: true, mode: FOLDER_MODE_MANUAL.into(), only_new: false }])?;
     let validated = trusted_scope.validate_file(src)?;
     let identity = validated.identity.clone();
     let canonical_source = validated.canonical_path.clone();
@@ -3804,7 +3812,7 @@ mod accept_tests {
 
     fn index_fixture(fixture: &AcceptFixture) {
         lock_db().unwrap().execute_batch("DELETE FROM watched_folders; DELETE FROM file_inventory; DELETE FROM inventory_fingerprints; DELETE FROM accepted_suggestion_feedback;").unwrap();
-        add_watched_folder(&fixture.root().to_string_lossy(), FOLDER_MODE_MANUAL).unwrap();
+        register_watched_folder(&fixture.root().to_string_lossy(), FOLDER_MODE_MANUAL, false).unwrap();
         let summary = crate::scan::scan_roots(&[fixture.root().to_string_lossy().into_owned()], |_| {});
         assert_eq!(summary[0].status,"complete");
     }

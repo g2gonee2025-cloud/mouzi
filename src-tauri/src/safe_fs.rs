@@ -362,17 +362,16 @@ fn inspect_watched_root(path: &Path) -> Result<(PathBuf, FileIdentity), Director
 struct ScopedRoot { path: PathBuf, identity: FileIdentity, active: bool }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct UnavailableRoot { path: PathBuf, active: bool }
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RootScope {
     roots: Vec<ScopedRoot>,
-    unavailable: Vec<UnavailableRoot>,
+    missing: Vec<PathBuf>,
+    unavailable_active: Vec<String>,
 }
 
 pub fn eligible_scope(folders: &[crate::db::WatchedFolder]) -> Result<RootScope, String> {
     let mut roots: Vec<ScopedRoot> = Vec::new();
-    let mut unavailable = Vec::new();
+    let mut missing = Vec::new();
+    let mut unavailable_active = Vec::new();
     for folder in folders {
         let registered = Path::new(&folder.path);
         let active = folder.enabled && folder.mode != crate::db::FOLDER_MODE_PAUSED;
@@ -381,17 +380,23 @@ pub fn eligible_scope(folders: &[crate::db::WatchedFolder]) -> Result<RootScope,
             // Only registered folders can be omitted. Callers supplying
             // explicit authorization paths still require all of them.
             Err(error) if folder.id.is_some() && error.proves_unavailable(registered) => {
-                unavailable.push(UnavailableRoot { path: registered.to_path_buf(), active });
+                missing.push(registered.to_path_buf());
+                if active { unavailable_active.push(folder.path.clone()); }
                 continue;
             }
             Err(error) => return Err(error.to_string()),
         };
+        // A present replacement still owns this subtree for exclusion purposes.
+        // Omitting it would give a watched ancestor authority over its contents.
+        let bound = folder.id.is_none() || folder.watch_identity.as_ref() == Some(&identity.key());
+        if active && !bound { unavailable_active.push(folder.path.clone()); }
+        let active = active && bound;
         if let Some(existing) = roots.iter_mut().find(|root| root.identity == identity) {
             // Conflicting legacy aliases fail closed rather than enabling an inactive root.
             existing.active &= active;
         } else { roots.push(ScopedRoot { path, identity, active }); }
     }
-    Ok(RootScope { roots, unavailable })
+    Ok(RootScope { roots, missing, unavailable_active })
 }
 
 #[derive(Debug)]
@@ -437,8 +442,7 @@ impl RootScope {
     pub fn active_roots(&self) -> Vec<PathBuf> { self.roots.iter().filter(|r| r.active).map(|r| r.path.clone()).collect() }
     pub fn root_identities(&self) -> Vec<FileIdentity> { self.roots.iter().map(|r| r.identity.clone()).collect() }
     pub(crate) fn unavailable_active_roots(&self) -> Vec<String> {
-        self.unavailable.iter().filter(|root| root.active)
-            .map(|root| root.path.to_string_lossy().into_owned()).collect()
+        self.unavailable_active.clone()
     }
 
     fn validate(&self, path: &Path, directory: bool) -> Result<(PathBuf, FileIdentity, File, Metadata, AncestorGuard, PathBuf), String> {
@@ -459,18 +463,18 @@ impl RootScope {
         }
         // Recheck after pinning the target. A nested root that reappears
         // cannot grant authority through the parent scope of an older review.
-        for root in &self.unavailable {
-            match inspect_watched_root(&root.path) {
-                Err(error) if error.proves_unavailable(&root.path) => {}
+        for root in &self.missing {
+            match inspect_watched_root(root) {
+                Err(error) if error.proves_unavailable(root) => {}
                 Err(error) => return Err(error.to_string()),
-                Ok(_) => return Err(format!("Watched folder is available again: {}. Refresh the review.", root.path.display())),
+                Ok(_) => return Err(format!("Watched folder is available again: {}. Refresh the review.", root.display())),
             }
         }
         if self.roots.iter().any(|root| root.identity == identity) { return Err("A watched root cannot be mutated".into()); }
         let identities = ancestors.iter().map(identity_from_handle).collect::<Result<Vec<_>, _>>()?;
         let owner = identities.iter().find_map(|identity| self.roots.iter().find(|root| &root.identity == identity))
             .ok_or("Target is not strictly below a registered root")?;
-        if !owner.active { return Err("The owning root is disabled or paused".into()); }
+        if !owner.active { return Err("The owning folder has no active registration for its current identity".into()); }
         let canonical = std::fs::canonicalize(path).map_err(|e| e.to_string())?;
         if file_identity(&canonical)? != identity { return Err("Target changed identity during validation".into()); }
         Ok((canonical, identity, file, metadata, AncestorGuard { _files: ancestors }, owner.path.clone()))
@@ -564,7 +568,7 @@ pub(crate) fn resolve_future_directory(path: &Path) -> Result<PathBuf, String> {
 
 /// Convenience scope validation for callers that already own authorized roots.
 pub fn validate_scoped_path(path: &Path, roots: &[PathBuf], expect_dir: bool) -> Result<PathBuf, String> {
-    let folders: Vec<_> = roots.iter().map(|root| crate::db::WatchedFolder { id: None, path: root.to_string_lossy().into_owned(), enabled: true, mode: crate::db::FOLDER_MODE_MANUAL.into(), only_new: false }).collect();
+    let folders: Vec<_> = roots.iter().map(|root| crate::db::WatchedFolder { id: None, path: root.to_string_lossy().into_owned(), watch_identity: None, enabled: true, mode: crate::db::FOLDER_MODE_MANUAL.into(), only_new: false }).collect();
     let scope = eligible_scope(&folders)?;
     if expect_dir { Ok(scope.validate_dir(path)?.canonical_path) } else { Ok(scope.validate_file(path)?.canonical_path) }
 }
@@ -1537,6 +1541,7 @@ mod tests {
         crate::db::WatchedFolder {
             id: Some(id),
             path: path.to_string_lossy().into_owned(),
+            watch_identity: file_identity(path).ok().map(|identity| identity.key()),
             enabled: true,
             mode: mode.into(),
             only_new: false,
