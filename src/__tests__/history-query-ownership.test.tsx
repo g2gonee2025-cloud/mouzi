@@ -221,6 +221,7 @@ it("removes previous rows after a filter failure and retries the last applied fi
   expect(text(history())).not.toContain(first.file_name);
   expect(text(history())).toContain(legacy.source_path);
   const confirm = chooseAll();
+  expect(confirm.notice).toBe("restore");
   expect(confirm.preview).toEqual([second.source_path]);
   confirm.onClose?.();
   expect(find(history(), confirmation)).toBeUndefined();

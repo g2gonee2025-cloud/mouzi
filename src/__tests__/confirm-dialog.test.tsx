@@ -173,13 +173,13 @@ it("lets a person review every paired move within bounded pages and grants conse
   checkPage(first, 0, 8);
   expect(first).toContain("33 items");
   expect(first).toContain("Total size: 2.00 KiB");
-  expect(first).toContain("Type DELETE to confirm.");
+  expect(first).toContain("Type MOVE to confirm.");
   expect(buttons.get("Apply operations")?.disabled).toBe(true);
   expect([...buttons.keys()]).toContain("Next page");
   expect(buttons.get("Previous page")?.["aria-disabled"]).toBe(true);
 
   expect(inputs.has("Page number")).toBe(false);
-  inputs.get("typed")?.onChange?.({ target: { value: "DELETE" } });
+  inputs.get("typed")?.onChange?.({ target: { value: "MOVE" } });
   render();
   expect(buttons.get("Apply operations")?.disabled).toBe(false);
   for (let page = 1; page < 5; page += 1) {
@@ -187,7 +187,7 @@ it("lets a person review every paired move within bounded pages and grants conse
     const next = render();
     expect(next).toContain("Page " + (page + 1) + " of 5");
     checkPage(next, page * 8, Math.min((page + 1) * 8, moves.length));
-    expect(inputs.get("typed")?.value).toBe("DELETE");
+    expect(inputs.get("typed")?.value).toBe("MOVE");
     expect(buttons.get("Apply operations")?.disabled).toBe(false);
   }
   expect(buttons.get("Next page")?.["aria-disabled"]).toBe(true);
@@ -205,6 +205,43 @@ it("lets a person review every paired move within bounded pages and grants conse
   expect(cancel).toHaveBeenCalledTimes(1);
   expect(apply).not.toHaveBeenCalled();
   expect(applyReplacement).not.toHaveBeenCalled();
+});
+
+it("requires the action's word and clears prior consent when a move review becomes a restore", () => {
+  const preview = Array.from({ length: 26 }, (_, index) => "C:/Fixture/file-" + index);
+  const apply = vi.fn(), close = vi.fn();
+  const move: ConfirmDialogProps = { title: "Review files", count: preview.length, preview,
+    notice: "move", onConfirm: apply, onClose: close };
+  const { render, buttons, inputs } = reviewDialog(move);
+
+  expect(render()).toContain("Type MOVE to confirm.");
+  inputs.get("typed")!.onChange!({ target: { value: "DELETE" } });
+  render();
+  expect(buttons.get(move.title)?.disabled).toBe(true);
+  buttons.get(move.title)!.onClick!();
+  expect(apply).not.toHaveBeenCalled();
+  inputs.get("typed")!.onChange!({ target: { value: "  mOvE  " } });
+  render();
+  expect(buttons.get(move.title)?.disabled).toBe(false);
+  buttons.get("Next page")!.onClick!();
+  expect(render()).toContain("Page 2 of 4");
+
+  const restored = render({ ...move, notice: "restore" });
+  expect(restored).toContain("Type RESTORE to confirm.");
+  expect(restored).toContain("If a name is already taken, the restored file gets a suffix.");
+  expect(restored).not.toContain("You can reverse this from History");
+  expect(restored).toContain("Page 1 of 4");
+  expect(inputs.get("typed")?.value).toBe("");
+  expect(buttons.get(move.title)?.disabled).toBe(true);
+  inputs.get("typed")!.onChange!({ target: { value: "MOVE" } });
+  render();
+  expect(buttons.get(move.title)?.disabled).toBe(true);
+  inputs.get("typed")!.onChange!({ target: { value: "  rEsToRe  " } });
+  render();
+  expect(buttons.get(move.title)?.disabled).toBe(false);
+  buttons.get("Cancel")!.onClick!();
+  expect(close).toHaveBeenCalledTimes(1);
+  expect(apply).not.toHaveBeenCalled();
 });
 
 it("jumps to page 1,250 of a 10,000-item review without confirming or accepting bad page numbers", () => {

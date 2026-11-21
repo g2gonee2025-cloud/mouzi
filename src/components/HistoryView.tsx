@@ -109,8 +109,7 @@ export default function HistoryView() {
     setConfirm({
       title: t("beta.confirmUndo", { count: rows.length }),
       count: rows.length,
-      notice: "move",
-      note: t("beta.undoHelp"),
+      notice: "restore",
       preview: rows.map((log) => log.source_path),
       opener,
       focusFallback: () => heading.current,

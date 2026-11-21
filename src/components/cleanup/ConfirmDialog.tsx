@@ -23,8 +23,10 @@ export type ConfirmTier = "simple" | "explicit" | "typed";
  *                  behind undo / clear-history. No bin, no recovery at all.
  * - "move"      -> rules MOVE files, so nothing is removed; the only way back
  *                  is the app's own Undo, and only while the log survives.
+ * - "restore"   -> return files to their original folders, with a new name
+ *                  if the original name is occupied.
  */
-export type ConfirmNotice = "trash" | "permanent" | "move";
+export type ConfirmNotice = "trash" | "permanent" | "move" | "restore";
 
 const EXPLICIT_MIN_ITEMS = 10;
 const EXPLICIT_MIN_BYTES = 100 * 1024 * 1024;
@@ -33,10 +35,11 @@ const TYPED_MIN_BYTES = 1024 * 1024 * 1024;
 const PREVIEW_PAGE_SIZE = 8;
 const MAX_SEQUENTIAL_PREVIEW_PAGES = 8;
 
-const NOTICE_KEY = {
-  trash: "confirm.trashNotice",
-  move: "confirm.moveNotice",
-  permanent: "confirm.permanentNotice",
+const CONFIRM_COPY = {
+  trash: { notice: "confirm.trashNotice", word: "confirm.word" },
+  permanent: { notice: "confirm.permanentNotice", word: "confirm.word" },
+  move: { notice: "confirm.moveNotice", word: "confirm.moveWord" },
+  restore: { notice: "beta.undoHelp", word: "confirm.restoreWord" },
 } as const;
 
 type PreviewItem = string | { source: string; destination: string };
@@ -117,7 +120,8 @@ export default function ConfirmDialog({
   const previewId = useId();
 
   const tier = confirmTier(count, bytes);
-  const word = t("confirm.word");
+  const copy = CONFIRM_COPY[notice];
+  const word = t(copy.word);
   const nothingSelected = count <= 0 && countIsExact;
   // Compare case- and whitespace-insensitively so "  delete  " still counts,
   // while the word itself stays a real word in the prompt rather than a hash.
@@ -340,7 +344,7 @@ export default function ConfirmDialog({
             </form>
           )}
 
-          <p className="text-xs text-text-muted">{t(NOTICE_KEY[notice])}</p>
+          <p className="text-xs text-text-muted">{t(copy.notice)}</p>
 
           {tier === "typed" && (
             <div className="space-y-1">

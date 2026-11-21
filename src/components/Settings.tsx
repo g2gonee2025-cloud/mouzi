@@ -452,7 +452,7 @@ export default function Settings() {
       setPending({
         title: t("confirm.op.undoAll"),
         count: rows.length,
-        notice: "move",
+        notice: "restore",
         note: t("confirm.note.undoAll"),
         preview: rows.map(({ source }) => source),
         opener,
