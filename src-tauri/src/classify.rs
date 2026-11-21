@@ -784,8 +784,12 @@ mod tests {
         }
 
         fn register(&mut self, folder: &Path) {
+            self.register_with_mode(folder, db::FOLDER_MODE_MANUAL);
+        }
+
+        fn register_with_mode(&mut self, folder: &Path, mode: &str) {
             fs::create_dir_all(folder).unwrap();
-            self.roots.push(db::register_watched_folder(folder.to_str().unwrap(), db::FOLDER_MODE_MANUAL, false).unwrap());
+            self.roots.push(db::register_watched_folder(folder.to_str().unwrap(), mode, false).unwrap());
         }
 
         fn put(&self, relative: &str) -> PathBuf {
@@ -826,6 +830,16 @@ mod tests {
         let configured: Vec<_> = roots.iter().map(|root| root.to_string_lossy().into_owned()).collect();
         let summaries = crate::scan::scan_roots(&configured, |_| {});
         assert!(summaries.iter().all(|root| root.status == "complete"), "{summaries:?}");
+    }
+
+    #[derive(Default)]
+    struct RecordingModel(Mutex<Vec<String>>);
+
+    impl AiProvider for RecordingModel {
+        fn classify(&self, filename: &str) -> Result<Option<Prediction>, String> {
+            self.0.lock().unwrap().push(filename.into());
+            Ok(Some(Prediction { category: "Images".into(), confidence: 0.65, source: PredictionSource::Ollama }))
+        }
     }
 
     #[test]
@@ -897,14 +911,6 @@ mod tests {
         scan_suggestion_roots(&[&excluded, &healthy]);
         crate::ignore::save_mouziignore(excluded.to_str().unwrap(), &["*.r109probe".into()]).unwrap();
 
-        #[derive(Default)]
-        struct RecordingModel(Mutex<Vec<String>>);
-        impl AiProvider for RecordingModel {
-            fn classify(&self, filename: &str) -> Result<Option<Prediction>, String> {
-                self.0.lock().unwrap().push(filename.into());
-                Ok(Some(Prediction { category: "Images".into(), confidence: 0.65, source: PredictionSource::Ollama }))
-            }
-        }
         let model = RecordingModel::default();
         let result = collect_inventory_suggestions(200, &model, &[], || false).unwrap();
         assert_eq!(*model.0.lock().unwrap(), ["last-item.r109probe"]);
@@ -951,6 +957,54 @@ mod tests {
         scan_suggestion_roots(&[&child]);
         assert_eq!(fixture.paths(&fixture.lookup()), BTreeSet::from([file, sibling.clone()]));
         assert_eq!(stale_parent_only, BTreeSet::from([sibling]));
+    }
+
+    fn probe_unavailable_nested_root(mode: &str) {
+        let mut fixture = SuggestionInventoryFixture::new();
+        let parent = fixture.directory.join("A");
+        let child = parent.join("Child");
+        let peer = fixture.directory.join("Z");
+        fixture.register(&parent);
+        fixture.register(&peer);
+        let previous_child = fixture.put("A/Child/Subdir/opaque-child.r109probe");
+        let sibling = fixture.put("A/Independent/opaque-sibling.r109probe");
+        let anchor_file = fixture.put("A/opaque-anchor.r109probe");
+        let outside = fixture.put("Z/opaque-peer.r109probe");
+        scan_suggestion_roots(&[&parent, &peer]);
+        let indexed = db::get_suggestion_candidates_page(PAGE_SIZE, Some(parent.to_str().unwrap())).unwrap();
+        assert!(indexed.iter().any(|item| Path::new(&item.path) == previous_child));
+
+        // The folder picker may return a plain DOS path while the inventory's
+        // parent walk used the canonical extended spelling.
+        #[cfg(windows)]
+        let registration = PathBuf::from(child.to_str().unwrap().strip_prefix(r"\\?\").unwrap());
+        #[cfg(not(windows))]
+        let registration = child.clone();
+        fixture.register_with_mode(&registration, mode);
+        fs::rename(&child, fixture.directory.join("MovedChild")).unwrap();
+
+        let model = RecordingModel::default();
+        let result = collect_inventory_suggestions(200, &model, &[], || false).unwrap();
+        assert_eq!(fixture.paths(&result), BTreeSet::from([sibling, anchor_file, outside]));
+        assert_eq!(*model.0.lock().unwrap(), ["opaque-sibling.r109probe", "opaque-anchor.r109probe", "opaque-peer.r109probe"]);
+        let issues = fixture.policy_issues(result);
+        if mode == db::FOLDER_MODE_PAUSED {
+            assert!(issues.is_empty());
+        } else {
+            assert_eq!(issues.len(), 1);
+            assert_eq!(issues[0]["root"], registration.to_str().unwrap());
+        }
+        assert_eq!(fs::read(fixture.directory.join("MovedChild/Subdir/opaque-child.r109probe")).unwrap(), b"fixture-only payload");
+    }
+
+    #[test]
+    fn suggestion_policy_listing_preserves_unavailable_nested_root_boundary() {
+        probe_unavailable_nested_root(db::FOLDER_MODE_MANUAL);
+    }
+
+    #[test]
+    fn suggestion_policy_listing_preserves_unavailable_paused_nested_root_boundary() {
+        probe_unavailable_nested_root(db::FOLDER_MODE_PAUSED);
     }
 
     type FakeResponse = Result<TransportResponse, ProviderFailure>;
