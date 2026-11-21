@@ -18,7 +18,10 @@ const mock = vi.hoisted(() => ({
 }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke: mock.invoke }));
 vi.mock("react-i18next", () => ({ useTranslation: () => ({
-  t: (key: string, options?: { path?: string }) => options?.path ? key + ": " + options.path : key,
+  t: (key: string, options?: { path?: string; count?: number; size?: string }) => {
+    if (key === "cleanup.duplicateSelection") return `${options?.count} selected · ${options?.size}`;
+    return options?.path ? key + ": " + options.path : key;
+  },
 }) }));
 vi.mock("../components/cleanup/ConfirmDialog", () => ({ default: () => null }));
 vi.mock("../components/cleanup/ResultsPanel", () => ({ default: () => null }));
@@ -68,6 +71,7 @@ type Props = Partial<ConfirmDialogProps> & {
   role?: string;
   type?: string;
   disabled?: boolean;
+  checked?: boolean;
   ref?: { current: HTMLButtonElement | null };
   onClick?: (event: { currentTarget: HTMLButtonElement }) => void;
   value?: string | number;
@@ -262,6 +266,60 @@ it("prepares ordered victims from the current choices for more than one group", 
   expect(review.preview).toEqual([report.path, third.path, smallerCopy.path]);
   review.onClose!();
   expect(sent()).toEqual([]);
+});
+
+it("starts above the review limit with nothing selected and reviews only explicit copies across groups", async () => {
+  const files = Array.from({ length: 10_002 }, (_, i) => ({ path: `C:/Fixture/big-${i}.txt`, size: 32, mtime: 1 }));
+  const pair = { hash: "pair", files: [
+    { path: "C:/Fixture/pair-a.txt", size: 17, mtime: 1 },
+    { path: "C:/Fixture/pair-b.txt", size: 17, mtime: 1 },
+  ] };
+  const groups = [{ hash: "oversized", files }, pair];
+  useCleanupStore.setState({ duplicates: groups });
+  const confirm = () => find(render("duplicates"), button("cleanup.confirm"))!;
+  expect(confirm().props.disabled).toBe(true);
+  expect(text(render("duplicates"))).toContain("0 selected");
+  expect(mock.invoke).not.toHaveBeenCalled();
+
+  chooseCopy("oversized", files[1].path);
+  expect(confirm().props.disabled).toBe(true);
+  const checkbox = (hash: string, path: string) => find(duplicateCard(hash), (node) =>
+    node.type === "input" && node.props["aria-label"] === "cleanup.duplicateSelectFile: " + path)!.props;
+  expect(checkbox("oversized", files[1].path)).toMatchObject({ checked: false, disabled: true });
+  expect(checkbox("oversized", files[0].path).checked).toBe(false);
+  checkbox("oversized", files[0].path).onChange!();
+  checkbox("pair", pair.files[1].path).onChange!();
+  expect(text(render("duplicates"))).toContain("2 selected · 49 B");
+
+  const review = await open("duplicates");
+  expect(review.preview).toEqual([files[0].path, pair.files[1].path]);
+  expect(mock.invoke.mock.lastCall).toEqual(["prepare_cleanup_cmd", { actions: [
+    { kind: "trash_duplicate", path: files[0].path, keepPath: files[1].path },
+    { kind: "trash_duplicate", path: pair.files[1].path, keepPath: pair.files[0].path },
+  ] }]);
+  review.onClose!();
+  checkbox("pair", pair.files[1].path).onChange!();
+  expect(text(render("duplicates"))).toContain("1 selected · 32 B");
+  const adjusted = await open("duplicates");
+  expect(adjusted.preview).toEqual([files[0].path]);
+  adjusted.onClose!();
+  useCleanupStore.getState().invalidateFileCandidates();
+  mock.invoke.mockResolvedValueOnce(groups);
+  await useCleanupStore.getState().findDuplicates();
+  expect(confirm().props.disabled).toBe(true);
+  expect(checkbox("oversized", files[0].path).checked).toBe(false);
+  expect(sent()).toEqual([]);
+});
+
+it("offers the ordinary defaults at precisely 10,000 copies without rendering the whole group", () => {
+  const files = Array.from({ length: 10_001 }, (_, i) => ({ path: `C:/Fixture/copy-${i}.txt`, size: 1, mtime: 1 }));
+  useCleanupStore.setState({ duplicates: [{ hash: "at-limit", files }] });
+  const controls = text(render("duplicates"));
+  const card = duplicateCard("at-limit");
+  expect(find(render("duplicates"), button("cleanup.confirm"))?.props.disabled).toBe(false);
+  expect(controls).toContain("10000 selected");
+  expect(text(card)).toContain("copy-1.txt");
+  expect(text(card)).not.toContain("copy-10000.txt");
 });
 
 
