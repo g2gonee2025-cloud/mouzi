@@ -514,7 +514,8 @@
     "alreadyFiled": "Bereits abgelegt; Kategorie gespeichert",
     "localAiModelMissing": "Das ausgewählte Modell fehlt in Ollama. Installieren Sie es oder wählen Sie unter Einstellungen → Allgemein ein installiertes Modell aus. Wenn die Meldung nach dem Aktualisieren weiterhin erscheint, aktualisieren Sie die Vorschläge in einer Minute erneut.",
     "localAiUnreachable": "Ollama ist nicht erreichbar. Starten Sie Ollama und aktualisieren Sie die Vorschläge. Wenn die Meldung bestehen bleibt, aktualisieren Sie die Vorschläge in einer Minute erneut.",
-    "localAiGenerationFailed": "Ollama konnte eine Anfrage mit dem ausgewählten Modell nicht abschließen. Prüfen Sie, ob das Modell in Ollama funktioniert, oder wählen Sie unter Einstellungen → Allgemein ein anderes Modell aus. Warten Sie nach der Fehlerbehebung eine Minute und aktualisieren Sie dann die Vorschläge."
+    "localAiGenerationFailed": "Ollama konnte eine Anfrage mit dem ausgewählten Modell nicht abschließen. Prüfen Sie, ob das Modell in Ollama funktioniert, oder wählen Sie unter Einstellungen → Allgemein ein anderes Modell aus. Warten Sie nach der Fehlerbehebung eine Minute und aktualisieren Sie dann die Vorschläge.",
+    "policyReadIncomplete": "Diese Ordner wurden bei den Vorschlägen übersprungen, weil ihre Ausschlüsse nicht geprüft werden konnten. Lesen Sie die Details, beheben Sie das Problem und aktualisieren Sie die Vorschläge."
   },
   "confirm": {
     "impactItems": "{{count}} Element",

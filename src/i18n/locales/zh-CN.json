@@ -508,7 +508,8 @@
     "alreadyFiled": "文件已在目标位置，分类已保存",
     "localAiModelMissing": "Ollama 缺少所选模型。请安装该模型，或在设置 → 常规中选择已安装的模型。如果刷新后仍有此提示，请在一分钟后再次刷新建议。",
     "localAiUnreachable": "无法连接到 Ollama。请启动 Ollama 并刷新建议。如果仍有此提示，请在一分钟后再次刷新。",
-    "localAiGenerationFailed": "Ollama 未能使用所选模型完成一次请求。请检查该模型能否在 Ollama 中运行，或在设置 → 常规中选择其他模型。解决问题后，请等待一分钟再刷新建议。"
+    "localAiGenerationFailed": "Ollama 未能使用所选模型完成一次请求。请检查该模型能否在 Ollama 中运行，或在设置 → 常规中选择其他模型。解决问题后，请等待一分钟再刷新建议。",
+    "policyReadIncomplete": "由于无法检查排除规则，整理建议已跳过以下文件夹。请查看详情，解决问题后刷新建议。"
   },
   "confirm": {
     "impactItems": "{{count}} 项",
