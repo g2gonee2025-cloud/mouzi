@@ -41,8 +41,9 @@ vi.mock("react", async (importOriginal) => {
     useRef: (current: unknown) => mock.slots[claim({ current })],
     useState: (initial: unknown) => {
       const slot = claim(typeof initial === "function" ? initial() : initial);
-      return [mock.slots[slot], (value: unknown) => {
-        mock.slots[slot] = typeof value === "function" ? value(mock.slots[slot]) : value;
+      const slots = mock.slots;
+      return [slots[slot], (value: unknown) => {
+        slots[slot] = typeof value === "function" ? value(slots[slot]) : value;
       }];
     },
     useLayoutEffect: (effect: EffectCallback, deps: readonly unknown[]) => {
@@ -72,6 +73,8 @@ type Props = Partial<ConfirmDialogProps> & {
   value?: string | number;
   onChange?: (event?: { target: { value: string } }) => void;
   results?: CleanupOutcome[];
+  error?: string | null;
+  onDone?: () => void;
   group?: DuplicateGroup;
   "aria-label"?: string;
   "aria-pressed"?: boolean;
@@ -170,7 +173,7 @@ function chooseCopy(hash = "fixture-content", path = copy.path) {
 function closeTab() {
   mock.effects.forEach(({ stop }) => stop?.());
   mock.effects.clear();
-  mock.slots.length = 0;
+  mock.slots = [];
 }
 
 it("keeps the explicitly chosen copy when switching Cleanup tabs and canceling review", async () => {
@@ -321,6 +324,89 @@ it("preserves a dispatched confirmation through overlapping events and shows its
   expect(guidance(receipt)).toBeUndefined();
   expect(find(receipt, (node) => node.type === ResultsPanel)?.props.results).toEqual(outcomes);
   expect(useCleanupStore.getState().results).toEqual(outcomes);
+});
+
+const receipt = (tab: Tab) => find(render(tab), (node) => node.type === ResultsPanel)?.props;
+
+it.each<Tab>(["duplicates", "large", "stale", "empty"])(
+  "shows the same completed %s receipt after remount until it is acknowledged",
+  async (tab) => {
+    const review = await open(tab);
+    const path = String(review.preview?.[0]);
+    const outcome: CleanupOutcome = { path, status: "failed", message: "Retained fixture" };
+    mock.invoke.mockResolvedValueOnce([outcome]);
+    await review.onConfirm?.();
+    review.onClose?.();
+    expect(receipt(tab)?.results).toEqual([outcome]);
+
+    closeTab();
+    const other = tab === "empty" ? "large" : "empty";
+    expect(receipt(other)).toBeUndefined();
+    closeTab();
+    const returned = receipt(tab);
+    expect.soft(returned?.results).toEqual([outcome]);
+    mock.invoke.mockResolvedValueOnce([]);
+    returned?.onDone?.();
+    expect(receipt(tab)).toBeUndefined();
+    await settle();
+    if (tab === "large" || tab === "stale") {
+      expect(threshold(render(tab)).value).toBe("100");
+    }
+    closeTab();
+    expect(receipt(tab)).toBeUndefined();
+    expect(sent()).toHaveLength(1);
+  },
+);
+
+it("keeps a receipt delivered after departure alongside a later execution in another finder", async () => {
+  useCleanupStore.setState({ largeFiles: { minBytes: 100 * 1_048_576, files: [report, copy] } });
+  const first = await open("large");
+  const outcomes: CleanupOutcome[] = [
+    { path: report.path, status: "ok", message: "Recovery unverified" },
+    { path: copy.path, status: "skipped", message: "File changed before cleanup began" },
+  ];
+  let finish!: (rows: CleanupOutcome[]) => void;
+  mock.invoke.mockReturnValueOnce(new Promise<CleanupOutcome[]>((resolve) => { finish = resolve; }));
+  const firstExecution = first.onConfirm?.();
+  closeTab();
+  finish(outcomes);
+  await firstExecution;
+  expect(receipt("empty")).toBeUndefined();
+
+  const second = await open("empty");
+  const emptyOutcome: CleanupOutcome = { path: empty, status: "ok" };
+  mock.invoke.mockResolvedValueOnce([emptyOutcome]);
+  await second.onConfirm?.();
+  second.onClose?.();
+  expect(receipt("empty")?.results).toEqual([emptyOutcome]);
+
+  closeTab();
+  const firstReceipt = receipt("large");
+  expect.soft(firstReceipt?.results).toEqual(outcomes);
+  mock.invoke.mockResolvedValueOnce([copy]);
+  firstReceipt?.onDone?.();
+  await settle();
+  const list = render("large");
+  expect(receipt("large")).toBeUndefined();
+  expect(find(list, button("cleanup.confirm"))?.props.disabled).toBe(true);
+  closeTab();
+  expect(receipt("empty")?.results).toEqual([emptyOutcome]);
+  expect(sent()).toHaveLength(2);
+});
+
+it("shows an execution rejection in its own finder after navigation", async () => {
+  const review = await open("stale");
+  let fail!: (reason: string) => void;
+  mock.invoke.mockReturnValueOnce(new Promise<CleanupOutcome[]>((_, reject) => { fail = reject; }));
+  const execution = review.onConfirm?.();
+  const rejection = expect(execution).rejects.toBe("The file changed before cleanup started");
+  closeTab();
+  fail("The file changed before cleanup started");
+  await rejection;
+  expect(receipt("large")).toBeUndefined();
+  closeTab();
+  expect(receipt("stale")).toMatchObject({ results: [], error: "The file changed before cleanup started" });
+  expect(sent()).toHaveLength(1);
 });
 
 type FileTab = "large" | "stale";
