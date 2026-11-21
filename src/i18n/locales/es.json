@@ -112,7 +112,7 @@
       "startupDifferentLocation": "Windows está configurado para iniciar Mouzi desde otra ubicación. Activa esta opción para usar esta copia.",
       "startupUnavailable": "Los ajustes de inicio automático no están disponibles en esta versión de desarrollo aislada.",
       "gracePeriod": "Período de gracia",
-      "gracePeriodDesc": "Tiempo de espera antes de mover un archivo después de su última modificación. 0 = instantáneo.",
+      "gracePeriodDesc": "Mouzi espera este tiempo desde la última modificación del archivo antes de moverlo automáticamente. Incluso con el valor 0, la espera mínima es de 2 segundos.",
       "checkFileLock": "Verificar bloqueo de archivo",
       "checkFileLockDesc": "Omitir archivos en uso por otro proceso",
       "gracePeriodSeconds": "Segundos",

@@ -129,7 +129,7 @@
       "startupDifferentLocation": "Windows 设置为从其他位置启动 Mouzi。开启此选项可改用当前副本。",
       "startupUnavailable": "此隔离开发版本不支持开机启动设置。",
       "gracePeriod": "等待时间",
-      "gracePeriodDesc": "文件最后修改后，等待一段时间再移动。设为 0 表示立即移动。",
+      "gracePeriodDesc": "文件最后一次修改后，Mouzi 会等待指定的时间再自动移动文件。即使设为 0，也会至少等待 2 秒。",
       "checkFileLock": "检查文件占用",
       "checkFileLockDesc": "跳过正被其他进程使用的文件",
       "gracePeriodSeconds": "秒",

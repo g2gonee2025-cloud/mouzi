@@ -129,7 +129,7 @@
       "startupDifferentLocation": "Windows ist so eingestellt, dass Mouzi von einem anderen Speicherort startet. Aktivieren Sie diese Option, um diese Kopie zu verwenden.",
       "startupUnavailable": "Die Autostarteinstellungen sind in dieser isolierten Entwicklungsversion nicht verfügbar.",
       "gracePeriod": "Wartezeit",
-      "gracePeriodDesc": "Wartezeit, bevor eine Datei nach der letzten Änderung verschoben wird. 0 = sofort.",
+      "gracePeriodDesc": "So lange wartet Mouzi nach der letzten Änderung, bevor eine Datei automatisch verschoben wird. Auch bei 0 beträgt die Wartezeit mindestens 2 Sekunden.",
       "checkFileLock": "Dateisperre prüfen",
       "checkFileLockDesc": "Dateien überspringen, die gerade von einem anderen Prozess verwendet werden",
       "gracePeriodSeconds": "Sekunden",

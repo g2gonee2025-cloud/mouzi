@@ -129,7 +129,7 @@
       "startupDifferentLocation": "Windows では、別の場所にある Mouzi が起動するように設定されています。このコピーを使うには、この設定をオンにしてください。",
       "startupUnavailable": "この隔離された開発版では、自動起動を設定できません。",
       "gracePeriod": "猶予時間",
-      "gracePeriodDesc": "ファイルが最後に変更されてから移動するまでの待機時間。0にするとすぐに移動します。",
+      "gracePeriodDesc": "ファイルが最後に変更されてから自動で移動するまでの待機時間です。0 に設定しても、少なくとも 2 秒間は待機します。",
       "checkFileLock": "ファイルロックの確認",
       "checkFileLockDesc": "他のプロセスで使用中のファイルをスキップ",
       "gracePeriodSeconds": "秒",

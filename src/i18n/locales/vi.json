@@ -135,7 +135,7 @@
       "startupDifferentLocation": "Windows được đặt để khởi động Mouzi từ một vị trí khác. Bật tùy chọn này để dùng bản sao hiện tại.",
       "startupUnavailable": "Bản dựng phát triển biệt lập này không hỗ trợ cài đặt khởi động cùng hệ thống.",
       "gracePeriod": "Thời gian chờ",
-      "gracePeriodDesc": "Thời gian chờ trước khi di chuyển tệp sau lần chỉnh sửa cuối cùng. 0 = tức thì.",
+      "gracePeriodDesc": "Mouzi chờ khoảng thời gian này kể từ lần thay đổi tệp cuối cùng trước khi tự động di chuyển tệp. Ngay cả khi đặt thành 0, thời gian chờ tối thiểu vẫn là 2 giây.",
       "checkFileLock": "Kiểm tra tệp đang khóa",
       "checkFileLockDesc": "Bỏ qua các tệp hiện đang được sử dụng bởi tiến trình khác",
       "gracePeriodSeconds": "Giây",
