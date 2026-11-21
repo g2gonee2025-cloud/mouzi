@@ -362,6 +362,72 @@ it("displays a live rule's exact folder and permits an explicit scope change", a
   expect(db.get(scopedInvoice.id)?.folder_id).toBe(0);
 });
 
+const extensionsField = () => field("settings.rules.extensions");
+
+it("preserves extension keystrokes and sends the existing trimmed array on Save", async () => {
+  edit("Invoices");
+  expect(extensionsField().props.value).toBe("fixture");
+  for (const value of ["fixture,", "fixture, ", "fixture,", "fixture", " .JPEG,  tif , JPEG,, "]) {
+    change(extensionsField(), { value });
+    expect(extensionsField().props.value).toBe(value);
+  }
+  change(field("settings.rules.name"), { value: "Photo invoices" });
+  expect(extensionsField().props.value).toBe(" .JPEG,  tif , JPEG,, ");
+  expect(harness.invoke).not.toHaveBeenCalled();
+
+  ruleReadFails = true;
+  await submit();
+  expect(harness.invoke).toHaveBeenCalledWith("update_rule_cmd", {
+    rule: { ...invoice, name: "Photo invoices", extensions: [".JPEG", "tif", "JPEG", "", ""] },
+  });
+  edit("Photo invoices");
+  expect(extensionsField().props.value).toBe("jpeg, tif");
+});
+
+it("keeps raw Extensions through tab and row edits, then resets on Cancel or a new rule", async () => {
+  edit("Invoices");
+  const draft = "  acme,    b";
+  change(extensionsField(), { value: draft });
+  click(requireElement(({ props }) => props.label === "settings.general.title"));
+  expect(find(editor(), (node) => node.props["aria-label"] === "settings.rules.extensions")).toBeUndefined();
+  click(requireElement(({ props }) => props.label === "settings.rules.title"));
+  expect(extensionsField().props.value).toBe(draft);
+
+  toggle("Invoices");
+  await settle();
+  expect(extensionsField().props.value).toBe(draft);
+  expect(db.get(1)).toEqual({ ...invoice, enabled: false });
+  click(requireElement(button("common.cancel")));
+  edit("Invoices");
+  expect(extensionsField().props.value).toBe("fixture");
+  change(extensionsField(), { value: draft });
+  edit("Receipts");
+  expect(extensionsField().props.value).toBe("fixture");
+  change(extensionsField(), { value: draft });
+  click(requireElement(button("settings.rules.add")));
+  expect(extensionsField().props.value).toBe("");
+  change(field("settings.rules.name"), { value: "New exclusions" });
+  chooseRuleAction("ignore");
+  change(extensionsField(), { value: "  .PNG,jpg, " });
+  await submit();
+  expect(db.get(10)?.extensions).toEqual([".PNG", "jpg", ""]);
+  expect(db.get(2)).toEqual(receipts);
+});
+
+it("keeps the exact extension draft after Save rejects it, then sends the corrected array", async () => {
+  edit("Invoices");
+  change(extensionsField(), { value: "  ,," });
+  harness.invoke.mockRejectedValueOnce("Provide at least one extension or *");
+  await submit();
+  expect(harness.invoke).toHaveBeenCalledWith("update_rule_cmd", { rule: { ...invoice, extensions: ["", "", ""] } });
+  expect(extensionsField().props.value).toBe("  ,,");
+  expect(db.get(1)).toEqual(invoice);
+
+  change(extensionsField(), { value: " .PDF, jpg " });
+  await submit();
+  expect(db.get(1)?.extensions).toEqual([".PDF", "jpg"]);
+});
+
 const normalizationLabel = "settings.rules.normalizeExtensions";
 const normalizationMapping = "JPEG:JPG, tif:tiff";
 

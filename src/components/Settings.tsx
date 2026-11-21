@@ -214,6 +214,7 @@ export default function Settings() {
   const [tab, setTab] = useState<Tab>("folders");
   const [reviewPaths, setReviewPaths] = useState<string[] | null>(null);
   const [editingRule, setEditingRule] = useState<Rule | null>(null);
+  const [ruleExtensionsInput, setRuleExtensionsInput] = useState<string | null>(null);
   const folderPaths = new Map(folders.map((folder) => [folder.id, folder.path]));
   const missingRuleFolder = !!editingRule?.folder_id && !folderPaths.has(editingRule.folder_id);
   const ruleScopeReady = !editingRule?.folder_id || (folderRead.status === "ready" && !missingRuleFolder);
@@ -342,9 +343,17 @@ export default function Settings() {
     }
   };
 
+  const beginRuleEdit = (rule: Rule) => {
+    setEditingRule(rule);
+    setRuleExtensionsInput(null);
+  };
+
   const handleSaveRule = async () => {
     if (!editingRule || !ruleScopeReady) return;
-    const rule = editingRule;
+    const rule = ruleExtensionsInput === null ? editingRule : {
+      ...editingRule,
+      extensions: ruleExtensionsInput.split(",").map((extension) => extension.trim()),
+    };
     if (await runWrite(() => rule.id ? updateRule(rule) : addRule(rule))) setEditingRule(null);
   };
 
@@ -649,7 +658,7 @@ export default function Settings() {
               <h2 ref={sectionHeading} tabIndex={-1} className="text-lg font-semibold">{t("settings.rules.title")}</h2>
               <button
                 onClick={() =>
-                  setEditingRule({
+                  beginRuleEdit({
                     name: "",
                     priority: 0,
                     enabled: true,
@@ -730,13 +739,8 @@ export default function Settings() {
                     <label className="text-xs font-medium text-text-muted">{t("settings.rules.extensions")}</label>
                     <input
                       aria-label={t("settings.rules.extensions")}
-                      value={editingRule.extensions.join(", ")}
-                      onChange={(e) =>
-                        setEditingRule({
-                          ...editingRule,
-                          extensions: e.target.value.split(",").map((s) => s.trim()),
-                        })
-                      }
+                      value={ruleExtensionsInput ?? editingRule.extensions.join(", ")}
+                      onChange={(e) => setRuleExtensionsInput(e.target.value)}
                       placeholder={t("settings.rules.extensions")}
                       className="mt-1 w-full rounded-md border border-border bg-surface px-2 py-1.5 text-sm outline-none focus:border-primary"
                     />
@@ -891,7 +895,7 @@ export default function Settings() {
                     </button>
                     <button
                       aria-label={`${t("settings.rules.edit")}: ${r.name}`}
-                      onClick={() => setEditingRule({ ...r })}
+                      onClick={() => beginRuleEdit({ ...r })}
                       className="p-1.5 rounded-md hover:bg-border text-text-muted"
                     >
                       <Save size={14} />
