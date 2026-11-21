@@ -191,7 +191,7 @@ export default function Popup() {
     }
   };
 
-  const handleQuit = () => {
+  const closePopup = () => {
     invoke("close_popup");
   };
 
@@ -231,10 +231,10 @@ export default function Popup() {
           <span className="font-semibold text-sm">{t("popup.title")}</span>
         </div>
         <button
-          onClick={handleQuit}
+          onClick={closePopup}
           className="p-1.5 rounded-md hover:bg-border transition-colors"
-          title={t("popup.quit")}
-          aria-label={t("popup.quit")}
+          title={t("common.close")}
+          aria-label={t("common.close")}
         >
           <X size={14} />
         </button>
