@@ -15,7 +15,7 @@ Open **Settings → History**. Filter by filename, rule, extension or a date/tim
 
 Select entries or **Select this run**, choose **Review undo**, then confirm. Each file receives its own result. Pause the watched folder first if you are investigating an unexpected organization run.
 
-If the original name is taken, Mouzi looks for a free name with a suffix. The result shows where the file was restored. The file already at the original path stays in place.
+In Mouzi 0.2.1, Undo reports a failure if the original path already contains a file. Both files stay where they are. A successful restore goes back to the original path shown in History.
 
 If the organized file is missing or has changed, check the original and organized locations before restoring it manually.
 
@@ -24,6 +24,7 @@ Restored files are protected from immediate automatic reorganization until their
 ### History in development builds
 
 - Choose **Retry** if the filtered history fails to load. This runs the last filter you applied and keeps any edits you have made to the filter fields.
+- If the original name is taken, Undo looks for an available name with a suffix. The result shows the actual restore path, and the file at the original path stays in place.
 - If a verified move cannot be undone because its file is missing, put the same file back at its recorded organized path and retry undo.
 - **File restored. Its History record is incomplete.** means the file has moved back. Use the displayed path to find it and check the reason shown for the incomplete record.
 
