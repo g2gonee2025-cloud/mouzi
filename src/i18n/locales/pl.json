@@ -466,6 +466,8 @@
     "accepted": "Przeniesiono",
     "refresh": "Odśwież",
     "failed": "Niepowodzenie",
+    "movedWithWarning": "Przeniesiono z ostrzeżeniem",
+    "moveNeedsReview": "Sprawdź wynik przenoszenia",
     "missing": "Plik już nie istnieje",
     "resultsTitle": "Wyniki",
     "backToList": "Powrót do listy",

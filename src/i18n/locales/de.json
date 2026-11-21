@@ -464,6 +464,8 @@
     "accepted": "Verschoben",
     "refresh": "Aktualisieren",
     "failed": "Fehlgeschlagen",
+    "movedWithWarning": "Mit Warnung verschoben",
+    "moveNeedsReview": "Ergebnis des Verschiebens prüfen",
     "missing": "Datei existiert nicht mehr",
     "resultsTitle": "Ergebnisse",
     "backToList": "Zurück zur Liste",

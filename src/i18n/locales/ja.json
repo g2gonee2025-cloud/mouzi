@@ -460,6 +460,8 @@
     "accepted": "移動済み",
     "refresh": "更新",
     "failed": "失敗",
+    "movedWithWarning": "移動しました（警告あり）",
+    "moveNeedsReview": "移動結果を確認してください",
     "missing": "ファイルはもう存在しません",
     "resultsTitle": "結果",
     "backToList": "リストに戻る",

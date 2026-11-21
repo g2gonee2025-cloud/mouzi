@@ -466,6 +466,8 @@
     "accepted": "Déplacé",
     "refresh": "Actualiser",
     "failed": "Échoué",
+    "movedWithWarning": "Déplacé avec un avertissement",
+    "moveNeedsReview": "Résultat du déplacement à vérifier",
     "missing": "Le fichier n'existe plus",
     "resultsTitle": "Résultats",
     "backToList": "Retour à la liste",

@@ -466,6 +466,8 @@
     "accepted": "Переміщено",
     "refresh": "Оновити",
     "failed": "Помилка",
+    "movedWithWarning": "Переміщено з попередженням",
+    "moveNeedsReview": "Перевірте результат переміщення",
     "missing": "Файл більше не існує",
     "resultsTitle": "Результати",
     "backToList": "Назад до списку",

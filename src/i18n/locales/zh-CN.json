@@ -460,6 +460,8 @@
     "accepted": "已移动",
     "refresh": "刷新",
     "failed": "失败",
+    "movedWithWarning": "已移动，但有警告",
+    "moveNeedsReview": "请检查移动结果",
     "missing": "文件已不存在",
     "resultsTitle": "结果",
     "backToList": "返回列表",

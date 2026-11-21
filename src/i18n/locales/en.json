@@ -464,6 +464,8 @@
     "accepted": "Moved",
     "refresh": "Refresh",
     "failed": "Failed",
+    "movedWithWarning": "Moved with a warning",
+    "moveNeedsReview": "Move outcome needs review",
     "missing": "File no longer exists",
     "resultsTitle": "Results",
     "backToList": "Back to list",

@@ -466,6 +466,8 @@
     "accepted": "Đã di chuyển",
     "refresh": "Làm mới",
     "failed": "Thất bại",
+    "movedWithWarning": "Đã di chuyển nhưng có cảnh báo",
+    "moveNeedsReview": "Cần kiểm tra kết quả di chuyển",
     "missing": "Tệp không còn tồn tại",
     "resultsTitle": "Kết quả",
     "backToList": "Quay lại danh sách",
