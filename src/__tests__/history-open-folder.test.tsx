@@ -43,14 +43,14 @@ interface FolderButton {
   onClick?: () => void | Promise<void>;
 }
 
-function folderAction(node: ReactNode): FolderButton["onClick"] {
-  if (Array.isArray(node)) return node.map(folderAction).find(Boolean);
+function buttonAction(node: ReactNode, key: string): FolderButton["onClick"] {
+  if (Array.isArray(node)) return node.map((child) => buttonAction(child, key)).find(Boolean);
   if (!isValidElement<FolderButton>(node)) return;
   const { children, onClick, "aria-label": label } = node.props;
-  if (node.type === "button" && (children === "cleanup.openFolder" || label === "cleanup.openFolder")) {
+  if (node.type === "button" && (children === key || label === key)) {
     return onClick;
   }
-  return folderAction(children);
+  return buttonAction(children, key);
 }
 
 function render(view: () => ReactNode) {
@@ -63,7 +63,7 @@ async function clickSavedFolder(view: () => ReactNode) {
   const cleanups = mocks.effects.splice(0).map((effect) => effect());
   try {
     const click = await vi.waitFor(() => {
-      const action = folderAction(render(view));
+      const action = buttonAction(render(view), "cleanup.openFolder");
       if (!action) throw new Error("Saved history row did not show an Open folder button");
       return action;
     });
@@ -79,6 +79,69 @@ beforeEach(() => {
   mocks.state.length = 0;
   mocks.effects.length = 0;
   useCleanupStore.setState(useCleanupStore.getInitialState(), true);
+});
+
+it("opens Cleanup History and shows older entries after the first 100", async () => {
+  const row = (id: number): CleanupLogEntry => ({
+    id, timestamp, path: "C:/Watched/record-" + id + ".bin", prevPath: null, dest: null,
+    action: "trash_large", status: "ok", undoable: false,
+  });
+  const first = Array.from({ length: 100 }, (_, index) => row(103 - index));
+  const cursor = { timestamp, id: 4, throughId: 103 };
+  mocks.invoke.mockImplementation(async (command, args) => {
+    if (command === "get_cleanup_logs_cmd") return first;
+    if (command === "get_cleanup_history_page_cmd") {
+      return args.cursor ? { entries: [row(3), row(2), row(1)], nextCursor: null } : { entries: first, nextCursor: cursor };
+    }
+    throw new Error("Unexpected command " + command);
+  });
+
+  render(HistoryPanel);
+  mocks.effects.splice(0).forEach((effect) => effect());
+  await vi.waitFor(() => expect(useCleanupStore.getState().history).toHaveLength(100));
+
+  const older = buttonAction(render(HistoryPanel), "beta.more");
+  expect(older).toBeTypeOf("function");
+  await older?.();
+  expect(useCleanupStore.getState().history?.map(({ id }) => id)).toEqual(
+    Array.from({ length: 103 }, (_, index) => 103 - index),
+  );
+  expect(mocks.invoke).toHaveBeenLastCalledWith("get_cleanup_history_page_cmd", { limit: 100, cursor });
+  expect(buttonAction(render(HistoryPanel), "beta.more")).toBeUndefined();
+});
+
+it("retries the same history cursor and lets refresh supersede an in-flight older page", async () => {
+  const saved = (id: number): CleanupLogEntry => ({
+    id, timestamp, path: "C:/Watched/history-" + id, prevPath: null, dest: null,
+    action: "trash_large", status: "ok", undoable: false,
+  });
+  const initial = { entries: [saved(2)], nextCursor: { timestamp, id: 2, throughId: 2 } };
+  const refreshed = { entries: [saved(3), saved(2)], nextCursor: null };
+  mocks.invoke.mockResolvedValueOnce(initial).mockRejectedValueOnce(new Error("Temporary history read failure"));
+  await useCleanupStore.getState().loadHistory();
+  await useCleanupStore.getState().loadOlderHistory();
+  expect(useCleanupStore.getState()).toMatchObject({
+    history: initial.entries, historyCursor: initial.nextCursor, historyLoading: false,
+    historyError: "Error: Temporary history read failure",
+  });
+  expect(buttonAction(render(HistoryPanel), "beta.more")).toBeTypeOf("function");
+
+  let resolveOlder!: (page: { entries: CleanupLogEntry[]; nextCursor: null }) => void;
+  const older = new Promise<{ entries: CleanupLogEntry[]; nextCursor: null }>((resolve) => { resolveOlder = resolve; });
+  mocks.invoke.mockReturnValueOnce(older).mockResolvedValueOnce(refreshed);
+  const retry = useCleanupStore.getState().loadOlderHistory();
+  await useCleanupStore.getState().loadOlderHistory();
+  expect(mocks.invoke).toHaveBeenCalledTimes(3);
+  expect(mocks.invoke).toHaveBeenNthCalledWith(3, "get_cleanup_history_page_cmd", { limit: 100, cursor: initial.nextCursor });
+
+  await buttonAction(render(HistoryPanel), "cleanup.refresh")?.();
+  expect(mocks.invoke).toHaveBeenNthCalledWith(4, "get_cleanup_history_page_cmd", { limit: 100, cursor: null });
+  resolveOlder({ entries: [saved(1)], nextCursor: null });
+  await retry;
+  expect(useCleanupStore.getState()).toMatchObject({
+    history: refreshed.entries, historyCursor: null, historyLoading: false, historyError: null,
+  });
+  expect(buttonAction(render(HistoryPanel), "beta.more")).toBeUndefined();
 });
 
 const timestamp = "2026-11-20T12:00:00Z";
@@ -109,10 +172,10 @@ it.each([
     id: 1, timestamp, path, prevPath: null, dest: null,
     action: "trash_large", status: "ok", undoable: false, message: null,
   };
-  mocks.invoke.mockResolvedValueOnce([saved]).mockResolvedValueOnce(undefined);
+  mocks.invoke.mockResolvedValueOnce({ entries: [saved], nextCursor: null }).mockResolvedValueOnce(undefined);
 
   await clickSavedFolder(HistoryPanel);
 
-  expect(mocks.invoke).toHaveBeenNthCalledWith(1, "get_cleanup_logs_cmd", { limit: 100 });
+  expect(mocks.invoke).toHaveBeenNthCalledWith(1, "get_cleanup_history_page_cmd", { limit: 100, cursor: null });
   expect(mocks.invoke).toHaveBeenNthCalledWith(2, "open_folder_cmd", { path: parent });
 });

@@ -137,7 +137,7 @@ beforeEach(() => {
         actions: args.actions, totalBytes: report.size,
       };
     }
-    if (command === "get_cleanup_logs_cmd") return [];
+    if (command === "get_cleanup_history_page_cmd") return { entries: [], nextCursor: null };
     throw Error("Unexpected command " + command);
   });
 });

@@ -9,7 +9,7 @@ import { invoke } from "@tauri-apps/api/core";
 
 export default function HistoryPanel() {
   const { t } = useTranslation();
-  const { history, historyLoading, historyError, loadHistory } = useCleanupStore();
+  const { history, historyCursor, historyLoading, historyError, loadHistory, loadOlderHistory } = useCleanupStore();
   const [openError, setOpenError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -96,6 +96,16 @@ export default function HistoryPanel() {
             })}
           </div>
         </div>
+      )}
+      {historyCursor && (
+        <button
+          type="button"
+          onClick={loadOlderHistory}
+          disabled={historyLoading}
+          className="rounded-md border border-border px-3 py-2 text-xs font-medium text-primary hover:bg-surface-dark disabled:opacity-50"
+        >
+          {t("beta.more")}
+        </button>
       )}
     </div>
   );

@@ -16,6 +16,17 @@ export interface CleanupLogEntry {
   undoable: boolean;
 }
 
+interface CleanupHistoryCursor {
+  timestamp: string;
+  id: number;
+  throughId: number;
+}
+
+interface CleanupHistoryPage {
+  entries: CleanupLogEntry[];
+  nextCursor: CleanupHistoryCursor | null;
+}
+
 interface CleanupState {
   inventoryReady: boolean | null;
   duplicates: DuplicateGroup[] | null;
@@ -29,6 +40,7 @@ interface CleanupState {
   preparedPlan: CleanupPlan | null;
   results: CleanupOutcome[] | null;
   history: CleanupLogEntry[] | null;
+  historyCursor: CleanupHistoryCursor | null;
   historyLoading: boolean;
   historyError: string | null;
   findDuplicates: () => Promise<void>;
@@ -41,12 +53,14 @@ interface CleanupState {
   invalidateFileCandidates: () => void;
   observeInventoryReadiness: () => () => void;
   loadHistory: () => Promise<void>;
+  loadOlderHistory: () => Promise<void>;
   clearResults: () => void;
   clearError: () => void;
 }
 
 let candidatesGeneration = 0;
 let historyGeneration = 0;
+const HISTORY_PAGE_SIZE = 100;
 const emptyCandidates = { duplicates: null, largeFiles: null, staleFiles: null, emptyDirs: null };
 const inventoryEvents = ["scan-complete", "scan-finished", "folders-changed", "mutation-completed"];
 type FinderKey = keyof typeof emptyCandidates;
@@ -60,6 +74,26 @@ async function requestCandidates<Item>(command: string, args?: Record<string, nu
 export const useCleanupStore = create<CleanupState>((set, get) => {
   const preview = createPreviewSlot();
   let activeFinder: { key: FinderKey; generation: number } | null = null;
+
+  async function readHistory(older: boolean) {
+    const { history, historyCursor, historyLoading } = get();
+    if (older && (!history || !historyCursor || historyLoading)) return;
+    const generation = ++historyGeneration;
+    const cursor = older ? historyCursor : null;
+    set({ historyLoading: true, historyError: null });
+    try {
+      const page = await invoke<CleanupHistoryPage>("get_cleanup_history_page_cmd", { limit: HISTORY_PAGE_SIZE, cursor });
+      if (generation === historyGeneration) {
+        set({
+          history: older && history ? history.concat(page.entries) : page.entries,
+          historyCursor: page.nextCursor,
+          historyLoading: false,
+        });
+      }
+    } catch (error) {
+      if (generation === historyGeneration) set({ historyError: String(error), historyLoading: false });
+    }
+  }
 
   async function find<Key extends FinderKey>(
     key: Key,
@@ -99,7 +133,7 @@ export const useCleanupStore = create<CleanupState>((set, get) => {
     inventoryReady: null,
     unavailableRoots: {},
     loading: false, error: null, busy: false, preparedPlan: null,
-    results: null, history: null, historyLoading: false, historyError: null,
+    results: null, history: null, historyCursor: null, historyLoading: false, historyError: null,
     findDuplicates: () => find("duplicates", () => requestCandidates<DuplicateGroup>("find_duplicates_cmd")),
     findLargeFiles: (minBytes) => find("largeFiles", async () => {
       const { candidates: files, unavailableRoots } = await requestCandidates<CleanupFile>("find_large_files_cmd", { minBytes });
@@ -221,16 +255,8 @@ export const useCleanupStore = create<CleanupState>((set, get) => {
         }
       };
     },
-    loadHistory: async () => {
-      const generation = ++historyGeneration;
-      set({ historyLoading: true, historyError: null });
-      try {
-        const history = await invoke<CleanupLogEntry[]>("get_cleanup_logs_cmd", { limit: 100 });
-        if (generation === historyGeneration) set({ history, historyLoading: false });
-      } catch (error) {
-        if (generation === historyGeneration) set({ historyError: String(error), historyLoading: false });
-      }
-    },
+    loadHistory: () => readHistory(false),
+    loadOlderHistory: () => readHistory(true),
     clearResults: () => set({ results: null }),
     clearError: () => set({ error: null }),
   };

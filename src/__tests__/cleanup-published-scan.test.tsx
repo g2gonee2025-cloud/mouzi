@@ -136,7 +136,7 @@ it("releases a visible old-snapshot finder and rejects its late rows and omissio
 
 it("clears only inventory file rows and lets the Empty folders finder and History continue", async () => {
   const directory = deferred<{ candidates: string[]; unavailableRoots: string[] }>();
-  const history = deferred<[]>();
+  const history = deferred<{ entries: []; nextCursor: null }>();
   const receipt = [{ path: "C:/Fixture/finished.bin", status: "ok" }] as const;
   useCleanupStore.setState({
     duplicates: [{ hash: "hash", files: [oldFile, newFile] }],
@@ -154,7 +154,7 @@ it("clears only inventory file rows and lets the Empty folders finder and Histor
     duplicates: null, staleFiles: { days: 28, files: null }, loading: true, historyLoading: true, results: receipt,
   });
   directory.resolve({ candidates: ["C:/Fixture/empty"], unavailableRoots: ["Z:/Empty scope"] });
-  history.resolve([]);
+  history.resolve({ entries: [], nextCursor: null });
   await Promise.all([emptySearch, historyLoad]);
 
   expect(useCleanupStore.getState()).toMatchObject({

@@ -217,6 +217,7 @@ pub fn run() {
             get_logs_cmd,
             get_history_counts_cmd,
             get_cleanup_logs_cmd,
+            get_cleanup_history_page_cmd,
             get_stats_cmd,
             undo_action_cmd,
             preview_undo_all_cmd,

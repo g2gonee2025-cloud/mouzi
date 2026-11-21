@@ -144,6 +144,21 @@ pub struct CleanupAction {
     pub message: Option<String>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CleanupHistoryCursor {
+    timestamp: String,
+    id: i64,
+    through_id: i64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CleanupHistoryPage {
+    entries: Vec<CleanupAction>,
+    next_cursor: Option<CleanupHistoryCursor>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettings {
     pub id: Option<i64>,
@@ -280,6 +295,11 @@ fn initialize_schema(conn: &Connection) -> SqliteResult<()> {
             status TEXT NOT NULL,
             undoable INTEGER NOT NULL DEFAULT 0
         )",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS cleanup_actions_history_order
+         ON cleanup_actions(timestamp DESC, id DESC)",
         [],
     )?;
 
@@ -1505,27 +1525,73 @@ pub fn get_cleanup_logs(limit: i64) -> SqliteResult<Vec<CleanupAction>> {
     let conn = sqlite_lock()?;
     let mut stmt = conn.prepare(
         "SELECT id, timestamp, path, prev_path, dest, action, status, undoable,message
-         FROM cleanup_actions ORDER BY timestamp DESC LIMIT ?1",
+         FROM cleanup_actions ORDER BY timestamp DESC, id DESC LIMIT ?1",
     )?;
     let logs = stmt
-        .query_map(params![limit], |row| {
-            let ts_str: String = row.get(1)?;
-            Ok(CleanupAction {
-                id: row.get(0)?,
-                timestamp: DateTime::parse_from_rfc3339(&ts_str)
-                    .map(|d| d.with_timezone(&Utc))
-                    .unwrap_or_else(|_| Utc.timestamp_opt(0, 0).unwrap()),
-                path: row.get(2)?,
-                prev_path: row.get(3)?,
-                dest: row.get(4)?,
-                action: row.get(5)?,
-                status: row.get(6)?,
-                undoable: row.get::<_, i32>(7)? != 0,
-                message: row.get(8)?,
-            })
-        })?
+        .query_map(params![limit], |row| read_cleanup_action(row).map(|(_, _, action)| action))?
         .collect::<SqliteResult<Vec<_>>>()?;
     Ok(logs)
+}
+
+fn read_cleanup_action(row: &rusqlite::Row<'_>) -> SqliteResult<(i64, String, CleanupAction)> {
+    let id = row.get(0)?;
+    let stored_timestamp: String = row.get(1)?;
+    let timestamp = DateTime::parse_from_rfc3339(&stored_timestamp)
+        .map(|d| d.with_timezone(&Utc))
+        .unwrap_or_else(|_| Utc.timestamp_opt(0, 0).unwrap());
+    let action = CleanupAction {
+        id: Some(id),
+        timestamp,
+        path: row.get(2)?,
+        prev_path: row.get(3)?,
+        dest: row.get(4)?,
+        action: row.get(5)?,
+        status: row.get(6)?,
+        undoable: row.get::<_, i32>(7)? != 0,
+        message: row.get(8)?,
+    };
+    Ok((id, stored_timestamp, action))
+}
+
+const CLEANUP_HISTORY_SNAPSHOT: &str = "SELECT COALESCE(MAX(id), 0) FROM cleanup_actions";
+const CLEANUP_HISTORY_FIRST: &str = "SELECT id, timestamp, path, prev_path, dest, action, status, undoable, message
+    FROM cleanup_actions WHERE id <= ?1 ORDER BY timestamp DESC, id DESC LIMIT ?2";
+const CLEANUP_HISTORY_NEXT: &str = "SELECT id, timestamp, path, prev_path, dest, action, status, undoable, message
+    FROM cleanup_actions WHERE (timestamp, id) < (?1, ?2) AND id <= ?3 ORDER BY timestamp DESC, id DESC LIMIT ?4";
+
+pub fn get_cleanup_history_page(limit: i64, cursor: Option<&CleanupHistoryCursor>) -> SqliteResult<CleanupHistoryPage> {
+    cleanup_history_page_on(&*sqlite_lock()?, limit, cursor)
+}
+
+fn cleanup_history_page_on(
+    conn: &Connection,
+    limit: i64,
+    cursor: Option<&CleanupHistoryCursor>,
+) -> SqliteResult<CleanupHistoryPage> {
+    let limit = limit.clamp(1, 200);
+    let through_id = match cursor {
+        Some(cursor) => cursor.through_id,
+        None => conn.query_row(CLEANUP_HISTORY_SNAPSHOT, [], |row| row.get(0))?,
+    };
+    // The ID ceiling keeps new inserts out of an in-progress traversal, even if
+    // their timestamps fall on a tie or sort behind the last displayed row.
+    let mut stmt = conn.prepare(if cursor.is_some() { CLEANUP_HISTORY_NEXT } else { CLEANUP_HISTORY_FIRST })?;
+    let rows = match cursor {
+        Some(cursor) => stmt.query_map(params![cursor.timestamp, cursor.id, through_id, limit + 1], read_cleanup_action)?,
+        None => stmt.query_map(params![through_id, limit + 1], read_cleanup_action)?,
+    };
+    let mut rows = rows.collect::<SqliteResult<Vec<_>>>()?;
+    let next_cursor = if rows.len() > limit as usize {
+        rows.pop();
+        rows.last().map(|(id, timestamp, _)| CleanupHistoryCursor {
+            timestamp: timestamp.clone(),
+            id: *id,
+            through_id,
+        })
+    } else {
+        None
+    };
+    Ok(CleanupHistoryPage { entries: rows.into_iter().map(|(_, _, entry)| entry).collect(), next_cursor })
 }
 
 pub fn begin_operation_intent(action:&str,source:&str,requested_destination:Option<&str>)->SqliteResult<i64> {
@@ -3035,6 +3101,45 @@ mod tests {
         let corrupt = logs.iter().find(|l| l.path == "/corrupt-cleanup");
         assert!(corrupt.is_some(), "corrupt cleanup row should be returned with epoch fallback");
         assert_eq!(corrupt.unwrap().timestamp, Utc.timestamp_opt(0, 0).unwrap());
+    }
+
+    #[test]
+    fn cleanup_history_pages_keep_a_stable_snapshot_and_detect_the_end() {
+        let conn = mem_conn_with_inventory();
+        let ids = |page: &CleanupHistoryPage| page.entries.iter().map(|entry| entry.id.unwrap()).collect::<Vec<_>>();
+        let recent = "2026-11-20T12:00:00+00:00";
+        let earlier = "2026-11-19T13:00:00+00:00";
+        let insert = |timestamp, path| {
+            conn.execute(
+                "INSERT INTO cleanup_actions (timestamp, path, action, status) VALUES (?1, ?2, 'trash_large', 'ok')",
+                params![timestamp, path],
+            ).unwrap();
+        };
+
+        let empty = cleanup_history_page_on(&conn, 100, None).unwrap();
+        assert!(empty.entries.is_empty());
+        assert!(empty.next_cursor.is_none());
+        for _ in 0..100 { insert(recent, "/fixture"); }
+        let full = cleanup_history_page_on(&conn, 100, None).unwrap();
+        assert_eq!(full.entries.len(), 100);
+        assert!(full.next_cursor.is_none(), "Exactly one page leaves no more records");
+
+        for _ in 0..50 { insert(recent, "/fixture"); }
+        for _ in 0..50 { insert(earlier, "/fixture"); }
+        let first = cleanup_history_page_on(&conn, 100, None).unwrap();
+        assert_eq!(ids(&first), (51..=150).rev().collect::<Vec<_>>());
+        let cursor = first.next_cursor.as_ref().unwrap();
+
+        insert(recent, "/new-tie");
+        insert(earlier, "/new-backdated");
+        insert("2026-11-21T01:00:00+00:00", "/newer");
+        let older = cleanup_history_page_on(&conn, 100, Some(cursor)).unwrap();
+        assert_eq!(ids(&older), (1..=50).rev().chain((151..=200).rev()).collect::<Vec<_>>());
+        assert!(older.next_cursor.is_none(), "Exactly one older page also has no continuation");
+
+        let refreshed = cleanup_history_page_on(&conn, 100, None).unwrap();
+        assert_eq!(&ids(&refreshed)[..3], [203, 201, 150]);
+        assert_eq!(refreshed.next_cursor.unwrap().through_id, 203);
     }
 
     #[test]

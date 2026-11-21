@@ -662,6 +662,14 @@ pub fn get_cleanup_logs_cmd(limit: i64) -> Result<Vec<CleanupAction>, String> {
     get_cleanup_logs(limit).map_err(|e| e.to_string())
 }
 
+#[tauri::command(async)]
+pub fn get_cleanup_history_page_cmd(
+    limit: i64,
+    cursor: Option<CleanupHistoryCursor>,
+) -> Result<CleanupHistoryPage, String> {
+    get_cleanup_history_page(limit, cursor.as_ref()).map_err(|error| error.to_string())
+}
+
 /// Return the current app version and release date.
 #[tauri::command]
 pub fn get_version_cmd(app: AppHandle) -> Result<(String, String), String> {
