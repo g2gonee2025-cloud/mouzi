@@ -1183,7 +1183,9 @@ mod tests {
             let plans = PLANS.lock().unwrap();
             let plan = &plans[&preview.plan_id];
             assert_eq!(plan.duplicate_groups.len(), 1);
-            assert_eq!(plan.duplicate_groups[0].len(), 4);
+            let members: HashSet<_> = plan.duplicate_groups[0].iter().collect();
+            assert_eq!(members, HashSet::from([&first_keeper, &second_keeper, &first, &second]));
+            assert!(plan.actions.iter().all(|action| action.duplicate_group == Some(0)));
             assert_eq!(plan.files.len(), 4);
         }
         assert_eq!(preview.total_bytes, 8);
