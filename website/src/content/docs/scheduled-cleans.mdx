@@ -23,12 +23,11 @@ Scheduled runs skip **Manual**, **Suggest** and **Paused** folders. For a Manual
 
 ## Grace period and safety
 
-In public Mouzi 0.2.1, a scheduled pass bypasses the grace period. The same applies to operations you approve through **Organize Now**. Both still observe these safeguards:
+In public Mouzi 0.2.1, a scheduled pass bypasses the grace period. The same applies to operations you approve through **Organize Now**.
 
-- built-in file exclusions
-- the folder's `.mouziignore`
-- enabled rules and their priority
-- file-lock checking when that option is enabled
+Scheduled passes respect built-in file exclusions, the folder's `.mouziignore` and enabled rules in priority order. They apply file-lock checking when **Check file lock** is enabled.
+
+Review checks for locked files when it prepares the preview and again before applying approved operations, even if **Check file lock** is off.
 
 Do not schedule a run for a time when another application regularly writes unlocked temporary files into the watched folder. Add a `.mouziignore` pattern where necessary.
 
