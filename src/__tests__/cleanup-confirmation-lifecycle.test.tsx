@@ -77,6 +77,7 @@ type Props = Partial<ConfirmDialogProps> & {
   value?: string | number;
   onChange?: (event?: { target: { value: string } }) => void;
   results?: CleanupOutcome[];
+  label?: string;
   error?: string | null;
   onDone?: () => void;
   group?: DuplicateGroup;
@@ -322,6 +323,70 @@ it("offers the ordinary defaults at precisely 10,000 copies without rendering th
   expect(controls).toContain("10000 selected");
   expect(text(card)).toContain("copy-1.txt");
   expect(text(card)).not.toContain("copy-10000.txt");
+});
+
+it("can select the last copy and a later group while preserving choices off page", async () => {
+  const files = Array.from({ length: 26 }, (_, i) => ({ path: `C:/Fixture/copy-${i}.txt`, size: 2, mtime: 1 }));
+  const pairs = Array.from({ length: 12 }, (_, i) => ({
+    hash: `pair-${i}`,
+    files: ["a", "b"].map((copy) => ({ path: `C:/Fixture/pair-${i}-${copy}.txt`, size: 1, mtime: 1 })),
+  }));
+  useCleanupStore.setState({ duplicates: [{ hash: "many-copies", files }, ...pairs] });
+  find(render("duplicates"), button("beta.clearSelection"))!.props.onClick!({ currentTarget: opener });
+  const last = files[25].path;
+  const choose = (card: ReactNode, path: string) => find(card,
+    (node) => node.props["aria-label"] === "cleanup.duplicateSelectFile: " + path);
+  const nextPage = (tree: ReactNode, label: string) => {
+    const pager = find(tree, (node) => node.props.label === label)!;
+    const draw = pager.type as (props: Props) => ReactNode;
+    find(draw(pager.props), button("common.nextPage"))!.props.onClick!({ currentTarget: opener });
+  };
+  expect(choose(duplicateCard("many-copies"), last)).toBeUndefined();
+  nextPage(duplicateCard("many-copies"), "cleanup.duplicateCopyPages");
+  choose(duplicateCard("many-copies"), last)!.props.onChange!();
+
+  expect(find(render("duplicates"), (node) => node.props.group === pairs[11])).toBeUndefined();
+  nextPage(render("duplicates"), "cleanup.duplicateGroupPages");
+  choose(duplicateCard(pairs[11].hash), pairs[11].files[1].path)!.props.onChange!();
+  expect(text(render("duplicates"))).toContain("2 selected · 3 B");
+  const review = await open("duplicates");
+  expect(review.preview).toEqual([last, pairs[11].files[1].path]);
+  review.onClose!();
+});
+
+it.each([
+  { members: 10_002, initialAll: false },
+  { members: 5, initialAll: true },
+])("keeps a fresh manual selection after acknowledging a subset of $members copies", async ({ members, initialAll }) => {
+  const files = Array.from({ length: members }, (_, i) => ({ path: `C:/Fixture/copy-${i}.txt`, size: 1, mtime: 1 }));
+  const group = { hash: "oversized-or-explicit", files };
+  const store = useCleanupStore.getState;
+  const confirm = () => find(render("duplicates"), button("cleanup.confirm"))!;
+  mock.invoke.mockResolvedValueOnce([group]);
+  await store().findDuplicates();
+  expect(confirm().props.disabled).toBe(!initialAll);
+  if (initialAll) find(render("duplicates"), button("beta.clearSelection"))!.props.onClick!({ currentTarget: opener });
+  const victim = files[1].path;
+  find(duplicateCard(group.hash), (row) => row.props["aria-label"] === "cleanup.duplicateSelectFile: " + victim)!.props.onChange!();
+  const review = await open("duplicates");
+  expect(review.preview).toEqual([victim]);
+  mock.invoke.mockResolvedValueOnce([{ path: victim, status: "ok" }]);
+  await review.onConfirm?.();
+  review.onClose!();
+  store().invalidateFileCandidates();
+  const remainder = { ...group, files: files.filter(({ path }) => path !== victim) };
+  mock.invoke.mockResolvedValueOnce([remainder]);
+  receipt("duplicates")!.onDone!();
+  await settle();
+  expect.soft(confirm().props.disabled).toBe(true);
+  expect.soft(text(render("duplicates"))).toContain("0 selected");
+
+  const selectAll = find(render("duplicates"), button("cleanup.selectAll"));
+  expect(selectAll?.props.disabled).toBe(false);
+  selectAll?.props.onClick!({ currentTarget: opener });
+  expect(text(render("duplicates"))).toContain(`${members - 2} selected`);
+  expect(confirm().props.disabled).toBe(false);
+  expect(sent()).toHaveLength(1);
 });
 
 
