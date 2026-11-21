@@ -807,14 +807,18 @@ export default function Settings() {
                   </label>
                 </div>
                 <RuleConditions rule={editingRule} onChange={setEditingRule} />
-                <label className="flex items-center gap-2 text-sm">
-                  <input type="checkbox" checked={editingRule.normalize_extensions ?? false}
-                    onChange={(event) => setEditingRule({ ...editingRule, normalize_extensions: event.target.checked })} />
-                  {t("settings.rules.normalizeExtensions")}
-                </label>
-                {editingRule.normalize_extensions && <input aria-label={t("settings.rules.normalizeExtensions")}
-                  className="w-full rounded-md border border-border bg-surface p-2 text-sm" value={editingRule.extension_mappings ?? "jpeg:jpg"}
-                  onChange={(event) => setEditingRule({ ...editingRule, extension_mappings: event.target.value })} />}
+                {editingRule.action === "move" && (
+                  <>
+                    <label className="flex items-center gap-2 text-sm">
+                      <input type="checkbox" checked={editingRule.normalize_extensions ?? false}
+                        onChange={(event) => setEditingRule({ ...editingRule, normalize_extensions: event.target.checked })} />
+                      {t("settings.rules.normalizeExtensions")}
+                    </label>
+                    {editingRule.normalize_extensions && <input aria-label={t("settings.rules.normalizeExtensions")}
+                      className="w-full rounded-md border border-border bg-surface p-2 text-sm" value={editingRule.extension_mappings ?? "jpeg:jpg"}
+                      onChange={(event) => setEditingRule({ ...editingRule, extension_mappings: event.target.value })} />}
+                  </>
+                )}
                 <label className="block text-sm">{t("settings.rules.notificationMessage")}
                   <input className="mt-1 block w-full rounded-md border border-border bg-surface p-2"
                     value={editingRule.notification_message ?? ""} placeholder={t("settings.rules.notificationPlaceholder")}

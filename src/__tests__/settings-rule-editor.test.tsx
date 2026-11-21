@@ -362,6 +362,62 @@ it("displays a live rule's exact folder and permits an explicit scope change", a
   expect(db.get(scopedInvoice.id)?.folder_id).toBe(0);
 });
 
+const normalizationLabel = "settings.rules.normalizeExtensions";
+const normalizationMapping = "JPEG:JPG, tif:tiff";
+
+function chooseRuleAction(value: string) {
+  change(requireElement((node) => node.type === "select"
+    && !!find(node, (option) => option.type === "option" && option.props.value === "rename")), { value });
+}
+
+function expectNormalizationHidden() {
+  const form = editor();
+  const checkboxLabel = (node: Element) => node.type === "label" && text(node.props.children) === normalizationLabel;
+  const mappingInput = (node: Element) => node.type === "input" && node.props["aria-label"] === normalizationLabel;
+  expect(find(form, checkboxLabel)).toBeUndefined();
+  expect(find(form, mappingInput)).toBeUndefined();
+}
+
+it("keeps a new Move mapping while switching the rule draft through Rename and Ignore", async () => {
+  click(requireElement(button("settings.rules.add")));
+  change(field("settings.rules.name"), { value: "Normalized photos" });
+  change(field("settings.rules.extensions"), { value: "jpeg, tif" });
+  change(field("settings.rules.destination"), { value: "Photos" });
+  expect(checkbox(normalizationLabel).props.checked).toBe(false);
+  change(checkbox(normalizationLabel), { checked: true });
+  change(field(normalizationLabel), { value: normalizationMapping });
+
+  for (const action of ["rename", "ignore"]) {
+    chooseRuleAction(action);
+    expectNormalizationHidden();
+    chooseRuleAction("move");
+    expect(checkbox(normalizationLabel).props.checked).toBe(true);
+    expect(field(normalizationLabel).props.value).toBe(normalizationMapping);
+  }
+
+  expect(harness.invoke).not.toHaveBeenCalled();
+  await submit();
+  expect(db.get(10)).toMatchObject({ action: "move", normalize_extensions: true, extension_mappings: normalizationMapping });
+  edit("Normalized photos");
+  expect(field(normalizationLabel).props.value).toBe(normalizationMapping);
+});
+
+it.each(["rename", "ignore", "delete"])("hides and preserves a saved inactive mapping on an existing %s rule", async (action) => {
+  const existing = { ...invoice, action, normalize_extensions: true, extension_mappings: normalizationMapping };
+  db.set(1, existing);
+  useAppStore.setState({ rules: [...db.values()] });
+  edit("Invoices");
+  expectNormalizationHidden();
+  change(field("settings.rules.name"), { value: "Updated invoices" });
+  await submit();
+  expect(db.get(1)).toEqual({ ...existing, name: "Updated invoices" });
+
+  edit("Updated invoices");
+  chooseRuleAction("move");
+  expect(checkbox(normalizationLabel).props.checked).toBe(true);
+  expect(field(normalizationLabel).props.value).toBe(normalizationMapping);
+});
+
 const folderA = "C:/Fixture/Manual A";
 const folderB = "C:/Fixture/Manual B";
 const ignoreFolder = () => requireElement((node) => node.type === "select" && node.props["aria-label"] === "settings.ignore.folder", ignoreEditor());
