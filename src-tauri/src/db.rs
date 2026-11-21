@@ -2315,20 +2315,35 @@ fn register_inventory_search(conn: &Connection) -> SqliteResult<()> {
     )
 }
 
-fn inventory_files_sql(sort: &str) -> String {
-    let order = if sort == "mtime" {
-        "mtime DESC, path ASC"
+fn inventory_files_sql(sort: &str, filtered: bool) -> String {
+    let recent = sort == "mtime";
+    // Keep the indexed prefix for the snapshot; filtered searches may favor a root lookup.
+    let index = if recent && !filtered { " INDEXED BY idx_file_inventory_mtime" } else { "" };
+    let (join, order) = if recent {
+        // Only convert the fractional digits. The full Unix nanoseconds can exceed INTEGER.
+        (
+            " LEFT JOIN inventory_fingerprints f ON f.path = i.path",
+            "i.mtime DESC, COALESCE(CAST(substr(f.mtime_ns, -9) AS INTEGER), 0) DESC, i.path ASC",
+        )
     } else {
-        "size DESC, path ASC"
+        ("", "i.size DESC, i.path ASC")
+    };
+    let (filters, limit) = if filtered {
+        (
+            "AND (?1 = '' OR i.category = ?1)
+             AND (?2 = '' OR i.root_path = ?2)
+             AND (?3 = '' OR mouzi_path_contains(i.path,?3))",
+            "?4",
+        )
+    } else {
+        ("", "50")
     };
     format!(
-        "SELECT path, size, mtime, category, root_path FROM file_inventory
-         WHERE root_path IN (SELECT path FROM watched_folders)
-           AND (?1 = '' OR category = ?1)
-           AND (?2 = '' OR root_path = ?2)
-           AND (?3 = '' OR mouzi_path_contains(path,?3))
+        "SELECT i.path, i.size, i.mtime, i.category, i.root_path FROM file_inventory i{index}{join}
+         WHERE i.root_path IN (SELECT path FROM watched_folders)
+           {filters}
          ORDER BY {order}
-         LIMIT ?4"
+         LIMIT {limit}"
     )
 }
 
@@ -2343,7 +2358,7 @@ fn get_inventory_files_on(
     let cat = category.unwrap_or("");
     let root_path = root.unwrap_or("");
     let q = query.unwrap_or("").trim();
-    query_inventory_files(conn, &inventory_files_sql(sort), params![cat, root_path, q, limit.max(0)])
+    query_inventory_files(conn, &inventory_files_sql(sort, true), params![cat, root_path, q, limit.max(0)])
 }
 
 fn query_inventory_files(conn: &Connection, sql: &str, bindings: impl rusqlite::Params) -> SqliteResult<Vec<InventoryFile>> {
@@ -2488,11 +2503,8 @@ pub fn get_dashboard_snapshot() -> SqliteResult<DashboardSnapshot> {
     Ok(snapshot)
 }
 
-fn get_snapshot_files_on(conn:&Connection,sort:&str)->SqliteResult<Vec<InventoryFile>> {
-    let order=if sort=="mtime" {"mtime DESC,path ASC"} else {"size DESC,path ASC"};
-    let mut stmt=conn.prepare(&format!("SELECT path,size,mtime,category,root_path FROM file_inventory WHERE root_path IN (SELECT path FROM watched_folders) ORDER BY {order} LIMIT 50"))?;
-    let rows=stmt.query_map([],|r|Ok(InventoryFile{path:r.get(0)?,size:r.get(1)?,mtime:r.get(2)?,category:r.get(3)?,root_path:r.get(4)?}))?.collect::<SqliteResult<Vec<_>>>()?;
-    Ok(rows)
+fn get_snapshot_files_on(conn: &Connection, sort: &str) -> SqliteResult<Vec<InventoryFile>> {
+    query_inventory_files(conn, &inventory_files_sql(sort, false), [])
 }
 
 #[derive(Debug,Clone)]
@@ -3268,6 +3280,70 @@ mod tests {
         assert_eq!(root[0].root_path, "/pics");
     }
 
+    fn add_recent_fixture(
+        conn: &Connection, root: &str, name: &str, size: i64, second: i64, nanosecond: Option<u32>,
+    ) -> String {
+        let path = format!("{root}/{name}");
+        conn.execute(
+            "INSERT INTO file_inventory(root_path,path,size,mtime,category) VALUES(?1,?2,?3,?4,'Documents')",
+            params![root, path, size, second],
+        ).unwrap();
+        if let Some(nanosecond) = nanosecond {
+            let exact = (second as u128 * 1_000_000_000 + u128::from(nanosecond)).to_string();
+            conn.execute(
+                "INSERT INTO inventory_fingerprints(path,identity,size,mtime_ns) VALUES(?1,?2,?3,?4)",
+                params![path, path, size, exact],
+            ).unwrap();
+        }
+        path
+    }
+
+    #[test]
+    fn recent_files_order_subseconds_before_snapshot_and_search_cutoffs() {
+        let conn = mem_conn_with_inventory();
+        let root = "/receipts";
+        conn.execute("INSERT INTO watched_folders(path,mode) VALUES(?1,'manual')", [root]).unwrap();
+        let second = 1_795_176_000;
+        let mut expected = vec![
+            add_recent_fixture(&conn, root, "receipt-next.txt", 1, second + 1, Some(1)),
+            add_recent_fixture(&conn, root, "receipt-z.txt", 1, second, Some(900_000_000)),
+        ];
+        for index in 0..80 {
+            expected.push(add_recent_fixture(&conn, root, &format!("receipt-a{index:02}.txt"), 1, second, Some(100_000_000)));
+        }
+        expected.push(add_recent_fixture(&conn, root, "receipt-prior.txt", 1, second - 1, Some(999_999_999)));
+        let paths = |rows: Vec<InventoryFile>| rows.into_iter().map(|file| file.path).collect::<Vec<_>>();
+        let snapshot = paths(get_snapshot_files_on(&conn, "mtime").unwrap());
+        let filtered = paths(get_inventory_files_on(&conn, "mtime", Some("Documents"), Some(root), Some("RECEIPT"), 81).unwrap());
+        assert_eq!(snapshot.len(), 50);
+        assert_eq!(filtered.len(), 81);
+        assert_eq!((&snapshot[..3], &filtered[..3]), (&expected[..3], &expected[..3]));
+        assert_eq!(snapshot, expected[..50]);
+        assert_eq!(filtered, expected[..81]);
+    }
+
+    #[test]
+    fn recent_files_keep_exact_ties_and_legacy_rows_with_wide_unix_nanoseconds() {
+        let conn = mem_conn_with_inventory();
+        let root = "/wide";
+        conn.execute("INSERT INTO watched_folders(path,mode) VALUES(?1,'manual')", [root]).unwrap();
+        let second = 16_725_225_600;
+        let latest = add_recent_fixture(&conn, root, "z-latest.txt", 1, second, Some(900_000_000));
+        let tie_b = add_recent_fixture(&conn, root, "b-exact-tie.txt", 3, second, Some(100_000_000));
+        let tie_a = add_recent_fixture(&conn, root, "a-exact-tie.txt", 3, second, Some(100_000_000));
+        let legacy = add_recent_fixture(&conn, root, "c-legacy.txt", 4, second, None);
+        let whole = add_recent_fixture(&conn, root, "d-whole-second.txt", 2, second, Some(0));
+        let older = add_recent_fixture(&conn, root, "older.txt", 5, second - 1, Some(999_999_999));
+        let recent = [&latest, &tie_a, &tie_b, &legacy, &whole, &older];
+        let largest = [&older, &legacy, &tie_a, &tie_b, &whole, &latest];
+        for (sort, expected) in [("mtime", recent), ("size", largest)] {
+            let snapshot = get_snapshot_files_on(&conn, sort).unwrap();
+            let filtered = get_inventory_files_on(&conn, sort, Some("Documents"), Some(root), None, 80).unwrap();
+            assert!(snapshot.iter().map(|file| &file.path).eq(expected), "snapshot {sort}");
+            assert!(filtered.iter().map(|file| &file.path).eq(expected), "filtered {sort}");
+        }
+    }
+
     #[test]
     fn preference_patch_preserves_concurrent_schedule_and_returns_revision() {
         let conn=mem_conn_with_inventory();
@@ -3516,7 +3592,7 @@ mod tests {
 
             let mut metrics = Vec::new();
             for arm in 0..2 {
-                let sql = if arm == 0 { baseline_sql(search.sort) } else { inventory_files_sql(search.sort) };
+                let sql = if arm == 0 { baseline_sql(search.sort) } else { inventory_files_sql(search.sort, true) };
                 let implementation = implementations[arm];
                 let plan = connections[arm].prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap()
                     .query_map(bindings, |row| row.get::<_, String>(3)).unwrap()
