@@ -276,6 +276,8 @@ export default function Settings() {
   const startupCanChange = !startupWriting && startup !== null && startup !== "unavailable";
   const [reviewPaths, setReviewPaths] = useState<string[] | null>(null);
   const [editingRule, setEditingRule] = useState<Rule | null>(null);
+  const [pickedRuleDestination, setPickedRuleDestination] = useState<string | null>(null);
+  const rulePickerRequest = useRef(0);
   const [ruleExtensionsInput, setRuleExtensionsInput] = useState<string | null>(null);
   const [rulePriorityDraft, setRulePriorityDraft] = useState("");
   const [ruleSizeDraft, setRuleSizeDraft] = useState<RuleSizeDraft>({ min_size: "", max_size: "" });
@@ -284,6 +286,10 @@ export default function Settings() {
   const folderPaths = new Map(folders.map((folder) => [folder.id, folder.path]));
   const missingRuleFolder = !!editingRule?.folder_id && !folderPaths.has(editingRule.folder_id);
   const ruleScopeReady = !editingRule?.folder_id || (folderRead.status === "ready" && !missingRuleFolder);
+  const scopedFolder = editingRule?.folder_id ? folderPaths.get(editingRule.folder_id) ?? null : undefined;
+  const ruleDestination = (pickedRuleDestination === null
+    ? editingRule?.destination
+    : nextDestination(pickedRuleDestination, folders.map(({ path }) => path), scopedFolder)) ?? "";
   const ruleScopeLabel = (id: number) => {
     if (id === 0) return t("beta.allWatched");
     return folderPaths.get(id) ?? t(folderRead.status === "ready" ? "beta.removedRuleFolder" : "beta.ruleFolderById", { id });
@@ -421,7 +427,23 @@ export default function Settings() {
     }
   };
 
+  const clearRuleDestinationPick = () => {
+    ++rulePickerRequest.current;
+    setPickedRuleDestination(null);
+  };
+
+  const pickRuleDestination = async () => {
+    const request = ++rulePickerRequest.current;
+    try {
+      const path = await open({ directory: true });
+      if (path && request === rulePickerRequest.current) setPickedRuleDestination(path);
+    } catch (error) {
+      if (request === rulePickerRequest.current) setWriteError(errorText(error));
+    }
+  };
+
   const beginRuleEdit = (rule: Rule) => {
+    clearRuleDestinationPick();
     setEditingRule(rule);
     setRuleExtensionsInput(null);
     setRulePriorityDraft(String(rule.priority));
@@ -436,6 +458,7 @@ export default function Settings() {
     const rule: Rule = {
       ...editingRule,
       priority: rulePriority,
+      destination: ruleDestination,
       ...(ruleExtensionsInput === null ? {} : {
         extensions: ruleExtensionsInput.split(",").map((extension) => extension.trim()),
       }),
@@ -444,7 +467,10 @@ export default function Settings() {
       || sizeBounds.max_size !== (editingRule.options?.max_size ?? null)) {
       rule.options = { ...defaultRuleOptions, ...editingRule.options, ...sizeBounds };
     }
-    if (await runWrite(() => rule.id ? updateRule(rule) : addRule(rule))) setEditingRule(null);
+    if (await runWrite(() => rule.id ? updateRule(rule) : addRule(rule))) {
+      clearRuleDestinationPick();
+      setEditingRule(null);
+    }
   };
 
   const toggleRule = async (rule: Rule) => {
@@ -896,16 +922,15 @@ export default function Settings() {
                     <label className="text-xs font-medium text-text-muted">{t("settings.rules.destination")}</label>
                     <input
                       aria-label={t("settings.rules.destination")}
-                      value={editingRule.destination}
-                      onChange={(e) => setEditingRule({ ...editingRule, destination: e.target.value })}
+                      value={ruleDestination}
+                      onChange={(e) => {
+                        clearRuleDestinationPick();
+                        setEditingRule({ ...editingRule, destination: e.target.value });
+                      }}
                       className="mt-1 w-full rounded-md border border-border bg-surface px-2 py-1.5 text-sm outline-none focus:border-primary"
                     />
                     <button type="button" className="mt-2 rounded-md border border-border px-2 py-1 text-xs"
-                      onClick={() => void open({ directory: true }).then((path) => {
-                        const roots = folders.filter((folder) => !editingRule.folder_id || folder.id === editingRule.folder_id).map((folder) => folder.path);
-                        const destination = nextDestination(path, roots);
-                        if (destination !== null) setEditingRule((rule) => rule && { ...rule, destination });
-                      }).catch((error) => setWriteError(errorText(error)))}>
+                      onClick={() => void pickRuleDestination()}>
                       {t("beta.pickFolder")}
                     </button>
                   </div>}
@@ -986,7 +1011,10 @@ export default function Settings() {
                     {t("settings.rules.save")}
                   </button>
                   <button
-                    onClick={() => setEditingRule(null)}
+                    onClick={() => {
+                      clearRuleDestinationPick();
+                      setEditingRule(null);
+                    }}
                     className="flex items-center gap-1.5 rounded-md border border-border px-3 py-1.5 text-sm hover:bg-surface"
                   >
                     <X size={14} />

@@ -2,10 +2,8 @@
  * Turns a folder chosen in the rule destination picker into the value the rule
  * should store.
  *
- * Rule destinations are resolved relative to the watched folder (see
- * `execute_rule` in `src-tauri/src/rules.rs`), so a folder that lives inside a
- * watched folder is stored relative to it and only folders outside every
- * watched folder keep an absolute path.
+ * Rule destinations are resolved relative to the source watched folder (see
+ * `resolve_dest_dir` in `src-tauri/src/rules.rs`).
  */
 
 const SEPARATORS = /[\\/]+/;
@@ -32,18 +30,16 @@ function sameComponent(a: string, b: string, caseInsensitive: boolean): boolean 
 }
 
 /**
- * Returns `selected` rewritten relative to the deepest watched folder that
- * contains it, `"."` when it is a watched folder itself, or `selected`
- * unchanged when it sits outside all of them.
+ * An exact watched folder keeps its absolute path. Descendants are relative to
+ * the rule's scoped folder, or to the deepest watched folder for a global rule.
  *
- * Every watched folder is considered, not just the one the rule is bound to:
- * rules created from the defaults carry `folder_id` `0`, which matches no
- * folder row, so keying off the rule's own folder would leave those
- * destinations absolute.
+ * An undefined scope means all watched folders. A null scope means the rule's
+ * watched folder could not be found, so there is no relative base.
  */
 export function relativizeDestination(
   selected: string,
   watchedFolders: string[],
+  scopedFolder?: string | null,
 ): string {
   const selectedParts = toComponents(selected);
   if (selectedParts.length === 0) return selected;
@@ -55,16 +51,18 @@ export function relativizeDestination(
     const folderParts = toComponents(folder);
     if (folderParts.length === 0) continue;
     if (folderParts.length > selectedParts.length) continue;
-    if (folderParts.length <= deepest) continue;
 
     const caseInsensitive = isWindowsStyle(folder) || isWindowsStyle(selected);
     const contained = folderParts.every((part, i) =>
       sameComponent(part, selectedParts[i], caseInsensitive),
     );
     if (!contained) continue;
+    if (folderParts.length === selectedParts.length) return selected;
+    if (scopedFolder !== undefined && folder !== scopedFolder) continue;
+    if (folderParts.length <= deepest) continue;
 
     deepest = folderParts.length;
-    relative = selectedParts.slice(folderParts.length).join("/") || ".";
+    relative = selectedParts.slice(folderParts.length).join("/");
   }
 
   return relative ?? selected;
@@ -77,8 +75,9 @@ export function relativizeDestination(
 export function nextDestination(
   selected: string | string[] | null,
   watchedFolders: string[],
+  scopedFolder?: string | null,
 ): string | null {
   const path = Array.isArray(selected) ? selected[0] : selected;
   if (!path) return null;
-  return relativizeDestination(path, watchedFolders);
+  return relativizeDestination(path, watchedFolders, scopedFolder);
 }

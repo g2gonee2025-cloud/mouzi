@@ -7,6 +7,7 @@ import { defaultRuleOptions, useAppStore, type AppSettings, type Rule, type Sche
 const harness = vi.hoisted(() => ({
   invoke: vi.fn(),
   listen: vi.fn(),
+  open: vi.fn(),
   language: "en",
   slots: [] as unknown[],
   cursor: 0,
@@ -15,6 +16,7 @@ const harness = vi.hoisted(() => ({
 }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke: harness.invoke }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: harness.listen }));
+vi.mock("@tauri-apps/plugin-dialog", () => ({ open: harness.open }));
 vi.mock("react-i18next", async () => {
   const { default: english } = await import("../i18n/locales/en.json");
   const folderLabels: Record<string, unknown> = english.beta;
@@ -254,6 +256,7 @@ beforeEach(() => {
   harness.slots.length = 0;
   harness.invoke.mockReset();
   harness.listen.mockReset().mockResolvedValue(() => {});
+  harness.open.mockReset();
   harness.language = "en";
   db.clear();
   db.set(1, { ...invoice });
@@ -308,6 +311,73 @@ const folderMode: Match = (node) => node.type === "select" && node.props["aria-l
 const removeFolder: Match = ({ props }) => props["aria-label"] === `confirm.op.removeFolder: ${watchedFixture.path}`;
 const folderConfirmation: Match = ({ props }) => props.title === "confirm.op.removeFolder" && !!props.onConfirm;
 const alert: Match = ({ props }) => props.role === "alert";
+
+const ruleInbox = { ...watchedFixture, id: 23, path: "C:/Fixture/Inbox" };
+const ruleArchive = { ...watchedFixture, id: 24, path: "C:/Fixture/Archive" };
+const archiveChild = "c:\\fixture\\ARCHIVE\\Filed";
+const destinationField = () => field("settings.rules.destination");
+
+function addMoveRule() {
+  useAppStore.setState({ folders: [ruleInbox, ruleArchive], folderRead: { status: "ready" } });
+  click(requireElement(button("settings.rules.add")));
+  change(requireElement(nameField), { value: "File receipts" });
+  change(field("settings.rules.extensions"), { value: "fixture" });
+}
+
+function setRuleScope(id: number) {
+  const scope = requireElement((node) => node.type === "label" && text(node.props.children).startsWith("settings.folders.title"));
+  change(requireElement((node) => node.type === "select", scope), { value: String(id) });
+}
+
+async function pickRuleFolder(path: string | null) {
+  harness.open.mockResolvedValueOnce(path);
+  click(requireElement(button("beta.pickFolder")));
+  await settle();
+}
+
+it("keeps a picked rule folder's target when the source scope changes after the pick", async () => {
+  addMoveRule();
+  await pickRuleFolder(archiveChild);
+  expect(destinationField().props.value).toBe("Filed");
+  setRuleScope(ruleInbox.id);
+  expect(destinationField().props.value).toBe(archiveChild);
+  setRuleScope(ruleArchive.id);
+  expect(destinationField().props.value).toBe("Filed");
+  setRuleScope(0);
+  expect(destinationField().props.value).toBe("Filed");
+  setRuleScope(ruleInbox.id);
+  await submit();
+  expect(db.get(10)).toMatchObject({ folder_id: ruleInbox.id, destination: archiveChild });
+});
+
+it("keeps an exact watched root absolute when saving a picked rule folder", async () => {
+  addMoveRule();
+  const archive = "c:\\FIXTURE\\Archive";
+  await pickRuleFolder(archive);
+  expect(destinationField().props.value).toBe(archive);
+  await submit();
+  expect(db.get(10)).toMatchObject({ folder_id: 0, destination: archive });
+});
+
+it("keeps a cross-root pick absolute when the rule is already scoped", async () => {
+  addMoveRule();
+  setRuleScope(ruleInbox.id);
+  await pickRuleFolder(archiveChild);
+  expect(destinationField().props.value).toBe(archiveChild);
+  await submit();
+  expect(db.get(10)).toMatchObject({ folder_id: ruleInbox.id, destination: archiveChild });
+});
+
+it("keeps a typed rule folder override through scope changes and picker cancellation", async () => {
+  addMoveRule();
+  await pickRuleFolder(archiveChild);
+  change(destinationField(), { value: "Typed filing folder" });
+  setRuleScope(ruleInbox.id);
+  await pickRuleFolder(null);
+  expect(destinationField().props.value).toBe("Typed filing folder");
+  await submit();
+  expect(db.get(10)).toMatchObject({ folder_id: ruleInbox.id, destination: "Typed filing folder" });
+});
 
 function openWatchedFolders() {
   useAppStore.setState({ folders: [watchedFixture], folderRead: { status: "ready" } });
