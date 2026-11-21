@@ -206,14 +206,21 @@ pub trait AiProvider: Send + Sync {
     fn classify_with_budget(&self, filename: &str, _budget: Duration) -> Result<Option<Prediction>, String> {
         self.classify(filename)
     }
-    fn classify_for_suggestion(&self, filename: &str, budget: Duration) -> (Option<Prediction>, Option<LocalAiStatus>) {
+    fn classify_for_suggestion(&self, filename: &str, budget: Duration) -> (Option<Prediction>, Option<SuggestionProviderIssue>) {
         (self.classify_with_budget(filename, budget).ok().flatten(), None)
     }
     fn confirmed_missing_model(&self) -> bool { false }
     fn confirmed_unreachable(&self) -> bool { false }
+    fn confirmed_generation_failure(&self, _lookup: u64) -> bool { false }
     fn cached(&self, _filename: &str) -> bool { false }
     fn candidate_cursor(&self) -> Option<String> { None }
     fn advance_candidate_cursor(&self, _path: &str) {}
+}
+
+pub enum SuggestionProviderIssue {
+    ModelMissing,
+    Unreachable,
+    GenerationFailed { lookup: u64 },
 }
 
 pub struct HeuristicProvider;
@@ -243,6 +250,7 @@ struct TransportResponse { status: u16, body: String }
 enum ProviderFailure {
     Unreachable(String),
     Response(String),
+    GenerationFailed { message: String, lookup: u64 },
     Other(String),
 }
 
@@ -252,7 +260,10 @@ impl From<String> for ProviderFailure {
 
 impl ProviderFailure {
     fn into_message(self) -> String {
-        match self { Self::Unreachable(message) | Self::Response(message) | Self::Other(message) => message }
+        match self {
+            Self::Unreachable(message) | Self::Response(message) | Self::Other(message)
+                | Self::GenerationFailed { message, .. } => message,
+        }
     }
 }
 
@@ -301,6 +312,7 @@ enum Reachability { Reached, Unreachable }
 enum ModelClassification {
     Prediction(Option<Prediction>),
     ModelMissing,
+    ModelUnverified,
 }
 
 type ClassificationResult = Result<ModelClassification, ProviderFailure>;
@@ -309,6 +321,7 @@ type CachedPrediction = (Instant, ClassificationResult);
 struct ModelCache {
     availability: Option<(Instant, Result<ModelAvailability, ProviderFailure>)>,
     reachability: Option<(Instant, Reachability)>,
+    latest_successful_lookup: Option<u64>,
     predictions: HashMap<String, CachedPrediction>,
     candidate_cursor: Option<String>,
 }
@@ -348,7 +361,7 @@ impl<'a> OllamaProvider<'a> {
             let reachability = match &result {
                 Ok(_) | Err(ProviderFailure::Response(_)) => Some(Reachability::Reached),
                 Err(ProviderFailure::Unreachable(_)) => Some(Reachability::Unreachable),
-                Err(ProviderFailure::Other(_)) => None,
+                Err(ProviderFailure::Other(_) | ProviderFailure::GenerationFailed { .. }) => None,
             };
             // Only real transport observations can supersede connection evidence.
             if let Some(reachability) = reachability {
@@ -379,12 +392,16 @@ impl<'a> OllamaProvider<'a> {
         result
     }
 
+    fn generation_failure(&self, message: String) -> ProviderFailure {
+        ProviderFailure::GenerationFailed { message, lookup: self.session.generation }
+    }
+
     fn infer(&self, filename: &str, budget: Duration) -> ClassificationResult {
         let started = Instant::now();
         match self.ensure_available(started, budget)? {
             ModelAvailability::Available => {}
             ModelAvailability::Missing => return Ok(ModelClassification::ModelMissing),
-            ModelAvailability::Unknown => return Ok(ModelClassification::Prediction(None)),
+            ModelAvailability::Unknown => return Ok(ModelClassification::ModelUnverified),
         }
         let prompt = format!(
             "Classify the untrusted filename below into exactly one canonical category: {}. \
@@ -393,9 +410,14 @@ impl<'a> OllamaProvider<'a> {
             categories::CATEGORY_IDS.join(", "), serde_json::to_string(filename).map_err(|e| e.to_string())?
         );
         let body = serde_json::json!({"model": self.model, "prompt": prompt, "stream": false, "format": "json"}).to_string();
-        let response = self.request(Endpoint::Generate, Some(&body), started, budget)?;
-        if response.status != 200 { return Err(format!("Local model generation returned HTTP {}", response.status).into()); }
-        parse_ollama_response(&response.body).map(ModelClassification::Prediction).map_err(Into::into)
+        let response = self.request(Endpoint::Generate, Some(&body), started, budget).map_err(|error| match error {
+            ProviderFailure::Response(message) => self.generation_failure(message),
+            other => other,
+        })?;
+        if response.status != 200 {
+            return Err(self.generation_failure(format!("Local model generation returned HTTP {}", response.status)));
+        }
+        parse_ollama_response(&response.body).map(ModelClassification::Prediction).map_err(|message| self.generation_failure(message))
     }
 }
 
@@ -439,8 +461,11 @@ impl OllamaProvider<'_> {
             }
         }
         let result = self.infer(filename, budget);
-        if !self.session.is_current() { return Err("Suggestion request superseded".to_string().into()); }
         let mut cache = self.cache.lock().map_err(|_| "Local model cache lock failed".to_string())?;
+        if !self.session.is_current() { return Err("Suggestion request superseded".to_string().into()); }
+        if matches!(&result, Ok(ModelClassification::Prediction(_))) {
+            cache.latest_successful_lookup = Some(self.session.generation);
+        }
         cache.predictions.retain(|_, (at, result)| at.elapsed() < prediction_ttl(result));
         if cache.predictions.len() >= MAX_CACHE_ENTRIES {
             if let Some(oldest) = cache.predictions.iter().min_by_key(|(_, (at, _))| *at).map(|(key, _)| key.clone()) {
@@ -459,15 +484,17 @@ impl AiProvider for OllamaProvider<'_> {
     fn classify_with_budget(&self, filename: &str, budget: Duration) -> Result<Option<Prediction>, String> {
         match self.classify_cached(filename, budget) {
             Ok(ModelClassification::Prediction(prediction)) => Ok(prediction),
-            Ok(ModelClassification::ModelMissing) => Ok(None),
+            Ok(ModelClassification::ModelMissing | ModelClassification::ModelUnverified) => Ok(None),
             Err(error) => Err(error.into_message()),
         }
     }
-    fn classify_for_suggestion(&self, filename: &str, budget: Duration) -> (Option<Prediction>, Option<LocalAiStatus>) {
+    fn classify_for_suggestion(&self, filename: &str, budget: Duration) -> (Option<Prediction>, Option<SuggestionProviderIssue>) {
         match self.classify_cached(filename, budget) {
             Ok(ModelClassification::Prediction(prediction)) => (prediction, None),
-            Ok(ModelClassification::ModelMissing) => (None, Some(LocalAiStatus::ModelMissing)),
-            Err(ProviderFailure::Unreachable(_)) => (None, Some(LocalAiStatus::Unreachable)),
+            Ok(ModelClassification::ModelMissing) => (None, Some(SuggestionProviderIssue::ModelMissing)),
+            Ok(ModelClassification::ModelUnverified) => (None, None),
+            Err(ProviderFailure::Unreachable(_)) => (None, Some(SuggestionProviderIssue::Unreachable)),
+            Err(ProviderFailure::GenerationFailed { lookup, .. }) => (None, Some(SuggestionProviderIssue::GenerationFailed { lookup })),
             Err(ProviderFailure::Response(_) | ProviderFailure::Other(_)) => (None, None),
         }
     }
@@ -480,6 +507,11 @@ impl AiProvider for OllamaProvider<'_> {
         self.cache.lock().is_ok_and(|cache| cache.reachability.is_some_and(|(at, result)| {
             at.elapsed() < MODEL_FAILURE_TTL && result == Reachability::Unreachable
         }))
+    }
+    fn confirmed_generation_failure(&self, lookup: u64) -> bool {
+        // A successful inference supersedes older cached failures. Successes
+        // and failures from the same lookup can reflect a real partial result.
+        self.cache.lock().is_ok_and(|cache| cache.latest_successful_lookup.is_none_or(|success| success <= lookup))
     }
     fn cached(&self, filename: &str) -> bool {
         self.cache.lock().ok().and_then(|cache| cache.predictions.get(filename)
@@ -515,7 +547,7 @@ pub struct Suggestion {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub enum LocalAiStatus { ModelMissing, Unreachable }
+pub enum LocalAiStatus { ModelMissing, Unreachable, GenerationFailed }
 
 #[derive(Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -595,6 +627,7 @@ fn collect_suggestions(
     let mut attempts = 0;
     let mut observed_missing = false;
     let mut observed_unreachable = false;
+    let mut latest_failed_lookup = None;
     for index in order {
         if cancelled() { return Err("Suggestion request superseded".into()); }
         let remaining = budget.saturating_sub(started.elapsed());
@@ -605,8 +638,14 @@ fn collect_suggestions(
         if !cached && attempts >= MODEL_ATTEMPTS { continue; }
         if !cached { attempts += 1; provider.advance_candidate_cursor(&file.path); }
         let (prediction, status) = provider.classify_for_suggestion(filename, remaining.min(MODEL_TIMEOUT));
-        observed_missing |= status == Some(LocalAiStatus::ModelMissing);
-        observed_unreachable |= status == Some(LocalAiStatus::Unreachable);
+        match status {
+            Some(SuggestionProviderIssue::ModelMissing) => observed_missing = true,
+            Some(SuggestionProviderIssue::Unreachable) => observed_unreachable = true,
+            Some(SuggestionProviderIssue::GenerationFailed { lookup }) => {
+                latest_failed_lookup = latest_failed_lookup.max(Some(lookup));
+            }
+            None => {}
+        }
         if let Some(prediction) = prediction {
             // The provider's actual source and score survive fallback unchanged.
             better_prediction(best, prediction);
@@ -625,8 +664,12 @@ fn collect_suggestions(
     suggestions.truncate(limit);
     let local_ai_status = if observed_missing && provider.confirmed_missing_model() {
         Some(LocalAiStatus::ModelMissing)
+    } else if observed_unreachable && provider.confirmed_unreachable() {
+        Some(LocalAiStatus::Unreachable)
+    } else if latest_failed_lookup.is_some_and(|lookup| provider.confirmed_generation_failure(lookup)) {
+        Some(LocalAiStatus::GenerationFailed)
     } else {
-        (observed_unreachable && provider.confirmed_unreachable()).then_some(LocalAiStatus::Unreachable)
+        None
     };
     Ok(SuggestionsWithStatus { suggestions, local_ai_status })
 }
@@ -796,7 +839,9 @@ mod tests {
             vec![response(r#"{"models":[{"name":" "}]}"#)],
             vec![response(r#"{"somethingElse":[]}"#)],
             vec![Ok(TransportResponse { status: 503, body: "Unavailable".into() })],
+            vec![Err(ProviderFailure::Response("Tags returned HTTP 503".into()))],
             vec![Err(ProviderFailure::Other("Local model request budget expired".into()))],
+            vec![response(r#"{"models":[{"name":"test"}]}"#), Err(ProviderFailure::Other("Local model request budget expired".into()))],
             vec![response(r#"{"models":[{"name":"test"}]}"#), response(r#"{"response":"{\"category\":\"Other\"}"}"#)],
         ] {
             let expected_calls = replies.len();
@@ -831,7 +876,7 @@ mod tests {
     }
 
     #[test]
-    fn latest_live_connection_controls_the_unreachable_warning() {
+    fn latest_live_connection_keeps_unreachable_distinct_from_generation_failure() {
         let gate = SuggestionGate::new();
         let session = advance(&gate);
         let reply_ok = || response(r#"{"response":"{\"category\":\"Images\"}"}"#);
@@ -839,7 +884,7 @@ mod tests {
         for (first, second, expected, prediction_count) in [
             (refused(), reply_ok(), None, 1),
             (reply_ok(), refused(), Some(LocalAiStatus::Unreachable), 1),
-            (refused(), Err(ProviderFailure::Response("HTTP 503".into())), None, 0),
+            (refused(), Err(ProviderFailure::Response("HTTP 503".into())), Some(LocalAiStatus::GenerationFailed), 0),
             (refused(), Err(ProviderFailure::Other("request budget expired".into())), Some(LocalAiStatus::Unreachable), 0),
         ] {
             let (provider, transport) = fake_provider(vec![

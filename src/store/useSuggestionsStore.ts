@@ -16,7 +16,7 @@ export interface Suggestion {
   };
 }
 
-type LocalAiStatus = "modelMissing" | "unreachable" | null;
+type LocalAiStatus = "modelMissing" | "unreachable" | "generationFailed" | null;
 export interface SuggestionsResponse {
   suggestions: Suggestion[];
   localAiStatus: LocalAiStatus;
