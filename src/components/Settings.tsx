@@ -1251,9 +1251,7 @@ export default function Settings() {
           </div>
         )}
 
-        {tab === "ignore" && (
-          <IgnoreTab />
-        )}
+        <IgnoreTab active={tab === "ignore"} />
 
         {tab === "about" && (
           <About />
@@ -1268,45 +1266,73 @@ export default function Settings() {
   );
 }
 
-function IgnoreTab() {
+type IgnoreDraft = {
+  folderPath: string;
+  folderId: WatchedFolder["id"];
+  savedPatterns: string[];
+  patterns: string[];
+  input: string;
+};
+
+function hasIgnoreRegistration(draft: IgnoreDraft, folders: WatchedFolder[]) {
+  return folders.some((folder) => folder.path === draft.folderPath && folder.id === draft.folderId);
+}
+
+function IgnoreTab({ active }: { active: boolean }) {
   const { t } = useTranslation();
   const { folders } = useAppStore();
   const [selectedFolder, setSelectedFolder] = useState("");
-  const [draft, setDraft] = useState<{ folder: string; patterns: string[] } | null>(null);
-  const [newPattern, setNewPattern] = useState("");
+  const [draft, setDraft] = useState<IgnoreDraft | null>(null);
   const [saved, setSaved] = useState(false);
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [retry, setRetry] = useState(0);
-  const requestRef = useRef(0);
-  const patterns = draft?.folder === selectedFolder ? draft.patterns : [];
+  const dirtyDrafts = useRef(new Map<string, IgnoreDraft>());
+  const savingDraft = useRef<IgnoreDraft | null>(null);
+  const registration = folders.find((folder) => folder.path === selectedFolder);
+  const folderPath = registration?.path;
+  const folderId = registration?.id;
+  const current = draft && draft.folderPath === folderPath && draft.folderId === folderId ? draft : null;
+  const patterns = current?.patterns ?? [];
+  const newPattern = current?.input ?? "";
   const pendingPattern = newPattern.trim();
   const hasNewPattern = pendingPattern !== "" && !patterns.includes(pendingPattern);
-  const canEdit = Boolean(draft && draft.folder === selectedFolder && !loading && !saving && folders.some((f) => f.path === selectedFolder));
+  const canEdit = Boolean(current && !loading && !saving);
 
   useEffect(() => {
-    if (selectedFolder && !folders.some((f) => f.path === selectedFolder)) setSelectedFolder("");
-  }, [folders, selectedFolder]);
+    for (const entry of dirtyDrafts.current.values()) {
+      if (!hasIgnoreRegistration(entry, folders)) dirtyDrafts.current.delete(entry.folderPath);
+    }
+    if (selectedFolder && !folderPath) setSelectedFolder("");
+  }, [folders, folderPath, selectedFolder]);
 
   useEffect(() => {
-    const request = ++requestRef.current;
-    setDraft(null);
     setSaved(false);
     setError(null);
-    setNewPattern("");
-    setLoading(Boolean(selectedFolder));
-    if (selectedFolder) {
-      invoke<string[]>("load_mouziignore_cmd", { folderPath: selectedFolder }).then((patterns) => {
-        if (request === requestRef.current) setDraft({ folder: selectedFolder, patterns });
-      }).catch((e) => {
-        if (request === requestRef.current) setError(String(e));
-      }).finally(() => {
-        if (request === requestRef.current) setLoading(false);
-      });
+    if (!active || !folderPath) {
+      setDraft(null);
+      setLoading(false);
+      return;
     }
-    return () => { ++requestRef.current; };
-  }, [selectedFolder, retry]);
+    const retained = dirtyDrafts.current.get(folderPath) ?? savingDraft.current;
+    if (retained?.folderPath === folderPath && retained.folderId === folderId) {
+      setDraft(retained);
+      setLoading(false);
+      return;
+    }
+    let cancelled = false;
+    setDraft(null);
+    setLoading(true);
+    invoke<string[]>("load_mouziignore_cmd", { folderPath }).then((patterns) => {
+      if (!cancelled) setDraft({ folderPath, folderId, savedPatterns: patterns, patterns, input: "" });
+    }).catch((error) => {
+      if (!cancelled) setError(String(error));
+    }).finally(() => {
+      if (!cancelled) setLoading(false);
+    });
+    return () => { cancelled = true; };
+  }, [active, folderPath, folderId, retry]);
 
   useEffect(() => {
     if (!saved) return;
@@ -1314,42 +1340,55 @@ function IgnoreTab() {
     return () => clearTimeout(timer);
   }, [saved]);
 
-  const handleAdd = () => {
-    if (!canEdit || !draft || !hasNewPattern) return;
-    setDraft({ ...draft, patterns: [...patterns, pendingPattern] });
-    setNewPattern("");
+  const updateDraft = (patterns: string[], input: string) => {
+    if (!canEdit || !current || savingDraft.current) return;
+    const next = { ...current, patterns, input };
+    const { savedPatterns } = current;
+    if (input || patterns.length !== savedPatterns.length || patterns.some((pattern, index) => pattern !== savedPatterns[index])) {
+      dirtyDrafts.current.set(current.folderPath, next);
+    } else {
+      dirtyDrafts.current.delete(current.folderPath);
+    }
+    setDraft(next);
     setSaved(false);
+  };
+
+  const handleAdd = () => {
+    if (hasNewPattern) updateDraft([...patterns, pendingPattern], "");
   };
 
   const handleRemove = (idx: number) => {
-    if (!canEdit || !draft) return;
-    setDraft({ ...draft, patterns: patterns.filter((_, i) => i !== idx) });
-    setSaved(false);
+    updateDraft(patterns.filter((_, i) => i !== idx), newPattern);
   };
 
   const handleSave = async () => {
-    if (!canEdit || !draft) return;
-    const request = requestRef.current;
+    if (!canEdit || !current || savingDraft.current) return;
     const nextPatterns = hasNewPattern ? [...patterns, pendingPattern] : patterns;
+    savingDraft.current = current;
     setSaving(true);
     setSaved(false);
     setError(null);
     try {
       await invoke("save_mouziignore_cmd", {
-        folderPath: draft.folder,
+        folderPath: current.folderPath,
         patterns: nextPatterns,
       });
-      if (request === requestRef.current) {
-        setDraft({ ...draft, patterns: nextPatterns });
-        setNewPattern("");
+      if (hasIgnoreRegistration(current, useAppStore.getState().folders)) {
+        dirtyDrafts.current.delete(current.folderPath);
+        setDraft((visible) => visible === current
+          ? { ...current, savedPatterns: nextPatterns, patterns: nextPatterns, input: "" }
+          : visible);
         setSaved(true);
       }
     } catch (e) {
-      if (request === requestRef.current) setError(String(e));
+      if (hasIgnoreRegistration(current, useAppStore.getState().folders)) setError(String(e));
     } finally {
+      savingDraft.current = null;
       setSaving(false);
     }
   };
+
+  if (!active) return null;
 
   return (
     <div className="space-y-6 max-w-md">
@@ -1380,7 +1419,7 @@ function IgnoreTab() {
 
       {loading && <p role="status" className="text-sm text-text-muted">{t("common.loading")}</p>}
       {error && <div role="alert" className="text-sm text-red-600">{error}
-        {!draft && <button type="button" className="block underline mt-2" onClick={() => setRetry((value) => value + 1)}>{t("common.retry")}</button>}
+        {!current && <button type="button" className="block underline mt-2" onClick={() => setRetry((value) => value + 1)}>{t("common.retry")}</button>}
       </div>}
 
       {selectedFolder && (
@@ -1419,10 +1458,7 @@ function IgnoreTab() {
               disabled={!canEdit}
               type="text"
               value={newPattern}
-              onChange={(e) => {
-                setNewPattern(e.target.value);
-                setSaved(false);
-              }}
+              onChange={(e) => updateDraft(patterns, e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && handleAdd()}
               placeholder={t("settings.ignore.placeholder")}
               className="flex-1 rounded-md border border-border bg-surface px-3 py-2 text-sm outline-none focus:border-primary"

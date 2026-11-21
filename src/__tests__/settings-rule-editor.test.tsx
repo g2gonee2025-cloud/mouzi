@@ -163,9 +163,13 @@ beforeEach(() => {
   click(requireElement(({ props }) => props.label === "settings.rules.title"));
 });
 
-afterEach(() => {
+function disposeIgnoreEffects() {
   harness.disposeEffects.forEach((dispose) => dispose());
   harness.disposeEffects.clear();
+}
+
+afterEach(() => {
+  disposeIgnoreEffects();
   vi.useRealTimers();
 });
 
@@ -360,6 +364,7 @@ it("displays a live rule's exact folder and permits an explicit scope change", a
 
 const folderA = "C:/Fixture/Manual A";
 const folderB = "C:/Fixture/Manual B";
+const ignoreFolder = () => requireElement((node) => node.type === "select" && node.props["aria-label"] === "settings.ignore.folder", ignoreEditor());
 const ignoreButton = (key: string) => requireElement(button(`settings.ignore.${key}`), ignoreEditor());
 const ignoreField = () => requireElement((node) => node.type === "input" && node.props["aria-label"] === "settings.ignore.patterns", ignoreEditor());
 const typePattern = (value: string) => change(ignoreField(), { value });
@@ -367,20 +372,29 @@ const patternRow = (pattern: string): Match => (node) => node.props["aria-label"
 const removePattern = (pattern: string) => click(requireElement(patternRow(pattern), ignoreEditor()));
 
 function ignoreEditor() {
-  const { type } = requireElement((node) => typeof node.type === "function" && node.type.name === "IgnoreTab");
-  if (typeof type !== "function") throw new Error("Ignore editor is absent");
+  const child = find(editor(), (node) => typeof node.type === "function" && node.type.name === "IgnoreTab");
+  if (!child) {
+    disposeIgnoreEffects();
+    harness.slots.length = harness.cursor;
+    return null;
+  }
   const effects: (() => void)[] = [];
   harness.effects = effects;
   try {
-    return (type as () => ReactNode)();
+    return (child.type as (props: Props) => ReactNode)(child.props);
   } finally {
     harness.effects = null;
     effects.forEach((run) => run());
   }
 }
 
+function visitSettingsTab(label: string) {
+  click(requireElement(({ props }) => props.label === label));
+  return ignoreEditor();
+}
+
 async function selectIgnoreFolder(value: string) {
-  const select = requireElement((node) => node.type === "select" && node.props["aria-label"] === "settings.ignore.folder", ignoreEditor());
+  const select = ignoreFolder();
   expect(select.props.disabled).toBe(false);
   change(select, { value });
   ignoreEditor();
@@ -389,10 +403,13 @@ async function selectIgnoreFolder(value: string) {
 
 async function openIgnore() {
   const files = new Map([[folderA, ["existing.tmp"]], [folderB, ["sibling.txt"]]]);
-  useAppStore.setState({ folders: [
-    { id: 1, path: folderA, enabled: true, mode: "manual" },
-    { id: 2, path: folderB, enabled: true, mode: "manual" },
-  ] });
+  useAppStore.setState({
+    folders: [
+      { id: 1, path: folderA, enabled: true, mode: "manual" },
+      { id: 2, path: folderB, enabled: true, mode: "manual" },
+    ],
+    folderRead: { status: "ready" },
+  });
   harness.invoke.mockImplementation(async (command: string, { folderPath, patterns }: { folderPath: string; patterns?: string[] }) => {
     if (!files.has(folderPath)) throw new Error(`Unexpected fixture folder ${folderPath}`);
     if (command === "load_mouziignore_cmd") return [...files.get(folderPath)!];
@@ -402,7 +419,7 @@ async function openIgnore() {
     }
     throw new Error(`Unexpected fixture command ${command}`);
   });
-  click(requireElement(({ props }) => props.label === "settings.ignore.title"));
+  visitSettingsTab("settings.ignore.title");
   await selectIgnoreFolder(folderA);
   return files;
 }
@@ -474,4 +491,121 @@ it("keeps staged removals and typed Ignore text after a write failure and retrie
   expect(files.get(folderA)).toEqual(["retry.tmp"]);
   expect(ignoreButton("saved")).toBeDefined();
   expect(find(ignoreEditor(), (node) => node.props.role === "alert")).toBeUndefined();
+});
+
+it("keeps independent unsaved Ignore drafts across folder selections", async () => {
+  const files = await openIgnore();
+  removePattern("existing.tmp");
+  typePattern("cache/");
+  click(ignoreButton("add"));
+  typePattern("  *.log  ");
+
+  await selectIgnoreFolder(folderB);
+  expect(ignoreField().props.value).toBe("");
+  expect(find(ignoreEditor(), patternRow("cache/"))).toBeUndefined();
+  typePattern("b-only.txt");
+  ignoreField().props.onKeyDown!({ key: "Enter" });
+  typePattern("  b-pending.txt ");
+
+  await selectIgnoreFolder(folderA);
+  expect(ignoreField().props.value).toBe("  *.log  ");
+  expect(find(ignoreEditor(), patternRow("cache/"))).toBeDefined();
+  expect(find(ignoreEditor(), patternRow("existing.tmp"))).toBeUndefined();
+  expect(files.get(folderA)).toEqual(["existing.tmp"]);
+  expect(files.get(folderB)).toEqual(["sibling.txt"]);
+  expect(harness.invoke.mock.calls.some(([command]) => command === "save_mouziignore_cmd")).toBe(false);
+
+  await click(ignoreButton("save"));
+  expect(files.get(folderA)).toEqual(["cache/", "*.log"]);
+  expect(files.get(folderB)).toEqual(["sibling.txt"]);
+  await selectIgnoreFolder(folderB);
+  expect(ignoreField().props.value).toBe("  b-pending.txt ");
+  expect(find(ignoreEditor(), patternRow("b-only.txt"))).toBeDefined();
+  await click(ignoreButton("save"));
+  expect(files.get(folderB)).toEqual(["sibling.txt", "b-only.txt", "b-pending.txt"]);
+});
+
+it("preserves the selected folder and unsaved Ignore draft through another Settings tab", async () => {
+  const files = await openIgnore();
+  removePattern("existing.tmp");
+  typePattern("  pending.tmp ");
+  expect(visitSettingsTab("settings.folders.title")).toBeNull();
+  visitSettingsTab("settings.ignore.title");
+  await settle();
+  expect(ignoreFolder().props.value).toBe(folderA);
+  expect(ignoreField().props.value).toBe("  pending.tmp ");
+  expect(find(ignoreEditor(), patternRow("existing.tmp"))).toBeUndefined();
+  expect(files.get(folderA)).toEqual(["existing.tmp"]);
+  expect(harness.invoke.mock.calls).toEqual([["load_mouziignore_cmd", { folderPath: folderA }]]);
+});
+
+it("rereads a clean Ignore folder after reverting changes and after saving", async () => {
+  const files = await openIgnore();
+  typePattern("reverted.tmp");
+  click(ignoreButton("add"));
+  removePattern("reverted.tmp");
+  typePattern("reverted input");
+  typePattern("");
+  await selectIgnoreFolder(folderB);
+  files.set(folderA, ["external-first.tmp"]);
+  await selectIgnoreFolder(folderA);
+  expect(find(ignoreEditor(), patternRow("external-first.tmp"))).toBeDefined();
+  typePattern("saved.tmp");
+  await click(ignoreButton("save"));
+  expect(files.get(folderA)).toEqual(["external-first.tmp", "saved.tmp"]);
+  visitSettingsTab("settings.folders.title");
+  files.set(folderA, ["external-second.tmp"]);
+  visitSettingsTab("settings.ignore.title");
+  if (!ignoreFolder().props.value) await selectIgnoreFolder(folderA);
+  await settle();
+  expect(find(ignoreEditor(), patternRow("external-second.tmp"))).toBeDefined();
+  expect(find(ignoreEditor(), patternRow("saved.tmp"))).toBeUndefined();
+});
+
+it.each([true, false])("drops the old Ignore draft after folder re-registration (observed removal: %s)", async (observedRemoval) => {
+  const files = await openIgnore();
+  const [original, sibling] = useAppStore.getState().folders;
+  removePattern("existing.tmp");
+  typePattern("old-registration.tmp");
+  visitSettingsTab("settings.folders.title");
+  if (observedRemoval) {
+    useAppStore.setState({ folders: [sibling] });
+    ignoreEditor();
+  }
+  files.set(folderA, ["new-registration.tmp"]);
+  useAppStore.setState({ folders: [{ ...original, id: 17 }, sibling] });
+  visitSettingsTab("settings.ignore.title");
+  if (!ignoreFolder().props.value) await selectIgnoreFolder(folderA);
+  await settle();
+  expect(ignoreField().props.value).toBe("");
+  expect(find(ignoreEditor(), patternRow("new-registration.tmp"))).toBeDefined();
+  expect(files.get(folderA)).toEqual(["new-registration.tmp"]);
+  expect(harness.invoke.mock.calls.some(([command]) => command === "save_mouziignore_cmd")).toBe(false);
+});
+
+it("does not restore an unsaved Ignore draft after a write completes on another Settings tab", async () => {
+  const files = await openIgnore();
+  typePattern("saved-while-away.tmp");
+  let finishWrite!: () => void;
+  harness.invoke.mockImplementationOnce((command, args) => {
+    expect(command).toBe("save_mouziignore_cmd");
+    expect(args).toEqual({ folderPath: folderA, patterns: ["existing.tmp", "saved-while-away.tmp"] });
+    return new Promise<void>((resolve) => {
+      finishWrite = () => {
+        files.set(folderA, args.patterns);
+        resolve();
+      };
+    });
+  });
+  const pending = click(ignoreButton("save"));
+  visitSettingsTab("settings.folders.title");
+  finishWrite();
+  await pending;
+  expect(files.get(folderA)).toEqual(["existing.tmp", "saved-while-away.tmp"]);
+  files.set(folderA, ["external-after-write.tmp"]);
+  visitSettingsTab("settings.ignore.title");
+  if (!ignoreFolder().props.value) await selectIgnoreFolder(folderA);
+  await settle();
+  expect(ignoreField().props.value).toBe("");
+  expect(find(ignoreEditor(), patternRow("external-after-write.tmp"))).toBeDefined();
 });
