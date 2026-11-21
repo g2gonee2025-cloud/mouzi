@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { pendingFilePath, useAppStore } from "../store/useAppStore";
+import { pendingFilePath, useAppStore, type ActionLog } from "../store/useAppStore";
 import {
   FolderOpen,
   FolderPlus,
@@ -19,7 +19,7 @@ import {
 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { parentDir } from "../utils/paths";
+import { fileName, parentDir } from "../utils/paths";
 import { canRestoreLog, UNDO_TONE_CLASS, undoNotice, type UndoNotice } from "../utils/undo";
 
 function getIconForType(typeName: string) {
@@ -33,8 +33,53 @@ function getIconForType(typeName: string) {
   return <File size={14} />;
 }
 
+function pathKey(path: string): string {
+  return path.replace(/\\/g, "/").replace(/^\/\/\?\/unc\//i, "//").replace(/^\/\/\?\//, "").toLowerCase();
+}
+
+function distinguishingFolder(folder: string, siblings: string[]): string {
+  const otherFolders = siblings.map(pathKey);
+  const parts = [...folder.matchAll(/[^\\/]+/g)];
+  for (const part of parts.reverse()) {
+    const suffix = folder.slice(part.index);
+    const key = pathKey(suffix);
+    if (otherFolders.every((other) => other !== key && !other.endsWith("/" + key))) return suffix;
+  }
+  return folder;
+}
+
+function originalActivityPath(log: ActionLog): string {
+  return log.source_path || log.destination_path || log.file_name;
+}
+
+function recentActivityIdentity(log: ActionLog, visible: ActionLog[], locale: string | undefined, sourceLabel: string) {
+  const name = log.file_name.toLowerCase();
+  const siblings = visible.filter((other) => other !== log && other.file_name.toLowerCase() === name);
+  if (!siblings.length) return { context: null, open: log.file_name, undo: log.file_name };
+
+  const source = originalActivityPath(log);
+  const folder = parentDir(source);
+  const filed = log.destination_path || source;
+  const siblingFolders = siblings.map((other) => parentDir(originalActivityPath(other)));
+  const sameFolder = siblingFolders.some((other) => pathKey(other) === pathKey(folder));
+  const repeatedSource = siblings.some((other) => pathKey(originalActivityPath(other)) === pathKey(source));
+  const sameDestinationFolder = siblings.some((other) =>
+    other.destination_path && pathKey(parentDir(other.destination_path)) === pathKey(parentDir(filed)),
+  );
+  const timestamp = new Date(log.timestamp);
+  const record = repeatedSource ? [
+    Number.isNaN(timestamp.getTime()) ? "" : timestamp.toLocaleString(locale),
+    log.id === undefined ? "" : `#${log.id}`,
+  ].filter(Boolean).join(" · ") : "";
+  const location = sameFolder || !folder ? source : distinguishingFolder(folder, siblingFolders);
+  const context = [location, repeatedSource && fileName(filed), record].filter(Boolean).join(" · ");
+  const undo = [source, record].filter(Boolean).join(" · ");
+  const open = sameDestinationFolder ? `${filed} · ${sourceLabel}: ${undo}` : filed;
+  return { context, open, undo };
+}
+
 export default function Popup() {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const {
     logs,
     logsReadStatus,
@@ -221,6 +266,7 @@ export default function Popup() {
   const hasFolders = folders.length > 0;
   const showQueue = folderRead.status === "ready" && hasFolders;
   const showPendingFiles = showQueue && pendingReadStatus === "ready" && pendingPaths.length > 0;
+  const recent = logs.slice(0, 5);
 
   return (
     <div className="flex h-full flex-col bg-surface text-text border border-border overflow-hidden">
@@ -327,42 +373,50 @@ export default function Popup() {
             </div>
           ) : (
             <div className="space-y-1.5">
-              {logs.slice(0, 5).map((log) => (
-                <div
-                  key={log.id}
-                  className="flex items-center gap-2 rounded-md bg-surface-dark px-2.5 py-2 text-xs"
-                >
-                  <span className="text-text-muted shrink-0">
-                    {getIconForType(log.file_type)}
-                  </span>
-                  <span className="flex-1 truncate" title={log.file_name}>
-                    {log.file_name}
-                  </span>
-                  <span className="text-text-muted truncate max-w-[80px]">
-                    {log.file_type}
-                  </span>
-                  {!log.undone && !!log.id && log.destination_path && (
-                    <button
-                      onClick={() => handleOpenActionFolder(log.id)}
-                      className="p-1 rounded hover:bg-border text-text-muted hover:text-text"
-                      title={t("cleanup.openFolder")}
-                      aria-label={t("cleanup.openFolder")}
-                    >
-                      <FolderOpen size={12} />
-                    </button>
-                  )}
-                  {canRestoreLog(log) && (
-                    <button
-                      onClick={() => void handleUndo(log.id)}
-                      className="p-1 rounded hover:bg-border text-text-muted hover:text-text"
-                      title={t("popup.undo")}
-                      aria-label={t("popup.undo")}
-                    >
-                      <RotateCcw size={12} />
-                    </button>
-                  )}
-                </div>
-              ))}
+              {recent.map((log) => {
+                const identity = recentActivityIdentity(log, recent, i18n.resolvedLanguage ?? i18n.language, t("beta.source"));
+                return (
+                  <div
+                    key={log.id}
+                    className="flex items-center gap-2 rounded-md bg-surface-dark px-2.5 py-2 text-xs"
+                  >
+                    <span className="text-text-muted shrink-0">
+                      {getIconForType(log.file_type)}
+                    </span>
+                    <div className="min-w-0 flex-1">
+                      <span className={identity.context ? "block wrap-anywhere" : "block truncate"} title={log.file_name} dir="auto">
+                        {log.file_name}
+                      </span>
+                      {identity.context && (
+                        <span className="block wrap-anywhere text-[10px] text-text-muted" dir="auto">{identity.context}</span>
+                      )}
+                    </div>
+                    <span className="text-text-muted truncate max-w-[80px]">
+                      {log.file_type}
+                    </span>
+                    {!log.undone && !!log.id && log.destination_path && (
+                      <button
+                        onClick={() => handleOpenActionFolder(log.id)}
+                        className="shrink-0 p-1 rounded hover:bg-border text-text-muted hover:text-text"
+                        title={t("cleanup.openFolder")}
+                        aria-label={`${t("cleanup.openFolder")}: ${identity.open}`}
+                      >
+                        <FolderOpen size={12} />
+                      </button>
+                    )}
+                    {canRestoreLog(log) && (
+                      <button
+                        onClick={() => void handleUndo(log.id)}
+                        className="shrink-0 p-1 rounded hover:bg-border text-text-muted hover:text-text"
+                        title={t("popup.undo")}
+                        aria-label={`${t("popup.undo")}: ${identity.undo}`}
+                      >
+                        <RotateCcw size={12} />
+                      </button>
+                    )}
+                  </div>
+                );
+              })}
             </div>
           )}
         </section>

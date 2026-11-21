@@ -1,12 +1,14 @@
 import { beforeEach, expect, it, vi } from "vitest";
 import { isValidElement, type ReactElement, type ReactNode } from "react";
 import Popup from "../components/Popup";
-import { useAppStore, type WatchedFolder } from "../store/useAppStore";
+import { useAppStore, type ActionLog, type WatchedFolder } from "../store/useAppStore";
 import en from "../i18n/locales/en.json";
+import es from "../i18n/locales/es.json";
 
 const fixture = vi.hoisted(() => ({
   invoke: vi.fn(),
   setState: vi.fn(),
+  language: "en" as "en" | "es",
   retained: null as { index: number; values: unknown[] } | null,
 }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke: fixture.invoke }));
@@ -30,9 +32,11 @@ vi.mock("../store/useAppStore", async (importOriginal) => {
 });
 vi.mock("react-i18next", () => ({
   useTranslation: () => ({
+    i18n: { resolvedLanguage: fixture.language },
     t: (key: string) => {
       const [section, name] = key.split(".");
-      const translations = en[section as keyof typeof en] as Record<string, unknown> | undefined;
+      const locale = fixture.language === "es" ? es : en;
+      const translations = locale[section as keyof typeof en] as Record<string, unknown> | undefined;
       const message = translations?.[name];
       return typeof message === "string" ? message : key;
     },
@@ -75,6 +79,7 @@ beforeEach(() => {
   fixture.invoke.mockReset();
   fixture.setState.mockClear();
   fixture.retained = null;
+  fixture.language = "en";
   useAppStore.setState(useAppStore.getInitialState(), true);
 });
 
@@ -107,6 +112,66 @@ function recentButton(popup: ReactNode, title: string) {
 function traySection(popup: ReactNode, name: string) {
   return findElement(popup, (element) => element.type === "section" && element.props["aria-label"] === name);
 }
+
+const recentEntry = (id: number, source: string, destination: string, file = "report.txt"): ActionLog => ({
+  id, timestamp: "2026-11-20T10:00:00Z", source_path: source, destination_path: destination,
+  action: "move", file_name: file, file_type: "text", undone: false, undo_verified: true,
+});
+
+function recentRows(locale: typeof en | typeof es, rows: ActionLog[]) {
+  useAppStore.setState({ logs: rows, logsReadStatus: "ready" });
+  return traySection(renderRetainedPopup(), locale.popup.recentActions);
+}
+
+it.each([["en", en], ["es", es]] as const)("identifies same-named Recent actions with localized exact targets in %s", async (language, locale) => {
+  fixture.language = language;
+  const personal = recentEntry(4, "C:\\Owned\\Personal\\Inbox\\report.txt", "C:\\Shared Filing\\report.txt");
+  const team = recentEntry(5, "C:\\Owned\\Team\\Inbox\\report.txt", "C:\\Shared Filing\\report_0.txt");
+  const unique = recentEntry(6, "C:\\Private\\notes.txt", "C:\\Private\\Filed\\notes.txt", "notes.txt");
+  const section = recentRows(locale, [team, personal, unique]);
+  const visible = label(section);
+  expect.soft(visible).toContain("Personal\\Inbox");
+  expect.soft(visible).toContain("Team\\Inbox");
+  expect.soft(visible).not.toContain("C:\\Owned");
+  expect.soft(visible).not.toContain("C:\\Private");
+
+  const open = (path: string) => findElement(section, (node) =>
+    node.type === "button" && node.props["aria-label"]?.startsWith(`${locale.cleanup.openFolder}: ${path}`) === true,
+  );
+  const undo = (path: string) => findElement(section, (node) =>
+    node.type === "button" && node.props["aria-label"] === `${locale.popup.undo}: ${path}`,
+  );
+  expect.soft(open(personal.destination_path!)).toBeDefined();
+  expect.soft(undo(personal.source_path)).toBeDefined();
+  expect.soft(open("notes.txt")?.props["aria-label"]).toBe(`${locale.cleanup.openFolder}: notes.txt`);
+  expect.soft(undo("notes.txt")).toBeDefined();
+  expect(open(team.destination_path!)).toBeDefined();
+  expect(undo(team.source_path)).toBeDefined();
+
+  fixture.invoke.mockResolvedValueOnce(undefined)
+    .mockResolvedValueOnce({ status: "ok", restoredTo: team.source_path, message: null })
+    .mockResolvedValue([]);
+  await open(team.destination_path!)?.props.onClick?.();
+  await undo(team.source_path)?.props.onClick?.();
+  expect(fixture.invoke).toHaveBeenNthCalledWith(1, "open_folder_cmd", { path: "C:\\Shared Filing" });
+  expect(fixture.invoke).toHaveBeenNthCalledWith(2, "undo_action_cmd", { id: 5 });
+});
+
+it("keeps different History entries identifiable when they have the same timestamp and paths", () => {
+  const later = recentEntry(22, "C:\\Owned\\Inbox\\report.txt", "C:\\Owned\\Filed\\report.txt");
+  const earlier = { ...later, id: 18 };
+  const section = recentRows(en, [later, earlier]);
+  expect.soft(label(section)).toContain("#22");
+  expect.soft(label(section)).toContain("#18");
+  for (const row of [later, earlier]) {
+    for (const verb of [en.popup.undo, en.cleanup.openFolder]) {
+      expect(findElement(section, (node) =>
+        node.type === "button" && node.props["aria-label"]?.startsWith(`${verb}: `) === true &&
+        node.props["aria-label"].includes(`#${row.id}`),
+      )).toBeDefined();
+    }
+  }
+});
 
 it("names the popup header X Close and dispatches only the popup hide command", async () => {
   const header = findElement(Popup(), (element) => element.props["data-tauri-drag-region"] === true);
