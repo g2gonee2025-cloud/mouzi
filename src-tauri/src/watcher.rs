@@ -376,8 +376,9 @@ impl FolderWatcher {
             }
         }
         if queues_changed {
-            if let Err(error) = self.prune_queues(folders) {
-                errors.push(error);
+            match self.prune_queues(folders) {
+                Ok(()) => self.update_tray_tooltip(),
+                Err(error) => errors.push(error),
             }
         }
         if errors.is_empty() { Ok(()) } else { Err(errors.join("; ")) }
@@ -468,6 +469,7 @@ impl FolderWatcher {
     pub(crate) fn reconcile_baseline(&mut self, id: i64) -> Result<(), String> {
         let folders = get_watched_folders().map_err(|error| error.to_string())?;
         self.prune_queues(&folders)?;
+        self.update_tray_tooltip();
         let Some(folder) = folders.iter().find(|folder| {
             folder.id == Some(id) && folder.enabled && !folder.only_new
                 && (is_folder_auto_mode(&folder.mode) || is_folder_manual_mode(&folder.mode))
@@ -515,7 +517,6 @@ impl FolderWatcher {
             for path in stale { manual.arrivals.remove(&path); }
             self.pending_manual.update_count(&manual);
         }
-        self.update_tray_tooltip();
         Ok(())
     }
 
@@ -523,6 +524,10 @@ impl FolderWatcher {
         if let Some(app) = self.app_handle.as_ref() {
             update_pending_tooltip(app, &self.pending_manual);
         }
+    }
+
+    pub(crate) fn pending_review_count(&self) -> usize {
+        self.pending_manual.visible_count.load(Ordering::Acquire)
     }
 
     pub fn get_pending_files(&self) -> Result<Vec<(String, String)>, String> {
@@ -905,8 +910,8 @@ mod tests {
         save_mouziignore(root.path.to_str().unwrap(), &["root-*.txt".into()]).unwrap();
         save_mouziignore(child.to_str().unwrap(), &["parent-*.txt".into()]).unwrap();
 
-        // The watcher currently enqueues only top-level files. Exercise the
-        // shared Review policy for the nested paths it can receive as well.
+        // The watcher currently enqueues only top-level files. Review also
+        // applies these protections to explicit requests for nested files.
         let mut arrivals = HashMap::new();
         for path in [root.path.join("root-top.txt"), child.join("root-nested.txt"),
             child.join("parent-nested.txt"), child.join("sibling.txt")] {

@@ -236,6 +236,31 @@ it("keeps only continuously present selections across reorder, a new arrival, an
   expect(pendingCheckbox(refreshed, "removed.txt").checked).toBe(false);
 });
 
+it("only reviews the selected arrival that stays visible across an exclusion update", async () => {
+  await loadFolderList([invoices]);
+  await publishPendingFiles("protected.txt", "sibling.txt");
+  const before = renderRetainedPopup();
+  for (const name of ["protected.txt", "sibling.txt"]) {
+    pendingCheckbox(before, name).onChange?.({ target: { checked: true } });
+  }
+  expect(reviewQueue(renderRetainedPopup())?.props.children).toContain(2);
+
+  await publishPendingFiles("sibling.txt");
+  const excluded = renderRetainedPopup();
+  expect(label(excluded)).not.toContain("protected.txt");
+  expect(pendingCheckbox(excluded, "sibling.txt").checked).toBe(true);
+  expect(reviewQueue(excluded)?.props.children).toContain(1);
+
+  await publishPendingFiles("protected.txt", "sibling.txt");
+  const returned = renderRetainedPopup();
+  expect(pendingCheckbox(returned, "protected.txt").checked).toBe(false);
+  expect(pendingCheckbox(returned, "sibling.txt").checked).toBe(true);
+  expect(reviewQueue(returned)?.props.children).toContain(1);
+  fixture.invoke.mockClear().mockResolvedValueOnce(undefined);
+  await reviewQueue(returned)?.props.onClick?.();
+  expect(fixture.invoke.mock.calls).toEqual([["show_review_cmd", { paths: [invoices.path + "/sibling.txt"] }]]);
+});
+
 it("blocks an old Review queue click when the current queue read has failed", async () => {
   await loadFolderList([invoices]);
   await publishPendingFiles("arrival.txt");
