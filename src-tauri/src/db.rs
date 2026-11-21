@@ -2437,8 +2437,16 @@ const INVENTORY_FILE_FILTERS: &str = "AND (?1 = '' OR i.category = ?1)
                                      AND (?2 = '' OR i.root_path = ?2)
                                      AND (?3 = '' OR mouzi_path_contains(i.path,?3))";
 
-fn inventory_files_sql(sort: &str, filtered: bool, after: bool) -> String {
+enum InventoryFileQuery {
+    Snapshot,
+    Filtered,
+    Continuation { scoped: bool },
+}
+
+fn inventory_files_sql(sort: &str, query: InventoryFileQuery) -> String {
     let recent = sort == "mtime";
+    let filtered = !matches!(query, InventoryFileQuery::Snapshot);
+    let after = matches!(query, InventoryFileQuery::Continuation { .. });
     let columns = "i.path, i.size, i.mtime, i.category, i.root_path";
     let watched = WATCHED_INVENTORY;
     let filters = if filtered { INVENTORY_FILE_FILTERS } else { "" };
@@ -2449,8 +2457,14 @@ fn inventory_files_sql(sort: &str, filtered: bool, after: bool) -> String {
         (true, false) => "AND i.size <= ?5 AND (i.size < ?5 OR i.path > ?6)",
         (false, _) => "",
     };
-    // Keep the indexed prefix for the snapshot; filtered searches may favor a root lookup.
-    let index = if recent && !filtered { " INDEXED BY idx_file_inventory_mtime" } else { "" };
+    // Seek from the last visible sort key. Scoped searches can favor the folder or category index.
+    let index = match (query, recent) {
+        (InventoryFileQuery::Snapshot | InventoryFileQuery::Continuation { scoped: false }, true) => {
+            " INDEXED BY idx_file_inventory_mtime"
+        }
+        (InventoryFileQuery::Continuation { scoped: false }, false) => " INDEXED BY idx_file_inventory_size",
+        _ => "",
+    };
     let (join, order) = if recent {
         // Only convert the fractional digits. The full Unix nanoseconds can exceed INTEGER.
         (
@@ -2466,7 +2480,7 @@ fn inventory_files_sql(sort: &str, filtered: bool, after: bool) -> String {
         return format!(
             "WITH coarse AS MATERIALIZED (
                  SELECT i.id, i.mtime
-                 FROM file_inventory i
+                 FROM file_inventory i{index}
                  WHERE {watched} {filters} {boundary_filter}
                  ORDER BY i.mtime DESC
                  LIMIT ?4
@@ -2503,7 +2517,7 @@ fn get_inventory_files_on(
     let cat = category.unwrap_or("");
     let root_path = root.unwrap_or("");
     let q = query.unwrap_or("").trim();
-    query_inventory_files(conn, &inventory_files_sql(sort, true, false), params![cat, root_path, q, limit.max(0)])
+    query_inventory_files(conn, &inventory_files_sql(sort, InventoryFileQuery::Filtered), params![cat, root_path, q, limit.max(0)])
 }
 
 fn query_inventory_files(conn: &Connection, sql: &str, bindings: impl rusqlite::Params) -> SqliteResult<Vec<InventoryFile>> {
@@ -2640,7 +2654,8 @@ fn get_inventory_files_page_on(conn: &Connection, page: InventoryFilePage<'_>) -
         params![category, root, query, after],
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     ).optional().map_err(|error| error.to_string())?.ok_or("inventory.changed")?;
-    let sql = inventory_files_sql(page.sort, true, true);
+    let scoped = !root.is_empty() || !category.is_empty();
+    let sql = inventory_files_sql(page.sort, InventoryFileQuery::Continuation { scoped });
     if page.sort == "mtime" {
         query_inventory_files(conn, &sql, params![category, root, query, page.limit, seconds, fraction, after])
     } else {
@@ -2706,7 +2721,7 @@ pub fn get_dashboard_snapshot() -> SqliteResult<DashboardSnapshot> {
 }
 
 fn get_snapshot_files_on(conn: &Connection, sort: &str) -> SqliteResult<Vec<InventoryFile>> {
-    query_inventory_files(conn, &inventory_files_sql(sort, false, false), [])
+    query_inventory_files(conn, &inventory_files_sql(sort, InventoryFileQuery::Snapshot), [])
 }
 
 #[derive(Debug,Clone)]
@@ -3856,7 +3871,7 @@ mod tests {
 
             let mut metrics = Vec::new();
             for arm in 0..2 {
-                let sql = if arm == 0 { baseline_sql(search.sort) } else { inventory_files_sql(search.sort, true, false) };
+                let sql = if arm == 0 { baseline_sql(search.sort) } else { inventory_files_sql(search.sort, InventoryFileQuery::Filtered) };
                 let implementation = implementations[arm];
                 let plan = connections[arm].prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap()
                     .query_map(bindings, |row| row.get::<_, String>(3)).unwrap()
