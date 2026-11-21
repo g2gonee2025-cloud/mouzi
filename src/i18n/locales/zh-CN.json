@@ -154,7 +154,7 @@
       "title": "关于",
       "tagline": "让下载文件井然有序。",
       "description": "Mouzi 是一款安静、简洁的文件整理工具。它驻留在系统托盘中，自动保持下载文件夹及其他文件夹整洁。它会在后台静默运行，监视选定的文件夹，并根据自定义规则移动、重命名或分类文件。",
-      "checkUpdates": "检查更新",
+      "checkUpdates": "打开原项目下载页",
       "support": "在 Ko-fi 上支持 Mouzi",
       "supportDesc": "你的支持会帮助 Mouzi 持续改进。谢谢！🙏",
       "versionLabel": "版本",
