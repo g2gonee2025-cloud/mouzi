@@ -113,6 +113,19 @@ impl IgnorePatterns {
         is_ignored(name, &self.patterns)
     }
 
+    /// Match the file and each directory that inventory traverses below its owning root.
+    pub(crate) fn ignores_inventory_path(&self, relative: &Path) -> bool {
+        if self.patterns.is_empty() {
+            return false;
+        }
+        relative.file_name().is_some_and(|name| self.is_ignored(&name.to_string_lossy()))
+            || relative.parent().is_some_and(|directory| {
+                directory.components().any(|part| {
+                    is_ignored_entry(&part.as_os_str().to_string_lossy(), true, &self.patterns)
+                })
+            })
+    }
+
     pub fn as_slice(&self) -> &[String] {
         &self.patterns
     }

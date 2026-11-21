@@ -1742,6 +1742,110 @@ mod tests {
         writer.finish().unwrap();
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn locked_zip_payload_is_retained_with_a_sorting_diagnostic() {
+        use crate::db;
+        use std::os::windows::fs::OpenOptionsExt;
+
+        struct Fixture { root: PathBuf, rules: Vec<i64> }
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                if let Ok(conn) = db::lock_db() {
+                    let path = self.root.to_string_lossy();
+                    let _ = conn.execute("DELETE FROM action_logs WHERE instr(source_path, ?1) = 1", [path.as_ref()]);
+                    let _ = conn.execute("DELETE FROM operation_intents WHERE instr(source_path, ?1) = 1", [path.as_ref()]);
+                    let _ = conn.execute("DELETE FROM processed_files WHERE instr(path, ?1) = 1", [path.as_ref()]);
+                }
+                for id in &self.rules { let _ = db::delete_rule(*id); }
+                let _ = fs::remove_dir_all(&self.root);
+            }
+        }
+
+        let _serial = db::serialise_test_db();
+        db::init_test_db();
+        assert!(db::get_settings().unwrap().lock_check_enabled);
+        let mut fixture = Fixture {
+            root: fs::canonicalize(test_dir("locked-sort")).unwrap(),
+            rules: Vec::new(),
+        };
+        for (name, ext, action) in [
+            ("R106 matching move", "r106move", "move"),
+            ("R106 intentional skip", "r106skip", "ignore"),
+        ] {
+            fixture.rules.push(db::add_rule(&db::Rule {
+                name: name.into(), priority: i32::MIN, enabled: true,
+                extensions: vec![ext.into()], destination: "Filed".into(),
+                action: action.into(), ..db::Rule::default()
+            }).unwrap());
+        }
+        let source = fixture.root.join("private.zip");
+        write_zip(&source, &[
+            ("held.r106move", b"held payload"),
+            ("good.r106move", b"movable payload"),
+            ("ignored.r106skip", b"ignored payload"),
+        ]);
+        let original = fs::read(&source).unwrap();
+        let cancelled = AtomicBool::new(false);
+        for hold in [false, true] {
+            let intent = db::begin_operation_intent("archive_import", &source.to_string_lossy(), None).unwrap();
+            let extraction = extract_archive_in(
+                &source, &fixture.root.join("archive-imports"), &cancelled,
+                |staging| db::observe_pending_archive_staging(intent, &staging.to_string_lossy()).map_err(|err| err.to_string()),
+                |_, _| {},
+            ).unwrap();
+            let staging = &extraction.staging_dir;
+            let held = staging.join("held.r106move");
+            // On Windows even an in-process read handle can deny another open
+            // for writing. Acquire it only after the verified ZIP extraction.
+            let sharing_guard = hold.then(|| OpenOptions::new().read(true).share_mode(1).open(&held).unwrap());
+            assert_eq!(crate::rules::is_file_locked(&held), hold);
+            let sorting = crate::rules::manual_scan_folder_cancelable(
+                staging, &crate::suppress::SuppressionSet::new(), &cancelled,
+            );
+            let summary = crate::commands::finish_archive_sort(intent, staging, extraction.extracted_files, sorting);
+            drop(sharing_guard);
+
+            assert_eq!(summary.extracted_count, Some(3));
+            assert_eq!(summary.sorted_count, if hold { 1 } else { 2 });
+            assert_eq!(fs::read(staging.join("Filed").join("good.r106move")).unwrap(), b"movable payload");
+            assert_eq!(fs::read(staging.join("ignored.r106skip")).unwrap(), b"ignored payload");
+            assert_eq!(fs::read(&source).unwrap(), original);
+            let manifest: serde_json::Value = serde_json::from_slice(
+                &fs::read(staging.with_extension("manifest.json")).unwrap(),
+            ).unwrap();
+            assert_eq!(manifest["extractedCount"], 3);
+            assert_eq!(manifest["sortedResults"].as_array().unwrap().len(), summary.sorted_count);
+            let conn = db::lock_db().unwrap();
+            let staging_prefix = staging.to_string_lossy();
+            let (status, message): (String, Option<String>) = conn.query_row(
+                "SELECT status, message FROM operation_intents WHERE id=?1", [intent],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            ).unwrap();
+            let counts = ["action_logs", "operation_intents"].map(|table| {
+                conn.query_row(&format!("SELECT COUNT(*) FROM {table} WHERE instr(source_path, ?1)=1"),
+                    [staging_prefix.as_ref()], |row| row.get::<_, usize>(0)).unwrap()
+            });
+            assert_eq!(counts, [summary.sorted_count; 2]);
+            assert_eq!(fs::read(if hold { held } else { staging.join("Filed").join("held.r106move") }).unwrap(), b"held payload");
+            if hold {
+                let diagnostic = "held.r106move: File is locked";
+                assert!(summary.issue.as_deref().is_some_and(|issue| issue.contains(diagnostic)),
+                    "locked matching payload was reported as a clean import");
+                assert_eq!(status, "partial");
+                assert_eq!(manifest["status"], "partial");
+                assert!(message.as_deref().is_some_and(|message| message.contains(diagnostic)));
+                assert!(manifest["message"].as_str().is_some_and(|message| message.contains(diagnostic)));
+                assert!(manifest["remainingEntries"].as_array().unwrap().iter().any(|row| row["name"] == "held.r106move"));
+                assert!(!staging.join("Filed").join("held.r106move").exists());
+            } else {
+                assert!(summary.issue.is_none() && message.is_none());
+                assert_eq!(status, "completed");
+                assert_eq!(manifest["status"], "completed");
+            }
+        }
+    }
+
     fn write_zip64(path: &Path, prefix_len: usize, count: u64, poison_central: bool) {
         write_zip(path, &[("nested/entry.txt", b"data")]);
         let mut zip = fs::read(path).unwrap();

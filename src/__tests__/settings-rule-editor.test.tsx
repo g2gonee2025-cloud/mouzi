@@ -1242,6 +1242,52 @@ it("keeps the exact extension draft after Save rejects it, then sends the correc
   expect(db.get(1)?.extensions).toEqual([".PDF", "jpg"]);
 });
 
+const patternField = () => field("settings.rules.pattern");
+
+it.each([
+  ["a leading space", " Report"],
+  ["spaces only", "  "],
+  ["ordinary regex syntax", "^AnnualReport$"],
+])("keeps %s in a filename pattern while typing, saving, and reopening", async (_case, pattern) => {
+  edit("Invoices");
+  expect(patternField().props.value).toBe("");
+  const displayed: Array<string | number | undefined> = [];
+  for (const character of pattern) {
+    const input = patternField();
+    change(input, { value: String(input.props.value) + character });
+    displayed.push(patternField().props.value);
+  }
+  expect.soft(displayed).toEqual(Array.from(pattern, (_, index) => pattern.slice(0, index + 1)));
+  expect(harness.invoke).not.toHaveBeenCalled();
+
+  await submit();
+
+  const saved = { ...invoice, pattern };
+  expect.soft(harness.invoke).toHaveBeenCalledWith("update_rule_cmd", { rule: saved });
+  expect.soft(db.get(1)).toEqual(saved);
+  expect(db.get(2)).toEqual(receipts);
+  edit("Invoices");
+  expect(patternField().props.value).toBe(pattern);
+});
+
+it("clears only the filename restriction when the edited pattern is empty", async () => {
+  const existing = { ...invoice, pattern: " Report" };
+  db.set(1, existing);
+  useAppStore.setState({ rules: [existing, receipts] });
+  edit("Invoices");
+  expect(patternField().props.value).toBe(existing.pattern);
+  change(patternField(), { value: "" });
+  expect(patternField().props.value).toBe("");
+
+  await submit();
+
+  expect(harness.invoke).toHaveBeenCalledWith("update_rule_cmd", { rule: invoice });
+  expect(db.get(1)).toEqual(invoice);
+  expect(db.get(2)).toEqual(receipts);
+  edit("Invoices");
+  expect(patternField().props.value).toBe("");
+});
+
 const normalizationLabel = "settings.rules.normalizeExtensions";
 const normalizationMapping = "JPEG:JPG, tif:tiff";
 
