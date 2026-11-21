@@ -109,6 +109,7 @@ describe("committed preference and schedule settings", () => {
 
 describe("archive import in Settings", () => {
   const running: ArchiveImportState = {
+    sourceName: "previous.zip", previousReceipt: null,
     revision: 4, jobId: 1, status: "running", phase: "extracting", bytes: 10, files: 1,
     cancelRequested: false, result: null, error: null,
   };
@@ -155,18 +156,31 @@ describe("archive import in Settings", () => {
     expect(useAppStore.getState().archiveImportState).toEqual(completed);
   });
 
-  it("retains the previous receipt when a new import fails before it can start", async () => {
+  it("retains the previous snapshot when the file chooser fails before starting a job", async () => {
     useAppStore.getState().applyArchiveImportState(completed);
-    ipc.invoke.mockRejectedValueOnce(new Error("Archive selection was rejected")).mockResolvedValueOnce(completed);
+    await useAppStore.getState().pickArchiveImport(async () => { throw new Error("File chooser unavailable"); });
+    expect(ipc.invoke).not.toHaveBeenCalled();
+    expect(useAppStore.getState().archiveImportError).toBe("Error: File chooser unavailable");
+    expect(useAppStore.getState().archiveImportState).toEqual(completed);
+  });
 
-    await useAppStore.getState().pickArchiveImport(async () => "C:/fixture.zip");
+  it("loads the failed job and its distinct previous receipt after the native import rejects the file", async () => {
+    useAppStore.getState().applyArchiveImportState(completed);
+    const failed: ArchiveImportState = {
+      revision: 8, jobId: 7, sourceName: "notes.txt.gz", status: "failed", phase: null,
+      bytes: 0, files: 0, cancelRequested: false, error: "Unsupported archive format", result: null,
+      previousReceipt: { sourceName: "previous.zip", receipt: partialReceipt },
+    };
+    ipc.invoke.mockRejectedValueOnce(failed.error).mockResolvedValueOnce(failed);
+    await useAppStore.getState().pickArchiveImport(async () => "C:/notes.txt.gz");
 
     expect(ipc.invoke.mock.calls).toEqual([
-      ["import_archive_cmd", { path: "C:/fixture.zip" }],
+      ["import_archive_cmd", { path: "C:/notes.txt.gz" }],
       ["get_archive_import_state_cmd"],
     ]);
-    expect(useAppStore.getState().archiveImportError).toBe("Error: Archive selection was rejected");
-    expect(useAppStore.getState().archiveImportState).toEqual(completed);
+    expect(useAppStore.getState().archiveImportState).toEqual(failed);
+    useAppStore.getState().applyArchiveImportState({ ...running, revision: 9, jobId: 9, sourceName: "third.zip" });
+    expect(useAppStore.getState().archiveImportError).toBeNull();
   });
 
   it("cancels the observed job and leaves a newer job alone", async () => {
@@ -317,6 +331,7 @@ describe("authoritative clean scope and history", () => {
         if (command === "import_archive_cmd") return result;
         if (command === "get_archive_import_state_cmd") return {
           revision: 7, jobId: 1, status: "completed", phase: null, bytes: 10, files: 2, cancelRequested: issue !== null,
+          sourceName: "fixture.zip", previousReceipt: null,
           result: { extractedCount: result.extractedCount, sortedCount: result.sortedCount, stagingPath: result.stagingPath, issue },
           error: null,
         };

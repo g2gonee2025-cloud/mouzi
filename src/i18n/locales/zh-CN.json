@@ -57,6 +57,7 @@
       "importSuccess": "已解压 {{extracted}} 个文件，并整理 {{count}} 个文件。",
       "importError": "导入归档文件失败：{{error}}",
       "openImportFolder": "打开导入文件夹",
+      "previousImport": "上一次导入：{{name}}",
       "sorting": "正在整理已解压的文件…",
       "organizedCount": "已整理 {{count}} 个文件。",
       "cancelling": "正在取消…",

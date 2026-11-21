@@ -37,7 +37,8 @@ export default function ArchiveImportPanel() {
   const canCancel = running && snapshot.jobId !== null;
   const cancelPending = canCancel && (snapshot.cancelRequested || cancelingJob === snapshot.jobId);
   const unavailable = connection.error ?? statusError;
-  const receipt = snapshot?.result;
+  const previous = snapshot?.status === "failed" ? snapshot.previousReceipt : null;
+  const receipt = snapshot?.result ?? previous?.receipt;
   const failure = snapshot?.status === "failed" ? snapshot.error : null;
 
   const chooseArchive = () => pickArchiveImport(() => open({
@@ -98,12 +99,20 @@ export default function ArchiveImportPanel() {
       )}
       {cancelError && running && <p role="alert" className="text-xs text-red-700 dark:text-red-400">{t("confirm.failed", { error: cancelError })}</p>}
       {importError && importError !== failure && <p role="alert" className="text-xs text-red-700 dark:text-red-400">{t("settings.archive.importError", { error: importError })}</p>}
-      {failure && <p role="alert" className="text-xs text-red-700 dark:text-red-400">{t("settings.archive.importError", { error: failure })}</p>}
+      {failure && (
+        <p role="alert" className="text-xs text-red-700 dark:text-red-400">
+          <strong className="block break-all">{snapshot?.sourceName}</strong>
+          {t("settings.archive.importError", { error: failure })}
+        </p>
+      )}
       {receipt && (
         <div className={`text-xs px-3 py-2 rounded-md ${receipt.issue === null
           ? "bg-green-50 text-green-700 border border-green-200"
           : "bg-amber-50 text-amber-800 border border-amber-200"}`}>
           <div role="status">
+            <p className="font-medium break-all">{previous
+              ? t("settings.archive.previousImport", { name: previous.sourceName })
+              : snapshot?.sourceName}</p>
             <p>{receipt.extractedCount === null
               ? t("settings.archive.organizedCount", { count: receipt.sortedCount })
               : t("settings.archive.importSuccess", { extracted: receipt.extractedCount, count: receipt.sortedCount })}</p>

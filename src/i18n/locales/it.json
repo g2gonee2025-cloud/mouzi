@@ -57,6 +57,7 @@
       "importSuccess": "{{extracted}} file estratti e {{count}} file organizzati.",
       "importError": "Impossibile importare l'archivio: {{error}}",
       "openImportFolder": "Apri cartella di importazione",
+      "previousImport": "Importazione precedente: {{name}}",
       "sorting": "Organizzazione dei file estratti…",
       "organizedCount": "{{count}} file organizzati.",
       "cancelling": "Annullamento in corso…",

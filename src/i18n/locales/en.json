@@ -57,6 +57,7 @@
       "importSuccess": "Extracted {{extracted}} file(s) and organized {{count}} file(s).",
       "importError": "Failed to import archive: {{error}}",
       "openImportFolder": "Open import folder",
+      "previousImport": "Previous import: {{name}}",
       "sorting": "Organizing extracted files…",
       "organizedCount": "Organized {{count}} file(s).",
       "cancelling": "Cancelling…",

@@ -57,6 +57,7 @@
       "importSuccess": "Розпаковано файлів: {{extracted}}, впорядковано: {{count}}.",
       "importError": "Не вдалося імпортувати архів: {{error}}",
       "openImportFolder": "Відкрити теку імпорту",
+      "previousImport": "Попередній імпорт: {{name}}",
       "sorting": "Упорядкування розпакованих файлів…",
       "organizedCount": "Упорядковано файлів: {{count}}.",
       "cancelling": "Скасування…",

@@ -57,6 +57,7 @@
       "importSuccess": "Wypakowano {{extracted}} plik(ów) i uporządkowano {{count}} plik(ów).",
       "importError": "Nie udało się zaimportować archiwum: {{error}}",
       "openImportFolder": "Otwórz folder importu",
+      "previousImport": "Poprzedni import: {{name}}",
       "sorting": "Porządkowanie wypakowanych plików…",
       "organizedCount": "Uporządkowano {{count}} plik(ów).",
       "cancelling": "Anulowanie…",

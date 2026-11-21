@@ -125,12 +125,14 @@ interface ArchiveImportResult extends ArchiveImportReceipt {
 export interface ArchiveImportState {
   revision: number;
   jobId: number | null;
+  sourceName: string | null;
   status: 'idle' | 'running' | 'completed' | 'failed';
   phase: 'extracting' | 'sorting' | null;
   bytes: number;
   files: number;
   cancelRequested: boolean;
   result: ArchiveImportReceipt | null;
+  previousReceipt: { sourceName: string; receipt: ArchiveImportReceipt } | null;
   error: string | null;
 }
 
@@ -518,10 +520,12 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   applyArchiveImportState: (snapshot) => set((state) => {
     if (state.archiveImportState && snapshot.revision <= state.archiveImportState.revision) return state;
+    const sameJob = snapshot.jobId === state.archiveImportState?.jobId;
     return {
       archiveImportState: snapshot,
       archiveStatusError: null,
-      archiveCancelError: snapshot.jobId === state.archiveImportState?.jobId ? state.archiveCancelError : null,
+      archiveImportError: sameJob ? state.archiveImportError : null,
+      archiveCancelError: sameJob ? state.archiveCancelError : null,
     };
   }),
 

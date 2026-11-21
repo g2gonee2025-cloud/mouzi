@@ -76,15 +76,24 @@ pub(crate) struct ArchiveImportReceipt {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
+struct PreviousArchiveImport {
+    source_name: String,
+    receipt: ArchiveImportReceipt,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ArchiveImportSnapshot {
     revision: u64,
     job_id: Option<u64>,
+    source_name: Option<String>,
     status: ImportStatus,
     phase: Option<ImportPhase>,
     bytes: u64,
     files: usize,
     cancel_requested: bool,
     result: Option<ArchiveImportReceipt>,
+    previous_receipt: Option<PreviousArchiveImport>,
     error: Option<String>,
 }
 
@@ -92,12 +101,14 @@ impl ArchiveImportSnapshot {
     const IDLE: Self = Self {
         revision: 0,
         job_id: None,
+        source_name: None,
         status: ImportStatus::Idle,
         phase: None,
         bytes: 0,
         files: 0,
         cancel_requested: false,
         result: None,
+        previous_receipt: None,
         error: None,
     };
 }
@@ -118,17 +129,23 @@ impl ImportLifecycle {
         self.0.lock().map(|state| state.snapshot.clone()).map_err(|_| "Archive job lock failed".into())
     }
 
-    pub(crate) fn start<'a>(&'a self, publish: &'a dyn Fn(&ArchiveImportSnapshot)) -> Result<ImportJob<'a>, String> {
+    pub(crate) fn start<'a>(&'a self, source: &Path, publish: &'a dyn Fn(&ArchiveImportSnapshot)) -> Result<ImportJob<'a>, String> {
         let cancelled = Arc::new(AtomicBool::new(false));
         let snapshot = {
             let mut state = self.0.lock().map_err(|_| "Archive job lock failed")?;
             if state.cancellation.is_some() { return Err("An archive import is already running".into()); }
             let id = state.snapshot.revision + 1;
+            let previous_receipt = match (state.snapshot.source_name.take(), state.snapshot.result.take()) {
+                (Some(source_name), Some(receipt)) => Some(PreviousArchiveImport { source_name, receipt }),
+                _ => state.snapshot.previous_receipt.take(),
+            };
             state.snapshot = ArchiveImportSnapshot {
                 revision: id,
                 job_id: Some(id),
+                source_name: Some(source.file_name().unwrap_or(source.as_os_str()).to_string_lossy().into_owned()),
                 status: ImportStatus::Running,
                 phase: Some(ImportPhase::Extracting),
+                previous_receipt,
                 ..ArchiveImportSnapshot::IDLE
             };
             state.cancellation = Some(cancelled.clone());
@@ -196,6 +213,7 @@ impl ImportJob<'_> {
                     }
                     state.snapshot.status = ImportStatus::Completed;
                     state.snapshot.result = Some(receipt);
+                    state.snapshot.previous_receipt = None;
                 }
                 Err(error) => {
                     state.snapshot.status = ImportStatus::Failed;
@@ -1283,10 +1301,10 @@ mod tests {
         let events = RefCell::new(Vec::new());
         let publish = |snapshot: &ArchiveImportSnapshot| events.borrow_mut().push(snapshot.clone());
         assert_eq!(lifecycle.snapshot().unwrap(), ArchiveImportSnapshot::IDLE);
-        let job = lifecycle.start(&publish).unwrap();
+        let job = lifecycle.start(Path::new("fixture.zip"), &publish).unwrap();
         let started = lifecycle.snapshot().unwrap();
         assert_eq!((started.status, started.phase), (ImportStatus::Running, Some(ImportPhase::Extracting)));
-        assert!(lifecycle.start(&publish).is_err());
+        assert!(lifecycle.start(Path::new("busy.zip"), &publish).is_err());
         assert_eq!(lifecycle.snapshot().unwrap(), started);
 
         job.progress(4096, 1);
@@ -1311,6 +1329,7 @@ mod tests {
         assert_eq!(serde_json::to_value(&completed).unwrap(), serde_json::json!({
             "revision": 5,
             "jobId": started.job_id,
+            "sourceName": "fixture.zip",
             "status": "completed",
             "phase": null,
             "bytes": 4096,
@@ -1323,6 +1342,7 @@ mod tests {
                 "issue": "Archive import cancelled",
             },
             "error": null,
+            "previousReceipt": null,
         }));
         drop(job);
         assert_eq!(lifecycle.snapshot().unwrap(), completed);
@@ -1330,24 +1350,64 @@ mod tests {
     }
 
     #[test]
+    fn archive_import_keeps_the_last_recoverable_source_until_another_has_a_receipt() {
+        let lifecycle = ImportLifecycle::new();
+        let publish = |_: &ArchiveImportSnapshot| {};
+        let first = ArchiveImportReceipt {
+            extracted_count: Some(2), sorted_count: 1, staging_path: "staging/first".into(), issue: None,
+        };
+        lifecycle.start(Path::new("inputs/first.zip"), &publish).unwrap().finish(Ok(first.clone()));
+
+        for name in ["notes.txt.gz", "retry.txt.gz"] {
+            let job = lifecycle.start(Path::new(name), &publish).unwrap();
+            job.finish(Err("Unsupported archive format"));
+            let failed = lifecycle.snapshot().unwrap();
+            assert_eq!(failed.status, ImportStatus::Failed);
+            assert_eq!(failed.source_name.as_deref(), Some(name));
+            assert_eq!(failed.error.as_deref(), Some("Unsupported archive format"));
+            assert_eq!((failed.files, failed.bytes, failed.result), (0, 0, None));
+            let prior = failed.previous_receipt.unwrap();
+            assert_eq!(prior.source_name, "first.zip");
+            assert_eq!(prior.receipt, first);
+        }
+
+        let last = ArchiveImportReceipt {
+            extracted_count: Some(3), sorted_count: 0, staging_path: "staging/third".into(),
+            issue: Some("Import cancelled".into()),
+        };
+        lifecycle.start(Path::new("third.zip"), &publish).unwrap().finish(Ok(last.clone()));
+        let completed = lifecycle.snapshot().unwrap();
+        assert_eq!(completed.status, ImportStatus::Completed);
+        assert_eq!(completed.source_name.as_deref(), Some("third.zip"));
+        assert_eq!(completed.result.as_ref(), Some(&last));
+        assert_eq!((completed.previous_receipt, completed.error), (None, None));
+
+        lifecycle.start(Path::new("later.gz"), &publish).unwrap().finish(Err("Unsupported archive format"));
+        let prior = lifecycle.snapshot().unwrap().previous_receipt.unwrap();
+        assert_eq!(prior.source_name, "third.zip");
+        assert_eq!(prior.receipt, last);
+    }
+
+    #[test]
     fn archive_import_state_ignores_old_jobs_and_retains_failure_after_drop() {
         let lifecycle = ImportLifecycle::new();
         let publish = |_: &ArchiveImportSnapshot| {};
-        let old_job = lifecycle.start(&publish).unwrap();
+        let old_job = lifecycle.start(Path::new("missing.zip"), &publish).unwrap();
         let old_id = lifecycle.snapshot().unwrap().job_id;
         old_job.finish(Err("Archive fixture not found"));
         let first_failure = lifecycle.snapshot().unwrap();
         assert_eq!(first_failure.status, ImportStatus::Failed);
         assert_eq!(first_failure.error.as_deref(), Some("Archive fixture not found"));
+        assert!(first_failure.result.is_none() && first_failure.previous_receipt.is_none());
 
-        let current_job = lifecycle.start(&publish).unwrap();
+        let current_job = lifecycle.start(Path::new("current.zip"), &publish).unwrap();
         let started = lifecycle.snapshot().unwrap();
         assert!(started.revision > first_failure.revision);
         assert_ne!(started.job_id, old_id);
         assert!(lifecycle.cancel(old_id).unwrap().is_none());
         old_job.progress(10, 1);
         drop(old_job);
-        assert!(lifecycle.start(&publish).is_err());
+        assert!(lifecycle.start(Path::new("busy.zip"), &publish).is_err());
         assert!(!current_job.cancelled.load(Ordering::Relaxed));
         assert_eq!(lifecycle.snapshot().unwrap(), started);
 
@@ -1356,7 +1416,7 @@ mod tests {
         let abandoned = lifecycle.snapshot().unwrap();
         assert_eq!((abandoned.job_id, abandoned.status, abandoned.phase), (started.job_id, ImportStatus::Failed, None));
         assert_eq!(abandoned.error.as_deref(), Some("Archive import stopped before reporting its result"));
-        assert!(lifecycle.start(&publish).is_ok());
+        assert!(lifecycle.start(Path::new("retry.zip"), &publish).is_ok());
     }
 
     fn test_dir(prefix: &str) -> PathBuf {

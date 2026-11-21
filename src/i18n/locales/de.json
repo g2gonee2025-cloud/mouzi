@@ -57,6 +57,7 @@
       "importSuccess": "{{extracted}} Datei(en) extrahiert und {{count}} Datei(en) organisiert.",
       "importError": "Archiv konnte nicht importiert werden: {{error}}",
       "openImportFolder": "Importordner öffnen",
+      "previousImport": "Vorheriger Import: {{name}}",
       "sorting": "Entpackte Dateien werden organisiert…",
       "organizedCount": "{{count}} Datei(en) organisiert.",
       "cancelling": "Wird abgebrochen…",

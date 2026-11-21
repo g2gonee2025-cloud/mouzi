@@ -57,6 +57,7 @@
       "importSuccess": "Распаковано файлов: {{extracted}}, организовано файлов: {{count}}.",
       "importError": "Не удалось импортировать архив: {{error}}",
       "openImportFolder": "Открыть папку импорта",
+      "previousImport": "Предыдущий импорт: {{name}}",
       "sorting": "Сортировка извлечённых файлов…",
       "organizedCount": "Организовано файлов: {{count}}.",
       "cancelling": "Отмена…",

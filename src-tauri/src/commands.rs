@@ -785,7 +785,7 @@ pub fn import_archive_cmd(app: AppHandle, path: String, state: tauri::State<AppS
     let publish = |snapshot: &crate::archive::ArchiveImportSnapshot| {
         let _ = app.emit(ARCHIVE_IMPORT_STATE_CHANGED, snapshot);
     };
-    let job = crate::archive::IMPORT.start(&publish)?;
+    let job = crate::archive::IMPORT.start(Path::new(&path), &publish)?;
     let result = run_archive_import(&app, &path, &state.ignored_files, &job);
     job.finish(result.as_ref().map(|summary| crate::archive::ArchiveImportReceipt {
         extracted_count: summary.extracted_count,

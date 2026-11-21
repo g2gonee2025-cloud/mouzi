@@ -43,9 +43,40 @@ function renderSettings(archiveImportState: ArchiveImportState) {
   }
 }
 
+const previousReceipt = {
+  sourceName: "first.zip",
+  receipt: { extractedCount: 2, sortedCount: 1, stagingPath: "C:/Archive Recovery/first", issue: null },
+};
+
+const noStaging: ArchiveImportState = {
+  revision: 10, jobId: 7, sourceName: "notes.txt.gz", status: "failed", phase: null,
+  bytes: 0, files: 0, cancelRequested: false, error: "Unsupported archive format", result: null,
+  previousReceipt,
+};
+
+it("identifies the failed archive separately from the previous recoverable import on reopening", () => {
+  const html = renderSettings(noStaging);
+  const alert = html.match(/<p role="alert"[^>]*>(.*?)<\/p>/s)?.[1];
+  expect(alert).toContain("notes.txt.gz");
+  expect(alert).toContain("Unsupported archive format");
+  expect(alert).not.toContain("first.zip");
+  expect(html).toContain("Previous import: first.zip");
+  expect(html).toContain("Extracted 2 file(s) and organized 1 file(s).");
+  expect(html).toContain("Open import folder");
+});
+
+it("offers no recovery folder if the first archive failed before staging", () => {
+  const html = renderSettings({ ...noStaging, previousReceipt: null });
+  expect(html).toContain("notes.txt.gz");
+  expect(html).toContain("Unsupported archive format");
+  expect(html).not.toContain("Previous import");
+  expect(html).not.toContain("Open import folder");
+});
+
 it("a reopened Settings page shows the running job and a Cancel action", () => {
   const html = renderSettings({
     revision: 2, status: "running", jobId: 1, phase: "extracting",
+    sourceName: "running.zip", previousReceipt: null,
     bytes: 2048, files: 3, cancelRequested: false, result: null, error: null,
   });
   expect(html).toContain("Extracted 3 files");
@@ -56,6 +87,7 @@ it("a reopened Settings page shows the running job and a Cancel action", () => {
 it("shows the sorting phase and disables repeat cancellation after the request", () => {
   const html = renderSettings({
     revision: 3, status: "running", jobId: 1, phase: "sorting",
+    sourceName: "sorting.zip", previousReceipt: null,
     bytes: 2048, files: 3, cancelRequested: true, result: null, error: null,
   });
   expect(html).toContain("Organizing extracted files…");
@@ -65,6 +97,7 @@ it("shows the sorting phase and disables repeat cancellation after the request",
 it("a reopened Settings page retains partial counts and recovery action", () => {
   const html = renderSettings({
     revision: 3, status: "completed", jobId: 1, phase: null,
+    sourceName: "partial.zip", previousReceipt: null,
     bytes: 2048, files: 2, cancelRequested: true,
     result: { extractedCount: 2, sortedCount: 1, stagingPath: "C:/Archive Recovery", issue: "Fixture cancellation" },
     error: null,
@@ -77,6 +110,7 @@ it("a reopened Settings page retains partial counts and recovery action", () => 
 it("preserves a recovery action without presenting unknown counts as zero", () => {
   const html = renderSettings({
     revision: 4, status: "completed", jobId: 2, phase: null,
+    sourceName: "recovery.zip", previousReceipt: null,
     bytes: 0, files: 0, cancelRequested: false,
     result: { extractedCount: null, sortedCount: 0, stagingPath: "C:/Archive Recovery", issue: "Fixture unreadable" },
     error: null,
@@ -98,14 +132,16 @@ function openFolderAction(tree: ReactNode): (() => void) | undefined {
   }
 }
 
-it("requires the exact directory when opening an archive import receipt", () => {
+it.each(["current", "previous"])("requires the exact directory when opening a %s archive import receipt", (which) => {
   const previous = useAppStore.getState();
-  const stagingPath = "C:/Archive Recovery/Import 1";
-  useAppStore.setState({ archiveImportState: {
-    revision: 4, status: "completed", jobId: 2, phase: null, bytes: 128, files: 1, cancelRequested: false,
-    result: { extractedCount: 1, sortedCount: 0, stagingPath, issue: null },
-    error: null,
-  } });
+  const completed: ArchiveImportState = {
+    ...noStaging, revision: 14, jobId: 11, sourceName: "third.zip", status: "completed", files: 3,
+    result: { extractedCount: 3, sortedCount: 2, stagingPath: "C:/Archive Recovery/third", issue: null },
+    error: null, previousReceipt: null,
+  };
+  const state = which === "current" ? completed : noStaging;
+  const stagingPath = which === "current" ? "C:/Archive Recovery/third" : "C:/Archive Recovery/first";
+  useAppStore.setState({ archiveImportState: state });
   let open: (() => void) | undefined;
   function CapturePanel() {
     const panel = ArchiveImportPanel();
@@ -115,7 +151,12 @@ it("requires the exact directory when opening an archive import receipt", () => 
 
   invoke.mockResolvedValueOnce(undefined);
   try {
-    renderToStaticMarkup(<CapturePanel />);
+    const html = renderToStaticMarkup(<CapturePanel />);
+    if (which === "current") {
+      expect(html).toContain("third.zip");
+      expect(html).not.toContain("first.zip");
+      expect(html).not.toContain("Unsupported archive format");
+    }
     expect(open).toBeTypeOf("function");
     open!();
     expect(invoke).toHaveBeenCalledExactlyOnceWith("open_folder_cmd", { path: stagingPath, directoryOnly: true });

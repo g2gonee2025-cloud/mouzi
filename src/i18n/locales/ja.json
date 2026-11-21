@@ -57,6 +57,7 @@
       "importSuccess": "{{extracted}} 個のファイルを展開し、{{count}} 個のファイルを整理しました。",
       "importError": "アーカイブのインポートに失敗しました: {{error}}",
       "openImportFolder": "インポートフォルダーを開く",
+      "previousImport": "前回のインポート：{{name}}",
       "sorting": "抽出したファイルを整理中…",
       "organizedCount": "{{count}} 個のファイルを整理しました。",
       "cancelling": "キャンセル中…",
