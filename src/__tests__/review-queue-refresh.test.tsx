@@ -154,6 +154,33 @@ async function initial(id: string, entries: Row[]) {
   await settled();
 }
 
+it("reports writer-held files without offering them for selection or showing a verified empty result", async () => {
+  const source = "C:/Fixture/writer-held.txt";
+  const deferredFiles = [{ source, error: "preview.locked" }];
+  replies.push(async () => ({ id: "held", entries: [], deferredFiles }));
+  render();
+  await settled();
+
+  const texts = render().map(node => node.props.children);
+  expect(texts).toContain(source);
+  expect(texts).toContain("preview.locked");
+  expect(texts).not.toContain("beta.empty");
+  expect(checks()).toEqual([]);
+  expect(texts).not.toContain("beta.apply");
+
+  const healthy = row("mixed", "healthy");
+  replies.push(async () => ({ id: "mixed", entries: [healthy], deferredFiles }));
+  button("beta.refresh").onClick?.();
+  await settled();
+  expect(render().map(node => node.props.children)).toContain(source);
+  expect(chosen()).toEqual([true]);
+  button("beta.apply").onClick?.({ currentTarget: {} });
+  const confirmation = render().find(node => node.type === ConfirmDialog)?.props;
+  expect(confirmation?.count).toBe(1);
+  expect(confirmation?.preview).toEqual([{ source: healthy.source, destination: healthy.destination }]);
+  expect(harness.invoke).not.toHaveBeenCalledWith("apply_preview_cmd", expect.anything());
+});
+
 beforeEach(() => {
   useReviewQueueStore.setState(useReviewQueueStore.getInitialState());
   scope = null;

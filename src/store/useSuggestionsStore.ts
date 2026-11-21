@@ -17,9 +17,15 @@ export interface Suggestion {
 }
 
 type LocalAiStatus = "modelMissing" | "unreachable" | "generationFailed" | null;
+interface SuggestionPolicyIssue {
+  root: string;
+  message: string;
+}
+
 export interface SuggestionsResponse {
   suggestions: Suggestion[];
   localAiStatus: LocalAiStatus;
+  policyIssues?: SuggestionPolicyIssue[];
 }
 
 export interface AcceptOutcome {
@@ -64,6 +70,7 @@ type SuggestionsLookup =
 interface SuggestionsState {
   suggestions: Suggestion[];
   localAiStatus: LocalAiStatus;
+  policyIssues: SuggestionPolicyIssue[];
   lookup: SuggestionsLookup;
   busy: boolean;
   error: string | null;
@@ -93,17 +100,21 @@ async function refreshSuggestions(keepDismissalNotice = false): Promise<void> {
   const { busy, preparedPlans, dismissChanged } = getState();
   if (busy || preparedPlans) return;
   const generation = ++loadGeneration;
-  setState({ lookup: { status: "loading" }, localAiStatus: null, dismissChanged: keepDismissalNotice && dismissChanged });
+  setState({
+    lookup: { status: "loading" }, localAiStatus: null, policyIssues: [],
+    dismissChanged: keepDismissalNotice && dismissChanged,
+  });
   try {
-    const { suggestions, localAiStatus } = await invoke<SuggestionsResponse>("get_suggestions_with_status_cmd", { limit: 100 });
-    if (generation === loadGeneration) setState({ suggestions, localAiStatus, lookup: { status: "ready" } });
+    const { suggestions, localAiStatus, policyIssues = [] } =
+      await invoke<SuggestionsResponse>("get_suggestions_with_status_cmd", { limit: 100 });
+    if (generation === loadGeneration) setState({ suggestions, localAiStatus, policyIssues, lookup: { status: "ready" } });
   } catch (error) {
     if (generation === loadGeneration) setState({ lookup: { status: "failed", reason: String(error) } });
   }
 }
 
 export const useSuggestionsStore = create<SuggestionsState>((set, get) => ({
-  suggestions: [], localAiStatus: null, lookup: { status: "idle" }, busy: false, error: null,
+  suggestions: [], localAiStatus: null, policyIssues: [], lookup: { status: "idle" }, busy: false, error: null,
   createRuleDefault: false, preparedPlans: null, results: null, dismissChanged: false,
   loadSuggestions: () => refreshSuggestions(),
   prepareSuggestions: async (suggestions, createRule, owner) => {

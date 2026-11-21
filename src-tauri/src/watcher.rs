@@ -1,7 +1,7 @@
 use crate::db::{get_settings, get_watched_folders, is_folder_auto_mode, is_folder_manual_mode, WatchedFolder};
 use crate::ignore::IgnorePatterns;
 use crate::operations::ProcessedCheckError;
-use crate::rules::{is_file_ignored_by_mouziignore, organization_path_is_protected_with, process_watched_file, same_path, should_ignore_file, ProcessOutcome, WatchedRoot};
+use crate::rules::{is_file_ignored_by_mouziignore, organization_grace_period, organization_path_is_protected_with, process_watched_file, same_path, should_ignore_file, ProcessOutcome, WatchedRoot};
 use crate::safe_fs::FileIdentity;
 use crate::suppress::{CancellationTicket, SuppressionSet};
 use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
@@ -16,7 +16,6 @@ use tauri::{Emitter, Manager};
 use tauri_plugin_notification::NotificationExt;
 
 const MAX_RETRIES: u8 = 8;
-const MIN_SETTLING: Duration = Duration::from_secs(2);
 const WATCH_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_WATCH_RETRY_DELAY: Duration = Duration::from_secs(30);
 
@@ -51,7 +50,9 @@ fn fingerprint(path: &Path) -> Result<Fingerprint, String> {
 struct PendingFile {
     path: PathBuf,
     root: Arc<WatchedRoot>,
-    scheduled: Instant,
+    queued_at: Instant,
+    retry_at: Option<Instant>,
+    grace_recheck: Option<(Duration, Instant)>,
     attempts: u8,
     ticket: CancellationTicket,
     identity: Option<FileIdentity>,
@@ -59,10 +60,23 @@ struct PendingFile {
 }
 
 impl PendingFile {
+    fn ready_at(&self, grace: Duration) -> Option<Instant> {
+        let mut ready = self.queued_at.checked_add(grace)?;
+        if let Some(retry_at) = self.retry_at {
+            ready = ready.max(retry_at);
+        }
+        if let Some((period, recheck_at)) = self.grace_recheck {
+            if period == grace {
+                ready = ready.max(recheck_at);
+            }
+        }
+        Some(ready)
+    }
+
     fn defer(&mut self, now: Instant) -> bool {
         if self.attempts >= MAX_RETRIES { return false; }
         self.attempts += 1;
-        self.scheduled = now + retry_delay(self.attempts);
+        self.retry_at = Some(now + retry_delay(self.attempts));
         true
     }
 }
@@ -271,10 +285,20 @@ impl FolderWatcher {
 
     fn tick(&self, now: Instant) -> BatchOutcome {
         self.suppression.sweep(now);
+        let Some(grace) = crate::db::watcher_grace_seconds().map(organization_grace_period) else {
+            return BatchOutcome::default();
+        };
         let ready = {
             let mut pending = self.pending.lock().unwrap_or_else(|error| error.into_inner());
-            let ready = pending.iter().filter(|item| now >= item.scheduled).cloned().collect::<Vec<_>>();
-            pending.retain(|item| now < item.scheduled);
+            let mut ready = Vec::new();
+            pending.retain(|item| {
+                if item.ready_at(grace).is_some_and(|deadline| now >= deadline) {
+                    ready.push(item.clone());
+                    false
+                } else {
+                    true
+                }
+            });
             ready
         };
         let mut outcome = BatchOutcome::default();
@@ -308,6 +332,16 @@ impl FolderWatcher {
                     }
                 }
                 Ok(ProcessOutcome::Skipped) => {}
+                Ok(ProcessOutcome::Settling { period, remaining }) => {
+                    // A fresh age check may see a newer write, a recent settings
+                    // save, or a wall clock that advanced less than this tick.
+                    if let Some(deadline) = now.checked_add(remaining) {
+                        item.grace_recheck = Some((period, deadline));
+                        self.requeue(item);
+                    } else {
+                        self.retry(item, now, "Cannot schedule the file settling deadline");
+                    }
+                }
                 Ok(ProcessOutcome::Retry { reason }) => self.retry(item, now, &reason),
                 Ok(ProcessOutcome::Retained { message }) => {
                     self.report_file_error(&item.path, &message);
@@ -322,12 +356,22 @@ impl FolderWatcher {
     }
 
     fn retry(&self, mut item: PendingFile, now: Instant, reason: &str) {
-        if !item.ticket.is_current() || self.suppression.is_suppressed(&item.path, Instant::now())
-            || !auto_root_is_current(&item.root) { return; }
         if !item.defer(now) {
-            self.report_file_error(&item.path, &format!("Automatic organization deferred after {MAX_RETRIES} retries: {reason}"));
+            if self.work_is_current(&item) {
+                self.report_file_error(&item.path, &format!("Automatic organization deferred after {MAX_RETRIES} retries: {reason}"));
+            }
             return;
         }
+        self.requeue(item);
+    }
+
+    fn work_is_current(&self, item: &PendingFile) -> bool {
+        item.ticket.is_current() && !self.suppression.is_suppressed(&item.path, Instant::now())
+            && auto_root_is_current(&item.root)
+    }
+
+    fn requeue(&self, item: PendingFile) {
+        if !self.work_is_current(&item) { return; }
         let mut pending = self.pending.lock().unwrap_or_else(|error| error.into_inner());
         if !pending.iter().any(|newer| same_path(&newer.path, &item.path)) { pending.push(item); }
     }
@@ -617,7 +661,6 @@ impl FolderWatcher {
     pub fn flush_manual_to_pending(&mut self, folder_path: &str) {
         let Some(root) = self.watchers.get(folder_path).map(|watch| &watch.root) else { return; };
         if !auto_root_is_current(root) { return; }
-        let Ok(settings) = get_settings() else { return; };
         let arrivals = {
             let mut manual = self.pending_manual.state.lock().unwrap_or_else(|error| error.into_inner());
             let mut arrivals = Vec::new();
@@ -633,9 +676,8 @@ impl FolderWatcher {
             self.pending_manual.update_count(&manual);
             arrivals
         };
-        let grace = Duration::from_secs(settings.grace_period_seconds.max(2) as u64);
         for (path, ticket) in arrivals {
-            let item = pending_item(&path, root, ticket, grace);
+            let item = pending_item(&path, root, ticket);
             let mut pending = self.pending.lock().unwrap_or_else(|error| error.into_inner());
             if !item.ticket.is_current() || self.suppression.is_suppressed(&path, Instant::now()) { continue; }
             pending.retain(|previous| !same_path(&previous.path, &path));
@@ -654,9 +696,9 @@ fn register_root_watch(root: &WatchedRoot, callback: impl notify::EventHandler) 
     Ok(watcher)
 }
 
-fn pending_item(path: &Path, root: &Arc<WatchedRoot>, ticket: CancellationTicket, grace: Duration) -> PendingFile {
-    PendingFile { path: path.to_path_buf(), root: root.clone(), scheduled: Instant::now() + grace.max(MIN_SETTLING),
-        attempts: 0, ticket, identity: crate::safe_fs::file_identity(path).ok(),
+fn pending_item(path: &Path, root: &Arc<WatchedRoot>, ticket: CancellationTicket) -> PendingFile {
+    PendingFile { path: path.to_path_buf(), root: root.clone(), queued_at: Instant::now(),
+        retry_at: None, grace_recheck: None, attempts: 0, ticket, identity: crate::safe_fs::file_identity(path).ok(),
         fingerprint: fingerprint(path).ok() }
 }
 
@@ -740,8 +782,7 @@ fn enqueue_path(path: &Path, source: EnqueueSource, root: &Arc<WatchedRoot>, pen
             update_pending_tooltip(app, manual);
         }
     } else if is_folder_auto_mode(&folder.mode) {
-        let settings = get_settings().map_err(|error| error.to_string())?;
-        let mut item = pending_item(path, root, ticket, Duration::from_secs(settings.grace_period_seconds.max(2) as u64));
+        let mut item = pending_item(path, root, ticket);
         let mut pending = pending.lock().unwrap_or_else(|error| error.into_inner());
         if !root.watch_is_active() || !item.ticket.is_current()
             || suppression.is_suppressed(path, Instant::now()) { return Ok(()); }
@@ -842,7 +883,7 @@ mod tests {
         let reviewed = root.path.join("reviewed.undocheck");
         let later = root.path.join("later.undocheck");
         for path in [&reviewed, &later] {
-            cancellation.pending.lock().unwrap().push(pending_item(path, &root, suppression.ticket(path), Duration::ZERO));
+            cancellation.pending.lock().unwrap().push(pending_item(path, &root, suppression.ticket(path)));
             cancellation.pending_manual.state.lock().unwrap().arrivals.insert(path.to_string_lossy().into_owned(), PendingReview {
                 root: root.clone(), ticket: suppression.ticket(path), excluded: false,
             });
@@ -885,12 +926,12 @@ mod tests {
             mode: crate::db::FOLDER_MODE_SILENT.into(),
             watch_identity: None, only_new: false,
         }).unwrap());
-        let mut pending = PendingFile { path: path.clone(), root,
-            scheduled: now, attempts: 0, ticket: suppression.ticket(&path), identity: None, fingerprint: None };
+        let mut pending = pending_item(&path, &root, suppression.ticket(&path));
         for _ in 0..MAX_RETRIES {
             assert!(pending.defer(now));
-            assert!(pending.scheduled > now);
-            assert!(pending.scheduled <= now + Duration::from_secs(60));
+            let retry_at = pending.retry_at.unwrap();
+            assert!(retry_at > now);
+            assert!(retry_at <= now + Duration::from_secs(60));
         }
         assert!(!pending.defer(now));
     }
@@ -1101,6 +1142,138 @@ mod tests {
         }
     }
 
+    fn save_grace_period(seconds: i64) {
+        let saved = crate::db::update_preferences(&crate::db::PreferencesPatch {
+            grace_period_seconds: Some(seconds), ..Default::default()
+        }).unwrap();
+        assert_eq!(saved.grace_period_seconds, seconds);
+    }
+
+    fn with_queued_grace_fixture(
+        initial_grace: i64,
+        age: Duration,
+        check: impl FnOnce(&FolderWatcher, &Path, &Path, Instant),
+    ) {
+        use crate::db::{self, FOLDER_MODE_SILENT};
+        use std::fs;
+
+        let _serial = db::serialise_test_db();
+        db::init_test_db();
+        let mut fixture = RecoveryFixture::new();
+        let root_path = fs::canonicalize(fixture.root()).unwrap();
+        let folder = db::register_watched_folder(root_path.to_str().unwrap(), FOLDER_MODE_SILENT, false).unwrap();
+        fixture.id = Some(folder);
+        let rule = db::add_rule(&db::Rule {
+            name: "Silent grace fixture".into(), priority: i32::MIN, enabled: true,
+            extensions: vec!["mouziwatchgrace".into()], destination: "Filed".into(),
+            action: "move".into(), folder_id: folder, ..db::Rule::default()
+        }).unwrap();
+        let source = root_path.join("report.mouziwatchgrace");
+        let destination = root_path.join("Filed").join(source.file_name().unwrap());
+        struct Restore<'a> { rule: i64, grace: i64, source: &'a Path, destination: &'a Path }
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                use crate::db;
+                if let Ok(conn) = db::lock_db() {
+                    let source = self.source.to_str().unwrap();
+                    let destination = self.destination.to_str().unwrap();
+                    let _ = conn.execute("DELETE FROM action_logs WHERE source_path=?1", [source]);
+                    let _ = conn.execute("DELETE FROM operation_intents WHERE source_path=?1", [source]);
+                    let _ = conn.execute("DELETE FROM processed_files WHERE path IN (?1,?2)", [source, destination]);
+                }
+                let _ = db::delete_rule(self.rule);
+                let _ = db::update_preferences(&db::PreferencesPatch {
+                    grace_period_seconds: Some(self.grace), ..Default::default()
+                });
+            }
+        }
+        let _restore = Restore { rule, grace: get_settings().unwrap().grace_period_seconds, source: &source, destination: &destination };
+        save_grace_period(initial_grace);
+        fs::write(&source, b"Silent grace fixture").unwrap();
+        fs::OpenOptions::new().write(true).open(&source).unwrap()
+            .set_modified(SystemTime::now() - age).unwrap();
+        let settings = get_watched_folders().unwrap().into_iter().find(|entry| entry.id == Some(folder)).unwrap();
+        let root = Arc::new(WatchedRoot::capture_unattended(&settings, false).unwrap());
+        let suppression = Arc::new(SuppressionSet::new());
+        let watcher = FolderWatcher::new(suppression.clone());
+        enqueue_path(&source, EnqueueSource::Notification, &root, &watcher.pending,
+            &watcher.pending_manual, &suppression, None).unwrap();
+        assert_eq!(watcher.pending.lock().unwrap().len(), 1);
+        check(&watcher, &source, &destination, Instant::now());
+    }
+
+    #[test]
+    fn changed_silent_grace_preserves_a_file_past_the_failure_retry_budget() {
+        with_queued_grace_fixture(10, Duration::ZERO, |watcher, source, destination, queued| {
+            save_grace_period(360);
+            for second in [11, 15, 23, 39, 71, 131, 191, 251, 311, 330] {
+                assert_eq!(watcher.tick(queued + Duration::from_secs(second)).organized, 0);
+            }
+            let pending = watcher.pending.lock().unwrap();
+            assert_eq!(pending.len(), 1, "the unchanged file still has time left to settle");
+            assert_eq!(pending[0].attempts, 0, "waiting for grace does not spend failure retries");
+            assert_eq!(std::fs::read(source).unwrap(), b"Silent grace fixture");
+            assert!(!destination.exists());
+        });
+    }
+
+    #[test]
+    fn changed_silent_grace_moves_a_queued_file_on_the_shorter_deadline() {
+        with_queued_grace_fixture(10, Duration::from_secs(20), |watcher, source, destination, queued| {
+            save_grace_period(0);
+            assert_eq!(watcher.tick(queued + Duration::from_secs(1)).organized, 0);
+            assert!(source.is_file(), "the two-second minimum still applies");
+            let identity = crate::safe_fs::file_identity(source).unwrap();
+            let shortened = queued + Duration::from_secs(3);
+            assert_eq!(watcher.tick(shortened).organized, 1, "the current grace applies to queued work");
+            assert!(!source.exists());
+            assert_eq!(std::fs::read(destination).unwrap(), b"Silent grace fixture");
+            assert_eq!(crate::safe_fs::file_identity(destination).unwrap(), identity);
+            assert_eq!(watcher.tick(shortened + Duration::from_secs(10)).organized, 0);
+        });
+    }
+
+    #[test]
+    fn silent_grace_change_replaces_a_wait_from_the_live_file_age_check() {
+        with_queued_grace_fixture(120, Duration::from_secs(20), |watcher, source, destination, queued| {
+            // Advance the monotonic queue clock while the file's wall-clock
+            // age is still below the saved grace period.
+            let first_check = queued + Duration::from_secs(121);
+            assert_eq!(watcher.tick(first_check).organized, 0);
+            assert!(source.is_file());
+            let pending = watcher.pending.lock().unwrap();
+            assert_eq!(pending.len(), 1);
+            assert_eq!(pending[0].attempts, 0);
+            drop(pending);
+
+            save_grace_period(0);
+            assert_eq!(watcher.tick(first_check + Duration::from_secs(1)).organized, 1);
+            assert!(!source.exists());
+            assert_eq!(std::fs::read(destination).unwrap(), b"Silent grace fixture");
+        });
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn silent_grace_reduction_preserves_the_backoff_after_a_sharing_failure() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        with_queued_grace_fixture(10, Duration::from_secs(20), |watcher, source, destination, queued| {
+            let handle = std::fs::OpenOptions::new().read(true).share_mode(1 | 2).open(source).unwrap();
+            let first_check = queued + Duration::from_secs(11);
+            assert_eq!(watcher.tick(first_check).organized, 0);
+            assert_eq!(watcher.pending.lock().unwrap()[0].attempts, 1);
+
+            save_grace_period(0);
+            drop(handle);
+            assert_eq!(watcher.tick(first_check + Duration::from_secs(3)).organized, 0);
+            assert!(source.is_file());
+            assert_eq!(watcher.tick(first_check + Duration::from_secs(4)).organized, 1);
+            assert!(!source.exists());
+            assert_eq!(std::fs::read(destination).unwrap(), b"Silent grace fixture");
+        });
+    }
+
     #[test]
     fn switching_to_silent_keeps_live_manual_work_without_reviving_cancelled_tickets() {
         use crate::db::{self, FOLDER_MODE_MANUAL, FOLDER_MODE_SILENT};
@@ -1272,10 +1445,12 @@ mod tests {
         let after_retry = snapshot(&watcher);
         for sibling in [earlier, later] {
             assert!(initial[sibling].ticket.is_current());
-            assert_eq!(initial[sibling].scheduled, after_retry[sibling].scheduled);
+            assert_eq!(initial[sibling].queued_at, after_retry[sibling].queued_at);
+            assert_eq!(initial[sibling].retry_at, after_retry[sibling].retry_at);
             assert_eq!(initial[sibling].attempts, after_retry[sibling].attempts);
         }
-        let ready = initial.values().map(|item| item.scheduled).max().unwrap();
+        let grace = organization_grace_period(get_settings().unwrap().grace_period_seconds);
+        let ready = initial.values().filter_map(|item| item.ready_at(grace)).max().unwrap();
         assert_eq!(watcher.tick(ready).organized, 2);
         for (sibling, bytes) in [earlier, later].into_iter().zip(sibling_bytes) {
             assert!(!sibling.exists());
@@ -1324,7 +1499,7 @@ mod tests {
         watcher.enqueue_existing_files(&root, None, None).unwrap();
         let before = {
             let mut pending = watcher.pending.lock().unwrap();
-            pending[0].scheduled = Instant::now() - Duration::from_secs(10);
+            pending[0].retry_at = Some(Instant::now() - Duration::from_secs(10));
             pending[0].attempts = 2;
             pending[0].clone()
         };
@@ -1333,7 +1508,8 @@ mod tests {
             let pending = watcher.pending.lock().unwrap();
             assert_eq!(pending.len(), 1);
             assert!(before.ticket.is_current());
-            assert_eq!(pending[0].scheduled, before.scheduled);
+            assert_eq!(pending[0].queued_at, before.queued_at);
+            assert_eq!(pending[0].retry_at, before.retry_at);
             assert_eq!(pending[0].attempts, 2);
         }
 
@@ -1348,8 +1524,8 @@ mod tests {
         assert!(!before.ticket.is_current());
         assert!(pending[0].ticket.is_current());
         assert_ne!(pending[0].fingerprint, before.fingerprint);
-        let grace = Duration::from_secs(get_settings().unwrap().grace_period_seconds.max(2) as u64);
-        assert!(pending[0].scheduled >= event + grace);
+        assert!(pending[0].queued_at >= event);
+        assert!(pending[0].retry_at.is_none());
         assert_eq!(pending[0].attempts, 0);
     }
 
@@ -1487,8 +1663,9 @@ mod tests {
             }
         };
 
+        let grace = organization_grace_period(get_settings().unwrap().grace_period_seconds);
         let first = arrive(b"first file");
-        assert_eq!(watcher.tick(first.scheduled).organized, 1);
+        assert_eq!(watcher.tick(first.ready_at(grace).unwrap()).organized, 1);
         let first_output = root_path.join("Filed").join(source.file_name().unwrap());
         assert_eq!(fs::read(&first_output).unwrap(), b"first file");
         assert!(suppression.is_suppressed(&first_output, Instant::now()));
@@ -1497,7 +1674,8 @@ mod tests {
         assert_ne!(first.identity, second.identity);
         let read_handle = fs::OpenOptions::new().read(true).share_mode(1 | 2).open(&source).unwrap();
         assert!(fs::OpenOptions::new().write(true).open(&source).is_ok(), "the write probe should pass");
-        assert_eq!(watcher.tick(second.scheduled).organized, 0);
+        let second_deadline = second.ready_at(grace).unwrap();
+        assert_eq!(watcher.tick(second_deadline).organized, 0);
         assert_eq!(fs::read(&source).unwrap(), b"second file");
         let deferred = {
             let pending = watcher.pending.lock().unwrap();
@@ -1506,7 +1684,7 @@ mod tests {
         };
         assert_eq!(deferred.identity, second.identity);
         assert_eq!(deferred.attempts, 1);
-        assert!(deferred.scheduled > second.scheduled);
+        assert_eq!(deferred.retry_at, Some(second_deadline + Duration::from_secs(4)));
         {
             let conn = db::lock_db().unwrap();
             let failed_count: i64 = conn.query_row(
@@ -1516,7 +1694,8 @@ mod tests {
             assert_eq!(failed_count, 1);
         }
         drop(read_handle);
-        assert_eq!(watcher.tick(deferred.scheduled).organized, 1);
+        assert_eq!(watcher.tick(deferred.retry_at.unwrap() - Duration::from_millis(1)).organized, 0);
+        assert_eq!(watcher.tick(deferred.retry_at.unwrap()).organized, 1);
         let second_output = root_path.join("Filed").join("report_0.mouziwatchfixture");
         assert_eq!(fs::read(&second_output).unwrap(), b"second file");
         assert_eq!(fs::read(&first_output).unwrap(), b"first file");
@@ -1528,7 +1707,7 @@ mod tests {
         }
         assert!(matches!(process_watched_file(&source, &root, &suppression, &paused.ticket,
             paused.identity.as_ref()).unwrap(), ProcessOutcome::Skipped));
-        assert_eq!(watcher.tick(paused.scheduled).organized, 0);
+        assert_eq!(watcher.tick(paused.ready_at(grace).unwrap()).organized, 0);
         assert_eq!(fs::read(&source).unwrap(), b"keep when paused");
 
         db::update_folder_mode(folder_id, db::FOLDER_MODE_SILENT).unwrap();

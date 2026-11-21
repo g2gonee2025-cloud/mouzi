@@ -49,6 +49,7 @@ mod windows_fs {
         fn GetFileInformationByHandle(handle: *mut c_void, info: *mut ByHandleInfo) -> i32;
         fn SetFileInformationByHandle(handle: *mut c_void, class: i32, info: *const c_void, size: u32) -> i32;
         fn GetDriveTypeW(root: *const u16) -> u32;
+        fn CompareStringOrdinal(left: *const u16, left_len: i32, right: *const u16, right_len: i32, ignore_case: i32) -> i32;
     }
 
     pub(super) fn drive_type(drive: u8) -> u32 {
@@ -72,6 +73,22 @@ mod windows_fs {
         options.open(path)
     }
 
+    pub(super) fn open_metadata_after_sharing_denial(path: &Path) -> io::Result<File> {
+        const ERROR_SHARING_VIOLATION: i32 = 32;
+        const ERROR_LOCK_VIOLATION: i32 = 33;
+        match open(path, false, false) {
+            Err(error) if matches!(error.raw_os_error(), Some(ERROR_SHARING_VIOLATION | ERROR_LOCK_VIOLATION)) => {
+                OpenOptions::new()
+                    .access_mode(0x80) // FILE_READ_ATTRIBUTES, with no content access
+                    .share_mode(1 | 2 | 4)
+                    .custom_flags(0x02000000 | 0x00200000)
+                    .open(path)
+            }
+            Err(error) => Err(error),
+            Ok(_) => Err(io::Error::other("The file is no longer locked")),
+        }
+    }
+
     pub(super) fn identity(file: &File) -> io::Result<FileIdentity> {
         let mut info = FileIdInfo { volume: 0, id: [0; 16] };
         let ok = unsafe { GetFileInformationByHandleEx(file.as_raw_handle(), 18, &mut info as *mut _ as *mut c_void, std::mem::size_of::<FileIdInfo>() as u32) };
@@ -91,6 +108,17 @@ mod windows_fs {
             )
         };
         ok != 0 && flags == 0
+    }
+
+    pub(super) fn directory_alias_equal(left: &std::ffi::OsStr, right: &std::ffi::OsStr) -> bool {
+        let left: Vec<_> = left.encode_wide().collect();
+        let right: Vec<_> = right.encode_wide().collect();
+        let (Ok(left_len), Ok(right_len)) = (i32::try_from(left.len()), i32::try_from(right.len())) else {
+            return false;
+        };
+        const CSTR_EQUAL: i32 = 2;
+        let order = unsafe { CompareStringOrdinal(left.as_ptr(), left_len, right.as_ptr(), right_len, 1) };
+        order == CSTR_EQUAL
     }
 
     pub(super) fn links(file: &File) -> io::Result<u64> {
@@ -340,6 +368,74 @@ pub fn validate_root(path: &Path) -> Result<PathBuf, String> {
 }
 
 fn inspect_watched_root(path: &Path) -> Result<(PathBuf, FileIdentity), DirectoryPinError<'_>> {
+    let (canonical, identity, _) = pin_watched_root(path)?;
+    Ok((canonical, identity))
+}
+
+pub(crate) struct WatchedRootGuardError {
+    pub message: String,
+    pub boundary: Option<UnavailableRootBoundary>,
+}
+
+pub(crate) struct UnavailableRootBoundary {
+    parent: PathBuf,
+    name: std::ffi::OsString,
+    #[cfg(windows)]
+    case_insensitive: bool,
+}
+
+impl UnavailableRootBoundary {
+    pub(crate) fn contains_file(&self, path: &Path) -> bool {
+        let Ok(relative) = path.strip_prefix(&self.parent) else { return false; };
+        let mut parts = relative.components();
+        let Some(Component::Normal(name)) = parts.next() else { return false; };
+        if parts.next().is_none() { return false; }
+        let matches = name == self.name.as_os_str();
+        // This recognizes aliases only to withhold an unavailable branch.
+        // It never supplies evidence of a directory's identity or authority.
+        #[cfg(windows)]
+        let matches = matches || (self.case_insensitive && windows_fs::directory_alias_equal(name, &self.name));
+        matches
+    }
+}
+
+pub(crate) fn guard_watched_root(path: &Path) -> Result<(PathBuf, FileIdentity, AncestorGuard), WatchedRootGuardError> {
+    pin_watched_root(path).map_err(|error| {
+        let message = error.to_string();
+        let boundary = if path.is_absolute() && !has_dot_component(path) && ordinary_registration(path) {
+            // An ancestor walk visits directories outside-in. Its first
+            // failed component already identifies the unresolved branch.
+            let unavailable = match error {
+                DirectoryPinError::Inspect(unavailable, _) => unavailable,
+                DirectoryPinError::Unsafe(_) => path,
+            };
+            unavailable_root_boundary(unavailable)
+        } else {
+            None
+        };
+        WatchedRootGuardError { message, boundary }
+    })
+}
+
+fn unavailable_root_boundary(unavailable: &Path) -> Option<UnavailableRootBoundary> {
+    for branch in unavailable.ancestors() {
+        let parent = branch.parent()?;
+        let name = branch.file_name()?;
+        let Ok(guard) = guard_directory(parent) else { continue; };
+        let canonical = std::fs::canonicalize(parent).ok()?;
+        let identity = identity_from_handle(guard._files.first()?).ok()?;
+        if file_identity(&canonical).ok()? != identity { return None; }
+        return Some(UnavailableRootBoundary {
+            parent: canonical,
+            name: name.to_os_string(),
+            #[cfg(windows)]
+            case_insensitive: guard.has_ascii_case_aliases(),
+        });
+    }
+    None
+}
+
+fn pin_watched_root(path: &Path) -> Result<(PathBuf, FileIdentity, AncestorGuard), DirectoryPinError<'_>> {
     if !path.is_absolute() || has_dot_component(path) {
         return Err(DirectoryPinError::Unsafe("Choose an absolute folder without dot segments".into()));
     }
@@ -355,7 +451,7 @@ fn inspect_watched_root(path: &Path) -> Result<(PathBuf, FileIdentity), Director
     if identity != file_identity(&canonical).map_err(DirectoryPinError::Unsafe)? {
         return Err(DirectoryPinError::Unsafe("Folder identity changed during validation".into()));
     }
-    Ok((canonical, identity))
+    Ok((canonical, identity, AncestorGuard { _files: guards }))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -436,6 +532,14 @@ pub struct ValidatedDirectory {
     pub metadata: Metadata, ancestors: AncestorGuard,
 }
 
+pub(crate) struct LockedReviewFile {
+    pub canonical_path: PathBuf,
+    pub identity: FileIdentity,
+    pub owning_root: PathBuf,
+    pub metadata: Metadata,
+    _ancestors: AncestorGuard,
+}
+
 impl ValidatedFile { pub fn into_parent_guard(self) -> AncestorGuard { self.ancestors } }
 impl ValidatedDirectory { pub fn into_parent_guard(self) -> AncestorGuard { self.ancestors } }
 
@@ -451,7 +555,12 @@ impl RootScope {
         self.unavailable_active.clone()
     }
 
-    fn validate(&self, path: &Path, directory: bool) -> Result<(PathBuf, FileIdentity, File, Metadata, AncestorGuard, PathBuf), String> {
+    fn validate(
+        &self,
+        path: &Path,
+        directory: bool,
+        open_target: impl FnOnce(&Path, bool) -> io::Result<File>,
+    ) -> Result<(PathBuf, FileIdentity, File, Metadata, AncestorGuard, PathBuf), String> {
         if !path.is_absolute() || has_dot_component(path) { return Err("Target must be an absolute path without dot segments".into()); }
         #[cfg(windows)]
         if has_stream_syntax(path) { return Err("Alternate data streams are not eligible targets".into()); }
@@ -459,7 +568,7 @@ impl RootScope {
         let ancestors = pin_ancestry(parent)?;
         let metadata = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
         if is_link(&metadata) || if directory { !metadata.is_dir() } else { !metadata.is_file() } { return Err("Target has the wrong type or is a link".into()); }
-        let file = open_guard(path, directory, false).map_err(|e| e.to_string())?;
+        let file = open_target(path, directory).map_err(|e| e.to_string())?;
         let metadata = file.metadata().map_err(|e| e.to_string())?;
         if is_link(&metadata) || if directory { !metadata.is_dir() } else { !metadata.is_file() } { return Err("Target changed type".into()); }
         let identity = identity_from_handle(&file)?;
@@ -487,14 +596,30 @@ impl RootScope {
     }
 
     pub fn validate_file(&self, path: &Path) -> Result<ValidatedFile, String> {
-        let (canonical_path, identity, file, metadata, ancestors, owning_root) = self.validate(path, false)?;
+        let (canonical_path, identity, file, metadata, ancestors, owning_root) =
+            self.validate(path, false, |path, directory| open_guard(path, directory, false))?;
         let link_count = link_count(&file)?;
         Ok(ValidatedFile { canonical_path, identity, file, link_count, metadata, ancestors, owning_root })
     }
 
     pub fn validate_dir(&self, path: &Path) -> Result<ValidatedDirectory, String> {
-        let (canonical_path, identity, file, metadata, ancestors, owning_root) = self.validate(path, true)?;
+        let (canonical_path, identity, file, metadata, ancestors, owning_root) =
+            self.validate(path, true, |path, directory| open_guard(path, directory, false))?;
         Ok(ValidatedDirectory { canonical_path, identity, file, metadata, ancestors, owning_root })
+    }
+
+    pub(crate) fn locked_review_file(&self, _path: &Path) -> Option<LockedReviewFile> {
+        #[cfg(windows)]
+        {
+            let (canonical_path, identity, _, metadata, ancestors, owning_root) = self.validate(
+                _path,
+                false,
+                |path, _| windows_fs::open_metadata_after_sharing_denial(path),
+            ).ok()?;
+            Some(LockedReviewFile { canonical_path, identity, owning_root, metadata, _ancestors: ancestors })
+        }
+        #[cfg(not(windows))]
+        None
     }
 }
 

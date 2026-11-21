@@ -129,7 +129,7 @@
       "startupDifferentLocation": "Windows 设置为从其他位置启动 Mouzi。开启此选项可改用当前副本。",
       "startupUnavailable": "此隔离开发版本不支持开机启动设置。",
       "gracePeriod": "等待时间",
-      "gracePeriodDesc": "文件最后修改后，等待一段时间再移动。设为 0 表示立即移动。",
+      "gracePeriodDesc": "文件最后一次修改后，Mouzi 会等待指定的时间再自动移动文件。即使设为 0，也会至少等待 2 秒。",
       "checkFileLock": "检查文件占用",
       "checkFileLockDesc": "跳过正被其他进程使用的文件",
       "gracePeriodSeconds": "秒",
@@ -508,7 +508,8 @@
     "alreadyFiled": "文件已在目标位置，分类已保存",
     "localAiModelMissing": "Ollama 缺少所选模型。请安装该模型，或在设置 → 常规中选择已安装的模型。如果刷新后仍有此提示，请在一分钟后再次刷新建议。",
     "localAiUnreachable": "无法连接到 Ollama。请启动 Ollama 并刷新建议。如果仍有此提示，请在一分钟后再次刷新。",
-    "localAiGenerationFailed": "Ollama 未能使用所选模型完成一次请求。请检查该模型能否在 Ollama 中运行，或在设置 → 常规中选择其他模型。解决问题后，请等待一分钟再刷新建议。"
+    "localAiGenerationFailed": "Ollama 未能使用所选模型完成一次请求。请检查该模型能否在 Ollama 中运行，或在设置 → 常规中选择其他模型。解决问题后，请等待一分钟再刷新建议。",
+    "policyReadIncomplete": "由于无法检查排除规则，整理建议已跳过以下文件夹。请查看详情，解决问题后刷新建议。"
   },
   "confirm": {
     "impactItems": "{{count}} 项",

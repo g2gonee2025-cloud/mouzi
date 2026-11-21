@@ -65,6 +65,7 @@ export default function Suggestions() {
   const {
     suggestions,
     localAiStatus,
+    policyIssues,
     lookup,
     busy,
     error,
@@ -81,6 +82,7 @@ export default function Suggestions() {
     clearError,
   } = useSuggestionsStore();
   const loading = lookup.status === "loading";
+  const partial = lookup.status === "ready" && policyIssues.length > 0;
   const canAct = lookup.status === "ready" && !busy && !preparedPlans;
 
   const [createRule, setCreateRule] = useState(createRuleDefault);
@@ -188,6 +190,19 @@ export default function Suggestions() {
 
       {/* Content */}
       <div className="flex-1 overflow-auto p-4 space-y-4">
+        {partial && (
+          <div role="status" className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800 dark:border-amber-900 dark:bg-amber-900/20 dark:text-amber-200">
+            <p className="font-medium">{t("suggestions.policyReadIncomplete")}</p>
+            <ul className="mt-2 list-disc space-y-2 ps-5">
+              {policyIssues.map(({ root, message }) => (
+                <li key={root}>
+                  <p className="font-medium wrap-anywhere" dir="auto">{root}</p>
+                  <p className="wrap-anywhere" dir="auto">{message}</p>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
         {lookup.status === "ready" && localAiStatus && (
           <p role="status" className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800 dark:border-amber-900 dark:bg-amber-900/20 dark:text-amber-200">
             {t(localAiMessages[localAiStatus])}
@@ -278,7 +293,7 @@ export default function Suggestions() {
         )}
 
         {/* Empty state */}
-        {lookup.status === "ready" && suggestions.length === 0 && !hasResults && (
+        {lookup.status === "ready" && suggestions.length === 0 && !hasResults && !partial && (
           <div className="flex flex-col items-center justify-center h-48 text-center">
             <Sparkles size={32} className="text-text-muted mb-2" />
             <p className="text-sm text-text-muted">{t("suggestions.empty")}</p>

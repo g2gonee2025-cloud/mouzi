@@ -129,7 +129,7 @@
       "startupDifferentLocation": "Windows est configuré pour lancer Mouzi depuis un autre emplacement. Activez cette option pour utiliser cette copie.",
       "startupUnavailable": "Les réglages du démarrage automatique sont indisponibles dans cette version de développement isolée.",
       "gracePeriod": "Délai de grâce",
-      "gracePeriodDesc": "Temps d'attente avant de déplacer un fichier après sa dernière modification. 0 = instantané.",
+      "gracePeriodDesc": "Mouzi attend ce délai après la dernière modification du fichier avant de le déplacer automatiquement. Même avec une valeur de 0, le délai minimal est de 2 secondes.",
       "checkFileLock": "Vérifier le verrouillage",
       "checkFileLockDesc": "Ignorer les fichiers actuellement utilisés par un autre processus",
       "gracePeriodSeconds": "Secondes",
@@ -514,7 +514,8 @@
     "alreadyFiled": "Déjà classé ; catégorie enregistrée",
     "localAiModelMissing": "Le modèle sélectionné manque dans Ollama. Installez-le ou choisissez un modèle installé dans Paramètres → Général. Si le message persiste après l’actualisation, actualisez de nouveau les suggestions dans une minute.",
     "localAiUnreachable": "Ollama est inaccessible. Démarrez Ollama et actualisez les suggestions. Si le message persiste, actualisez-les de nouveau dans une minute.",
-    "localAiGenerationFailed": "Ollama n’a pas pu terminer une requête avec le modèle sélectionné. Vérifiez que le modèle fonctionne dans Ollama ou choisissez-en un autre dans Paramètres → Général. Une fois le problème résolu, attendez une minute et actualisez les suggestions."
+    "localAiGenerationFailed": "Ollama n’a pas pu terminer une requête avec le modèle sélectionné. Vérifiez que le modèle fonctionne dans Ollama ou choisissez-en un autre dans Paramètres → Général. Une fois le problème résolu, attendez une minute et actualisez les suggestions.",
+    "policyReadIncomplete": "Ces dossiers ont été ignorés dans les suggestions, car leurs exclusions n’ont pas pu être vérifiées. Consultez les détails, corrigez le problème, puis actualisez les suggestions."
   },
   "confirm": {
     "impactItems": "{{count}} élément",

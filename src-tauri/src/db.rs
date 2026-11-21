@@ -3,6 +3,7 @@ use rusqlite::functions::FunctionFlags;
 use rusqlite::{params, Connection, OptionalExtension, Result as SqliteResult};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 use once_cell::sync::OnceCell;
@@ -216,13 +217,35 @@ pub struct ScheduleSettings {
     pub schedule_time_4: Option<String>,
 }
 
-static DB: OnceCell<Arc<Mutex<Connection>>> = OnceCell::new();
+struct Database {
+    connection: Arc<Mutex<Connection>>,
+    // The watcher reads this without taking the SQLite lock on every tick.
+    watcher_grace_seconds: AtomicI64,
+}
+
+const UNKNOWN_WATCHER_GRACE: i64 = i64::MIN;
+static DB: OnceCell<Database> = OnceCell::new();
 
 pub fn init_db(app_dir: PathBuf) -> SqliteResult<()> {
     let conn = open_database(&app_dir.join("mouzi.db"))?;
-    DB.set(Arc::new(Mutex::new(conn)))
-        .map_err(|_| rusqlite::Error::ExecuteReturnedResults)?;
+    let grace = read_watcher_grace_seconds(&conn).unwrap_or(UNKNOWN_WATCHER_GRACE);
+    DB.set(Database {
+        connection: Arc::new(Mutex::new(conn)),
+        watcher_grace_seconds: AtomicI64::new(grace),
+    })
+    .map_err(|_| rusqlite::Error::ExecuteReturnedResults)?;
     Ok(())
+}
+
+pub(crate) fn watcher_grace_seconds() -> Option<i64> {
+    DB.get().map(|db| db.watcher_grace_seconds.load(Ordering::Acquire))
+        .filter(|seconds| *seconds != UNKNOWN_WATCHER_GRACE)
+}
+
+fn read_watcher_grace_seconds(conn: &Connection) -> Option<i64> {
+    // Other preferences may need repair. Only read what the queue needs.
+    conn.query_row("SELECT grace_period_seconds FROM settings ORDER BY id LIMIT 1", [], |row| row.get(0))
+        .ok()
 }
 
 fn open_database(db_path: &Path) -> SqliteResult<Connection> {
@@ -508,7 +531,7 @@ fn initialize_schema(conn: &Connection) -> SqliteResult<()> {
 }
 
 pub fn get_db() -> Arc<Mutex<Connection>> {
-    DB.get().expect("Database not initialized").clone()
+    DB.get().expect("Database not initialized").connection.clone()
 }
 
 /// Acquire the global connection for one short piece of work.
@@ -521,7 +544,7 @@ pub fn lock_db() -> Result<MutexGuard<'static, Connection>, String> {
     let db = DB
         .get()
         .ok_or_else(|| "Database not initialized".to_string())?;
-    db.lock()
+    db.connection.lock()
         .map_err(|_| "Database lock is poisoned".to_string())
 }
 
@@ -973,6 +996,10 @@ pub(crate) fn verify_watch_identity(id: i64, path: &str, identity: &str, allow_l
         params![id, path],
         |row| row.get(0),
     ).map_err(|error| error.to_string())?;
+    require_watch_identity(expected.as_deref(), identity)
+}
+
+pub(crate) fn require_watch_identity(expected: Option<&str>, identity: &str) -> Result<(), String> {
     match expected {
         Some(expected) if expected == identity => Ok(()),
         Some(_) => Err("A different physical folder is at this location. Reconnect the original, or remove this registration and add the new folder.".into()),
@@ -1257,8 +1284,16 @@ fn update_preferences_on(conn: &Connection, patch: &PreferencesPatch) -> SqliteR
 }
 
 pub fn update_preferences(patch: &PreferencesPatch) -> SqliteResult<AppSettings> {
-    let mut conn=sqlite_lock()?;let tx=conn.transaction()?;
-    let settings=update_preferences_on(&tx,patch)?;tx.commit()?;Ok(settings)
+    let mut conn = sqlite_lock()?;
+    let tx = conn.transaction()?;
+    let settings = update_preferences_on(&tx, patch)?;
+    tx.commit()?;
+    if patch.grace_period_seconds.is_some() {
+        // Publish while holding the connection lock so concurrent saves stay in commit order.
+        DB.get().expect("Locked database is initialized").watcher_grace_seconds
+            .store(settings.grace_period_seconds, Ordering::Release);
+    }
+    Ok(settings)
 }
 
 fn update_schedule_settings_on(conn: &Connection, schedule: &ScheduleSettings) -> SqliteResult<AppSettings> {
@@ -2950,6 +2985,28 @@ pub(crate) struct SuggestionCandidate {
     pub path: String,
     pub category: String,
     pub version: SuggestionVersion,
+    pub root_id: i64,
+}
+
+pub(crate) struct SuggestionRoot {
+    pub id: i64,
+    pub path: String,
+    pub active: bool,
+    pub identity: Option<String>,
+}
+
+pub(crate) fn get_suggestion_roots() -> Result<Vec<SuggestionRoot>, String> {
+    let conn = lock_db()?;
+    let mut stmt = conn.prepare(
+        "SELECT id, path, enabled=1 AND mode<>'paused', watch_identity FROM watched_folders ORDER BY id",
+    ).map_err(|error| error.to_string())?;
+    let roots = stmt.query_map([], |row| Ok(SuggestionRoot {
+        id: row.get(0)?,
+        path: row.get(1)?,
+        active: row.get(2)?,
+        identity: row.get(3)?,
+    })).map_err(|error| error.to_string())?;
+    roots.collect::<SqliteResult<Vec<_>>>().map_err(|error| error.to_string())
 }
 
 /// Dismiss the listed version if it is still a suggestion candidate.
@@ -2990,7 +3047,7 @@ pub fn reset_dismissed_suggestions()->SqliteResult<()> {
 pub(crate) fn get_suggestion_candidates_page(limit: i64, after: Option<&str>) -> Result<Vec<SuggestionCandidate>, String> {
     let conn = lock_db()?;
     let mut stmt = conn.prepare(
-        "SELECT i.path,i.category,f.identity,CAST(f.size AS TEXT) AS size_text,f.mtime_ns
+        "SELECT i.path,i.category,f.identity,CAST(f.size AS TEXT) AS size_text,f.mtime_ns,w.id
          FROM file_inventory i
          JOIN watched_folders w ON w.path=i.root_path AND w.enabled=1 AND w.mode<>'paused'
          JOIN inventory_fingerprints f ON f.path=i.path
@@ -3003,6 +3060,7 @@ pub(crate) fn get_suggestion_candidates_page(limit: i64, after: Option<&str>) ->
         path: row.get(0)?,
         category: row.get(1)?,
         version: SuggestionVersion { identity: row.get(2)?, size: row.get(3)?, mtime_ns: row.get(4)? },
+        root_id: row.get(5)?,
     })).map_err(|error| error.to_string())?;
     candidates.collect::<SqliteResult<Vec<_>>>().map_err(|error| error.to_string())
 }
@@ -3066,6 +3124,20 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         create_file_inventory_table(&conn).unwrap();
         conn
+    }
+
+    #[test]
+    fn watcher_grace_loads_independently_of_other_preferences() {
+        let conn = mem_conn_with_inventory();
+        conn.execute(
+            "UPDATE settings SET telemetry_enabled='unreadable', grace_period_seconds=73",
+            [],
+        ).unwrap();
+        assert!(get_settings_on(&conn).is_err());
+        assert_eq!(read_watcher_grace_seconds(&conn), Some(73));
+
+        conn.execute("UPDATE settings SET grace_period_seconds='unreadable'", []).unwrap();
+        assert_eq!(read_watcher_grace_seconds(&conn), None);
     }
 
     #[test]

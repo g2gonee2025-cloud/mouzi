@@ -1,12 +1,12 @@
 //! Filename classification, explicit acceptance learning, and opt-in local inference.
 //! No classification source is allowed to supply a destination path.
 
-use crate::{categories, db};
+use crate::{categories, db, ignore::IgnorePatterns, safe_fs};
 use once_cell::sync::Lazy;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -554,6 +554,80 @@ pub enum LocalAiStatus { ModelMissing, Unreachable, GenerationFailed }
 pub struct SuggestionsWithStatus {
     pub suggestions: Vec<Suggestion>,
     pub local_ai_status: Option<LocalAiStatus>,
+    pub policy_issues: Vec<SuggestionPolicyIssue>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SuggestionPolicyIssue {
+    pub root: String,
+    pub message: String,
+}
+
+#[derive(Default)]
+struct SuggestionPolicies {
+    roots: HashMap<i64, (String, PathBuf)>,
+    by_path: HashMap<PathBuf, Option<IgnorePatterns>>,
+    unavailable: Vec<safe_fs::UnavailableRootBoundary>,
+    issues: Vec<SuggestionPolicyIssue>,
+}
+
+impl SuggestionPolicies {
+    fn read(cancelled: impl Fn() -> bool) -> Result<Self, String> {
+        let mut policies = Self::default();
+        for folder in db::get_suggestion_roots()? {
+            if cancelled() { return Err("Suggestion request superseded".into()); }
+            let root = Path::new(&folder.path);
+            match safe_fs::guard_watched_root(root) {
+                Ok((canonical, identity, _guard)) => {
+                    // Even inactive or replaced child roots bound a parent's
+                    // scan ownership. Read rules only from an active, verified root.
+                    let patterns = if folder.active {
+                        db::require_watch_identity(folder.identity.as_deref(), &identity.key())
+                            .and_then(|()| IgnorePatterns::from_folder(&canonical.to_string_lossy()))
+                            .map_err(|message| policies.issues.push(SuggestionPolicyIssue {
+                                root: folder.path.clone(), message,
+                            }))
+                            .ok()
+                    } else {
+                        None
+                    };
+                    if patterns.is_some() {
+                        policies.roots.insert(folder.id, (folder.path, canonical.clone()));
+                    }
+                    policies.by_path.entry(canonical)
+                        .and_modify(|stored| *stored = None)
+                        .or_insert(patterns);
+                }
+                Err(error) => {
+                    policies.unavailable.extend(error.boundary);
+                    if folder.active {
+                        policies.issues.push(SuggestionPolicyIssue { root: folder.path, message: error.message });
+                    }
+                }
+            }
+        }
+        Ok(policies)
+    }
+
+    fn allows(&self, candidate: &db::SuggestionCandidate) -> bool {
+        let Some((registered, root)) = self.roots.get(&candidate.root_id) else { return false; };
+        let path = Path::new(&candidate.path);
+        if let Ok(relative) = path.strip_prefix(root) {
+            return self.allows_path(path, root, relative);
+        }
+        // Inventory moves can retain the registered spelling. Resolve only
+        // this already verified alias and keep the relative spelling exact.
+        let Ok(relative) = path.strip_prefix(registered) else { return false; };
+        self.allows_path(&root.join(relative), root, relative)
+    }
+
+    fn allows_path(&self, path: &Path, root: &Path, relative: &Path) -> bool {
+        if self.unavailable.iter().any(|boundary| boundary.contains_file(path)) {
+            return false;
+        }
+        let owner = path.ancestors().skip(1).find_map(|parent| self.by_path.get_key_value(parent));
+        matches!(owner, Some((owner, Some(patterns))) if owner == root && !patterns.ignores_inventory_path(relative))
+    }
 }
 
 fn better_prediction(best: &mut Option<Prediction>, candidate: Prediction) {
@@ -579,7 +653,13 @@ fn filename_prediction(filename: &str, hints: &[LearnedHint]) -> Option<Predicti
 }
 
 pub fn get_suggestions(limit: usize) -> Result<Vec<Suggestion>, String> {
-    get_suggestions_with_status(limit).map(|result| result.suggestions)
+    let result = get_suggestions_with_status(limit)?;
+    if result.suggestions.is_empty() && !result.policy_issues.is_empty() {
+        return Err(result.policy_issues.into_iter().map(|issue| {
+            format!("{}: {}", issue.root, issue.message)
+        }).collect::<Vec<_>>().join("\n"));
+    }
+    Ok(result.suggestions)
 }
 
 pub fn get_suggestions_with_status(limit: usize) -> Result<SuggestionsWithStatus, String> {
@@ -590,15 +670,27 @@ pub fn get_suggestions_with_status(limit: usize) -> Result<SuggestionsWithStatus
     };
     let provider = provider_for_options(settings.local_ai_enabled, &settings.local_ai_model, session)?;
     let hints = learned_hints()?;
-    let result = collect_suggestions(limit.min(200), provider.as_ref(), &hints,
-        |after| db::get_suggestion_candidates_page(PAGE_SIZE, after),
-        || !session.is_current(), REQUEST_BUDGET);
+    let result = collect_inventory_suggestions(limit.min(200), provider.as_ref(), &hints, || !session.is_current());
     session.with_current(|| result)
+}
+
+fn collect_inventory_suggestions(
+    limit: usize, provider: &dyn AiProvider, hints: &[LearnedHint], cancelled: impl Fn() -> bool,
+) -> Result<SuggestionsWithStatus, String> {
+    if limit == 0 { return Ok(SuggestionsWithStatus::default()); }
+    let policies = SuggestionPolicies::read(&cancelled)?;
+    let mut result = collect_suggestions(
+        limit, provider, hints, |after| db::get_suggestion_candidates_page(PAGE_SIZE, after),
+        |candidate| policies.allows(candidate), cancelled, REQUEST_BUDGET,
+    )?;
+    result.policy_issues = policies.issues;
+    Ok(result)
 }
 
 fn collect_suggestions(
     limit: usize, provider: &dyn AiProvider, hints: &[LearnedHint],
     mut page: impl FnMut(Option<&str>) -> Result<Vec<db::SuggestionCandidate>, String>,
+    eligible: impl Fn(&db::SuggestionCandidate) -> bool,
     cancelled: impl Fn() -> bool, budget: Duration,
 ) -> Result<SuggestionsWithStatus, String> {
     if limit == 0 { return Ok(SuggestionsWithStatus::default()); }
@@ -613,6 +705,7 @@ fn collect_suggestions(
         let next = files.last().map(|file| file.path.clone()).unwrap();
         if cursor.as_ref().is_some_and(|old| next <= *old) { return Err("Suggestion candidate cursor did not advance".into()); }
         for file in files {
+            if !eligible(&file) { continue; }
             let filename = Path::new(&file.path).file_name().and_then(|v| v.to_str()).unwrap_or(&file.path).to_string();
             let best = filename_prediction(&filename, hints);
             candidates.push((file, filename, best));
@@ -671,13 +764,270 @@ fn collect_suggestions(
     } else {
         None
     };
-    Ok(SuggestionsWithStatus { suggestions, local_ai_status })
+    Ok(SuggestionsWithStatus { suggestions, local_ai_status, policy_issues: Vec::new() })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::VecDeque;
+    use std::fs;
+
+    struct SuggestionInventoryFixture {
+        _serial: MutexGuard<'static, ()>,
+        directory: PathBuf,
+        roots: Vec<i64>,
+    }
+
+    impl SuggestionInventoryFixture {
+        fn new() -> Self {
+            let serial = db::serialise_test_db();
+            db::init_test_db();
+            let directory = fs::canonicalize(std::env::temp_dir()).unwrap()
+                .join(format!("mouzi-suggestions-list-{}", crate::operations::new_run_id()));
+            fs::create_dir(&directory).unwrap();
+            Self { _serial: serial, directory, roots: Vec::new() }
+        }
+
+        fn register(&mut self, folder: &Path) {
+            self.register_with_mode(folder, db::FOLDER_MODE_MANUAL);
+        }
+
+        fn register_with_mode(&mut self, folder: &Path, mode: &str) {
+            fs::create_dir_all(folder).unwrap();
+            self.roots.push(db::register_watched_folder(folder.to_str().unwrap(), mode, false).unwrap());
+        }
+
+        fn put(&self, relative: &str) -> PathBuf {
+            let path = self.directory.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, b"fixture-only payload").unwrap();
+            path
+        }
+
+        fn lookup(&self) -> SuggestionsWithStatus {
+            collect_inventory_suggestions(200, &HeuristicProvider, &[], || false).unwrap()
+        }
+
+        fn paths(&self, response: &SuggestionsWithStatus) -> BTreeSet<PathBuf> {
+            response.suggestions.iter().map(|file| PathBuf::from(&file.path))
+                .filter(|path| path.starts_with(&self.directory)).collect()
+        }
+
+        fn policy_issues(&self, response: SuggestionsWithStatus) -> Vec<serde_json::Value> {
+            let wire = serde_json::to_value(response).unwrap();
+            assert!(wire["localAiStatus"].is_null());
+            wire["policyIssues"].as_array().unwrap().iter().filter(|issue| {
+                issue["root"].as_str().is_some_and(|root| Path::new(root).starts_with(&self.directory))
+            }).cloned().collect()
+        }
+    }
+
+    impl Drop for SuggestionInventoryFixture {
+        fn drop(&mut self) {
+            for root in self.roots.drain(..).rev() {
+                db::remove_watched_folder(root).unwrap();
+            }
+            fs::remove_dir_all(&self.directory).unwrap();
+        }
+    }
+
+    fn scan_suggestion_roots(roots: &[&Path]) {
+        let configured: Vec<_> = roots.iter().map(|root| root.to_string_lossy().into_owned()).collect();
+        let summaries = crate::scan::scan_roots(&configured, |_| {});
+        assert!(summaries.iter().all(|root| root.status == "complete"), "{summaries:?}");
+    }
+
+    #[derive(Default)]
+    struct RecordingModel(Mutex<Vec<String>>);
+
+    impl AiProvider for RecordingModel {
+        fn classify(&self, filename: &str) -> Result<Option<Prediction>, String> {
+            self.0.lock().unwrap().push(filename.into());
+            Ok(Some(Prediction { category: "Images".into(), confidence: 0.65, source: PredictionSource::Ollama }))
+        }
+    }
+
+    #[test]
+    fn suggestion_policy_listing_filters_live_exact_and_directory_patterns_by_owning_root() {
+        let mut fixture = SuggestionInventoryFixture::new();
+        let primary = fixture.directory.join("A");
+        let child = primary.join("Camera-Private");
+        let healthy = fixture.directory.join("Z");
+        for root in [&primary, &child, &healthy] {
+            fixture.register(root);
+        }
+        let exact = fixture.put("A/invoice-excluded.r109probe");
+        let nested = fixture.put("A/Camera-2024/Photos/invoice-nested.r109probe");
+        let regular = fixture.put("A/Camera-report.r109probe");
+        let owned_by_child = fixture.put("A/Camera-Private/budget-child.r109probe");
+        let independent = fixture.put("Z/invoice-independent.r109probe");
+        scan_suggestion_roots(&[&primary, &child, &healthy]);
+        let all = BTreeSet::from([exact.clone(), nested.clone(), regular.clone(), owned_by_child.clone(), independent.clone()]);
+        assert_eq!(fixture.paths(&fixture.lookup()), all);
+        crate::ignore::save_mouziignore(primary.to_str().unwrap(), &["invoice-excluded.r109probe".into(), "Camera-*/".into()]).unwrap();
+
+        let filtered = fixture.paths(&fixture.lookup());
+        crate::ignore::save_mouziignore(primary.to_str().unwrap(), &[]).unwrap();
+        assert_eq!(fixture.paths(&fixture.lookup()), all);
+        for source in &all {
+            assert_eq!(fs::read(source).unwrap(), b"fixture-only payload");
+        }
+        assert_eq!(filtered, BTreeSet::from([regular, owned_by_child, independent]));
+    }
+
+    #[test]
+    fn suggestion_policy_listing_reports_a_failed_root_without_hiding_healthy_results() {
+        let mut fixture = SuggestionInventoryFixture::new();
+        let broken = fixture.directory.join("A");
+        let healthy = fixture.directory.join("Z");
+        fixture.register(&broken);
+        fixture.register(&healthy);
+        let broken_first = fixture.put("A/invoice-broken.r109probe");
+        let broken_second = fixture.put("A/receipt-broken.r109probe");
+        let healthy_file = fixture.put("Z/budget-healthy.r109probe");
+        scan_suggestion_roots(&[&broken, &healthy]);
+        fs::write(broken.join(".mouziignore"), [0xff, 0xfe]).unwrap();
+
+        let partial = fixture.lookup();
+        assert_eq!(fixture.paths(&partial), BTreeSet::from([healthy_file.clone()]));
+        let issues = fixture.policy_issues(partial);
+        assert_eq!(issues.len(), 1);
+        let issue = &issues[0];
+        assert_eq!(issue["root"], broken.to_str().unwrap());
+        assert!(issue["message"].as_str().unwrap().contains("Unable to read ignore protection file"));
+
+        fs::remove_file(broken.join(".mouziignore")).unwrap();
+        let repaired = fixture.lookup();
+        assert_eq!(fixture.paths(&repaired), BTreeSet::from([broken_first, broken_second, healthy_file]));
+        assert!(fixture.policy_issues(repaired).is_empty());
+    }
+
+    #[test]
+    fn suggestion_policy_listing_advances_past_excluded_pages_without_spending_model_attempts() {
+        let mut fixture = SuggestionInventoryFixture::new();
+        let excluded = fixture.directory.join("A");
+        let healthy = fixture.directory.join("Z");
+        fixture.register(&excluded);
+        fixture.register(&healthy);
+        for index in 0..=PAGE_SIZE {
+            fixture.put(&format!("A/opaque-{index:04}.r109probe"));
+        }
+        let later = fixture.put("Z/last-item.r109probe");
+        scan_suggestion_roots(&[&excluded, &healthy]);
+        crate::ignore::save_mouziignore(excluded.to_str().unwrap(), &["*.r109probe".into()]).unwrap();
+
+        let model = RecordingModel::default();
+        let result = collect_inventory_suggestions(200, &model, &[], || false).unwrap();
+        assert_eq!(*model.0.lock().unwrap(), ["last-item.r109probe"]);
+        assert_eq!(fixture.paths(&result), BTreeSet::from([later]));
+    }
+
+    #[test]
+    fn suggestion_policy_listing_does_not_read_a_replacement_root_as_its_registration() {
+        let mut fixture = SuggestionInventoryFixture::new();
+        let replaced = fixture.directory.join("A");
+        let healthy = fixture.directory.join("Z");
+        fixture.register(&replaced);
+        fixture.register(&healthy);
+        let old = fixture.put("A/invoice-original.r109probe");
+        let independent = fixture.put("Z/receipt-independent.r109probe");
+        scan_suggestion_roots(&[&replaced, &healthy]);
+        fs::rename(&replaced, fixture.directory.join("Original")).unwrap();
+        fs::create_dir(&replaced).unwrap();
+        fs::write(&old, b"different fixture-only payload").unwrap();
+        fs::write(replaced.join(".mouziignore"), [0xff, 0xfe]).unwrap();
+
+        let result = fixture.lookup();
+        assert_eq!(fixture.paths(&result), BTreeSet::from([independent]));
+        let issues = fixture.policy_issues(result);
+        assert_eq!(issues.len(), 1);
+        let issue = &issues[0];
+        assert_eq!(issue["root"], replaced.to_str().unwrap());
+        assert!(issue["message"].as_str().unwrap().contains("different physical folder"));
+        assert_eq!(fs::read(&old).unwrap(), b"different fixture-only payload");
+    }
+
+    #[test]
+    fn suggestion_policy_listing_does_not_assign_stale_parent_rows_to_a_new_child_root() {
+        let mut fixture = SuggestionInventoryFixture::new();
+        let parent = fixture.directory.join("Parent");
+        let child = parent.join("Child");
+        fixture.register(&parent);
+        let file = fixture.put("Parent/Child/invoice-stale.r109probe");
+        let sibling = fixture.put("Parent/receipt-healthy.r109probe");
+        scan_suggestion_roots(&[&parent]);
+        assert_eq!(fixture.paths(&fixture.lookup()), BTreeSet::from([file.clone(), sibling.clone()]));
+        fixture.register(&child);
+        let stale_parent_only = fixture.paths(&fixture.lookup());
+        scan_suggestion_roots(&[&child]);
+        assert_eq!(fixture.paths(&fixture.lookup()), BTreeSet::from([file, sibling.clone()]));
+        assert_eq!(stale_parent_only, BTreeSet::from([sibling]));
+    }
+
+    fn probe_unavailable_nested_root(mode: &str, name: &str, registered_name: &str) {
+        let mut fixture = SuggestionInventoryFixture::new();
+        let parent = fixture.directory.join("A");
+        let child = parent.join(name);
+        let peer = fixture.directory.join("Z");
+        fixture.register(&parent);
+        fixture.register(&peer);
+        if name != registered_name && !safe_fs::guard_directory(&parent).unwrap().has_ascii_case_aliases() {
+            eprintln!("Fixture volume does not confirm a case-insensitive parent");
+            return;
+        }
+        let previous_child = fixture.put(&format!("A/{name}/Subdir/opaque-child.r109probe"));
+        let sibling = fixture.put("A/Independent/opaque-sibling.r109probe");
+        let anchor_file = fixture.put("A/opaque-anchor.r109probe");
+        let outside = fixture.put("Z/opaque-peer.r109probe");
+        scan_suggestion_roots(&[&parent, &peer]);
+        let indexed = db::get_suggestion_candidates_page(PAGE_SIZE, Some(parent.to_str().unwrap())).unwrap();
+        assert!(indexed.iter().any(|item| Path::new(&item.path) == previous_child));
+
+        // The folder picker may return a plain DOS path while the inventory's
+        // parent walk used the canonical extended spelling.
+        let typed = parent.join(registered_name);
+        #[cfg(windows)]
+        let registration = typed.to_str().unwrap().strip_prefix(r"\\?\")
+            .filter(|path| path.as_bytes().get(1) == Some(&b':'))
+            .map(PathBuf::from).unwrap_or(typed);
+        #[cfg(not(windows))]
+        let registration = typed;
+        assert_eq!(safe_fs::file_identity(&registration).unwrap(), safe_fs::file_identity(&child).unwrap());
+        fixture.register_with_mode(&registration, mode);
+        fs::rename(&child, fixture.directory.join("MovedChild")).unwrap();
+
+        let model = RecordingModel::default();
+        let result = collect_inventory_suggestions(200, &model, &[], || false).unwrap();
+        assert_eq!(fixture.paths(&result), BTreeSet::from([sibling, anchor_file, outside]));
+        assert_eq!(*model.0.lock().unwrap(), ["opaque-sibling.r109probe", "opaque-anchor.r109probe", "opaque-peer.r109probe"]);
+        let wire = serde_json::to_value(result).unwrap();
+        let issues: Vec<_> = wire["policyIssues"].as_array().unwrap().iter()
+            .filter(|issue| issue["root"] == registration.to_str().unwrap()).collect();
+        if mode == db::FOLDER_MODE_PAUSED {
+            assert!(issues.is_empty());
+        } else {
+            assert_eq!(issues.len(), 1);
+            assert!(issues[0]["message"].as_str().unwrap().contains("Cannot inspect"));
+        }
+        assert_eq!(fs::read(fixture.directory.join("MovedChild/Subdir/opaque-child.r109probe")).unwrap(), b"fixture-only payload");
+    }
+
+    #[test]
+    fn suggestion_policy_listing_preserves_unavailable_nested_root_boundary() {
+        probe_unavailable_nested_root(db::FOLDER_MODE_MANUAL, "Child", "Child");
+    }
+
+    #[test]
+    fn suggestion_policy_listing_preserves_unavailable_paused_nested_root_boundary() {
+        probe_unavailable_nested_root(db::FOLDER_MODE_PAUSED, "Child", "Child");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn suggestion_policy_listing_preserves_unavailable_unicode_alias_boundary() {
+        probe_unavailable_nested_root(db::FOLDER_MODE_MANUAL, "Été", "été");
+    }
 
     type FakeResponse = Result<TransportResponse, ProviderFailure>;
 
@@ -711,9 +1061,10 @@ mod tests {
                     path: format!("fixture/{filename}"),
                     category: "Other".into(),
                     version: db::SuggestionVersion { identity: (*filename).into(), size: "1".into(), mtime_ns: "0".into() },
+                    root_id: 0,
                 }).collect()
             })
-        }, || false, REQUEST_BUDGET).unwrap()
+        }, |_| true, || false, REQUEST_BUDGET).unwrap()
     }
 
     #[test]

@@ -31,11 +31,24 @@ const receipt: Suggestion = {
   ...invoice, path: "C:/Fixture/receipt.unrecognized", filename: "receipt.unrecognized", source: "learned",
 };
 
+const unreadable = {
+  root: "C:/Fixture/Policy folder",
+  message: "Unable to read ignore protection file C:/Fixture/Policy folder/.mouziignore",
+};
+const offline = {
+  root: "D:/Fixture/Offline",
+  message: "The watched folder is unavailable",
+};
+
 function deferredSuggestions() {
   let finish!: (response: SuggestionsResponse) => void;
   const result = new Promise<SuggestionsResponse>((resolve) => { finish = resolve; });
-  const resolve = (suggestions: Suggestion[], localAiStatus: SuggestionsResponse["localAiStatus"] = null) => {
-    finish({ suggestions, localAiStatus });
+  const resolve = (
+    suggestions: Suggestion[],
+    localAiStatus: SuggestionsResponse["localAiStatus"] = null,
+    policyIssues?: Array<typeof unreadable>,
+  ) => {
+    finish({ suggestions, localAiStatus, ...(policyIssues ? { policyIssues } : {}) });
   };
   return { resolve, result };
 }
@@ -120,6 +133,77 @@ it("distinguishes a fresh failed lookup from the next verified empty read", asyn
   const verified = renderScreen().html;
   expect(verified).toContain("suggestions.empty");
   expect(verified).not.toContain("suggestions.readFailed");
+});
+
+it("reports skipped policy folders while healthy suggestions and existing feedback stay usable", async () => {
+  const completed = "C:/Filed/completed.txt";
+  useSuggestionsStore.setState({
+    results: [{ path: "C:/Fixture/completed.txt", status: "ok", message: null, dest: completed }],
+    error: "The separate dismissal could not be saved",
+  });
+  mocks.invoke.mockResolvedValueOnce({
+    suggestions: [receipt], localAiStatus: "modelMissing", policyIssues: [unreadable, offline],
+  });
+  const store = useSuggestionsStore.getState();
+  await store.loadSuggestions();
+
+  const { html } = renderScreen();
+  expect.soft(html).toMatch(/role="status"[^>]*><p[^>]*>suggestions.policyReadIncomplete/);
+  for (const issue of [unreadable, offline]) {
+    expect.soft(html).toContain(issue.root);
+    expect.soft(html).toContain(issue.message);
+  }
+  expect.soft(html).toContain("suggestions.localAiModelMissing");
+  expect.soft(html).toContain("The separate dismissal could not be saved");
+  expect.soft(html).toContain(completed);
+  expect.soft(html).not.toContain("suggestions.readFailed");
+  expect(html).toContain(receipt.filename);
+  expect(html).not.toMatch(/<button disabled=""[^>]+aria-label="suggestions.accept"/);
+
+  mocks.invoke.mockResolvedValueOnce("fixture-preparation").mockResolvedValueOnce([{
+    planId: "fixture-plan", path: receipt.path, category: receipt.suggestedCategory,
+    destination: "C:/Filed/receipt.txt", size: 1, rule: null,
+  }]);
+  const plans = await store.prepareSuggestions([receipt], false);
+  await store.loadSuggestions();
+  expect(useSuggestionsStore.getState().preparedPlans).toBe(plans);
+  expect(mocks.invoke.mock.calls.filter(([command]) => command === "get_suggestions_with_status_cmd")).toHaveLength(1);
+});
+
+it("uses the partial notice instead of ordinary empty copy and clears it after a healthy retry", async () => {
+  const refresh = useSuggestionsStore.getState().loadSuggestions;
+  mocks.invoke.mockResolvedValueOnce({ suggestions: [], localAiStatus: null, policyIssues: [unreadable] });
+  await refresh();
+  const partial = renderScreen().html;
+  expect.soft(partial).toContain("suggestions.policyReadIncomplete");
+  expect.soft(partial).not.toContain("suggestions.empty");
+  expect.soft(partial).not.toContain("suggestions.hint");
+
+  const recovered = deferredSuggestions();
+  mocks.invoke.mockReturnValueOnce(recovered.result);
+  const request = refresh();
+  expect(renderScreen().html).not.toContain(unreadable.root);
+  recovered.resolve([]);
+  await request;
+  const verified = renderScreen().html;
+  expect(verified).toContain("suggestions.empty");
+  expect(verified).not.toContain("suggestions.policyReadIncomplete");
+});
+
+it("ignores an older policy diagnostic after the next healthy Suggestions read", async () => {
+  const stale = deferredSuggestions();
+  const refresh = useSuggestionsStore.getState().loadSuggestions;
+  mocks.invoke.mockReturnValueOnce(stale.result).mockResolvedValueOnce({
+    suggestions: [receipt], localAiStatus: null, policyIssues: [],
+  });
+  const oldRequest = refresh();
+  await refresh();
+  stale.resolve([], null, [unreadable]);
+  await oldRequest;
+  const { html } = renderScreen();
+  expect(html).toContain(receipt.filename);
+  expect(html).not.toContain(unreadable.root);
+  expect(html).not.toContain("suggestions.policyReadIncomplete");
 });
 
 it("retains a committed receipt and its mutation error through a later lookup failure", async () => {

@@ -112,7 +112,7 @@
       "startupDifferentLocation": "Windows está configurado para iniciar Mouzi desde otra ubicación. Activa esta opción para usar esta copia.",
       "startupUnavailable": "Los ajustes de inicio automático no están disponibles en esta versión de desarrollo aislada.",
       "gracePeriod": "Período de gracia",
-      "gracePeriodDesc": "Tiempo de espera antes de mover un archivo después de su última modificación. 0 = instantáneo.",
+      "gracePeriodDesc": "Mouzi espera este tiempo desde la última modificación del archivo antes de moverlo automáticamente. Incluso con el valor 0, la espera mínima es de 2 segundos.",
       "checkFileLock": "Verificar bloqueo de archivo",
       "checkFileLockDesc": "Omitir archivos en uso por otro proceso",
       "gracePeriodSeconds": "Segundos",
@@ -514,7 +514,8 @@
     "alreadyFiled": "Ya archivado; categoría guardada",
     "localAiModelMissing": "Falta el modelo seleccionado en Ollama. Instálalo o elige un modelo instalado en Configuración → General. Si el aviso sigue apareciendo al actualizar las sugerencias, vuelve a actualizarlas en un minuto.",
     "localAiUnreachable": "No se puede conectar con Ollama. Inicia Ollama y actualiza las sugerencias. Si el aviso sigue apareciendo, vuelve a actualizarlas en un minuto.",
-    "localAiGenerationFailed": "Ollama no pudo completar una solicitud con el modelo seleccionado. Comprueba que el modelo funcione en Ollama o elige otro en Configuración → General. Cuando resuelvas el problema, espera un minuto y actualiza las sugerencias."
+    "localAiGenerationFailed": "Ollama no pudo completar una solicitud con el modelo seleccionado. Comprueba que el modelo funcione en Ollama o elige otro en Configuración → General. Cuando resuelvas el problema, espera un minuto y actualiza las sugerencias.",
+    "policyReadIncomplete": "Las sugerencias omitieron estas carpetas porque no se pudieron comprobar sus exclusiones. Revisa los detalles y actualiza las sugerencias después de resolver el problema."
   },
   "confirm": {
     "impactItems": "{{count}} elemento",

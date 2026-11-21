@@ -1,7 +1,7 @@
 use crate::db::{self, ActionLog, OrganizationHistory, OrganizationLog, Rule, WatchedFolder};
 use crate::ignore::IgnorePatterns;
 use crate::rules::{self, FileInfo};
-use crate::safe_fs::{self, AncestorGuard, FileIdentity, RootScope, ValidatedFile};
+use crate::safe_fs::{self, AncestorGuard, FileIdentity, LockedReviewFile, RootScope, ValidatedFile};
 use crate::suppress::{SuppressionSet, SUPPRESSION_TTL};
 use chrono::Utc;
 use once_cell::sync::Lazy;
@@ -106,12 +106,20 @@ pub struct Preview {
     pub unavailable_roots: Vec<String>,
     #[serde(rename = "blockedRoots", skip_serializing_if = "Vec::is_empty")]
     pub blocked_roots: Vec<BlockedPreviewRoot>,
+    #[serde(rename = "deferredFiles", skip_serializing_if = "Vec::is_empty")]
+    pub deferred_files: Vec<DeferredPreviewFile>,
 }
 
 #[derive(Serialize)]
 pub struct BlockedPreviewRoot {
     pub root: String,
     pub error: String,
+}
+
+#[derive(Serialize)]
+pub struct DeferredPreviewFile {
+    pub source: String,
+    pub error: &'static str,
 }
 
 struct Planned {
@@ -190,8 +198,8 @@ fn preview_paths(paths: Option<Vec<String>>, scope: &RootScope) -> Result<Vec<Pa
     Ok(paths)
 }
 
-fn is_baselined(path: &Path, file: &ValidatedFile) -> Result<bool, String> {
-    db::is_organization_baseline(&path.to_string_lossy(), &file.canonical_path.to_string_lossy())
+fn is_baselined(path: &Path, canonical: &Path) -> Result<bool, String> {
+    db::is_organization_baseline(&path.to_string_lossy(), &canonical.to_string_lossy())
         .map_err(|error| error.to_string())
 }
 
@@ -204,10 +212,75 @@ fn eligible_file(
         Ok(file) => file,
         Err(_) => return Ok(None),
     };
-    if protected(path, &file.owning_root)? || is_baselined(path, &file)? {
+    if protected(path, &file.owning_root)? || is_baselined(path, &file.canonical_path)? {
         return Ok(None);
     }
     Ok(Some(file))
+}
+
+enum ReviewSource {
+    Ready(ValidatedFile),
+    Locked(LockedReviewFile),
+}
+
+impl ReviewSource {
+    fn open(scope: &RootScope, path: &Path) -> Option<Self> {
+        match scope.validate_file(path) {
+            Ok(file) => Some(Self::Ready(file)),
+            Err(_) => scope.locked_review_file(path).map(Self::Locked),
+        }
+    }
+
+    fn owning_root(&self) -> &PathBuf {
+        match self {
+            Self::Ready(file) => &file.owning_root,
+            Self::Locked(file) => &file.owning_root,
+        }
+    }
+}
+
+fn can_report_locked_file(
+    path: &Path, file: &LockedReviewFile, folders: &[WatchedFolder], rules: &[Rule],
+) -> Result<bool, String> {
+    let Some(mut info) = rules::describe_file_from_metadata(path, &file.metadata) else { return Ok(false); };
+    let can_move = |info: &FileInfo, rule: &Rule| {
+        matches!(rule.action.as_str(), "move" | "rename")
+            && checked_destination(&file.owning_root, info, rule).is_ok()
+    };
+    let eligible = if !info.extension.is_empty() {
+        rules::matching_rule_in_root(&info, Some(&file.owning_root), folders, rules)
+            .is_some_and(|rule| can_move(&info, rule))
+    } else {
+        // The file header is unavailable. Consider possible rule outcomes, but
+        // do not claim a match or surface a path a higher-priority rule could ignore.
+        let possible_extensions: HashSet<_> = rules.iter().flat_map(|rule| &rule.extensions)
+            .map(String::as_str)
+            .filter(|extension| *extension == "exe" || infer::is_supported(extension))
+            .chain(std::iter::once(""))
+            .collect();
+        let mut eligible = false;
+        for extension in possible_extensions {
+            extension.clone_into(&mut info.extension);
+            if let Some(rule) = rules::matching_rule_in_root(&info, Some(&file.owning_root), folders, rules) {
+                match rule.action.as_str() {
+                    "ignore" => return Ok(false),
+                    "move" | "rename" => match checked_destination(&file.owning_root, &info, rule) {
+                        Ok(_) => eligible = true,
+                        Err(error) if error == "preview.unchanged" => return Ok(false),
+                        Err(_) => {}
+                    },
+                    _ => {}
+                }
+            }
+        }
+        eligible
+    };
+    if !eligible || is_baselined(path, &file.canonical_path)? {
+        return Ok(false);
+    }
+    // Existing processed records need a stable content check on refresh.
+    db::organization_fingerprints(&path.to_string_lossy(), &file.canonical_path.to_string_lossy(), false)
+        .map(|fingerprints| fingerprints.is_empty()).map_err(|error| error.to_string())
 }
 
 #[derive(Default)]
@@ -225,17 +298,20 @@ impl PreviewExclusions {
             if exclusions.owning_roots.contains_key(parent) || rules::should_ignore_file(path) {
                 continue;
             }
-            // A verified source pins its parent and root while the policies are read.
-            let Ok(file) = scope.validate_file(path) else { continue; };
-            let root = &file.owning_root;
+            // Keep the verified source's parent and root pinned while reading policy.
+            let Some(source) = ReviewSource::open(scope, path) else { continue; };
+            let root = source.owning_root();
             if !exclusions.blocked.contains_key(root) {
-                if is_baselined(path, &file)? { continue; }
-                let info = rules::describe_file(path, &file.metadata).ok_or("Invalid organization file name")?;
-                if rules::matching_rule_in_root(&info, Some(root), folders, rules)
-                    .is_none_or(|rule| rule.action == "ignore")
-                {
-                    continue;
-                }
+                let relevant = match &source {
+                    ReviewSource::Ready(file) => {
+                        if is_baselined(path, &file.canonical_path)? { continue; }
+                        let info = rules::describe_file(path, &file.metadata).ok_or("Invalid organization file name")?;
+                        rules::matching_rule_in_root(&info, Some(root), folders, rules)
+                            .is_some_and(|rule| rule.action != "ignore")
+                    }
+                    ReviewSource::Locked(file) => can_report_locked_file(path, file, folders, rules)?,
+                };
+                if !relevant { continue; }
 
                 let root_policy = (!rules::same_path(parent, root)).then_some(root.as_path());
                 for directory in std::iter::once(parent).chain(root_policy) {
@@ -336,19 +412,32 @@ pub(crate) fn preview(paths: Option<Vec<String>>, suppression: &SuppressionSet) 
     let mut reserved = HashSet::new();
     let mut items = Vec::new();
     let mut entries = Vec::new();
+    let mut deferred_files = Vec::new();
     for path in paths {
         let Some(root) = path.parent().and_then(|parent| exclusions.owning_roots.get(parent)) else { continue; };
         if exclusions.blocked.contains_key(root) { continue; }
         // Probe before taking the write-denying file handle.
         let locked = check_locks && rules::is_file_locked(&path);
-        let Some(mut file) = eligible_file(&scope, &path, |path, current_root| {
-            if current_root != root.as_path() {
-                return Err("Owning folder changed; preview again".into());
+        let Some(source) = ReviewSource::open(&scope, &path) else { continue; };
+        if source.owning_root() != root {
+            return Err("Owning folder changed; preview again".into());
+        }
+        if rules::organization_path_is_protected_with(&path, root, |directory, name| {
+            exclusions.matches(directory, name)
+        })? { continue; }
+        let mut file = match source {
+            ReviewSource::Ready(file) => file,
+            ReviewSource::Locked(file) => {
+                if can_report_locked_file(&path, &file, &folders, &rules)? && seen.insert(file.identity) {
+                    deferred_files.push(DeferredPreviewFile {
+                        source: path.to_string_lossy().into_owned(),
+                        error: "preview.locked",
+                    });
+                }
+                continue;
             }
-            rules::organization_path_is_protected_with(path, current_root, |directory, name| {
-                exclusions.matches(directory, name)
-            })
-        })? else { continue; };
+        };
+        if is_baselined(&path, &file.canonical_path)? { continue; }
         if !seen.insert(file.identity.clone()) { continue; }
         let info = rules::describe_file(&path, &file.metadata).ok_or("Invalid organization file name")?;
         let Some(rule) = rules::matching_rule_in_root(&info, Some(&file.owning_root), &folders, &rules) else {
@@ -422,7 +511,7 @@ pub(crate) fn preview(paths: Option<Vec<String>>, suppression: &SuppressionSet) 
         root: root.to_string_lossy().into_owned(),
         error,
     }).collect();
-    Ok(Preview { id, entries, unavailable_roots: scope.unavailable_active_roots(), blocked_roots })
+    Ok(Preview { id, entries, unavailable_roots: scope.unavailable_active_roots(), blocked_roots, deferred_files })
 }
 
 pub fn discard(id: &str) {
