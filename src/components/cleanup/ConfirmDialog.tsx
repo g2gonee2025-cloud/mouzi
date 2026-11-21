@@ -31,6 +31,7 @@ const EXPLICIT_MIN_BYTES = 100 * 1024 * 1024;
 const TYPED_MIN_ITEMS = 25;
 const TYPED_MIN_BYTES = 1024 * 1024 * 1024;
 const PREVIEW_PAGE_SIZE = 8;
+const MAX_SEQUENTIAL_PREVIEW_PAGES = 8;
 
 const NOTICE_KEY = {
   trash: "confirm.trashNotice",
@@ -92,13 +93,13 @@ export default function ConfirmDialog({
 }: ConfirmDialogProps) {
   const { t } = useTranslation();
   const review = { onConfirm, preview, count, countIsExact, bytes, notice };
-  const [draft, setDraft] = useState({ review, typed: "", page: 0 });
+  const [draft, setDraft] = useState({ review, typed: "", page: 0, jump: "1" });
   const previous = draft.review;
   const sameReview = previous.onConfirm === onConfirm && previous.preview === preview &&
     previous.count === count && previous.countIsExact === countIsExact &&
     previous.bytes === bytes && previous.notice === notice;
   // A replacement request cannot reuse consent typed for the previous one.
-  const activeDraft = sameReview ? draft : { review, typed: "", page: 0 };
+  const activeDraft = sameReview ? draft : { review, typed: "", page: 0, jump: "1" };
   if (!sameReview) setDraft(activeDraft);
   const { typed } = activeDraft;
   const [busy, setBusy] = useState(false);
@@ -127,6 +128,8 @@ export default function ConfirmDialog({
   const page = Math.min(activeDraft.page, Math.max(0, pages - 1));
   const first = page * PREVIEW_PAGE_SIZE;
   const shownPreview = preview?.slice(first, first + PREVIEW_PAGE_SIZE) ?? [];
+  const jumpTarget = Number(activeDraft.jump) - 1;
+  const jumpIsValid = Number.isInteger(jumpTarget) && jumpTarget >= 0 && jumpTarget < pages;
 
   useLayoutEffect(() => {
     if (previewRef.current) previewRef.current.scrollTop = 0;
@@ -185,7 +188,7 @@ export default function ConfirmDialog({
 
   const goToPage = (target: number) => {
     if (busy || target < 0 || target >= pages) return;
-    setDraft((current) => ({ ...current, page: target }));
+    setDraft((current) => ({ ...current, page: target, jump: String(target + 1) }));
   };
 
   return (
@@ -298,6 +301,43 @@ export default function ConfirmDialog({
                 {t("common.nextPage")}
               </button>
             </div>
+          )}
+
+          {pages > MAX_SEQUENTIAL_PREVIEW_PAGES && (
+            <form
+              className="flex flex-wrap items-center gap-2 text-xs"
+              onSubmit={(event) => {
+                event.preventDefault();
+                if (jumpIsValid) goToPage(jumpTarget);
+              }}
+            >
+              <label className="flex flex-wrap items-center gap-2 text-text-muted">
+                {t("common.pageNumber")}
+                <input
+                  type="number"
+                  aria-label={t("common.pageNumber")}
+                  aria-controls={previewId}
+                  aria-invalid={activeDraft.jump !== "" && !jumpIsValid}
+                  min={1}
+                  max={pages}
+                  required
+                  value={activeDraft.jump}
+                  disabled={busy}
+                  onChange={(event) => {
+                    const jump = event.target.value;
+                    setDraft((current) => ({ ...current, jump }));
+                  }}
+                  className="w-24 rounded border border-border bg-surface px-2 py-1 text-text aria-invalid:border-red-500"
+                />
+              </label>
+              <button
+                type="submit"
+                disabled={busy}
+                className="rounded border border-border px-2 py-1 hover:bg-surface-dark disabled:opacity-50"
+              >
+                {t("common.goToPage")}
+              </button>
+            </form>
           )}
 
           <p className="text-xs text-text-muted">{t(NOTICE_KEY[notice])}</p>

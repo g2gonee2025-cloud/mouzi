@@ -102,9 +102,49 @@ interface DialogControl {
   children?: ReactNode;
   onClick?: () => void;
   onChange?: (event: { target: { value: string } }) => void;
+  onSubmit?: (event: { preventDefault: () => void }) => void;
   value?: string;
+  type?: string;
   disabled?: boolean;
+  "aria-label"?: string;
   "aria-disabled"?: boolean;
+}
+
+function reviewDialog(initial: ConfirmDialogProps) {
+  const frame = { slots: [] as unknown[], cursor: 0 };
+  const buttons = new Map<string, DialogControl>();
+  const inputs = new Map<string, DialogControl>();
+  let form: DialogControl | undefined;
+
+  function capture(node: ReactNode) {
+    Children.forEach(node, (child) => {
+      if (!isValidElement<DialogControl>(child)) return;
+      if (child.type === "button" && typeof child.props.children === "string") buttons.set(child.props.children, child.props);
+      if (child.type === "input") inputs.set(child.props["aria-label"] ?? "typed", child.props);
+      if (child.type === "form") form = child.props;
+      capture(child.props.children);
+    });
+  }
+
+  let props = initial;
+  function render(next = props) {
+    props = next;
+    function CaptureDialog() {
+      const tree = ConfirmDialog(props);
+      capture(tree);
+      return tree;
+    }
+
+    buttons.clear();
+    inputs.clear();
+    form = undefined;
+    frame.cursor = 0;
+    stateFrame.active = frame;
+    try { return renderToStaticMarkup(<CaptureDialog />); }
+    finally { stateFrame.active = null; }
+  }
+
+  return { render, buttons, inputs, pageForm: () => form };
 }
 
 it("lets a person review every paired move within bounded pages and grants consent only for the same plan", () => {
@@ -117,33 +157,7 @@ it("lets a person review every paired move within bounded pages and grants conse
   const apply = vi.fn(), applyReplacement = vi.fn(), cancel = vi.fn();
   let props: ConfirmDialogProps = { title: "Apply operations", count: moves.length, preview: moves, notice: "move",
     bytes: 2048, onConfirm: apply, onClose: cancel };
-  const frame = { slots: [] as unknown[], cursor: 0 };
-  const buttons = new Map<string, DialogControl>();
-  let typed: DialogControl | undefined;
-
-  function capture(node: ReactNode) {
-    Children.forEach(node, (child) => {
-      if (!isValidElement<DialogControl>(child)) return;
-      if (child.type === "button" && typeof child.props.children === "string") buttons.set(child.props.children, child.props);
-      if (child.type === "input") typed = child.props;
-      capture(child.props.children);
-    });
-  }
-
-  function render() {
-    function CaptureDialog() {
-      const tree = ConfirmDialog(props);
-      capture(tree);
-      return tree;
-    }
-
-    buttons.clear();
-    typed = undefined;
-    frame.cursor = 0;
-    stateFrame.active = frame;
-    try { return renderToStaticMarkup(<CaptureDialog />); }
-    finally { stateFrame.active = null; }
-  }
+  const { render, buttons, inputs } = reviewDialog(props);
 
   function checkPage(markup: string, first: number, last: number) {
     const rows = markup.match(/<li\b[^>]*>[\s\S]*?<\/li>/g) ?? [];
@@ -164,7 +178,8 @@ it("lets a person review every paired move within bounded pages and grants conse
   expect([...buttons.keys()]).toContain("Next page");
   expect(buttons.get("Previous page")?.["aria-disabled"]).toBe(true);
 
-  typed?.onChange?.({ target: { value: "DELETE" } });
+  expect(inputs.has("Page number")).toBe(false);
+  inputs.get("typed")?.onChange?.({ target: { value: "DELETE" } });
   render();
   expect(buttons.get("Apply operations")?.disabled).toBe(false);
   for (let page = 1; page < 5; page += 1) {
@@ -172,7 +187,7 @@ it("lets a person review every paired move within bounded pages and grants conse
     const next = render();
     expect(next).toContain("Page " + (page + 1) + " of 5");
     checkPage(next, page * 8, Math.min((page + 1) * 8, moves.length));
-    expect(typed?.value).toBe("DELETE");
+    expect(inputs.get("typed")?.value).toBe("DELETE");
     expect(buttons.get("Apply operations")?.disabled).toBe(false);
   }
   expect(buttons.get("Next page")?.["aria-disabled"]).toBe(true);
@@ -180,16 +195,57 @@ it("lets a person review every paired move within bounded pages and grants conse
   checkPage(render(), 24, 32);
 
   props = { ...props, count: replacement.length, preview: replacement, onConfirm: applyReplacement };
-  const replaced = render();
+  const replaced = render(props);
   expect(replaced).toContain("Page 1 of 4");
   expect(replaced).toContain(replacement[0].destination);
   expect(replaced).not.toContain(moves[0].destination);
-  expect(typed?.value).toBe("");
+  expect(inputs.get("typed")?.value).toBe("");
   expect(buttons.get("Apply operations")?.disabled).toBe(true);
   buttons.get("Cancel")?.onClick?.();
   expect(cancel).toHaveBeenCalledTimes(1);
   expect(apply).not.toHaveBeenCalled();
   expect(applyReplacement).not.toHaveBeenCalled();
+});
+
+it("jumps to page 1,250 of a 10,000-item review without confirming or accepting bad page numbers", () => {
+  const preview = Array.from({ length: 10_000 }, (_, index) =>
+    "C:/Fixture/directory-" + String(index + 1).padStart(5, "0"));
+  const execute = vi.fn();
+  const close = vi.fn();
+  const { render, inputs, buttons, pageForm } = reviewDialog({
+    title: "Remove empty folders", count: preview.length, preview, notice: "permanent",
+    onConfirm: execute, onClose: close,
+  });
+
+  expect(render()).toContain("Page 1 of 1250");
+  expect(Array.from(inputs.keys())).toContain("Page number");
+  expect(buttons.get("Go")?.type).toBe("submit");
+  expect(buttons.get("Remove empty folders")?.type).toBe("button");
+  inputs.get("typed")?.onChange?.({ target: { value: "DELETE" } });
+  render();
+  expect(buttons.get("Remove empty folders")?.disabled).toBe(false);
+
+  function submitPage(value: string) {
+    inputs.get("Page number")?.onChange?.({ target: { value } });
+    render();
+    const preventDefault = vi.fn();
+    pageForm()?.onSubmit?.({ preventDefault });
+    expect(preventDefault).toHaveBeenCalledTimes(1);
+    return render();
+  }
+
+  const last = submitPage("1250");
+  expect(last).toContain("Page 1250 of 1250");
+  expect(last.match(/<li\b/g)).toHaveLength(8);
+  expect(last).toContain(preview[9_992]);
+  expect(last).toContain(preview[9_999]);
+  expect(last).not.toContain(preview[0]);
+  for (const invalid of ["0", "1251", "1.5", "", "invalid"]) {
+    expect(submitPage(invalid)).toContain("Page 1250 of 1250");
+  }
+  expect(inputs.get("typed")?.value).toBe("DELETE");
+  expect(execute).not.toHaveBeenCalled();
+  expect(close).not.toHaveBeenCalled();
 });
 
 it("keeps a path-only consumer unchanged", () => {
