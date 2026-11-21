@@ -6,7 +6,9 @@ The supported build target for this fork is Windows 10/11 with WebView2. Upstrea
 
 ## First launch and folders
 
-New profiles start without watched folders, scheduled cleaning, local AI or Windows autostart. Default organizer rules are initialized together with the detected supported system language. Existing profiles keep their saved preferences and rules.
+New profiles start without watched folders, scheduled cleaning or local AI. Default organizer rules are initialized together with the detected supported system language. Existing profiles keep their saved preferences and rules.
+
+**Start with System** in General Settings shows Mouzi’s Windows startup registration. If you turn Mouzi off in Windows Startup Apps, it stays off when you reopen Mouzi. To enable it again, use the switch in General Settings or Windows Startup Apps.
 
 Choose **Add a watched folder** in the tray popup to open Watched Folders in Settings. Once you add a folder, the popup offers **Organize Now** to review proposed changes.
 
