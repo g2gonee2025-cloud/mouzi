@@ -34,6 +34,7 @@ export default function ReviewQueue({ paths }: { paths: string[] | null }) {
   // A non-null set means the user chose the selection, even when it is empty.
   const selectionIntent = useRef<Set<string> | null>(null);
   const heading = useRef<HTMLHeadingElement>(null);
+  const content = useRef<HTMLDivElement>(null);
   async function refresh() {
     const request = ++generation.current;
     const intent = selectionIntent.current;
@@ -41,6 +42,7 @@ export default function ReviewQueue({ paths }: { paths: string[] | null }) {
     currentId.current = null;
     setBusy(true); setError(''); setConfirm(null); setResults([]);
     setPreview(null);
+    if (content.current) content.current.scrollTop = 0;
     try {
       if (previous) await invoke('discard_preview_cmd', { id: previous });
       if (request !== generation.current) return;
@@ -87,6 +89,7 @@ export default function ReviewQueue({ paths }: { paths: string[] | null }) {
           if (request === generation.current) setError(errorText(cause));
         } finally {
           if (request === generation.current) {
+            if (content.current) content.current.scrollTop = 0;
             currentId.current = null;
             setPreview(null);
             setSelected(new Set());
@@ -107,40 +110,52 @@ export default function ReviewQueue({ paths }: { paths: string[] | null }) {
     choose(next);
   };
   const hasOmissions = !!(preview?.unavailableRoots?.length || preview?.blockedRoots?.length);
-  return <section className="space-y-4" aria-busy={busy}>
-    <div className="flex flex-wrap justify-between items-center gap-3"><h2 ref={heading} tabIndex={-1} className="text-lg font-semibold">{t('beta.review')}</h2><button className={buttonClass} onClick={refresh} disabled={busy}>{t('beta.refresh')}</button></div>
-    <p className="text-sm text-text-muted">{t('beta.previewHelp')}</p>
-    {busy && <p role="status">{t('beta.loading')}</p>}
-    {error && <p role="alert" className="text-sm text-red-700 dark:text-red-300">{error}</p>}
-    <Results results={results} />
-    {preview && <>
-      {hasOmissions && (
-        <div role="status" className="space-y-1 text-sm text-amber-800 dark:text-amber-200">
-          <p>{t('beta.unavailableFolders')}</p>
-          <ul className="list-disc space-y-1 pl-5">
-            {preview.unavailableRoots?.map(path => <li key={path} className="break-all">{path}</li>)}
-            {preview.blockedRoots?.map(({ root, error }) => <li key={root} className="break-words">
-              <p>{root}</p>
-              <p>{errorText(error)}</p>
-            </li>)}
-          </ul>
+  const hasEntries = !!preview?.entries.length;
+  return <section className="flex min-h-0 flex-1 flex-col gap-3" aria-busy={busy}>
+    <div className="flex shrink-0 flex-wrap items-center justify-between gap-3">
+      <h2 ref={heading} tabIndex={-1} className="text-lg font-semibold">{t('beta.review')}</h2>
+      <button className={buttonClass} onClick={refresh} disabled={busy}>{t('beta.refresh')}</button>
+    </div>
+    <p className="shrink-0 text-sm text-text-muted">{t('beta.previewHelp')}</p>
+    {preview && hasEntries && (
+      <div className="flex shrink-0 flex-wrap items-center justify-between gap-2 border-b border-border pb-3">
+        <div className="flex flex-wrap items-center gap-2">
+          <button className={buttonClass} disabled={busy} onClick={() => choose(new Set(preview.entries.filter(isOrdinaryProposal).map(entry => entry.id)))}>{t('beta.selectAll')}</button>
+          <button className={buttonClass} disabled={busy} onClick={() => choose(new Set())}>{t('beta.clearSelection')}</button>
         </div>
-      )}
-      <div className="flex flex-wrap items-center gap-2">
-        <button className={buttonClass} disabled={busy} onClick={() => choose(new Set(preview.entries.filter(isOrdinaryProposal).map(entry => entry.id)))}>{t('beta.selectAll')}</button>
-        <button className={buttonClass} disabled={busy} onClick={() => choose(new Set())}>{t('beta.clearSelection')}</button>
-        <span className="text-sm">{t('beta.selected', { count: selected.size })}</span>
+        <div className="ml-auto flex flex-wrap items-center justify-end gap-2">
+          <span role="status" className="text-sm tabular-nums">{t('beta.selected', { count: selected.size })}</span>
+          <button className={primaryClass} disabled={busy || !selected.size} onClick={(event) => askApply(event.currentTarget)}>{t('beta.apply')}</button>
+        </div>
       </div>
-      {!preview.entries.length && !hasOmissions && <p className="py-8 text-text-muted">{t('beta.empty')}</p>}
-      <div className="space-y-2">{preview.entries.map(entry => <div key={entry.id} className="rounded-lg border border-border p-3">
-        <label className="flex gap-3 items-start"><input type="checkbox" className="mt-1" checked={selected.has(entry.id)} disabled={busy || !!entry.error} onChange={() => toggle(entry.id)} />
-          <span className="min-w-0 text-sm break-all"><span className="block font-medium">{entry.source}</span><span className="block mt-1">{entry.rule} · {t(`beta.${entry.action}`)} · {entry.size.toLocaleString()} B</span>{entry.destination && <span className="block text-text-muted">{entry.destination}</span>}</span>
-        </label>
-        {entry.warning && <p className="mt-2 text-sm text-amber-800 dark:text-amber-200">{t('beta.warning')}</p>}
-        {entry.error && <p className="mt-2 text-sm text-text-muted">{entry.error === 'preview.recoveryUnavailable' ? t('beta.recoveryUnavailable') : errorText(entry.error)}</p>}
-      </div>)}</div>
-      <button className={primaryClass} disabled={busy || !selected.size} onClick={(event) => askApply(event.currentTarget)}>{t('beta.apply')}</button>
-    </>}
+    )}
+    <div ref={content} role="region" aria-label={t('beta.review')} tabIndex={hasEntries ? 0 : undefined} className="min-h-24 space-y-3 overflow-y-auto pr-1">
+      {busy && <p role="status">{t('beta.loading')}</p>}
+      {error && <p role="alert" className="text-sm text-red-700 dark:text-red-300">{error}</p>}
+      <Results results={results} />
+      {preview && <>
+        {hasOmissions && (
+          <div role="status" className="space-y-1 text-sm text-amber-800 dark:text-amber-200">
+            <p>{t('beta.unavailableFolders')}</p>
+            <ul className="list-disc space-y-1 pl-5">
+              {preview.unavailableRoots?.map(path => <li key={path} className="break-all">{path}</li>)}
+              {preview.blockedRoots?.map(({ root, error }) => <li key={root} className="break-words">
+                <p>{root}</p>
+                <p>{errorText(error)}</p>
+              </li>)}
+            </ul>
+          </div>
+        )}
+        {!hasEntries && !hasOmissions && <p className="py-8 text-text-muted">{t('beta.empty')}</p>}
+        <div className="space-y-2">{preview.entries.map(entry => <div key={entry.id} className="rounded-lg border border-border p-3">
+          <label className="flex gap-3 items-start"><input type="checkbox" className="mt-1" checked={selected.has(entry.id)} disabled={busy || !!entry.error} onChange={() => toggle(entry.id)} />
+            <span className="min-w-0 text-sm break-all"><span className="block font-medium">{entry.source}</span><span className="block mt-1">{entry.rule} · {t(`beta.${entry.action}`)} · {entry.size.toLocaleString()} B</span>{entry.destination && <span className="block text-text-muted">{entry.destination}</span>}</span>
+          </label>
+          {entry.warning && <p className="mt-2 text-sm text-amber-800 dark:text-amber-200">{t('beta.warning')}</p>}
+          {entry.error && <p className="mt-2 text-sm text-text-muted">{entry.error === 'preview.recoveryUnavailable' ? t('beta.recoveryUnavailable') : errorText(entry.error)}</p>}
+        </div>)}</div>
+      </>}
+    </div>
     {confirm && <ConfirmDialog {...confirm} onClose={() => setConfirm((active) => active === confirm ? null : active)} />}
   </section>;
 }

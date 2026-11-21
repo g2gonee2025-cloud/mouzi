@@ -698,10 +698,10 @@ export default function Settings() {
       </div>
 
       {/* Content */}
-      <div className="flex-1 overflow-auto p-6">
+      <div className={`flex-1 overflow-auto p-6 ${tab === "review" ? "flex min-w-0 flex-col" : ""}`}>
         {writeError && <p role="alert" className="mb-4 rounded-md border border-red-200 bg-red-50 p-3 text-sm text-red-700">{writeError}</p>}
         {isSaving && <p role="status" className="mb-3 text-xs text-text-muted">{t("common.saving")}</p>}
-        <fieldset disabled={isSaving} className="min-w-0">
+        <fieldset disabled={isSaving} className={tab === "review" ? "flex min-h-0 min-w-0 flex-1 flex-col" : "min-w-0"}>
         {tab === "folders" && (
           <div className="space-y-4">
             <h2 ref={sectionHeading} tabIndex={-1} className="text-lg font-semibold">{t("settings.folders.title")}</h2>
