@@ -105,6 +105,45 @@ it("lets an inventory change replace an outstanding Suggestions lookup", async (
   expect(settled).not.toContain("suggestions.localAiModelMissing");
 });
 
+it("distinguishes a fresh failed lookup from the next verified empty read", async () => {
+  expect.soft(renderScreen().html).not.toContain("suggestions.empty");
+  mocks.invoke.mockRejectedValueOnce("Could not read fixture inventory");
+  await useSuggestionsStore.getState().loadSuggestions();
+  const failure = renderScreen().html;
+  expect.soft(failure).toContain("suggestions.readFailed");
+  expect.soft(failure).toContain("common.retry");
+  expect.soft(failure).toContain("Could not read fixture inventory");
+  expect.soft(failure).not.toContain("suggestions.empty");
+
+  mocks.invoke.mockResolvedValueOnce({ suggestions: [], localAiStatus: null });
+  await useSuggestionsStore.getState().loadSuggestions();
+  const verified = renderScreen().html;
+  expect(verified).toContain("suggestions.empty");
+  expect(verified).not.toContain("suggestions.readFailed");
+});
+
+it("retains a committed receipt and its mutation error through a later lookup failure", async () => {
+  useSuggestionsStore.setState({
+    results: [{ path: "C:/Fixture/completed.txt", status: "partial", message: "Receipt warning", dest: "C:/Filed/completed.txt" }],
+    error: "A mutation could not be recorded",
+  });
+  mocks.invoke.mockRejectedValueOnce("Could not read fixture inventory");
+  await useSuggestionsStore.getState().loadSuggestions();
+  const failed = renderScreen().html;
+  expect(failed).toContain("C:/Filed/completed.txt");
+  expect(failed).toContain("Receipt warning");
+  expect.soft(failed).toContain("A mutation could not be recorded");
+  expect.soft(failed).toContain("suggestions.readFailed");
+
+  mocks.invoke.mockResolvedValueOnce({ suggestions: [receipt], localAiStatus: "modelMissing" });
+  await useSuggestionsStore.getState().loadSuggestions();
+  const recovered = renderScreen().html;
+  expect(recovered).toContain("C:/Filed/completed.txt");
+  expect(recovered).toContain("receipt.unrecognized");
+  expect(recovered).toContain("suggestions.localAiModelMissing");
+  expect(recovered).toContain("A mutation could not be recorded");
+});
+
 describe("local AI diagnostics", () => {
   function nextLookup(suggestions: Suggestion[], localAiStatus: SuggestionsResponse["localAiStatus"]) {
     mocks.invoke.mockImplementationOnce(async (command: string) => {

@@ -39,7 +39,7 @@ interface Props {
   children?: ReactNode;
   role?: string;
   "aria-label"?: string;
-  onClick?: () => Promise<void> | void;
+  onClick?: (event?: { currentTarget: HTMLButtonElement }) => Promise<void> | void;
 }
 function text(node: ReactNode): string {
   if (Array.isArray(node)) return node.map(text).join("");
@@ -124,4 +124,41 @@ it("preserves a later bulk failure and lets the user refresh after a stale dismi
   expect(useSuggestionsStore.getState().suggestions).toEqual([replacement, receipt]);
   expect(text(Suggestions())).not.toContain("Could not save dismissal");
   expect(text(Suggestions())).not.toContain("suggestions.dismissChanged");
+});
+
+it.each([
+  ["suggestions.accept", "pending"],
+  ["suggestions.acceptAll", "pending"],
+  ["suggestions.dismiss", "pending"],
+  ["suggestions.dismissAll", "pending"],
+  ["suggestions.accept", "failed"],
+  ["suggestions.acceptAll", "failed"],
+  ["suggestions.dismiss", "failed"],
+  ["suggestions.dismissAll", "failed"],
+] as const)("blocks the captured %s callback while the lookup is %s", async (label, phase) => {
+  const store = useSuggestionsStore.getState();
+  const response = { suggestions: [invoice, receipt], localAiStatus: null };
+  ipc.invoke.mockResolvedValueOnce(response);
+  await store.loadSuggestions();
+  const captured = find(Suggestions(), (node) => node.type === "button"
+    && (node.props["aria-label"] === label || text(node) === label))!.props.onClick!;
+
+  let finish!: (result: typeof response) => void;
+  if (phase === "failed") ipc.invoke.mockRejectedValueOnce("Directory lookup failed");
+  else ipc.invoke.mockReturnValueOnce(new Promise<typeof response>((resolve) => { finish = resolve; }));
+  const refreshed = store.loadSuggestions();
+  if (phase === "failed") await refreshed;
+  ipc.invoke.mockImplementation(async (command: string) => {
+    if (command === "begin_suggestion_preparation_cmd") return "fixture-preparation";
+    if (command === "prepare_suggestions_cmd") return [];
+    if (command === dismissCommand) return true;
+    throw new Error("Unexpected command " + command);
+  });
+  const priorCalls = ipc.invoke.mock.calls.length;
+  await captured({ currentTarget: {} as HTMLButtonElement });
+  if (phase === "pending") {
+    finish(response);
+    await refreshed;
+  }
+  expect(ipc.invoke.mock.calls.slice(priorCalls)).toEqual([]);
 });
