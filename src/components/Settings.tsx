@@ -1114,6 +1114,7 @@ export default function Settings() {
             {undoReceipt && (
               <div className="space-y-2">
                 <div
+                  id="bulk-undo-receipt"
                   role="status"
                   aria-live="polite"
                   aria-label={undoReceiptHasPaths ? t("beta.results") : undefined}
@@ -1130,7 +1131,7 @@ export default function Settings() {
                   ))}
                 </div>
                 {undoReceiptHasPaths && (
-                  <button type="button" className="text-sm underline" onClick={() => {
+                  <button type="button" aria-controls="bulk-undo-receipt" className="text-sm underline" onClick={() => {
                     setUndoReceipt(null);
                     sectionHeading.current?.focus();
                   }}>{t("common.dismiss")}</button>

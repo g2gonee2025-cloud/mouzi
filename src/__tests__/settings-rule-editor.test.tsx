@@ -93,6 +93,7 @@ interface Props {
   title?: string;
   "aria-label"?: string;
   "aria-checked"?: boolean;
+  "aria-controls"?: string;
   "aria-describedby"?: string;
   "aria-invalid"?: boolean;
   onClick?: (event: { currentTarget: HTMLButtonElement }) => unknown;
@@ -610,8 +611,13 @@ it("keeps a bulk collision path available past the routine timeout until dismiss
 
   await vi.advanceTimersByTimeAsync(8_001);
   const afterTimeout = renderSettings();
-  expect.soft(text(receipt(afterTimeout))).toContain(`Now at ${actual}`);
-  click(requireElement(button("common.dismiss"), afterTimeout));
+  const retainedReceipt = receipt(afterTimeout);
+  expect.soft(text(retainedReceipt)).toContain(`Now at ${actual}`);
+  const dismiss = requireElement(button("common.dismiss"), afterTimeout);
+  expect(retainedReceipt?.props.id).toBe("bulk-undo-receipt");
+  expect(dismiss.props["aria-controls"]).toBe(retainedReceipt?.props.id);
+  expect(find(retainedReceipt, button("common.dismiss"))).toBeUndefined();
+  click(dismiss);
   expect(receipt(renderSettings())).toBeUndefined();
 
   outcome = { status: "ok", restoredTo: original, message: null };
