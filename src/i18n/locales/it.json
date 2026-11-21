@@ -166,6 +166,7 @@
       "enable": "Abilita organizzazione programmata",
       "timesPerDay": "Volte al giorno",
       "time": "Orario {{number}}",
+      "timeRequired": "Imposta l’ora {{number}}.",
       "desc": "Organizza automaticamente i file agli orari programmati.",
       "once": "Una volta al giorno",
       "twice": "Due volte al giorno",

@@ -166,6 +166,7 @@
       "enable": "Enable scheduled organization",
       "timesPerDay": "Times per day",
       "time": "Time {{number}}",
+      "timeRequired": "Time {{number}} is required.",
       "desc": "Organize files automatically at scheduled times.",
       "once": "Once per day",
       "twice": "Twice per day",

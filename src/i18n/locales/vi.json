@@ -172,6 +172,7 @@
       "enable": "Bật sắp xếp theo lịch",
       "timesPerDay": "Số lần mỗi ngày",
       "time": "Thời gian {{number}}",
+      "timeRequired": "Hãy chọn giờ {{number}}.",
       "desc": "Tự động sắp xếp tệp vào các khung giờ đã lên lịch.",
       "once": "Một lần mỗi ngày",
       "twice": "Hai lần mỗi ngày",

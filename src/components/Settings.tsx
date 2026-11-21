@@ -99,16 +99,22 @@ function schedulesMatch(saved: ScheduleSettings, draft: ScheduleSettings): boole
   return (Object.keys(saved) as Array<keyof ScheduleSettings>).every((key) => saved[key] === draft[key]);
 }
 
-function activeScheduleDefaults(draft: ScheduleSettings): ScheduleSettings {
-  if (!draft.schedule_enabled) return draft;
-  const times = draft.schedule_times_per_day;
-  return {
-    ...draft,
-    schedule_time_1: draft.schedule_time_1 || "08:00",
-    schedule_time_2: times >= 2 ? draft.schedule_time_2 || "14:00" : draft.schedule_time_2,
-    schedule_time_3: times >= 3 ? draft.schedule_time_3 || "20:00" : draft.schedule_time_3,
-    schedule_time_4: times >= 4 ? draft.schedule_time_4 || "23:00" : draft.schedule_time_4,
-  };
+const scheduleTimeSlots = [
+  ["schedule_time_1", "08:00"],
+  ["schedule_time_2", "14:00"],
+  ["schedule_time_3", "20:00"],
+  ["schedule_time_4", "23:00"],
+] as const;
+type ScheduleTimeKey = (typeof scheduleTimeSlots)[number][0];
+type ScheduleDraft = { values: ScheduleSettings; clearedTimes: ReadonlySet<ScheduleTimeKey> };
+
+function activeScheduleDefaults({ values, clearedTimes }: ScheduleDraft): ScheduleSettings {
+  if (!values.schedule_enabled) return values;
+  const filled = { ...values };
+  for (const [key, fallback] of scheduleTimeSlots.slice(0, values.schedule_times_per_day)) {
+    if (!filled[key] && !clearedTimes.has(key)) filled[key] = fallback;
+  }
+  return filled;
 }
 
 type SchedulerRun = {
@@ -234,10 +240,15 @@ export default function Settings() {
   const [graceDraft, setGraceDraft] = useState<GraceDraft | null>(null);
   const graceInput = useRef<HTMLInputElement>(null);
 
-  const [scheduleDraft, setScheduleDraft] = useState<ScheduleSettings | null>(null);
+  const [scheduleDraft, setScheduleDraft] = useState<ScheduleDraft | null>(null);
+  const [scheduleChecked, setScheduleChecked] = useState(false);
   const scheduleSwitch = useRef<HTMLButtonElement>(null);
   const localSchedule = scheduleDraft ? activeScheduleDefaults(scheduleDraft) : schedule ?? defaultSchedule();
   const scheduleDirty = !!schedule && !!scheduleDraft && !schedulesMatch(schedule, localSchedule);
+  const visibleScheduleTimes = scheduleTimeSlots.slice(0, localSchedule.schedule_times_per_day);
+  const missingScheduleTime = localSchedule.schedule_enabled
+    ? visibleScheduleTimes.findIndex(([key]) => !localSchedule[key])
+    : -1;
   const [ruleToast, setRuleToast] = useState<{ message: string; type: "success" | "error" } | null>(null);
   const [replaceOnImport, setReplaceOnImport] = useState(false);
   const [pending, setPending] = useState<ConfirmRequest | null>(null);
@@ -441,16 +452,30 @@ export default function Settings() {
     await savePreferences({ language: lang });
   };
 
-  const handleScheduleChange = (patch: Partial<ScheduleSettings>) => {
+  const handleScheduleChange = (patch: Partial<ScheduleSettings>, editedTime?: ScheduleTimeKey) => {
     if (!schedule) return;
-    const next = { ...(scheduleDraft ?? schedule), ...patch };
-    next.schedule_times_per_day = Math.max(1, Math.min(4, next.schedule_times_per_day || 1));
-    setScheduleDraft(schedulesMatch(schedule, activeScheduleDefaults(next)) ? null : next);
+    setScheduleDraft((current) => {
+      const values = { ...(current?.values ?? schedule), ...patch };
+      values.schedule_times_per_day = Math.max(1, Math.min(4, values.schedule_times_per_day || 1));
+      const clearedTimes = new Set(current?.clearedTimes);
+      if (editedTime) {
+        if (values[editedTime]) clearedTimes.delete(editedTime);
+        else clearedTimes.add(editedTime);
+      }
+      const next = { values, clearedTimes };
+      return !clearedTimes.size && schedulesMatch(schedule, activeScheduleDefaults(next)) ? null : next;
+    });
   };
 
   const handleSaveSchedule = async () => {
-    if (scheduleDirty && (await runWrite(() => updateSchedule(localSchedule)))) {
+    if (!scheduleDirty) return;
+    if (missingScheduleTime !== -1) {
+      setScheduleChecked(true);
+      return;
+    }
+    if (await runWrite(() => updateSchedule(localSchedule))) {
       setScheduleDraft(null);
+      setScheduleChecked(false);
     }
   };
 
@@ -1209,23 +1234,31 @@ export default function Settings() {
               </div>
 
               <div className="space-y-2">
-                {Array.from({ length: localSchedule.schedule_times_per_day }).map((_, idx) => {
-                  const key = `schedule_time_${idx + 1}` as keyof ScheduleSettings;
+                {visibleScheduleTimes.map(([key], idx) => {
+                  const invalid = scheduleChecked && missingScheduleTime === idx;
+                  const errorId = `schedule-time-${idx + 1}-error`;
                   return (
-                    <div key={idx}>
+                    <div key={key}>
                       <label className="text-xs font-medium text-text-muted block mb-1">
                         {t("settings.scheduler.time", { number: idx + 1 })}
                       </label>
                       <input
                         aria-label={t("settings.scheduler.time", { number: idx + 1 })}
+                        aria-invalid={invalid}
+                        aria-describedby={invalid ? errorId : undefined}
                         type="time"
-                        value={(localSchedule[key] as string | null) || ""}
+                        value={localSchedule[key] ?? ""}
                         disabled={!schedule}
                         onChange={(e) =>
-                          handleScheduleChange({ [key]: e.target.value || null } as Partial<ScheduleSettings>)
+                          handleScheduleChange({ [key]: e.target.value || null }, key)
                         }
                         className="w-full rounded-md border border-border bg-surface px-3 py-2 text-sm outline-none focus:border-primary"
                       />
+                      {invalid && (
+                        <p id={errorId} role="alert" className="mt-1 text-xs text-red-700 dark:text-red-400">
+                          {t("settings.scheduler.timeRequired", { number: idx + 1 })}
+                        </p>
+                      )}
                     </div>
                   );
                 })}
@@ -1246,6 +1279,7 @@ export default function Settings() {
                     type="button"
                     onClick={() => {
                       setScheduleDraft(null);
+                      setScheduleChecked(false);
                       scheduleSwitch.current?.focus();
                     }}
                     className="rounded-md border border-border px-3 py-2 text-sm hover:bg-surface-dark"

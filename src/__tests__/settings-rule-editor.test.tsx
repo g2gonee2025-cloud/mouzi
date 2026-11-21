@@ -1,7 +1,7 @@
-import { isValidElement, type ReactElement, type ReactNode } from "react";
+import { Children, isValidElement, type ReactElement, type ReactNode } from "react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import Settings from "../components/Settings";
-import { useAppStore, type Rule } from "../store/useAppStore";
+import { useAppStore, type AppSettings, type Rule, type ScheduleSettings } from "../store/useAppStore";
 
 const harness = vi.hoisted(() => ({
   invoke: vi.fn(),
@@ -11,7 +11,13 @@ const harness = vi.hoisted(() => ({
   disposeEffects: new Set<() => void>(),
 }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke: harness.invoke }));
-vi.mock("react-i18next", () => ({ useTranslation: () => ({ t: (key: string) => key }) }));
+vi.mock("react-i18next", () => ({
+  useTranslation: () => ({
+    t: (key: string, values?: { number?: number }) => key === "settings.scheduler.time"
+      ? `${key} ${values?.number}`
+      : key,
+  }),
+}));
 vi.mock("../i18n", () => ({
   default: { t: (key: string, options?: { defaultValue?: string }) => options?.defaultValue ?? key, language: "en" },
 }));
@@ -56,6 +62,7 @@ vi.mock("../store/useAppStore", async (importOriginal) => {
 
 interface Props {
   children?: ReactNode;
+  type?: string;
   value?: string | number;
   disabled?: boolean;
   checked?: boolean;
@@ -63,6 +70,7 @@ interface Props {
   role?: string;
   title?: string;
   "aria-label"?: string;
+  "aria-invalid"?: boolean;
   onClick?: (event: { currentTarget: HTMLButtonElement }) => unknown;
   onChange?: (event: { target: { value?: string; checked?: boolean } }) => void;
   onKeyDown?: (event: { key: string }) => void;
@@ -171,6 +179,117 @@ function disposeIgnoreEffects() {
 afterEach(() => {
   disposeIgnoreEffects();
   vi.useRealTimers();
+});
+
+const scheduleFixture: AppSettings = {
+  id: 1, revision: 4, language: "en", theme: "system", telemetry_enabled: false,
+  first_run: false, autostart: false, grace_period_seconds: 300,
+  lock_check_enabled: true, recursive_watch: false, local_ai_enabled: false, local_ai_model: "llama3.2",
+  schedule_enabled: true, schedule_times_per_day: 2, schedule_time_1: "21:17", schedule_time_2: "23:19",
+  schedule_time_3: null, schedule_time_4: null,
+};
+
+function openScheduler(patch: Partial<AppSettings> = {}) {
+  let persisted = { ...scheduleFixture, ...patch };
+  useAppStore.getState().applySettings(persisted);
+  harness.invoke.mockImplementation(async (command: string, args: { schedule: ScheduleSettings }) => {
+    if (command !== "update_schedule_cmd") throw new Error(`Unexpected fixture command ${command}`);
+    persisted = { ...persisted, ...args.schedule, revision: persisted.revision + 1 };
+    return persisted;
+  });
+  click(requireElement(({ props }) => props.label === "settings.general.title"));
+  return () => persisted;
+}
+
+const scheduleTime = (number: number) => field(`settings.scheduler.time ${number}`);
+const schedulerPanel = () => requireElement(({ props }) => {
+  const [intro] = Children.toArray(props.children);
+  return isValidElement<Props>(intro) && Children.toArray(intro.props.children).some(
+    (node) => isValidElement<Props>(node) && node.type === "h3" && text(node) === "settings.scheduler.title",
+  );
+});
+const scheduleAction = (action: string) => click(requireElement(button(action), schedulerPanel()));
+const saveSchedule = () => scheduleAction("common.save");
+const scheduleCount = () => requireElement((node) => node.type === "select" && node.props["aria-label"] === "settings.scheduler.timesPerDay");
+const scheduleSwitch = () => requireElement(({ props }) => props.role === "switch" && props["aria-label"] === "settings.scheduler.enable");
+const graceNumber = () => requireElement((node) => node.type === "input" && node.props.type === "number" && node.props["aria-label"] === "settings.general.gracePeriod");
+
+it("keeps a cleared active time visible while preserving Cancel and an unrelated grace draft", () => {
+  const persisted = openScheduler();
+  change(graceNumber(), { value: "13" });
+  change(scheduleTime(1), { value: "" });
+  expect(scheduleTime(1).props.value).toBe("");
+  expect(scheduleTime(2).props.value).toBe("23:19");
+  expect(find(editor(), ({ props }) => props.role === "alert")).toBeUndefined();
+
+  scheduleAction("common.cancel");
+  expect(scheduleTime(1).props.value).toBe("21:17");
+  expect(scheduleTime(2).props.value).toBe("23:19");
+  expect(graceNumber().props.value).toBe("13");
+  expect(persisted().revision).toBe(4);
+  expect(harness.invoke).not.toHaveBeenCalled();
+});
+
+it("blocks saving a blank active time, then commits only the refilled schedule", async () => {
+  const persisted = openScheduler();
+  change(scheduleTime(2), { value: "" });
+  await saveSchedule();
+  expect(harness.invoke).not.toHaveBeenCalled();
+  expect(persisted()).toMatchObject({ schedule_time_2: "23:19", revision: 4 });
+  expect(scheduleTime(2).props["aria-invalid"]).toBe(true);
+  expect(text(requireElement(({ props }) => props.role === "alert"))).toContain("settings.scheduler.timeRequired");
+
+  change(scheduleTime(2), { value: "22:31" });
+  expect(find(editor(), ({ props }) => props.role === "alert")).toBeUndefined();
+  await saveSchedule();
+  expect(harness.invoke).toHaveBeenCalledExactlyOnceWith("update_schedule_cmd", {
+    schedule: {
+      schedule_enabled: true, schedule_times_per_day: 2, schedule_time_1: "21:17",
+      schedule_time_2: "22:31", schedule_time_3: null, schedule_time_4: null,
+    },
+  });
+  expect(persisted()).toMatchObject({ schedule_time_2: "22:31", revision: 5 });
+  expect(scheduleTime(2).props.value).toBe("22:31");
+});
+
+it("still supplies defaults for legacy empty slots on enabling and adding times", async () => {
+  const persisted = openScheduler({
+    schedule_enabled: false, schedule_time_1: null, schedule_time_2: "",
+  });
+  click(scheduleSwitch());
+  expect(scheduleTime(1).props.value).toBe("08:00");
+  expect(scheduleTime(2).props.value).toBe("14:00");
+  change(scheduleCount(), { value: "4" });
+  expect(scheduleTime(3).props.value).toBe("20:00");
+  expect(scheduleTime(4).props.value).toBe("23:00");
+  await saveSchedule();
+  expect(persisted()).toMatchObject({
+    schedule_enabled: true, schedule_times_per_day: 4, schedule_time_1: "08:00",
+    schedule_time_2: "14:00", schedule_time_3: "20:00", schedule_time_4: "23:00",
+  });
+});
+
+it("defaults a newly active slot without filling an explicitly cleared slot", async () => {
+  const persisted = openScheduler();
+  change(scheduleTime(2), { value: "" });
+  change(scheduleCount(), { value: "3" });
+  expect(scheduleTime(2).props.value).toBe("");
+  expect(scheduleTime(3).props.value).toBe("20:00");
+
+  change(scheduleCount(), { value: "1" });
+  await saveSchedule();
+  expect(persisted()).toMatchObject({
+    schedule_enabled: true, schedule_times_per_day: 1, schedule_time_1: "21:17", schedule_time_2: null,
+  });
+});
+
+it("allows a blank time to be saved while scheduling is disabled", async () => {
+  const persisted = openScheduler({ schedule_enabled: false });
+  change(scheduleTime(1), { value: "" });
+  expect(scheduleTime(1).props.value).toBe("");
+  await saveSchedule();
+  expect(persisted()).toMatchObject({ schedule_enabled: false, schedule_time_1: null, revision: 5 });
+  expect(find(editor(), ({ props }) => props.role === "alert")).toBeUndefined();
 });
 
 it("keeps both a same-row toggle and other changes from the open draft", async () => {

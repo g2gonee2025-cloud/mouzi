@@ -166,6 +166,7 @@
       "enable": "启用定时整理",
       "timesPerDay": "每天执行次数",
       "time": "时间 {{number}}",
+      "timeRequired": "请填写时间 {{number}}。",
       "desc": "在设定的时间自动整理文件。",
       "once": "每天一次",
       "twice": "每天两次",

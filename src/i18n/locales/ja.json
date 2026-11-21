@@ -166,6 +166,7 @@
       "enable": "定期整理を有効化",
       "timesPerDay": "1日あたりの回数",
       "time": "時刻 {{number}}",
+      "timeRequired": "時刻 {{number}} を入力してください。",
       "desc": "指定した時刻にファイルを自動で整理します。",
       "once": "1日1回",
       "twice": "1日2回",

@@ -166,6 +166,7 @@
       "enable": "Activer l’organisation planifiée",
       "timesPerDay": "Fois par jour",
       "time": "Heure {{number}}",
+      "timeRequired": "Renseignez l’heure {{number}}.",
       "desc": "Organisez automatiquement les fichiers aux heures planifiées.",
       "once": "Une fois par jour",
       "twice": "Deux fois par jour",

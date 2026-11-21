@@ -166,6 +166,7 @@
       "enable": "Geplante Organisation aktivieren",
       "timesPerDay": "Male pro Tag",
       "time": "Zeit {{number}}",
+      "timeRequired": "Zeit {{number}} ist erforderlich.",
       "desc": "Dateien automatisch zu festgelegten Zeiten organisieren.",
       "once": "Einmal pro Tag",
       "twice": "Zweimal pro Tag",

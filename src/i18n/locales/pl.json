@@ -166,6 +166,7 @@
       "enable": "Włącz planowe porządkowanie",
       "timesPerDay": "Razy dziennie",
       "time": "Godzina {{number}}",
+      "timeRequired": "Ustaw godzinę {{number}}.",
       "desc": "Automatycznie porządkuj pliki o zaplanowanych porach.",
       "once": "Raz dziennie",
       "twice": "Dwa razy dziennie",
