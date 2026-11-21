@@ -41,6 +41,7 @@ vi.mock("react-i18next", () => ({
 
 interface ElementProps {
   "aria-label"?: string;
+  "data-tauri-drag-region"?: boolean;
   children?: ReactNode;
   onClick?: () => Promise<void> | void;
   onChange?: (event: { target: { checked: boolean } }) => void;
@@ -106,6 +107,17 @@ function recentButton(popup: ReactNode, title: string) {
 function traySection(popup: ReactNode, name: string) {
   return findElement(popup, (element) => element.type === "section" && element.props["aria-label"] === name);
 }
+
+it("names the popup header X Close and dispatches only the popup hide command", async () => {
+  const header = findElement(Popup(), (element) => element.props["data-tauri-drag-region"] === true);
+  const close = findElement(header, (element) => element.type === "button");
+  expect(close?.props.onClick).toBeTypeOf("function");
+  fixture.invoke.mockResolvedValueOnce(undefined);
+  await close?.props.onClick?.();
+
+  expect(fixture.invoke).toHaveBeenCalledExactlyOnceWith("close_popup");
+  expect(close?.props).toMatchObject({ title: en.common.close, "aria-label": en.common.close });
+});
 
 it("reports pending activity and only shows both empty messages after verified replies", async () => {
   let finishRecent!: (rows: unknown[]) => void;
