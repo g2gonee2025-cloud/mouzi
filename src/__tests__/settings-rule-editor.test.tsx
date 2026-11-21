@@ -1433,6 +1433,12 @@ it("keeps an incoming scope behind an approved receipt and later reopens the ful
   expect(result.props).toMatchObject({ results: [receipt] });
   expect(requestedPreviews()).toHaveLength(1);
 
+  requested = [...nextScope];
+  onReview();
+  await settle();
+  expect(requireElement(node => node.type === Results, review()).props).toMatchObject({ results: [receipt] });
+  expect(requestedPreviews()).toHaveLength(1);
+
   await click(requireElement(button("beta.refresh"), review()));
   expect(requestedPreviews()).toEqual([["preview_cmd", { paths: firstScope }], ["preview_cmd", { paths: nextScope }]]);
   sidebar("settings.folders.title");
@@ -1440,6 +1446,58 @@ it("keeps an incoming scope behind an approved receipt and later reopens the ful
   review();
   await settle();
   expect(requestedPreviews().slice(-1)[0]).toEqual(["preview_cmd", { paths: null }]);
+});
+
+it("immediately opens the next native review after a same-view receipt was presented and the user visited History", async () => {
+  const first = "C:/Fixture/seen.txt";
+  const next = "C:/Fixture/fresh.txt";
+  let requested: string[] | null = [first];
+  const proposal = (source: string) => ({
+    id: source, selectionKey: source, source, destination: source + ".filed",
+    rule: "Fixture route", action: "move", size: 1, warning: false, error: null,
+  });
+  const outcome = { id: first, source: first, success: true, error: null, actualDestination: first + ".filed" };
+  useReviewQueueStore.setState(useReviewQueueStore.getInitialState());
+  harness.invoke.mockImplementation(async (command: string, args?: { paths: string[] | null }) => {
+    if (command === "take_review_request_cmd") {
+      const paths = requested;
+      requested = null;
+      return paths;
+    }
+    if (command === "preview_cmd") return { id: "fixture-plan", entries: (args?.paths ?? []).map(proposal) };
+    if (command === "apply_preview_cmd") return [outcome];
+    return reviewSettingsReply(command);
+  });
+  const settings = () => renderWithEffects(editor);
+  const sidebar = (label: string) => click(requireElement(({ props }) => props.label === label, settings()));
+  const review = () => renderEffectfulChild(requireElement(node => node.type === ReviewQueue, settings()));
+
+  settings();
+  await settle();
+  review();
+  await settle();
+  click(requireElement(button("beta.apply"), review()));
+  const confirmation = requireElement(node => node.type === ConfirmDialog, review());
+  await confirmation.props.onConfirm!();
+  confirmation.props.onClose!();
+  expect(requireElement(node => node.type === Results, review()).props).toMatchObject({ results: [outcome] });
+
+  sidebar("settings.history.title");
+  sidebar("beta.review");
+  expect(requireElement(node => node.type === Results, review()).props).toMatchObject({ results: [outcome] });
+  sidebar("settings.history.title");
+
+  requested = [next];
+  const onReview = harness.listen.mock.calls.find(([event]) => event === "open-review")?.[1];
+  expect(onReview).toBeTypeOf("function");
+  onReview();
+  await settle();
+  review();
+  await settle();
+  expect(harness.invoke).toHaveBeenCalledWith("preview_cmd", { paths: [next] });
+  expect(text(review())).toContain(next);
+  expect(requireElement(node => node.type === Results, review()).props).toMatchObject({ results: [] });
+  expect(harness.invoke.mock.calls.filter(([command]) => command === "apply_preview_cmd")).toHaveLength(1);
 });
 
 function visitSettingsTab(label: string) {
