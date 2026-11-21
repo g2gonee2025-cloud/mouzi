@@ -30,20 +30,17 @@ pub(crate) fn is_file_locked(path: &Path) -> bool {
     }
 }
 
-/// Check whether a file has passed its grace period since last modification.
-/// Returns true if the file is ready to be moved.
-fn check_grace_period(path: &Path, grace_seconds: i64) -> Result<bool, String> {
+/// Time since the file was last modified, or None for a future timestamp.
+fn file_age(path: &Path) -> Result<Option<Duration>, String> {
     let modified = fs::metadata(path).and_then(|metadata| metadata.modified())
         .map_err(|e| format!("Cannot check file settling for {}: {e}", path.display()))?;
-    Ok(settled_at(modified, SystemTime::now(), grace_seconds))
+    Ok(SystemTime::now().duration_since(modified).ok())
 }
 
-fn settled_at(modified: SystemTime, now: SystemTime, grace_seconds: i64) -> bool {
+pub(crate) fn organization_grace_period(grace_seconds: i64) -> Duration {
     // An unattended move always needs a short quiet interval, including when
-    // the optional user grace period is zero. Future timestamps fail closed.
-    now.duration_since(modified)
-        .map(|elapsed| elapsed >= Duration::from_secs(grace_seconds.max(2) as u64))
-        .unwrap_or(false)
+    // the optional user grace period is zero.
+    Duration::from_secs(grace_seconds.max(2) as u64)
 }
 
 #[derive(Debug, Clone)]
@@ -450,6 +447,7 @@ pub enum ProcessOutcome {
     Organized { rule: Rule, destination: String, warning: Option<String> },
     Retained { message: String },
     Skipped,
+    Settling { period: Duration, remaining: Duration },
     Retry { reason: String },
 }
 
@@ -639,8 +637,15 @@ fn process_file(
     if if use_folder_protection { organization_path_is_protected(path, root)? } else { should_ignore_file(path) } {
         return Ok(ProcessOutcome::Skipped);
     }
-    if !bypass_grace && !check_grace_period(path, settings.grace_period_seconds)? {
-        return Ok(ProcessOutcome::Retry { reason: "File is still settling".into() });
+    if !bypass_grace {
+        // A future modification timestamp still fails closed through bounded retries.
+        let Some(age) = file_age(path)? else {
+            return Ok(ProcessOutcome::Retry { reason: "File is still settling".into() });
+        };
+        let period = organization_grace_period(settings.grace_period_seconds);
+        if age < period {
+            return Ok(ProcessOutcome::Settling { period, remaining: period - age });
+        }
     }
     if settings.lock_check_enabled && is_file_locked(path) {
         return Ok(ProcessOutcome::Retry { reason: "File is locked".into() });
@@ -837,7 +842,7 @@ fn scan_scheduled_entries(
                 progress.organized += 1;
                 if let Some(warning) = warning { progress.record_error(warning); }
             }
-            Ok(ProcessOutcome::Retry { .. }) => progress.deferred += 1,
+            Ok(ProcessOutcome::Retry { .. } | ProcessOutcome::Settling { .. }) => progress.deferred += 1,
             Ok(ProcessOutcome::Skipped) => {}
             Ok(ProcessOutcome::Retained { message }) | Err(message) => {
                 progress.record_error(format!("{}: {message}", path.display()));
@@ -907,7 +912,7 @@ fn scan_folder_entries(
             Ok(ProcessOutcome::Retry { reason }) if matches!(authority, FolderAuthority::ArchiveStaging(_)) => {
                 errors.push(format!("{file_name}: {reason}"));
             }
-            Ok(ProcessOutcome::Skipped | ProcessOutcome::Retry { .. }) => {}
+            Ok(ProcessOutcome::Skipped | ProcessOutcome::Retry { .. } | ProcessOutcome::Settling { .. }) => {}
             Ok(ProcessOutcome::Retained { message }) | Err(message) => errors.push(format!("{file_name}: {message}")),
         }
     }

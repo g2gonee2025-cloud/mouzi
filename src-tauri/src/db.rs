@@ -3,6 +3,7 @@ use rusqlite::functions::FunctionFlags;
 use rusqlite::{params, Connection, OptionalExtension, Result as SqliteResult};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 use once_cell::sync::OnceCell;
@@ -213,13 +214,35 @@ pub struct ScheduleSettings {
     pub schedule_time_4: Option<String>,
 }
 
-static DB: OnceCell<Arc<Mutex<Connection>>> = OnceCell::new();
+struct Database {
+    connection: Arc<Mutex<Connection>>,
+    // The watcher reads this without taking the SQLite lock on every tick.
+    watcher_grace_seconds: AtomicI64,
+}
+
+const UNKNOWN_WATCHER_GRACE: i64 = i64::MIN;
+static DB: OnceCell<Database> = OnceCell::new();
 
 pub fn init_db(app_dir: PathBuf) -> SqliteResult<()> {
     let conn = open_database(&app_dir.join("mouzi.db"))?;
-    DB.set(Arc::new(Mutex::new(conn)))
-        .map_err(|_| rusqlite::Error::ExecuteReturnedResults)?;
+    let grace = read_watcher_grace_seconds(&conn).unwrap_or(UNKNOWN_WATCHER_GRACE);
+    DB.set(Database {
+        connection: Arc::new(Mutex::new(conn)),
+        watcher_grace_seconds: AtomicI64::new(grace),
+    })
+    .map_err(|_| rusqlite::Error::ExecuteReturnedResults)?;
     Ok(())
+}
+
+pub(crate) fn watcher_grace_seconds() -> Option<i64> {
+    DB.get().map(|db| db.watcher_grace_seconds.load(Ordering::Acquire))
+        .filter(|seconds| *seconds != UNKNOWN_WATCHER_GRACE)
+}
+
+fn read_watcher_grace_seconds(conn: &Connection) -> Option<i64> {
+    // Other preferences may need repair. Only read what the queue needs.
+    conn.query_row("SELECT grace_period_seconds FROM settings ORDER BY id LIMIT 1", [], |row| row.get(0))
+        .ok()
 }
 
 fn open_database(db_path: &Path) -> SqliteResult<Connection> {
@@ -505,7 +528,7 @@ fn initialize_schema(conn: &Connection) -> SqliteResult<()> {
 }
 
 pub fn get_db() -> Arc<Mutex<Connection>> {
-    DB.get().expect("Database not initialized").clone()
+    DB.get().expect("Database not initialized").connection.clone()
 }
 
 /// Acquire the global connection for one short piece of work.
@@ -518,7 +541,7 @@ pub fn lock_db() -> Result<MutexGuard<'static, Connection>, String> {
     let db = DB
         .get()
         .ok_or_else(|| "Database not initialized".to_string())?;
-    db.lock()
+    db.connection.lock()
         .map_err(|_| "Database lock is poisoned".to_string())
 }
 
@@ -1254,8 +1277,16 @@ fn update_preferences_on(conn: &Connection, patch: &PreferencesPatch) -> SqliteR
 }
 
 pub fn update_preferences(patch: &PreferencesPatch) -> SqliteResult<AppSettings> {
-    let mut conn=sqlite_lock()?;let tx=conn.transaction()?;
-    let settings=update_preferences_on(&tx,patch)?;tx.commit()?;Ok(settings)
+    let mut conn = sqlite_lock()?;
+    let tx = conn.transaction()?;
+    let settings = update_preferences_on(&tx, patch)?;
+    tx.commit()?;
+    if patch.grace_period_seconds.is_some() {
+        // Publish while holding the connection lock so concurrent saves stay in commit order.
+        DB.get().expect("Locked database is initialized").watcher_grace_seconds
+            .store(settings.grace_period_seconds, Ordering::Release);
+    }
+    Ok(settings)
 }
 
 fn update_schedule_settings_on(conn: &Connection, schedule: &ScheduleSettings) -> SqliteResult<AppSettings> {
@@ -3086,6 +3117,20 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         create_file_inventory_table(&conn).unwrap();
         conn
+    }
+
+    #[test]
+    fn watcher_grace_loads_independently_of_other_preferences() {
+        let conn = mem_conn_with_inventory();
+        conn.execute(
+            "UPDATE settings SET telemetry_enabled='unreadable', grace_period_seconds=73",
+            [],
+        ).unwrap();
+        assert!(get_settings_on(&conn).is_err());
+        assert_eq!(read_watcher_grace_seconds(&conn), Some(73));
+
+        conn.execute("UPDATE settings SET grace_period_seconds='unreadable'", []).unwrap();
+        assert_eq!(read_watcher_grace_seconds(&conn), None);
     }
 
     #[test]
