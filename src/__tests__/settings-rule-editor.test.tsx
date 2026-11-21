@@ -6,22 +6,30 @@ import { defaultRuleOptions, useAppStore, type AppSettings, type Rule, type Sche
 
 const harness = vi.hoisted(() => ({
   invoke: vi.fn(),
+  listen: vi.fn(),
+  language: "en",
   slots: [] as unknown[],
   cursor: 0,
   effects: null as (() => void)[] | null,
   disposeEffects: new Set<() => void>(),
 }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke: harness.invoke }));
+vi.mock("@tauri-apps/api/event", () => ({ listen: harness.listen }));
 vi.mock("react-i18next", async () => {
   const { default: english } = await import("../i18n/locales/en.json");
   const folderLabels: Record<string, unknown> = english.beta;
   return {
     useTranslation: () => ({
-      t: (key: string, values?: { number?: number; path?: string }) => {
+      i18n: { resolvedLanguage: harness.language },
+      t: (key: string, values?: Record<string, string | number>) => {
         if (key === "settings.scheduler.time") return `${key} ${values?.number}`;
+        if (key === "settings.scheduler.scheduledTimes") return `${key} ${values?.occurrences}`;
+        if (key === "settings.scheduler.runCounts") return `${key} ${values?.organized}/${values?.errors}/${values?.deferred}`;
+        if (key === "settings.scheduler.pendingRecovery") return `${key} ${values?.count}`;
+        if (key === "settings.scheduler.readError") return `${key} ${values?.error}`;
         if (key === "beta.onlyNewOnAdd" || key === "beta.onlyNewForPath") {
           const label = folderLabels[key.slice("beta.".length)];
-          if (typeof label === "string") return label.replace("{{path}}", values?.path ?? "");
+          if (typeof label === "string") return label.replace("{{path}}", String(values?.path ?? ""));
         }
         return key;
       },
@@ -245,6 +253,8 @@ it("shows the exact stored u64 and preserves it on unrelated edits and the enabl
 beforeEach(() => {
   harness.slots.length = 0;
   harness.invoke.mockReset();
+  harness.listen.mockReset().mockResolvedValue(() => {});
+  harness.language = "en";
   db.clear();
   db.set(1, { ...invoice });
   db.set(2, { ...receipts });
@@ -509,6 +519,98 @@ const scheduleCount = () => requireElement((node) => node.type === "select" && n
 const scheduleSwitch = () => requireElement(({ props }) => props.role === "switch" && props["aria-label"] === "settings.scheduler.enable");
 const graceNumber = () => requireElement((node) => node.type === "input" && node.props.type === "number" && node.props["aria-label"] === "settings.general.gracePeriod");
 const startupSwitch: Match = ({ props }) => props.role === "switch" && props["aria-label"] === "settings.general.startWithSystem";
+
+const catchupReceipt = {
+  id: 6, status: "completed", claimed_at: "2026-11-20T14:17:23.987654321Z",
+  occurrences: 2, organized: 0, errors: 0, deferred: 0, uncertain: 0, message: null,
+};
+
+function schedulerReceipts() {
+  return renderEffectfulChild(requireElement(
+    (node) => typeof node.type === "function" && node.type.name === "SchedulerRunStatus",
+    schedulerPanel(),
+  ));
+}
+
+it("reports scheduled occurrences and work separately in the selected app language", async () => {
+  openScheduler();
+  harness.language = "de";
+  const ordinary = { ...catchupReceipt, id: 5, occurrences: 1 };
+  harness.invoke.mockResolvedValueOnce([catchupReceipt, ordinary]);
+  schedulerReceipts();
+  await settle();
+
+  const list = requireElement((node) => node.type === "ul", schedulerReceipts());
+  const [catchup, single] = Children.toArray(list.props.children).map(text);
+  expect.soft(catchup).toContain("settings.scheduler.scheduledTimes 2");
+  expect.soft(single).toContain("settings.scheduler.scheduledTimes 1");
+  expect.soft(catchup).toContain(new Date(catchupReceipt.claimed_at).toLocaleString("de"));
+  expect(catchup).toContain("settings.scheduler.status.completed");
+  expect(catchup).toContain("settings.scheduler.runCounts 0/0/0");
+
+  harness.language = "ja";
+  expect(text(schedulerReceipts())).toContain(new Date(catchupReceipt.claimed_at).toLocaleString("ja"));
+  expect(harness.invoke).toHaveBeenCalledExactlyOnceWith("get_recent_scheduler_runs_cmd");
+});
+
+it("translates exact interrupted reasons while retaining unknown records and actual failures", async () => {
+  openScheduler();
+  const recovery = {
+    ...catchupReceipt, status: "interrupted", organized: 3, errors: 1, deferred: 2, uncertain: 4,
+    message: "The app closed before this run finished",
+  };
+  const settingsChanged = { ...recovery, id: 5, message: "Schedule settings changed during the run" };
+  const failed = { ...recovery, id: 4, status: "failed", message: "C:/Fixture: access denied." };
+  const legacy = { ...recovery, id: 3, status: "old-status", message: "The app closed before this run finished (legacy detail)" };
+  harness.invoke.mockResolvedValueOnce([recovery, settingsChanged, failed, legacy]);
+  schedulerReceipts();
+  await settle();
+
+  const list = requireElement((node) => node.type === "ul", schedulerReceipts());
+  const [interrupted, revoked, failure, unknown] = Children.toArray(list.props.children).map(text);
+  expect.soft(interrupted).toContain("settings.scheduler.appClosed");
+  expect.soft(revoked).toContain("settings.scheduler.settingsChanged");
+  expect(interrupted).toContain("settings.scheduler.status.interrupted");
+  expect(interrupted).toContain("settings.scheduler.runCounts 3/1/2");
+  expect(interrupted).toContain("settings.scheduler.pendingRecovery 4");
+  expect(failure).toContain("settings.scheduler.status.failed");
+  expect(failure).toContain(failed.message);
+  expect.soft(unknown).toContain(legacy.status);
+  expect(unknown).not.toContain(`status.${legacy.status}`);
+  expect(unknown).toContain(legacy.message);
+});
+
+it("keeps saved receipts on a read failure and retries without clearing an unsaved-result warning", async () => {
+  openScheduler();
+  let emitScheduledDone!: (event: { payload: { result_saved: boolean } }) => void;
+  harness.listen.mockImplementation(async (_name, listener) => {
+    emitScheduledDone = listener;
+    return () => {};
+  });
+  harness.invoke.mockResolvedValueOnce([catchupReceipt]);
+  schedulerReceipts();
+  await settle();
+
+  harness.invoke.mockRejectedValueOnce("Fixture database read failed");
+  emitScheduledDone({ payload: { result_saved: false } });
+  await settle();
+  const failedRead = schedulerReceipts();
+  expect(text(failedRead)).toContain("settings.scheduler.status.completed");
+  expect.soft(text(failedRead)).toContain("settings.scheduler.readError Fixture database read failed");
+  expect.soft(text(failedRead)).toContain("settings.scheduler.resultUnsaved");
+
+  harness.invoke.mockResolvedValueOnce([catchupReceipt]);
+  click(requireElement(button("common.retry"), failedRead));
+  await settle();
+  expect(text(schedulerReceipts())).not.toContain("Fixture database read failed");
+  expect(text(schedulerReceipts())).toContain("settings.scheduler.resultUnsaved");
+
+  harness.invoke.mockResolvedValueOnce([catchupReceipt]);
+  emitScheduledDone({ payload: { result_saved: true } });
+  await settle();
+  expect(text(schedulerReceipts())).not.toContain("settings.scheduler.resultUnsaved");
+  expect(harness.invoke.mock.calls).toEqual(Array.from({ length: 4 }, () => ["get_recent_scheduler_runs_cmd"]));
+});
 
 it("waits for the Windows startup status even if an older profile saved On", () => {
   openScheduler({ autostart: true });
@@ -1029,6 +1131,10 @@ function ignoreEditor() {
     harness.slots.length = harness.cursor;
     return null;
   }
+  return renderEffectfulChild(child);
+}
+
+function renderEffectfulChild(child: Element) {
   const effects: (() => void)[] = [];
   harness.effects = effects;
   try {
