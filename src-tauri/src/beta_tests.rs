@@ -248,6 +248,65 @@ fn review_distinguishes_read_only_files_from_sharing_locks() {
     assert!(!read_only.exists());
 }
 
+#[cfg(windows)]
+#[test]
+fn review_reports_a_writer_held_file_until_it_can_be_previewed() {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let mut fixture = Fixture::new();
+    fixture.add(&fixture.rule());
+    let held = fixture.write("writer-held.txt", "writer payload");
+    let healthy = fixture.write("healthy.txt", "healthy payload");
+    let excluded = fixture.write("excluded.txt", "excluded payload");
+    let unmatched = fixture.write("unmatched.bin", "unmatched payload");
+    let canonical_root = fs::canonicalize(&fixture.root).unwrap();
+    let history_before = db::get_organization_logs().unwrap().len();
+    crate::ignore::save_mouziignore(fixture.root.to_str().unwrap(), &["excluded.txt".into()]).unwrap();
+    let writers: Vec<_> = [&held, &excluded, &unmatched].into_iter().map(|path| {
+        fs::OpenOptions::new().write(true).share_mode(1).open(path).unwrap()
+    }).collect();
+    let sharing_denial = fs::OpenOptions::new().read(true).share_mode(1).open(&held).unwrap_err();
+    assert_eq!(sharing_denial.raw_os_error(), Some(32));
+
+    let all = op::preview(None, &fixture.suppression).unwrap();
+    op::discard(&all.id);
+    let sole = fixture.preview(&[&held]);
+    op::discard(&sole.id);
+    let empty = fixture.preview(&[&excluded, &unmatched]);
+    op::discard(&empty.id);
+    drop(writers);
+    let refreshed = op::preview(None, &fixture.suppression).unwrap();
+    op::discard(&refreshed.id);
+
+    assert_eq!(all.entries.len(), 1);
+    assert_eq!(Path::new(&all.entries[0].source), canonical_root.join("healthy.txt"));
+    assert!(all.entries[0].error.is_none());
+    assert!(all.entries[0].selection_key.is_some());
+    assert!(sole.entries.is_empty());
+    assert!(empty.entries.is_empty());
+    let wire = serde_json::to_value(&all).unwrap();
+    assert_eq!(wire["deferredFiles"], serde_json::json!([{
+        "source": canonical_root.join("writer-held.txt"),
+        "error": "preview.locked",
+    }]), "the writer-held path must be reported beside the healthy proposal");
+    assert_eq!(serde_json::to_value(&sole).unwrap()["deferredFiles"], serde_json::json!([{
+        "source": held,
+        "error": "preview.locked",
+    }]));
+    assert!(serde_json::to_value(&empty).unwrap().get("deferredFiles").is_none());
+    assert!(serde_json::to_value(&refreshed).unwrap().get("deferredFiles").is_none());
+    assert_eq!(refreshed.entries.len(), 2);
+    let recovered = refreshed.entries.iter().find(|entry| Path::new(&entry.source) == canonical_root.join("writer-held.txt")).unwrap();
+    assert!(recovered.error.is_none());
+    assert!(recovered.selection_key.is_some());
+    assert_eq!(Path::new(recovered.destination.as_deref().unwrap()), canonical_root.join("Sorted/writer-held.txt"));
+    assert_eq!(fs::read_to_string(&held).unwrap(), "writer payload");
+    assert_eq!(fs::read_to_string(&healthy).unwrap(), "healthy payload");
+    assert_eq!(fs::read_to_string(&excluded).unwrap(), "excluded payload");
+    assert_eq!(fs::read_to_string(&unmatched).unwrap(), "unmatched payload");
+    assert_eq!(db::get_organization_logs().unwrap().len(), history_before);
+}
+
 #[test]
 fn apply_uses_only_the_selected_entries_and_rechecks_the_review() {
     let mut f = Fixture::new();
