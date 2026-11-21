@@ -23,13 +23,15 @@ Add a folder in Settings. New folders are added in Manual mode. Choose the behav
 
 Clean Now opens the review queue for enabled, nonpaused folders. Review the exact paths and select which moves or renames to approve. The **Only new files** setting takes a baseline of files currently in the watched folder. Suspicious names require explicit selection even in Silent mode. An empty configuration performs no organization. Volume roots, dot traversal, links and linked ancestors are rejected as watched roots. Physical aliases refer to the same folder. Conflicting legacy aliases and invalid configured roots are blocked rather than silently removed or remoded.
 
+Once you confirm a review, you can switch to Dashboard or another Settings tab. Return to **Review queue** to see its progress or results, including any renamed destination. Choose **Refresh preview** when you’re ready to review the next request.
+
 Mouzi remembers the physical identity of each newly registered watched folder. When the folder goes offline, the watcher retries and resumes when the same folder returns. Settings shows a problem if a different folder occupies its path. To use the replacement, remove the old registration and add the new folder. For an older registration without a saved identity, startup binds to the folder then present at the saved path. If that path is offline, reconnect the intended folder and restart Mouzi or add the folder again in Settings.
 
 Rules can apply to all watched folders or to one folder. Conditions include extension, filename pattern, size, and modification date. Rules can move, rename, or ignore files. Existing delete rules are visible in review with a recovery error. Relative destinations resolve under the watched root, and collision suffixes preserve existing files.
 
 Rule import accepts UTF-8 JSON with or without a leading byte-order mark, so you can edit an export in a Windows text editor and import it again.
 
-The rule editor shows the destination it will save. For a rule that applies to all watched folders, picking a subfolder such as `Inbox\Filed` stores `Filed` under each source folder. Picking a watched folder itself keeps its full path. For a rule limited to one folder, picking a destination outside it also keeps the full path.
+The rule editor shows the destination it will save. For a rule that applies to all watched folders, picking a subfolder such as `Inbox\Filed` stores `Filed` under each source folder. Picking a watched folder itself keeps its full path. For a rule limited to one folder, picking a destination outside it also keeps the full path. If both a parent and its child are watched, a relative destination in a child-only rule resolves under the child in both Review and Silent mode.
 
 Automatic and scheduled organization respect the grace period (300 seconds by default) and a minimum two-second settling interval. Explicit manual cleaning/import sorting bypasses the age grace period. Transient locks are retried with bounded backoff; exhausted retries require a later event or explicit action. Already filed outputs and queued work invalidated by Undo are skipped.
 
@@ -48,6 +50,8 @@ Dashboard totals, categories, root metadata and file lists describe scan data. T
 Duplicate, large-file, stale-file and empty-directory discovery is limited to current eligible roots. Hard links and physical aliases are excluded from reclaimable duplicates. Discovery reads current files rather than treating cached hashes as deletion evidence.
 
 In Duplicates, choose a keeper for each group and select the copies to remove. Mouzi initially selects every nonkeeper when the total fits in one review. If there are more than 10,000 nonkeepers, selection starts empty so you can choose a smaller batch. After you narrow a batch, a fresh search clears those choices. Use **Select all** to select every nonkeeper when the results fit in one review.
+
+In **Empty Dirs**, **Large Files** and **Stale Files**, choose **Select first 10,000** when the results exceed one review. You can swap items by unchecking a selected row and checking another. **Clear selection** lets you start again.
 
 Check the selected count and size, then open the confirmation to inspect the paths. You can page through the list or jump to a page in a long review. Cancel discards that review and leaves the files in place.
 
@@ -83,7 +87,7 @@ SQLite stores an operation intent before app-managed file mutations and finalize
 
 Move history supports single Undo, selected Undo, and Undo All, including accepted suggestions. Filter organization runs by text, rule, extension, or date. Reviewed moves save a content fingerprint that Undo checks before restoring. If the original name is occupied, Undo restores the file with a suffix. Move records with a saved file identity let Undo verify the file at the recorded destination. Older records without that identity remain visible and require manual restoration when a file is present. An interrupted Undo keeps a recovery record and asks you to inspect the recorded paths before restoring manually. Revert All restores the moves covered by its confirmation. Moves recorded afterward stay organized. If a file is missing, History keeps the move eligible for another Undo attempt when the file returns to its recorded destination. The interface counts restored files and missing files separately. Clear History removes the records covered by its confirmation and preserves later moves and their Undo actions. An interrupted restore keeps the History record needed for recovery. Use Windows Recycle Bin to restore cleanup items that are present there.
 
-After Revert All, the receipt lists the full path of each file restored under a new name. A receipt with these paths stays available in the current Settings session until you dismiss it or run Revert All again.
+After Revert All, the receipt lists the full path of each file restored under a new name. A receipt with these paths stays available in the current Settings session until you dismiss it or run Revert All again. In History, **Open folder** opens the organized file’s destination folder. Once a move is restored, the same button opens its original folder, including when Undo gave the file a new name.
 
 ## Scheduling and settings
 
