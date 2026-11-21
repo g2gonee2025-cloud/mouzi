@@ -30,7 +30,7 @@ const EXPLICIT_MIN_ITEMS = 10;
 const EXPLICIT_MIN_BYTES = 100 * 1024 * 1024;
 const TYPED_MIN_ITEMS = 25;
 const TYPED_MIN_BYTES = 1024 * 1024 * 1024;
-const PREVIEW_LIMIT = 8;
+const PREVIEW_PAGE_SIZE = 8;
 
 const NOTICE_KEY = {
   trash: "confirm.trashNotice",
@@ -91,18 +91,29 @@ export default function ConfirmDialog({
   onClose,
 }: ConfirmDialogProps) {
   const { t } = useTranslation();
-  const [typed, setTyped] = useState("");
+  const review = { onConfirm, preview, count, countIsExact, bytes, notice };
+  const [draft, setDraft] = useState({ review, typed: "", page: 0 });
+  const previous = draft.review;
+  const sameReview = previous.onConfirm === onConfirm && previous.preview === preview &&
+    previous.count === count && previous.countIsExact === countIsExact &&
+    previous.bytes === bytes && previous.notice === notice;
+  // A replacement request cannot reuse consent typed for the previous one.
+  const activeDraft = sameReview ? draft : { review, typed: "", page: 0 };
+  if (!sameReview) setDraft(activeDraft);
+  const { typed } = activeDraft;
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const dialogRef = useRef<HTMLDialogElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+  const previewRef = useRef<HTMLUListElement>(null);
   const running = useRef(false);
   const confirmed = useRef(false);
   const pressedBackdrop = useRef(false);
   const titleId = useId();
   const bodyId = useId();
   const inputId = useId();
+  const previewId = useId();
 
   const tier = confirmTier(count, bytes);
   const word = t("confirm.word");
@@ -112,6 +123,14 @@ export default function ConfirmDialog({
   const wordMatches =
     typed.trim().toLocaleLowerCase() === word.trim().toLocaleLowerCase();
   const confirmDisabled = busy || nothingSelected || (tier === "typed" && !wordMatches);
+  const pages = Math.ceil((preview?.length ?? 0) / PREVIEW_PAGE_SIZE);
+  const page = Math.min(activeDraft.page, Math.max(0, pages - 1));
+  const first = page * PREVIEW_PAGE_SIZE;
+  const shownPreview = preview?.slice(first, first + PREVIEW_PAGE_SIZE) ?? [];
+
+  useLayoutEffect(() => {
+    if (previewRef.current) previewRef.current.scrollTop = 0;
+  }, [page, preview]);
 
   useLayoutEffect(() => {
     const dialog = dialogRef.current;
@@ -164,8 +183,10 @@ export default function ConfirmDialog({
     }
   };
 
-  const shownPreview = preview?.slice(0, PREVIEW_LIMIT) ?? [];
-  const hiddenCount = (preview?.length ?? 0) - shownPreview.length;
+  const goToPage = (target: number) => {
+    if (busy || target < 0 || target >= pages) return;
+    setDraft((current) => ({ ...current, page: target }));
+  };
 
   return (
     <dialog
@@ -184,7 +205,7 @@ export default function ConfirmDialog({
       }}
       onKeyDown={(e) => {
         if (e.key !== "Tab") return;
-        const controls = Array.from(e.currentTarget.querySelectorAll<HTMLElement>("button:not(:disabled), input:not(:disabled)"));
+        const controls = Array.from(e.currentTarget.querySelectorAll<HTMLElement>("button:not(:disabled), input:not(:disabled), [tabindex='0']"));
         const first = controls[0];
         const last = controls[controls.length - 1];
         const active = e.currentTarget.ownerDocument.activeElement;
@@ -227,11 +248,16 @@ export default function ConfirmDialog({
           {note && <p className="text-xs text-text-muted whitespace-pre-line">{note}</p>}
 
           {shownPreview.length > 0 && (
-            <ul className="rounded-md border border-border bg-surface-dark max-h-28 overflow-auto">
+            <ul
+              id={previewId}
+              ref={previewRef}
+              tabIndex={0}
+              className="rounded-md border border-border bg-surface-dark max-h-28 overflow-y-auto focus-visible:-outline-offset-2"
+            >
               {shownPreview.map((item) => typeof item === "string" ? (
                 <li
                   key={item}
-                  className="px-2.5 py-1 text-[10px] text-text-muted truncate border-b border-border last:border-b-0"
+                  className="px-2.5 py-1 text-[10px] text-text-muted whitespace-pre-wrap wrap-anywhere border-b border-border last:border-b-0"
                   title={item}
                 >
                   {item}
@@ -239,7 +265,7 @@ export default function ConfirmDialog({
               ) : (
                 <li
                   key={item.source}
-                  className="px-2.5 py-1 text-xs break-all border-b border-border last:border-b-0"
+                  className="px-2.5 py-1 text-xs whitespace-pre-wrap wrap-anywhere border-b border-border last:border-b-0"
                   title={`${item.source} → ${item.destination}`}
                 >
                   <span className="block"><span className="text-text-muted">{t("beta.source")}</span> {item.source}</span>
@@ -248,10 +274,30 @@ export default function ConfirmDialog({
               ))}
             </ul>
           )}
-          {hiddenCount > 0 && (
-            <p className="text-[10px] text-text-muted">
-              {t("confirm.more", { count: hiddenCount })}
-            </p>
+          {pages > 1 && (
+            <div className="flex flex-wrap items-center justify-between gap-1 text-xs">
+              <button
+                type="button"
+                aria-controls={previewId}
+                aria-disabled={busy || page === 0}
+                onClick={() => goToPage(page - 1)}
+                className="rounded border border-border px-2 py-1 hover:bg-surface-dark aria-disabled:opacity-50"
+              >
+                {t("common.previousPage")}
+              </button>
+              <p role="status" className="text-text-muted tabular-nums">
+                {t("common.pageStatus", { page: page + 1, total: pages })}
+              </p>
+              <button
+                type="button"
+                aria-controls={previewId}
+                aria-disabled={busy || page === pages - 1}
+                onClick={() => goToPage(page + 1)}
+                className="rounded border border-border px-2 py-1 hover:bg-surface-dark aria-disabled:opacity-50"
+              >
+                {t("common.nextPage")}
+              </button>
+            </div>
           )}
 
           <p className="text-xs text-text-muted">{t(NOTICE_KEY[notice])}</p>
@@ -265,7 +311,10 @@ export default function ConfirmDialog({
                 id={inputId}
                 ref={inputRef}
                 value={typed}
-                onChange={(e) => setTyped(e.target.value)}
+                onChange={(e) => {
+                  const value = e.target.value;
+                  setDraft((current) => ({ ...current, typed: value }));
+                }}
                 onKeyDown={(e) => {
                   if (e.key === "Enter" && !e.repeat && !e.nativeEvent.isComposing) {
                     e.preventDefault();
