@@ -343,6 +343,57 @@ it("keeps a newer queue error after an older read finally succeeds", async () =>
   expect(label(failed)).not.toContain("last-known.txt");
 });
 
+const personalInbox: WatchedFolder = { ...invoices, id: 2, path: "C:\\Fixture\\Personal\\Inbox" };
+const teamInbox: WatchedFolder = { ...invoices, id: 3, path: "D:\\Fixture\\Team\\Inbox" };
+const personalPath = (name: string) => personalInbox.path + "\\" + name;
+const teamPath = (name: string) => teamInbox.path + "\\" + name;
+
+async function publishInboxFiles(personal: string, team?: string) {
+  const pending = [[personalInbox.path, personal], [personalInbox.path, "unique.txt"]];
+  if (team) pending.push([teamInbox.path, team]);
+  fixture.invoke.mockResolvedValueOnce(pending);
+  await useAppStore.getState().getPendingFiles();
+}
+
+function pendingRow(popup: ReactNode, path: string) {
+  return findElement(popup, (element) => element.type === "label" && element.props.title === path);
+}
+
+it.each([
+  ["report.pdf", "report.pdf"],
+  ["photo.JPG", "PHOTO.jpg"],
+])("shows the parent in the checkbox label for %s and %s", async (personal, team) => {
+  await loadFolderList([personalInbox, teamInbox]);
+  await publishInboxFiles(personal, team);
+  const popup = renderRetainedPopup();
+  const rows = [pendingRow(popup, personalPath(personal)), pendingRow(popup, teamPath(team)), pendingRow(popup, personalPath("unique.txt"))];
+  for (const row of rows) expect(findElement(row, (element) => element.type === "input")).toBeDefined();
+  expect(rows.map(label)).toEqual([personal + " " + personalInbox.path, team + " " + teamInbox.path, "unique.txt"]);
+});
+
+it("keeps exact selection when a same-named arrival disappears", async () => {
+  await loadFolderList([personalInbox, teamInbox]);
+  await publishInboxFiles("report.pdf", "report.pdf");
+  const popup = renderRetainedPopup();
+  const personal = findElement(pendingRow(popup, personalPath("report.pdf")), (element) => element.type === "input");
+  const team = findElement(pendingRow(popup, teamPath("report.pdf")), (element) => element.type === "input");
+  expect(personal).toBeDefined();
+  expect(team).toBeDefined();
+  personal?.props.onChange?.({ target: { checked: true } });
+  const refreshed = renderRetainedPopup();
+  expect(findElement(pendingRow(refreshed, personalPath("report.pdf")), (element) => element.type === "input")?.props.checked).toBe(true);
+  expect(findElement(pendingRow(refreshed, teamPath("report.pdf")), (element) => element.type === "input")?.props.checked).toBe(false);
+
+  await publishInboxFiles("report.pdf");
+  const remaining = renderRetainedPopup();
+  expect(pendingCheckbox(remaining, "report.pdf").checked).toBe(true);
+  fixture.invoke.mockClear().mockResolvedValueOnce(undefined);
+  const review = findElement(remaining, (element) => element.type === "button" && label(element).startsWith("Review queue ("))?.props.onClick;
+  expect(review).toBeTypeOf("function");
+  await review?.();
+  expect(fixture.invoke.mock.calls).toEqual([["show_review_cmd", { paths: [personalPath("report.pdf")] }]]);
+});
+
 it("takes a confirmed zero-folder popup directly to Watched Folders", async () => {
   await loadFolderList([]);
   fixture.invoke.mockResolvedValueOnce(undefined);

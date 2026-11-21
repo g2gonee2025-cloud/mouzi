@@ -140,10 +140,19 @@ export default function Popup() {
     }
   };
 
-  const pendingPaths = pendingFiles.map((file) => ({
-    name: file[1],
-    path: pendingFilePath(file),
-  }));
+  const pendingNameCounts = new Map<string, number>();
+  for (const [, name] of pendingFiles) {
+    const key = name.toLowerCase();
+    pendingNameCounts.set(key, (pendingNameCounts.get(key) ?? 0) + 1);
+  }
+  const pendingPaths = pendingFiles.map((file) => {
+    const [folder, name] = file;
+    return {
+      name,
+      path: pendingFilePath(file),
+      visibleFolder: (pendingNameCounts.get(name.toLowerCase()) ?? 0) > 1 ? folder : null,
+    };
+  });
   const reviewSelection = () => {
     const { folders, folderRead, pendingFiles, pendingReadStatus, selectedPendingPaths } = useAppStore.getState();
     if (pendingReadStatus !== "ready" || folderRead.status !== "ready" || folders.length === 0) return;
@@ -253,11 +262,16 @@ export default function Popup() {
         <ActionRefreshWarnings />
         {showPendingFiles && <div className="mt-2 space-y-2">
           <div className="max-h-24 space-y-1 overflow-auto text-xs">
-            {pendingPaths.map(({ name, path }) => <label key={path} className="flex items-center gap-2" title={path}>
-              <input type="checkbox" checked={selectedPendingPaths.has(path)}
-                onChange={(event) => setPendingFileSelected(path, event.target.checked)} />
-              <span className="truncate">{name}</span>
-            </label>)}
+            {pendingPaths.map(({ name, path, visibleFolder }) => (
+              <label key={path} className="flex items-start gap-2" title={path}>
+                <input type="checkbox" className="mt-0.5 shrink-0" checked={selectedPendingPaths.has(path)}
+                  onChange={(event) => setPendingFileSelected(path, event.target.checked)} />
+                <span className="min-w-0">
+                  <span className={visibleFolder ? "block wrap-anywhere" : "block truncate"} dir="auto">{name}</span>
+                  {visibleFolder && <>{" "}<span className="block wrap-anywhere text-text-muted" dir="auto">{visibleFolder}</span></>}
+                </span>
+              </label>
+            ))}
           </div>
           <button type="button" disabled={!selectedPendingPaths.size} className="text-xs text-primary underline disabled:opacity-50"
             onClick={reviewSelection}>{t("beta.review")} ({selectedPendingPaths.size})</button>
