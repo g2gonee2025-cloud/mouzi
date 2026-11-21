@@ -41,6 +41,7 @@ export interface SuggestionPlan {
   path: string;
   category: string;
   destination: string;
+  size: number;
   rule: SuggestionRulePreview | null;
 }
 export function distinctSuggestionRules(plans: readonly SuggestionPlan[]): SuggestionRulePreview[] {

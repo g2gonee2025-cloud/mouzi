@@ -111,6 +111,7 @@ export default function Suggestions() {
       setPending({
         title: captured.length === 1 ? t("suggestions.accept") : t("confirm.op.acceptAll"),
         count: plans.length,
+        bytes: plans.reduce((total, plan) => total + plan.size, 0),
         notice: "move",
         note: ruleNotes.length ? [t("suggestions.ruleCount", { count: rules.filter((r) => r.disposition === "create").length }), ...ruleNotes].join("\n") : undefined,
         preview: plans.map((plan) => `${plan.path} → ${plan.destination}`),

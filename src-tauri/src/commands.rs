@@ -1878,6 +1878,7 @@ pub struct SuggestionPlanPreview {
     pub path: String,
     pub category: String,
     pub destination: String,
+    pub size: u64,
     pub rule: Option<SuggestionRulePreview>,
 }
 
@@ -2137,6 +2138,7 @@ fn prepare_suggestion_review(
             path,
             category: suggested_category,
             destination: destination.to_string_lossy().into_owned(),
+            size: content.size,
             rule,
         };
         reviewed.push(SuggestionPlan {
@@ -3768,6 +3770,8 @@ mod accept_tests {
         std::fs::write(&first, b"first").unwrap();
         std::fs::write(&second, b"second").unwrap();
         index_fixture(&fixture);
+        // Review must use the file that was actually hashed, even after a scan.
+        std::fs::write(&second, b"updated second").unwrap();
 
         let reviewed = prepare_suggestions(vec![
             suggestion_request(&first, "Documents"), suggestion_request(&second, "Documents"),
@@ -3775,9 +3779,12 @@ mod accept_tests {
         assert!(reviewed[0].destination.ends_with("report.xyz"));
         assert!(reviewed[1].destination.ends_with("report_0.xyz"));
         assert_ne!(reviewed[0].destination, reviewed[1].destination);
+        let wire = serde_json::to_value(&reviewed).unwrap();
+        assert_eq!(wire[0]["size"].as_u64(), Some(5));
+        assert_eq!(wire[1]["size"].as_u64(), Some(14));
 
         let ignored = ignored_files();
-        for (plan, payload) in reviewed.iter().zip([b"first".as_slice(), b"second".as_slice()]) {
+        for (plan, payload) in reviewed.iter().zip([b"first".as_slice(), b"updated second".as_slice()]) {
             let outcome = accept_reviewed_suggestion(&plan.plan_id, &ignored).unwrap();
             assert_eq!(outcome.status, "ok");
             assert_eq!(outcome.dest.as_deref(), Some(plan.destination.as_str()));
