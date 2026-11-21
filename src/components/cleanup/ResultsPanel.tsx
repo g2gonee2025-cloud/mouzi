@@ -1,6 +1,7 @@
 import type { Ref } from "react";
 import { useTranslation } from "react-i18next";
 import {
+  cleanupStatusLabel,
   cleanupStatusMark,
   cleanupSummaryRows,
   type CleanupOutcome,
@@ -52,33 +53,34 @@ export default function ResultsPanel({
       </div>
 
       <div className="rounded-lg border border-border bg-surface-dark overflow-hidden">
-        <div className="max-h-72 overflow-auto">
+        <ul className="max-h-72 overflow-auto">
           {results.map((r) => {
             const fname =
               r.path.split("\\").pop()?.split("/").pop() || r.path;
             const mark = cleanupStatusMark(r.status);
             const Icon = mark.icon;
             return (
-              <div
+              <li
                 key={r.path}
                 className="flex items-start gap-2 px-3 py-2 border-b border-border last:border-0"
               >
-                <Icon size={14} className={`${mark.className} mt-0.5 shrink-0`} />
-                <div className="min-w-0">
+                <Icon size={14} aria-hidden="true" className={`${mark.className} mt-0.5 shrink-0`} />
+                <div className="min-w-0 flex-1">
                   <div className="text-xs text-text truncate">{fname}</div>
-                  <div className="text-[10px] text-text-muted truncate">
+                  <div className="break-all text-[10px] text-text-muted">
                     {r.path}
                   </div>
+                  <p className="text-xs font-medium text-text">{t(cleanupStatusLabel(r.status))}</p>
                   {r.message && (
                     <div className="text-[10px] text-text-muted">
                       {r.message}
                     </div>
                   )}
                 </div>
-              </div>
+              </li>
             );
           })}
-        </div>
+        </ul>
       </div>
     </div>
   );
