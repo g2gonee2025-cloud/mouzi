@@ -10,7 +10,8 @@
 # version tag was pushed. This fork keeps the upstream product name and the
 # upstream app identifier (cc.mouzi.app) while making no releases at all, so a
 # tag-triggered release would publish the upstream's product under the
-# upstream's identity. Those five workflows were deleted rather than disabled.
+# upstream's identity. The five original workflows are preserved as references
+# in .github/upstream-workflows, outside GitHub's active workflows directory.
 # Do not reintroduce signing, publishing or release steps without an explicit
 # decision about this fork's distribution model.
 
