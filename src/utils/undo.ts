@@ -73,10 +73,11 @@ export function undoNotice(result: UndoResult): UndoNotice[] {
   ];
 }
 
-function undoDetails(result: UndoResult): UndoNotice[] {
+function undoDetails(result: UndoResult, reportedRestorePaths?: Set<string>): UndoNotice[] {
   const notices: UndoNotice[] = [];
   const historyPending = result.status === "restored_pending";
-  if (MOVED_BACK[result.status] && result.restoredTo) {
+  if (MOVED_BACK[result.status] && result.restoredTo && !reportedRestorePaths?.has(result.restoredTo)) {
+    reportedRestorePaths?.add(result.restoredTo);
     notices.push({
       tone: historyPending ? "warning" : "success",
       key: "undo.restoredTo",
@@ -117,6 +118,7 @@ export function undoAllNotices(result: UndoAllResult): UndoNotice[] {
   const breakdown = undoAllBreakdown(result.results);
   const incomplete = breakdown.restoredPending + breakdown.missing + breakdown.failed;
   const notices: UndoNotice[] = [];
+  const reportedRestorePaths = new Set<string>();
 
   if (breakdown.total === 0) {
     // Reuses the history button's own disabled hint rather than a new string
@@ -141,6 +143,9 @@ export function undoAllNotices(result: UndoAllResult): UndoNotice[] {
       key: "undo.allCollision",
       values: { count: breakdown.collision },
     });
+    for (const row of result.results) {
+      if (row.status === "collision") notices.push(...undoDetails(row, reportedRestorePaths));
+    }
   }
   if (breakdown.restoredPending > 0) {
     notices.push({
@@ -149,7 +154,7 @@ export function undoAllNotices(result: UndoAllResult): UndoNotice[] {
       values: { count: breakdown.restoredPending },
     });
     for (const row of result.results) {
-      if (row.status === "restored_pending") notices.push(...undoDetails(row));
+      if (row.status === "restored_pending") notices.push(...undoDetails(row, reportedRestorePaths));
     }
   }
   if (breakdown.missing > 0) {

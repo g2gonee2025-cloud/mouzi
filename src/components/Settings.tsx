@@ -324,15 +324,14 @@ export default function Settings() {
   const [replaceOnImport, setReplaceOnImport] = useState(false);
   const [pending, setPending] = useState<ConfirmRequest | null>(null);
   const sectionHeading = useRef<HTMLHeadingElement>(null);
-  const [undoToast, setUndoToast] = useState<UndoNotice[] | null>(null);
+  const [undoReceipt, setUndoReceipt] = useState<UndoNotice[] | null>(null);
+  const undoReceiptHasPaths = undoReceipt?.some((notice) => notice.key === "undo.restoredTo") ?? false;
 
-  // 8s, not the 3s the export/import toasts use: a `collision` line ends in a
-  // filesystem path, and 3s cuts it off before it can be read or copied.
   useEffect(() => {
-    if (!undoToast) return;
-    const timer = setTimeout(() => setUndoToast(null), 8000);
+    if (!undoReceipt || undoReceiptHasPaths) return;
+    const timer = setTimeout(() => setUndoReceipt(null), 8000);
     return () => clearTimeout(timer);
-  }, [undoToast]);
+  }, [undoReceipt, undoReceiptHasPaths]);
 
   useEffect(() => {
     Promise.all([loadRules(), loadFolders().catch(() => {}), loadLogs(), getSchedule()])
@@ -535,7 +534,7 @@ export default function Settings() {
         opener,
         focusFallback: () => sectionHeading.current,
         onConfirm: async () => {
-          setUndoToast(undoAllNotices(await undoAll(reviewedIds)));
+          setUndoReceipt(undoAllNotices(await undoAll(reviewedIds)));
         },
       });
     } catch (e) {
@@ -1112,16 +1111,30 @@ export default function Settings() {
               </div>
             </div>
             <ActionRefreshWarnings />
-            {undoToast && (
-              <div role="status" aria-live="polite" className="space-y-1">
-                {undoToast.map((notice, index) => (
-                  <div
-                    key={`${notice.key}-${index}`}
-                    className={`rounded-md px-3 py-2 text-xs ${UNDO_TONE_CLASS[notice.tone]}`}
-                  >
-                    {t(notice.key, notice.values)}
-                  </div>
-                ))}
+            {undoReceipt && (
+              <div className="space-y-2">
+                <div
+                  role="status"
+                  aria-live="polite"
+                  aria-label={undoReceiptHasPaths ? t("beta.results") : undefined}
+                  tabIndex={undoReceiptHasPaths ? 0 : undefined}
+                  className={undoReceiptHasPaths ? "max-h-64 space-y-1 overflow-y-auto" : "space-y-1"}
+                >
+                  {undoReceipt.map((notice, index) => (
+                    <div
+                      key={`${notice.key}-${index}`}
+                      className={`rounded-md px-3 py-2 text-xs whitespace-pre-wrap [overflow-wrap:anywhere] ${UNDO_TONE_CLASS[notice.tone]}`}
+                    >
+                      {t(notice.key, notice.values)}
+                    </div>
+                  ))}
+                </div>
+                {undoReceiptHasPaths && (
+                  <button type="button" className="text-sm underline" onClick={() => {
+                    setUndoReceipt(null);
+                    sectionHeading.current?.focus();
+                  }}>{t("common.dismiss")}</button>
+                )}
               </div>
             )}
             <HistoryView />
