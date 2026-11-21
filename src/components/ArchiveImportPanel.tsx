@@ -48,7 +48,7 @@ export default function ArchiveImportPanel() {
   const openImportFolder = async (path: string) => {
     setFolderError(null);
     try {
-      await invoke("open_folder_cmd", { path });
+      await invoke("open_folder_cmd", { path, directoryOnly: true });
     } catch (error) {
       setFolderError({ path, message: String(error) });
     }
