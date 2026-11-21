@@ -135,8 +135,9 @@ function verifiedFolderId(folder: WatchedFolder): number | undefined {
 
 type SchedulerRun = {
   id: number;
-  status: "claimed" | "running" | "completed" | "failed" | "interrupted";
+  status: string;
   claimed_at: string;
+  occurrences: number;
   organized: number;
   errors: number;
   deferred: number;
@@ -144,29 +145,43 @@ type SchedulerRun = {
   message: string | null;
 };
 
+const schedulerRunStatuses = new Set(["claimed", "running", "completed", "failed", "interrupted"]);
+
+function schedulerRunMessageKey({ status, message }: SchedulerRun) {
+  if (status !== "interrupted") return;
+  if (message === "Schedule settings changed during the run") return "settings.scheduler.settingsChanged";
+  if (message === "The app closed before this run finished") return "settings.scheduler.appClosed";
+}
+
 function SchedulerRunStatus() {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const [runs, setRuns] = useState<SchedulerRun[]>([]);
-  const [error, setError] = useState<string | null>(null);
+  const [readError, setReadError] = useState<string | null>(null);
+  const [resultUnsaved, setResultUnsaved] = useState(false);
+  const refreshRuns = useRef<(() => Promise<void>) | null>(null);
 
   useEffect(() => {
     let disposed = false;
     let request = 0;
     let unlisten: (() => void) | undefined;
-    const refresh = async (resultSaved = true) => {
+    const refresh = async () => {
       const current = ++request;
       try {
         const runs = await invoke<SchedulerRun[]>("get_recent_scheduler_runs_cmd");
         if (!disposed && current === request) {
           setRuns(runs);
-          setError(resultSaved ? null : "The latest result could not be saved.");
+          setReadError(null);
         }
       } catch (cause) {
-        if (!disposed && current === request) setError(String(cause));
+        if (!disposed && current === request) setReadError(String(cause));
       }
     };
+    refreshRuns.current = refresh;
     listen<{ result_saved: boolean }>("scheduled-clean-done", ({ payload }) => {
-      if (!disposed) void refresh(payload.result_saved);
+      if (!disposed) {
+        setResultUnsaved(!payload.result_saved);
+        void refresh();
+      }
     }).then((stop) => {
       if (disposed) stop();
       else {
@@ -174,32 +189,49 @@ function SchedulerRunStatus() {
         if (!request) void refresh();
       }
     }).catch(() => { if (!disposed) void refresh(); });
-    return () => { disposed = true; unlisten?.(); };
+    return () => {
+      disposed = true;
+      refreshRuns.current = null;
+      unlisten?.();
+    };
   }, []);
 
-  if (!runs.length && !error) return null;
-  const title = t("settings.scheduler.recentRuns", { defaultValue: "Recent scheduled runs" });
+  if (!runs.length && readError === null && !resultUnsaved) return null;
+  const title = t("settings.scheduler.recentRuns");
+  const locale = i18n.resolvedLanguage ?? i18n.language;
   return (
     <div className="text-xs text-text-muted space-y-1">
       <p className="font-medium">{title}</p>
       {runs.length > 0 && (
         <ul aria-label={title} tabIndex={0} className="max-h-64 overflow-y-auto space-y-2">
-          {runs.map((run) => (
-            <li key={run.id}>
-              <p>{new Date(run.claimed_at).toLocaleString()} · {t(`settings.scheduler.status.${run.status}`, { defaultValue: run.status })}</p>
-              <p>{t("settings.scheduler.runCounts", {
-                defaultValue: "Organized {{organized}} · Errors {{errors}} · Deferred {{deferred}}",
-                organized: run.organized, errors: run.errors, deferred: run.deferred,
-              })}</p>
-              {run.uncertain > 0 && <p>{t("settings.scheduler.pendingRecovery", {
-                defaultValue: "Move records needing review: {{count}}", count: run.uncertain,
-              })}</p>}
-              {run.message && <p className="break-words">{run.message}</p>}
-            </li>
-          ))}
+          {runs.map((run) => {
+            const claimedAt = new Date(run.claimed_at);
+            const time = Number.isNaN(claimedAt.getTime()) ? run.claimed_at : claimedAt.toLocaleString(locale);
+            const status = schedulerRunStatuses.has(run.status) ? t(`settings.scheduler.status.${run.status}`) : run.status;
+            const messageKey = schedulerRunMessageKey(run);
+            return (
+              <li key={run.id}>
+                <p>{time} · {status}</p>
+                <p>{t("settings.scheduler.scheduledTimes", {
+                  count: run.occurrences, occurrences: run.occurrences,
+                })}</p>
+                <p>{t("settings.scheduler.runCounts", {
+                  organized: run.organized, errors: run.errors, deferred: run.deferred,
+                })}</p>
+                {run.uncertain > 0 && <p>{t("settings.scheduler.pendingRecovery", { count: run.uncertain })}</p>}
+                {run.message && <p className="break-words">{messageKey ? t(messageKey) : run.message}</p>}
+              </li>
+            );
+          })}
         </ul>
       )}
-      {error && <p role="status" className="break-words">{error}</p>}
+      {resultUnsaved && <p role="status">{t("settings.scheduler.resultUnsaved")}</p>}
+      {readError !== null && (
+        <div>
+          <p role="status" className="break-words">{t("settings.scheduler.readError", { error: readError })}</p>
+          <button type="button" className="underline" onClick={() => void refreshRuns.current?.()}>{t("common.retry")}</button>
+        </div>
+      )}
     </div>
   );
 }
