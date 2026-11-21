@@ -1393,7 +1393,8 @@ fn write_rule_export(path: &Path, bytes: &[u8]) -> Result<(), String> {
 }
 
 fn decode_rule_transfer(data: &[u8]) -> Result<Vec<RuleTransferEntry>, String> {
-    let input: RuleTransferInput = serde_json::from_slice(data).map_err(|error| error.to_string())?;
+    let json = data.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(data);
+    let input: RuleTransferInput = serde_json::from_slice(json).map_err(|error| error.to_string())?;
     let entries = match input {
         RuleTransferInput::Legacy(rules) => {
             if let Some(rule) = rules.iter().find(|rule| rule.folder_id != 0) {
