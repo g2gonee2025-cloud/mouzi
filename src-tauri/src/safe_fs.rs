@@ -359,7 +359,7 @@ fn inspect_watched_root(path: &Path) -> Result<(PathBuf, FileIdentity), Director
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ScopedRoot { path: PathBuf, identity: FileIdentity, active: bool }
+struct ScopedRoot { path: PathBuf, identity: FileIdentity, blocked_reason: Option<&'static str> }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RootScope {
@@ -389,12 +389,18 @@ pub fn eligible_scope(folders: &[crate::db::WatchedFolder]) -> Result<RootScope,
         // A present replacement still owns this subtree for exclusion purposes.
         // Omitting it would give a watched ancestor authority over its contents.
         let bound = folder.id.is_none() || folder.watch_identity.as_ref() == Some(&identity.key());
-        if active && !bound { unavailable_active.push(folder.path.clone()); }
-        let active = active && bound;
+        let blocked_reason = if !active {
+            Some("The owning root is disabled or paused")
+        } else if !bound {
+            unavailable_active.push(folder.path.clone());
+            Some("The owning folder does not match a saved folder identity")
+        } else {
+            None
+        };
         if let Some(existing) = roots.iter_mut().find(|root| root.identity == identity) {
             // Conflicting legacy aliases fail closed rather than enabling an inactive root.
-            existing.active &= active;
-        } else { roots.push(ScopedRoot { path, identity, active }); }
+            existing.blocked_reason = existing.blocked_reason.or(blocked_reason);
+        } else { roots.push(ScopedRoot { path, identity, blocked_reason }); }
     }
     Ok(RootScope { roots, missing, unavailable_active })
 }
@@ -439,7 +445,7 @@ fn has_stream_syntax(path: &Path) -> bool {
 }
 
 impl RootScope {
-    pub fn active_roots(&self) -> Vec<PathBuf> { self.roots.iter().filter(|r| r.active).map(|r| r.path.clone()).collect() }
+    pub fn active_roots(&self) -> Vec<PathBuf> { self.roots.iter().filter(|r| r.blocked_reason.is_none()).map(|r| r.path.clone()).collect() }
     pub fn root_identities(&self) -> Vec<FileIdentity> { self.roots.iter().map(|r| r.identity.clone()).collect() }
     pub(crate) fn unavailable_active_roots(&self) -> Vec<String> {
         self.unavailable_active.clone()
@@ -474,7 +480,7 @@ impl RootScope {
         let identities = ancestors.iter().map(identity_from_handle).collect::<Result<Vec<_>, _>>()?;
         let owner = identities.iter().find_map(|identity| self.roots.iter().find(|root| &root.identity == identity))
             .ok_or("Target is not strictly below a registered root")?;
-        if !owner.active { return Err("The owning folder has no active registration for its current identity".into()); }
+        if let Some(reason) = owner.blocked_reason { return Err(reason.into()); }
         let canonical = std::fs::canonicalize(path).map_err(|e| e.to_string())?;
         if file_identity(&canonical)? != identity { return Err("Target changed identity during validation".into()); }
         Ok((canonical, identity, file, metadata, AncestorGuard { _files: ancestors }, owner.path.clone()))

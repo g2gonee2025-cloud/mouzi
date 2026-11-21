@@ -408,6 +408,8 @@ fn manual_review_skips_replaced_and_unbound_nested_roots_until_registered_identi
     fs::create_dir(&registered).unwrap();
     fs::write(&candidate, "replacement").unwrap();
     review(false, false);
+    let scope = crate::safe_fs::eligible_scope(&db::get_watched_folders().unwrap()).unwrap();
+    assert!(scope.validate_file(&candidate).unwrap_err().contains("saved folder identity"));
     assert!(rules::manual_scan_folder_with_suppression(registered.to_str().unwrap(), &fixture.suppression)
         .unwrap_err().contains("different physical folder"));
     assert_eq!(fs::read(&candidate).unwrap(), b"replacement");
