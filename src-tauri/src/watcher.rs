@@ -1,10 +1,12 @@
 use crate::db::{get_settings, get_watched_folders, is_folder_auto_mode, is_folder_manual_mode, WatchedFolder};
 use crate::ignore::IgnorePatterns;
+use crate::operations::ProcessedCheckError;
 use crate::rules::{is_file_ignored_by_mouziignore, organization_path_is_protected_with, process_watched_file, same_path, should_ignore_file, ProcessOutcome, WatchedRoot};
 use crate::safe_fs::FileIdentity;
 use crate::suppress::{CancellationTicket, SuppressionSet};
 use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -82,9 +84,43 @@ impl Drop for ActiveWatch {
 }
 
 struct WatchFailure {
-    message: String,
+    cause: CatchUpFailure,
     retry_at: Instant,
     delay: Duration,
+}
+
+#[derive(Debug)]
+struct CatchUpFailure {
+    message: String,
+    // Present only after a complete enumeration under this active watcher.
+    // New changes remain the responsibility of the installed notification callback.
+    entries: Option<Vec<OsString>>,
+}
+
+impl From<String> for CatchUpFailure {
+    fn from(message: String) -> Self { Self { message, entries: None } }
+}
+
+#[derive(Debug)]
+enum EnqueueError {
+    Entry(String),
+    Root(String),
+}
+
+impl From<String> for EnqueueError {
+    fn from(message: String) -> Self { Self::Root(message) }
+}
+
+impl EnqueueError {
+    fn into_message(self) -> String {
+        match self { Self::Entry(message) | Self::Root(message) => message }
+    }
+}
+
+#[derive(PartialEq, Eq)]
+enum EnqueueSource {
+    CatchUp,
+    Notification,
 }
 
 struct PendingReview {
@@ -349,7 +385,7 @@ impl FolderWatcher {
                     let error = if retired { warning.unwrap_or(error) } else { error };
                     queues_changed = true;
                     errors.push(format!("{}: {error}", folder.path));
-                    self.record_watch_failure(&folder.path, error, now);
+                    self.record_watch_failure(&folder.path, error.into(), now);
                     continue;
                 }
                 if watch.mode == folder.mode && !self.failures.contains_key(&folder.path) {
@@ -359,8 +395,15 @@ impl FolderWatcher {
             if !force && self.failures.get(&folder.path).is_some_and(|failure| now < failure.retry_at) {
                 continue;
             }
-            let result = self.ensure_watch(folder, allow_legacy)
-                .and_then(|root| self.enqueue_existing_files(&root, self.app_handle.as_ref()));
+            let retry_entries = !force && self.watchers.get(&folder.path)
+                .is_some_and(|watch| watch.mode == folder.mode);
+            let result = self.ensure_watch(folder, allow_legacy).map_err(CatchUpFailure::from)
+                .and_then(|root| {
+                    let entries = if retry_entries {
+                        self.failures.get(&folder.path).and_then(|failure| failure.cause.entries.as_deref())
+                    } else { None };
+                    self.enqueue_existing_files(&root, self.app_handle.as_ref(), entries)
+                });
             match result {
                 Ok(()) => {
                     queues_changed = true;
@@ -369,9 +412,9 @@ impl FolderWatcher {
                         report_health(app, &folder.path, "active", None);
                     }
                 }
-                Err(error) => {
-                    errors.push(format!("{}: {error}", folder.path));
-                    self.record_watch_failure(&folder.path, error, now);
+                Err(failure) => {
+                    errors.push(format!("{}: {}", folder.path, failure.message));
+                    self.record_watch_failure(&folder.path, failure, now);
                 }
             }
         }
@@ -384,14 +427,14 @@ impl FolderWatcher {
         if errors.is_empty() { Ok(()) } else { Err(errors.join("; ")) }
     }
 
-    fn record_watch_failure(&mut self, path: &str, error: String, now: Instant) {
+    fn record_watch_failure(&mut self, path: &str, cause: CatchUpFailure, now: Instant) {
         let previous = self.failures.get(path);
-        let changed = previous.is_none_or(|failure| failure.message != error);
+        let changed = previous.is_none_or(|failure| failure.cause.message != cause.message);
         let delay = previous.map_or(WATCH_CHECK_INTERVAL, |failure| (failure.delay * 2).min(MAX_WATCH_RETRY_DELAY));
-        self.failures.insert(path.to_owned(), WatchFailure { message: error.clone(), retry_at: now + delay, delay });
+        self.failures.insert(path.to_owned(), WatchFailure { cause, retry_at: now + delay, delay });
         if changed {
             if let Some(app) = self.app_handle.as_ref() {
-                report_health(app, path, "error", Some(&error));
+                report_health(app, path, "error", Some(&self.failures[path].cause.message));
             }
         }
     }
@@ -436,7 +479,9 @@ impl FolderWatcher {
                         crate::db::forget_removed_baseline(callback_root.id, &path, &callback_root.path)
                             .map_err(|error| error.to_string())?;
                     }
-                    enqueue_path(&path, &callback_root, &pending, &manual, &suppression, app.as_ref())
+                    enqueue_path(&path, EnqueueSource::Notification, &callback_root, &pending,
+                        &manual, &suppression, app.as_ref())
+                        .map_err(EnqueueError::into_message)
                 })();
                 if let Err(error) = result {
                     if warning.is_none() {
@@ -457,11 +502,41 @@ impl FolderWatcher {
         Ok(root)
     }
 
-    fn enqueue_existing_files(&self, root: &Arc<WatchedRoot>, app: Option<&tauri::AppHandle>) -> Result<(), String> {
+    fn enqueue_existing_files(&self, root: &Arc<WatchedRoot>, app: Option<&tauri::AppHandle>,
+        retry_entries: Option<&[OsString]>) -> Result<(), CatchUpFailure> {
         let _guard = root.guard_physical()?;
-        for entry in std::fs::read_dir(&root.path).map_err(|error| error.to_string())? {
-            let path = entry.map_err(|error| error.to_string())?.path();
-            enqueue_path(&path, root, &self.pending, &self.pending_manual, &self.suppression, app)?;
+        let mut failed_entries = Vec::new();
+        let mut example = None;
+        let mut enqueue = |name: OsString| -> Result<(), String> {
+            let path = root.path.join(&name);
+            match enqueue_path(&path, EnqueueSource::CatchUp, root, &self.pending,
+                &self.pending_manual, &self.suppression, app) {
+                Ok(()) => Ok(()),
+                Err(EnqueueError::Root(error)) => Err(error),
+                Err(EnqueueError::Entry(error)) => {
+                    example.get_or_insert_with(|| format!("{}: {error}", path.display()));
+                    failed_entries.push(name);
+                    Ok(())
+                }
+            }
+        };
+        if let Some(entries) = retry_entries {
+            for name in entries { enqueue(name.clone())?; }
+        } else {
+            for entry in std::fs::read_dir(&root.path).map_err(|error| error.to_string())? {
+                enqueue(entry.map_err(|error| error.to_string())?.file_name())?;
+            }
+        }
+        if let Some(example) = example {
+            let message = if failed_entries.len() == 1 {
+                format!("Could not check this file during watcher catch-up: {example}")
+            } else {
+                format!("Could not check {} files during watcher catch-up. First error: {example}", failed_entries.len())
+            };
+            return Err(CatchUpFailure {
+                message,
+                entries: Some(failed_entries),
+            });
         }
         Ok(())
     }
@@ -474,12 +549,17 @@ impl FolderWatcher {
             folder.id == Some(id) && folder.enabled && !folder.only_new
                 && (is_folder_auto_mode(&folder.mode) || is_folder_manual_mode(&folder.mode))
         }) else { return Ok(()); };
-        let result = self.ensure_watch(folder, false)
-            .and_then(|root| self.enqueue_existing_files(&root, self.app_handle.as_ref()));
-        if let (Some(app), Err(error)) = (&self.app_handle, &result) {
-            report_health(app, &folder.path, "error", Some(error));
+        let result = self.ensure_watch(folder, false).map_err(CatchUpFailure::from)
+            .and_then(|root| self.enqueue_existing_files(&root, self.app_handle.as_ref(), None));
+        if let Err(failure) = result {
+            let message = failure.message.clone();
+            self.record_watch_failure(&folder.path, failure, Instant::now());
+            return Err(message);
         }
-        result
+        if self.failures.remove(&folder.path).is_some() {
+            if let Some(app) = self.app_handle.as_ref() { report_health(app, &folder.path, "active", None); }
+        }
+        Ok(())
     }
 
     pub fn refresh(&mut self, app_handle: tauri::AppHandle) -> Result<(), String> {
@@ -489,7 +569,7 @@ impl FolderWatcher {
 
     pub(crate) fn issues(&self) -> HashMap<String, String> {
         let mut issues = self.callback_warnings.lock().unwrap_or_else(|error| error.into_inner()).clone();
-        issues.extend(self.failures.iter().map(|(path, failure)| (path.clone(), failure.message.clone())));
+        issues.extend(self.failures.iter().map(|(path, failure)| (path.clone(), failure.cause.message.clone())));
         issues
     }
 
@@ -584,11 +664,11 @@ fn auto_root_is_current(root: &WatchedRoot) -> bool {
         && root.guard_physical().is_ok()
 }
 
-fn path_is_baselined(path: &Path, folder: &WatchedFolder) -> Result<bool, String> {
+fn path_is_baselined(path: &Path, folder: &WatchedFolder) -> Result<bool, EnqueueError> {
     if !folder.only_new { return Ok(false); }
-    let canonical = std::fs::canonicalize(path).map_err(|error| error.to_string())?;
+    let canonical = std::fs::canonicalize(path).map_err(|error| EnqueueError::Entry(error.to_string()))?;
     crate::db::is_organization_baseline(&path.to_string_lossy(), &canonical.to_string_lossy())
-        .map_err(|error| error.to_string())
+        .map_err(|error| EnqueueError::Root(error.to_string()))
 }
 
 fn pending_review_is_current(path: &Path, root: &WatchedRoot, folders: &[WatchedFolder]) -> Result<bool, String> {
@@ -598,7 +678,7 @@ fn pending_review_is_current(path: &Path, root: &WatchedRoot, folders: &[Watched
             || (is_folder_auto_mode(&folder.mode) && crate::operations::suspicious_name(path)))
     }) else { return Ok(false); };
     match std::fs::metadata(path) {
-        Ok(metadata) => Ok(metadata.is_file() && !path_is_baselined(path, folder)?),
+        Ok(metadata) => Ok(metadata.is_file() && !path_is_baselined(path, folder).map_err(EnqueueError::into_message)?),
         Err(error) if matches!(error.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory) => Ok(false),
         Err(error) => Err(format!("Cannot inspect pending file {}: {error}", path.display())),
     }
@@ -613,8 +693,8 @@ fn update_pending_tooltip(app: &tauri::AppHandle, manual: &Arc<PendingManual>) {
     });
 }
 
-fn enqueue_path(path: &Path, root: &Arc<WatchedRoot>, pending: &Mutex<Vec<PendingFile>>,
-    manual: &Arc<PendingManual>, suppression: &SuppressionSet, app: Option<&tauri::AppHandle>) -> Result<(), String> {
+fn enqueue_path(path: &Path, source: EnqueueSource, root: &Arc<WatchedRoot>, pending: &Mutex<Vec<PendingFile>>,
+    manual: &Arc<PendingManual>, suppression: &SuppressionSet, app: Option<&tauri::AppHandle>) -> Result<(), EnqueueError> {
     if !root.watch_is_active() || path.parent() != Some(root.path.as_path()) || !path.is_file() { return Ok(()); }
     let folders = get_watched_folders().map_err(|error| error.to_string())?;
     let Some(folder) = folders.iter().find(|folder| folder.enabled && root.matches_registration(folder)
@@ -624,7 +704,10 @@ fn enqueue_path(path: &Path, root: &Arc<WatchedRoot>, pending: &Mutex<Vec<Pendin
     if !path.is_file() || should_ignore_file(path) || suppression.is_suppressed(path, Instant::now())
         || is_file_ignored_by_mouziignore(path)? { return Ok(()); }
     if path_is_baselined(path, folder)? { return Ok(()); }
-    if crate::operations::already_processed(path)? { return Ok(()); }
+    if crate::operations::already_processed(path).map_err(|error| match error {
+        ProcessedCheckError::File(message) => EnqueueError::Entry(message),
+        ProcessedCheckError::Database(error) => EnqueueError::Root(error.to_string()),
+    })? { return Ok(()); }
     if is_folder_manual_mode(&folder.mode) || crate::operations::suspicious_name(path) {
         {
             let mut queue = manual.state.lock().unwrap_or_else(|error| error.into_inner());
@@ -633,8 +716,13 @@ fn enqueue_path(path: &Path, root: &Arc<WatchedRoot>, pending: &Mutex<Vec<Pendin
             // inserting, under the same queue lock as pruning.
             let folders = get_watched_folders().map_err(|error| error.to_string())?;
             if !pending_review_is_current(path, root, &folders)? { return Ok(()); }
+            let key = path.to_string_lossy();
+            if source == EnqueueSource::CatchUp && queue.arrivals.get(key.as_ref())
+                .is_some_and(|arrival| !arrival.excluded && Arc::ptr_eq(&arrival.root, root)) {
+                return Ok(());
+            }
             let previous = queue.arrivals.insert(
-                path.to_string_lossy().into_owned(),
+                key.into_owned(),
                 PendingReview { root: root.clone(), excluded: false },
             );
             if !queue.exclusions_unavailable && previous.is_none_or(|arrival| arrival.excluded) {
@@ -652,9 +740,19 @@ fn enqueue_path(path: &Path, root: &Arc<WatchedRoot>, pending: &Mutex<Vec<Pendin
         let mut item = pending_item(path, root, suppression, Duration::from_secs(settings.grace_period_seconds.max(2) as u64));
         let mut pending = pending.lock().unwrap_or_else(|error| error.into_inner());
         if !root.watch_is_active() { return Ok(()); }
+        if let Some(index) = pending.iter().position(|previous| same_path(&previous.path, path)) {
+            let previous = &pending[index];
+            // A real notification may have queued a recovery entry already.
+            // Keep its deadline if catch-up observes the same exact version.
+            if source == EnqueueSource::CatchUp && previous.ticket.is_current()
+                && Arc::ptr_eq(&previous.root, root) && previous.identity.is_some() && previous.identity == item.identity
+                && previous.fingerprint.is_some() && previous.fingerprint == item.fingerprint {
+                return Ok(());
+            }
+            pending.remove(index);
+        }
         suppression.invalidate(&[path.to_path_buf()]);
         item.ticket = suppression.ticket(path);
-        pending.retain(|previous| !same_path(&previous.path, path));
         pending.push(item);
     }
     Ok(())
@@ -827,7 +925,7 @@ mod tests {
         assert!(row.only_new);
         let mut watcher = FolderWatcher::new(Arc::new(SuppressionSet::new()));
         let root = watcher.ensure_watch(&row, false).unwrap();
-        watcher.enqueue_existing_files(&root, None).unwrap();
+        watcher.enqueue_existing_files(&root, None, None).unwrap();
         let pending = || ["new.txt".to_string(), "old.txt".to_string()];
         assert_eq!(watcher.get_pending_files().unwrap().into_iter().map(|(_, name)| name).collect::<Vec<_>>(), ["new.txt"]);
 
@@ -865,7 +963,8 @@ mod tests {
         let original = db::history_counts().unwrap().total;
         for (path, bytes) in [(&protected, b"protected contents".as_slice()), (&sibling, b"sibling contents".as_slice())] {
             fs::write(path, bytes).unwrap();
-            enqueue_path(path, &root, &watcher.pending, &watcher.pending_manual, &watcher.suppression, None).unwrap();
+            enqueue_path(path, EnqueueSource::Notification, &root, &watcher.pending,
+                &watcher.pending_manual, &watcher.suppression, None).unwrap();
         }
         let names = || {
             let mut found = watcher.get_pending_files().unwrap().into_iter().map(|(_, name)| name).collect::<Vec<_>>();
@@ -1042,8 +1141,169 @@ mod tests {
         let retry_at = watcher.failures[path].retry_at;
         watcher.reconcile_watches_for_folders(&folders, retry_at, false, false).unwrap();
         assert!(!Arc::ptr_eq(&watcher.watchers[path].root, &recovered));
-        enqueue_path(&arrival, &recovered, &watcher.pending, &watcher.pending_manual, &watcher.suppression, None).unwrap();
+        enqueue_path(&arrival, EnqueueSource::Notification, &recovered, &watcher.pending,
+            &watcher.pending_manual, &watcher.suppression, None).unwrap();
         assert!(Arc::ptr_eq(&watcher.pending_manual.state.lock().unwrap().arrivals[arrival.to_str().unwrap()].root, &watcher.watchers[path].root));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn catch_up_delivers_healthy_siblings_while_a_processed_file_is_write_open() {
+        use crate::db::{self, FOLDER_MODE_SILENT};
+        use std::fs;
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let _serial = db::serialise_test_db();
+        db::init_test_db();
+        let mut fixture = RecoveryFixture::new();
+        let root = fs::canonicalize(fixture.root()).unwrap();
+        let configured = root.to_str().unwrap();
+        let folder = db::register_watched_folder(configured, FOLDER_MODE_SILENT, false).unwrap();
+        fixture.id = Some(folder);
+        let rule = db::add_rule(&db::Rule {
+            name: "Catch-up recovery fixture".into(), priority: i32::MIN, enabled: true,
+            extensions: vec!["mouziwatchcatchup".into()], destination: "Filed".into(),
+            action: "move".into(), folder_id: folder, ..db::Rule::default()
+        }).unwrap();
+        let folders = get_watched_folders().unwrap().into_iter()
+            .filter(|entry| entry.id == Some(folder)).collect::<Vec<_>>();
+        let age = Duration::from_secs(get_settings().unwrap().grace_period_seconds.max(2) as u64 + 10);
+        for name in ["one", "two", "three"] {
+            let path = root.join(format!("{name}.mouziwatchcatchup"));
+            fs::write(&path, name.as_bytes()).unwrap();
+            fs::OpenOptions::new().write(true).open(path).unwrap()
+                .set_modified(SystemTime::now() - age).unwrap();
+        }
+        let entries = fs::read_dir(&root).unwrap().map(|entry| entry.unwrap().path()).collect::<Vec<_>>();
+        let [earlier, protected, later] = entries.as_slice() else { panic!("Expected three observed arrivals") };
+        let stored = format!("blake3:{}", blake3::hash(&fs::read(protected).unwrap()).to_hex());
+        struct RemoveRecords<'a> { root: &'a Path, entries: &'a [PathBuf], rule: i64 }
+        impl Drop for RemoveRecords<'_> {
+            fn drop(&mut self) {
+                if let Ok(conn) = db::lock_db() {
+                    for source in self.entries {
+                        let source_path = source.to_str().unwrap();
+                        let destination = self.root.join("Filed").join(source.file_name().unwrap());
+                        let _ = conn.execute("DELETE FROM action_logs WHERE source_path=?1", [source_path]);
+                        let _ = conn.execute("DELETE FROM operation_intents WHERE source_path=?1", [source_path]);
+                        let _ = conn.execute("DELETE FROM processed_files WHERE path IN (?1,?2)",
+                            [source_path, destination.to_str().unwrap()]);
+                    }
+                }
+                let _ = db::delete_rule(self.rule);
+            }
+        }
+        let _records = RemoveRecords { root: &root, entries: &entries, rule };
+        db::lock_db().unwrap().execute("INSERT INTO processed_files(path,fingerprint) VALUES(?1,?2)",
+            [protected.to_str().unwrap(), &stored]).unwrap();
+        assert!(crate::operations::already_processed(protected).unwrap());
+        // Ordinary Windows writers allow readers yet a guarded fingerprint read
+        // must still refuse them. Keep the writer open through both deliveries.
+        let writer = fs::OpenOptions::new().write(true).share_mode(1 | 2 | 4).open(protected).unwrap();
+        assert!(crate::safe_fs::open_guarded_regular_file(protected).err().unwrap().contains("os error 32"));
+        let protected_bytes = fs::read(protected).unwrap();
+        let sibling_bytes = [fs::read(earlier).unwrap(), fs::read(later).unwrap()];
+
+        let mut watcher = FolderWatcher::new(Arc::new(SuppressionSet::new()));
+        let now = Instant::now();
+        assert!(watcher.reconcile_watches_for_folders(&folders, now, false, true).is_err());
+        let snapshot = |watcher: &FolderWatcher| {
+            watcher.pending.lock().unwrap().iter()
+                .map(|item| (item.path.clone(), item.clone())).collect::<HashMap<_, _>>()
+        };
+        let initial = snapshot(&watcher);
+        assert_eq!(initial.len(), 2, "both observed healthy siblings must remain eligible");
+        for sibling in [earlier, later] { assert!(initial.contains_key(sibling)); }
+        assert!(!initial.contains_key(protected));
+        assert!(watcher.issues()[configured].contains(protected.to_str().unwrap()));
+
+        let first_retry = watcher.failures[configured].retry_at;
+        assert!(watcher.reconcile_watches_for_folders(&folders, first_retry - Duration::from_millis(1), false, false).is_ok());
+        assert_eq!(watcher.failures[configured].retry_at, first_retry);
+        assert!(watcher.reconcile_watches_for_folders(&folders, first_retry, false, false).is_err());
+        assert!(watcher.failures[configured].delay > WATCH_CHECK_INTERVAL);
+        let after_retry = snapshot(&watcher);
+        for sibling in [earlier, later] {
+            assert!(initial[sibling].ticket.is_current());
+            assert_eq!(initial[sibling].scheduled, after_retry[sibling].scheduled);
+            assert_eq!(initial[sibling].attempts, after_retry[sibling].attempts);
+        }
+        let ready = initial.values().map(|item| item.scheduled).max().unwrap();
+        assert_eq!(watcher.tick(ready).organized, 2);
+        for (sibling, bytes) in [earlier, later].into_iter().zip(sibling_bytes) {
+            assert!(!sibling.exists());
+            assert_eq!(fs::read(root.join("Filed").join(sibling.file_name().unwrap())).unwrap(), bytes);
+        }
+        assert!(watcher.issues().contains_key(configured));
+        assert_eq!(fs::read(protected).unwrap(), protected_bytes);
+
+        drop(writer);
+        assert!(crate::operations::already_processed(protected).unwrap());
+        let next_retry = watcher.failures[configured].retry_at;
+        watcher.reconcile_watches_for_folders(&folders, next_retry, false, false).unwrap();
+        assert!(!watcher.issues().contains_key(configured));
+        assert!(snapshot(&watcher).is_empty());
+        assert_eq!(fs::read(protected).unwrap(), protected_bytes);
+
+        let writer = fs::OpenOptions::new().write(true).share_mode(1 | 2 | 4).open(protected).unwrap();
+        assert!(watcher.reconcile_baseline(folder).is_err());
+        assert!(watcher.issues().contains_key(configured));
+        drop(writer);
+        let moved_away = fixture.parent.join("dismissed");
+        fs::rename(protected, &moved_away).unwrap();
+        let next_retry = watcher.failures[configured].retry_at;
+        watcher.reconcile_watches_for_folders(&folders, next_retry, false, false).unwrap();
+        assert!(!watcher.issues().contains_key(configured));
+        assert!(snapshot(&watcher).is_empty());
+        assert_eq!(fs::read(moved_away).unwrap(), protected_bytes);
+    }
+
+    #[test]
+    fn catch_up_keeps_pending_grace_until_a_real_change() {
+        use crate::db::{self, FOLDER_MODE_SILENT};
+        use std::fs;
+
+        let _serial = db::serialise_test_db();
+        db::init_test_db();
+        let mut fixture = RecoveryFixture::new();
+        let path = fs::canonicalize(fixture.root()).unwrap();
+        fixture.id = Some(db::register_watched_folder(path.to_str().unwrap(), FOLDER_MODE_SILENT, false).unwrap());
+        let folder = get_watched_folders().unwrap().into_iter().find(|folder| folder.id == fixture.id).unwrap();
+        let root = Arc::new(WatchedRoot::capture_unattended(&folder, false).unwrap());
+        let watcher = FolderWatcher::new(Arc::new(SuppressionSet::new()));
+        let name = OsString::from("grace.txt");
+        let file = root.path.join(&name);
+        fs::write(&file, b"incoming").unwrap();
+        watcher.enqueue_existing_files(&root, None, None).unwrap();
+        let before = {
+            let mut pending = watcher.pending.lock().unwrap();
+            pending[0].scheduled = Instant::now() - Duration::from_secs(10);
+            pending[0].attempts = 2;
+            pending[0].clone()
+        };
+        watcher.enqueue_existing_files(&root, None, Some(std::slice::from_ref(&name))).unwrap();
+        {
+            let pending = watcher.pending.lock().unwrap();
+            assert_eq!(pending.len(), 1);
+            assert!(before.ticket.is_current());
+            assert_eq!(pending[0].scheduled, before.scheduled);
+            assert_eq!(pending[0].attempts, 2);
+        }
+
+        // Deliver a genuine content change through the live-notification entry point
+        // without racing an asynchronous second callback in this deadline test.
+        fs::write(&file, b"updated arrival").unwrap();
+        let event = Instant::now();
+        enqueue_path(&file, EnqueueSource::Notification, &root, &watcher.pending,
+            &watcher.pending_manual, &watcher.suppression, None).unwrap();
+        let pending = watcher.pending.lock().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(!before.ticket.is_current());
+        assert!(pending[0].ticket.is_current());
+        assert_ne!(pending[0].fingerprint, before.fingerprint);
+        let grace = Duration::from_secs(get_settings().unwrap().grace_period_seconds.max(2) as u64);
+        assert!(pending[0].scheduled >= event + grace);
+        assert_eq!(pending[0].attempts, 0);
     }
 
     #[test]
@@ -1172,7 +1432,8 @@ mod tests {
                     | notify::EventKind::Modify(notify::event::ModifyKind::Name(
                         notify::event::RenameMode::To | notify::event::RenameMode::Both)));
                 if !arrived || !event.paths.contains(&source) { continue; }
-                enqueue_path(&source, &root, &watcher.pending, &watcher.pending_manual, &suppression, None).unwrap();
+                enqueue_path(&source, EnqueueSource::Notification, &root, &watcher.pending,
+                    &watcher.pending_manual, &suppression, None).unwrap();
                 let pending = watcher.pending.lock().unwrap();
                 break pending.iter().find(|item| item.path == source)
                     .expect("the native arrival should enter the production organizer queue").clone();

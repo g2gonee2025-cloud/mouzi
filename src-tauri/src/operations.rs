@@ -67,16 +67,22 @@ pub(crate) fn move_without_overwrite(source: &Path, destination: &Path) -> Resul
     safe_fs::move_reviewed_file(source, destination, &identity, digest.as_str()).map(|_| ())
 }
 
-pub fn already_processed(path: &Path) -> Result<bool, String> {
-    let canonical = fs::canonicalize(path).map_err(|error| error.to_string())?;
+#[derive(Debug)]
+pub(crate) enum ProcessedCheckError {
+    File(String),
+    Database(rusqlite::Error),
+}
+
+pub(crate) fn already_processed(path: &Path) -> Result<bool, ProcessedCheckError> {
+    let canonical = fs::canonicalize(path).map_err(|error| ProcessedCheckError::File(error.to_string()))?;
     let fingerprints = db::organization_fingerprints(&path.to_string_lossy(), &canonical.to_string_lossy(), true)
-        .map_err(|error| error.to_string())?;
+        .map_err(ProcessedCheckError::Database)?;
     if fingerprints.is_empty() {
         return Ok(false);
     }
-    let (mut file, _ancestors) = safe_fs::open_guarded_regular_file(path)?;
-    let digest = safe_fs::hash_handle(&mut file)?.to_hex();
-    fingerprints_match(&mut file, &fingerprints, digest.as_str())
+    let (mut file, _ancestors) = safe_fs::open_guarded_regular_file(path).map_err(ProcessedCheckError::File)?;
+    let digest = safe_fs::hash_handle(&mut file).map_err(ProcessedCheckError::File)?.to_hex();
+    fingerprints_match(&mut file, &fingerprints, digest.as_str()).map_err(ProcessedCheckError::File)
 }
 
 #[derive(Clone, Serialize)]
