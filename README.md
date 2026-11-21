@@ -23,7 +23,7 @@ Add a folder in Settings. New folders are added in Manual mode. Choose the behav
 
 Clean Now opens the review queue for enabled, nonpaused folders. Review the exact paths and select which moves or renames to approve. The **Only new files** setting takes a baseline of files currently in the watched folder. Suspicious names require explicit selection even in Silent mode. An empty configuration performs no organization. Volume roots, dot traversal, links and linked ancestors are rejected as watched roots. Physical aliases refer to the same folder. Conflicting legacy aliases and invalid configured roots are blocked rather than silently removed or remoded.
 
-Once you confirm a review, you can switch to Dashboard or another Settings tab. Return to **Review queue** to see its progress or results, including any renamed destination. If a second request arrived while the first was running, choose **Refresh preview** after reading the result to open that request.
+Once you confirm a review, you can switch to Dashboard or another Settings tab. Return to **Review queue** to see its progress or results, including any renamed destination. If more requests arrive while the first is running, choose **Refresh preview** after reading the result to open the most recent request.
 
 Mouzi remembers the physical identity of each newly registered watched folder. When the folder goes offline, the watcher retries and resumes when the same folder returns. Settings shows a problem if a different folder occupies its path. To use the replacement, remove the old registration and add the new folder. For an older registration without a saved identity, startup binds to the folder then present at the saved path. If that path is offline, reconnect the intended folder and restart Mouzi or add the folder again in Settings.
 
@@ -109,6 +109,8 @@ npm run tauri build -- --no-bundle --ci -- --locked --jobs 2
 ```
 
 The final command produces an unsigned executable at `src-tauri/target/release/mouzi.exe`. Tauri builds the frontend as part of this command. Standard builds produce the executable only. Explicit installer requests fail because installer identity and upgrade behavior still need verification. CI runs both test suites on `main`, `wip/**`, pull requests and manual dispatch. Its log records the checked-out commit, runner and toolchain versions, and the executable's size and SHA-256 digest.
+
+A manual CI run also launches the optimized executable and exercises its Windows interface on the hosted runner.
 
 The real Recycle Bin integration test is ignored by default. Run it only on disposable fixtures through the explicit manual CI input or an explicitly chosen local test. Passing ordinary tests does not establish Shell recycling, real cross-volume movement, desktop event timing or installer upgrade behavior.
 

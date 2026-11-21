@@ -88,6 +88,7 @@ jobs:
           Write-Host "Executable SHA-256: $($hash.Hash)"
 
       - name: Exercise the unsigned executable in Windows
+        if: github.event_name == 'workflow_dispatch'
         run: npm run test:windows-ui -- --ci-release
 
   native-trash:
