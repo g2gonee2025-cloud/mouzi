@@ -27,6 +27,36 @@ function messageKey(key) {
 }
 const messageKeys = entries => [...new Set(Object.keys(entries).map(messageKey))].sort();
 
+// These are the words the person approving the selection should see.
+const selectionCaptions = {
+  de: [[1, '1 Aktion ausführen', '1 Datei wiederherstellen'], [2, '2 Aktionen ausführen', '2 Dateien wiederherstellen']],
+  en: [[1, 'Apply 1 operation', 'Restore 1 file'], [2, 'Apply 2 operations', 'Restore 2 files']],
+  es: [[1, 'Aplicar 1 operación', 'Restaurar 1 archivo'], [2, 'Aplicar 2 operaciones', 'Restaurar 2 archivos']],
+  fr: [[1, 'Appliquer 1 opération', 'Restaurer 1 fichier'], [2, 'Appliquer 2 opérations', 'Restaurer 2 fichiers']],
+  it: [[1, 'Applica 1 operazione', 'Ripristina 1 file'], [2, 'Applica 2 operazioni', 'Ripristina 2 file']],
+  ja: [[1, '1 件の操作を実行', '1 件のファイルを復元'], [2, '2 件の操作を実行', '2 件のファイルを復元']],
+  pl: [
+    [1, 'Wykonaj 1 operację', 'Przywróć 1 plik'],
+    [2, 'Wykonaj 2 operacje', 'Przywróć 2 pliki'],
+    [5, 'Wykonaj 5 operacji', 'Przywróć 5 plików'],
+    [21, 'Wykonaj 21 operacji', 'Przywróć 21 plików'],
+  ],
+  ru: [
+    [1, 'Выполнить 1 операцию', 'Восстановить 1 файл'],
+    [2, 'Выполнить 2 операции', 'Восстановить 2 файла'],
+    [5, 'Выполнить 5 операций', 'Восстановить 5 файлов'],
+    [21, 'Выполнить 21 операцию', 'Восстановить 21 файл'],
+  ],
+  uk: [
+    [1, 'Виконати 1 операцію', 'Відновити 1 файл'],
+    [2, 'Виконати 2 операції', 'Відновити 2 файли'],
+    [5, 'Виконати 5 операцій', 'Відновити 5 файлів'],
+    [21, 'Виконати 21 операцію', 'Відновити 21 файл'],
+  ],
+  vi: [[1, 'Thực hiện 1 thao tác', 'Khôi phục 1 tệp'], [2, 'Thực hiện 2 thao tác', 'Khôi phục 2 tệp']],
+  'zh-CN': [[1, '执行 1 项操作', '恢复 1 个文件'], [2, '执行 2 项操作', '恢复 2 个文件']],
+};
+
 function integerPluralExamples(language) {
   const rules = new Intl.PluralRules(language);
   const examples = new Map();
@@ -40,6 +70,14 @@ function integerPluralExamples(language) {
 }
 
 for (const [language, locale] of Object.entries(locales)) {
+  test(language + ': review and restore confirmations name the exact selection', async () => {
+    const instance = i18next.createInstance();
+    await instance.init({ lng: language, fallbackLng: false, resources: { [language]: { translation: locale } } });
+    const expected = selectionCaptions[language];
+    const actual = expected.map(([count]) => [count, instance.t('beta.confirm', { count }), instance.t('beta.confirmUndo', { count })]);
+    assert.deepEqual(actual, expected);
+  });
+
   test(`${language}: all UI keys and placeholders are present without fallback (#67)`, async () => {
     assert.ok(locale.beta, 'Missing organization translations');
     const translated = strings(locale);

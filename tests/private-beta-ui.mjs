@@ -95,7 +95,9 @@ async function review(paths, expected = paths) {
 }
 async function applySelected(count) {
   await button('Review selected operations').click();
-  await button(`Apply ${count} operations`).click();
+  const caption = fork && count === 1 ? 'Apply 1 operation' : `Apply ${count} operations`;
+  if (fork) await page.getByRole('heading', { name: caption, exact: true }).waitFor();
+  await button(caption).click();
   await page.getByRole('heading', { name: 'Operation results', exact: true }).waitFor();
 }
 async function editRule(ruleName) {
@@ -235,7 +237,10 @@ try {
   await caseOf('History filter and safe undo with a conflicting original filename', async () => {
     await writeFile(a, 'unrelated conflict'); await button('History').click();
     await page.getByLabel('Filename', { exact: true }).fill('faktura A.mzt'); await button('Filter history').click();
-    await button('Select eligible files').click(); await button('Review undo').click(); await button('Restore 1 files').click();
+    await button('Select eligible files').click(); await button('Review undo').click();
+    const caption = fork ? 'Restore 1 file' : 'Restore 1 files';
+    if (fork) await page.getByRole('heading', { name: caption, exact: true }).waitFor();
+    await button(caption).click();
     await page.getByText('Restored under a different name', { exact: true }).waitFor();
     const restoredPath = (await page.getByText(/^Now at /).textContent()).slice('Now at '.length);
     assert.equal(await realpath(restoredPath), await realpath(join(fixture, 'faktura A_0.mzt')));
