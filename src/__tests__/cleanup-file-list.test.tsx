@@ -33,6 +33,65 @@ function renderFileList(kind: "large" | "stale", defaultThreshold: number) {
   );
 }
 
+it("distinguishes an unsearched or interrupted duplicate search from a completed empty result", async () => {
+  const renderDuplicates = () => renderToStaticMarkup(<DuplicatesTab />);
+  expect(renderDuplicates()).toContain("cleanup.notSearched");
+  ipc.invoke.mockResolvedValueOnce([]);
+  await useCleanupStore.getState().findDuplicates();
+  expect(renderDuplicates()).toContain("cleanup.noDuplicates");
+  useCleanupStore.getState().invalidateFileCandidates();
+  expect(renderDuplicates()).toContain("cleanup.notSearched");
+  expect(renderDuplicates()).not.toContain("cleanup.noDuplicates");
+});
+
+it("shows the current duplicate search phase and ignores late progress", async () => {
+  const renderDuplicates = () => renderToStaticMarkup(<DuplicatesTab />);
+  let finish!: (result: unknown[]) => void;
+  ipc.invoke.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+  const pending = useCleanupStore.getState().findDuplicates();
+  const { searchId } = ipc.invoke.mock.calls[0][1];
+  const report = useCleanupStore.getState().reportDuplicateProgress;
+  expect(renderDuplicates()).toContain("cleanup.duplicateStarting");
+  report(searchId, { stage: "inspect", checked: 5, total: 10 });
+  expect(renderDuplicates()).toContain("cleanup.duplicateInspecting");
+  report(searchId, { stage: "compare", checked: 4, total: 8 });
+  report(searchId, { stage: "inspect", checked: 10, total: 10 });
+  report(searchId, { stage: "compare", checked: 2, total: 8 });
+  expect(useCleanupStore.getState().duplicateProgress).toEqual({ stage: "compare", checked: 4, total: 8 });
+  expect(renderDuplicates()).toContain("cleanup.duplicateComparing");
+  finish([]);
+  await pending;
+  report(searchId, { stage: "compare", checked: 8, total: 8 });
+  expect(renderDuplicates()).toContain("cleanup.noDuplicates");
+  expect(useCleanupStore.getState().duplicateProgress).toBeNull();
+});
+
+it("explains when a new inventory interrupts an active duplicate search", async () => {
+  let finish!: (result: unknown[]) => void;
+  ipc.invoke.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+  const pending = useCleanupStore.getState().findDuplicates();
+  useCleanupStore.getState().invalidateFileCandidates();
+  finish([]);
+  await pending;
+  const result = renderToStaticMarkup(<DuplicatesTab />);
+  expect(result).toContain("cleanup.duplicateInterrupted");
+  expect(result).not.toContain("cleanup.noDuplicates");
+});
+
+it("reports locked files until a complete duplicate search succeeds", async () => {
+  const renderDuplicates = () => renderToStaticMarkup(<DuplicatesTab />);
+  ipc.invoke.mockResolvedValueOnce({ candidates: [], unavailableRoots: ["D:/Offline"], uncheckedFiles: 1 });
+  await useCleanupStore.getState().findDuplicates();
+  expect(renderDuplicates()).toContain("cleanup.duplicateLocked");
+  expect(renderDuplicates()).toContain("D:/Offline");
+  expect(renderDuplicates()).not.toContain("cleanup.noMatchesInAvailableFolders");
+  expect(renderDuplicates()).not.toContain("cleanup.noDuplicates");
+  ipc.invoke.mockResolvedValueOnce([]);
+  await useCleanupStore.getState().findDuplicates();
+  expect(renderDuplicates()).toContain("cleanup.noDuplicates");
+  expect(renderDuplicates()).not.toContain("cleanup.duplicateLocked");
+});
+
 it("restores the successful large-file threshold when the tab mounts again", async () => {
   ipc.invoke.mockResolvedValueOnce([{ path: "fixture-large.bin", size: 20 * 1_048_576, mtime: 1 }]);
   await useCleanupStore.getState().findLargeFiles(10 * 1_048_576);

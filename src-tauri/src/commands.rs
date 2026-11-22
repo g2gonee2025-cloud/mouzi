@@ -1873,9 +1873,21 @@ fn require_cleanup_inventory() -> Result<(), String> {
 
 /// Find duplicate files across the scanned inventory.
 #[tauri::command(async)]
-pub fn find_duplicates_cmd() -> Result<crate::cleanup::FinderResult<crate::cleanup::DuplicateGroup>, String> {
+pub fn find_duplicates_cmd(
+    window: tauri::WebviewWindow,
+    search_id: Option<u64>,
+) -> Result<crate::cleanup::FinderResult<crate::cleanup::DuplicateGroup>, String> {
+    let report = |progress| {
+        let _ = window.emit_to(window.label(), "duplicate-search-progress", (search_id, progress));
+    };
+    find_inventory_duplicates(search_id.map(|_| &report as _))
+}
+
+pub(crate) fn find_inventory_duplicates(
+    progress: crate::cleanup::ProgressReporter<'_>,
+) -> Result<crate::cleanup::FinderResult<crate::cleanup::DuplicateGroup>, String> {
     require_cleanup_inventory()?;
-    crate::cleanup::find_duplicates()
+    crate::cleanup::find_duplicates(progress)
 }
 
 /// Find files larger than a given threshold (in bytes).

@@ -76,6 +76,7 @@ export default function DuplicatesTab() {
     }
     return { paths, byGroup, bytes };
   }, [actions, groups]);
+  const progress = store.duplicateProgress;
   const atLimit = actions.length >= CLEANUP_REVIEW_LIMIT;
 
   const handleFind = () => {
@@ -134,9 +135,26 @@ export default function DuplicatesTab() {
         </div>
       )}
 
-      <UnavailableCleanupRoots paths={unavailableRoots ?? undefined} noMatches={groups.length === 0} />
+      <UnavailableCleanupRoots paths={unavailableRoots ?? undefined} noMatches={groups.length === 0 && !store.duplicateUncheckedFiles} />
 
-      {store.duplicates && groups.length === 0 && !unavailableRoots?.length && (
+      {progress && (
+        <p role="status" className="text-xs text-text-muted">
+          {progress === "starting" ? t("cleanup.duplicateStarting") : t(
+            progress.stage === "inspect" ? "cleanup.duplicateInspecting" : "cleanup.duplicateComparing",
+            { checked: progress.checked.toLocaleString(), total: progress.total.toLocaleString() },
+          )}
+        </p>
+      )}
+      {store.duplicateUncheckedFiles > 0 && (
+        <p role="status" className="text-xs text-text-muted">
+          {t("cleanup.duplicateLocked", { files: store.duplicateUncheckedFiles.toLocaleString() })}
+        </p>
+      )}
+      {store.duplicates === null && !reviewNeedsSearch && !store.loading && !store.error && store.inventoryReady !== false && (
+        <p className="text-xs text-text-muted">{t(store.duplicateSearchInterrupted ? "cleanup.duplicateInterrupted" : "cleanup.notSearched")}</p>
+      )}
+
+      {store.duplicates && groups.length === 0 && !unavailableRoots?.length && !store.duplicateUncheckedFiles && (
         <div className="rounded-lg border border-border bg-surface-dark p-6 text-center text-xs text-text-muted">
           {t("cleanup.noDuplicates")}
         </div>
@@ -147,6 +165,7 @@ export default function DuplicatesTab() {
           <div className="flex flex-wrap items-center justify-between gap-2 px-1">
             <div className="text-xs text-text-muted">
               <span>{groups.length} {t("cleanup.groupCount")} &middot;{" "}</span>
+              <span>{t("cleanup.duplicateCopiesFound", { copies: copyCount.toLocaleString() })} &middot;{" "}</span>
               <span aria-live="polite">{t("cleanup.duplicateSelection", { count: actions.length, size: formatBytes(selection.bytes) })}</span>
               {copyCount > CLEANUP_REVIEW_LIMIT && (
                 <p>{t("cleanup.duplicateSelectionLimit", { limit: CLEANUP_REVIEW_LIMIT.toLocaleString() })}</p>

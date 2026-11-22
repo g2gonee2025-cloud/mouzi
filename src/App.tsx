@@ -5,7 +5,7 @@ import { useTranslation } from "react-i18next";
 import { initI18n, SupportedLang } from "./i18n";
 import { useAppStore, type AppSettings } from "./store/useAppStore";
 import { useDashboardStore, type ScanComplete } from "./store/useDashboardStore";
-import { useCleanupStore } from "./store/useCleanupStore";
+import { type DuplicateProgress, useCleanupStore } from "./store/useCleanupStore";
 import { useSuggestionsStore } from "./store/useSuggestionsStore";
 import Popup from "./components/Popup";
 import Settings from "./components/Settings";
@@ -114,6 +114,9 @@ function App() {
       void refreshVisibleSuggestions().catch(console.error);
     };
     listen("file-organized", refreshActivity).then(keepListener).catch(console.error);
+    listen<[number, DuplicateProgress]>("duplicate-search-progress", ({ payload: [searchId, progress] }) => {
+      if (!disposed) useCleanupStore.getState().reportDuplicateProgress(searchId, progress);
+    }).then(keepListener).catch(console.error);
     listen<ScanComplete>("scan-complete", ({ payload }) => {
       if (!disposed && payload?.status === "complete") useCleanupStore.getState().invalidateFileCandidates();
     }).then(keepListener).catch(console.error);

@@ -6,6 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -85,16 +86,22 @@ pub enum FinderResult<T> {
         candidates: Vec<T>,
         #[serde(rename = "unavailableRoots")]
         unavailable_roots: Vec<String>,
+        #[serde(rename = "uncheckedFiles", skip_serializing_if = "Option::is_none")]
+        unchecked_files: Option<usize>,
     },
 }
 
 impl<T> FinderResult<T> {
     fn from_scope(candidates: Vec<T>, scope: &safe_fs::RootScope) -> Self {
+        Self::with_unchecked_files(candidates, scope, 0)
+    }
+
+    fn with_unchecked_files(candidates: Vec<T>, scope: &safe_fs::RootScope, unchecked: usize) -> Self {
         let unavailable_roots = scope.unavailable_active_roots();
-        if unavailable_roots.is_empty() {
+        if unavailable_roots.is_empty() && unchecked == 0 {
             Self::Complete(candidates)
         } else {
-            Self::Partial { candidates, unavailable_roots }
+            Self::Partial { candidates, unavailable_roots, unchecked_files: (unchecked > 0).then_some(unchecked) }
         }
     }
 
@@ -218,15 +225,38 @@ const DUPLICATE_FILES_PER_WORKER: usize = 128;
 // Overlapping finder and review requests can still proceed serially.
 static PARALLEL_DUPLICATE_DISCOVERY: Mutex<()> = Mutex::new(());
 
+#[derive(Clone, Serialize)]
+pub struct DuplicateSearchProgress {
+    stage: &'static str,
+    checked: usize,
+    total: usize,
+}
+
+pub(crate) type ProgressReporter<'a> = Option<&'a (dyn Fn(DuplicateSearchProgress) + Sync)>;
+
 fn inspect_duplicate_paths<'a, P: AsRef<str> + Sync, T: Send>(
     paths: &'a [P],
     worker_limit: usize,
+    stage: &'static str,
+    progress: ProgressReporter<'_>,
     inspect: impl Fn(&Path) -> Option<T> + Sync,
 ) -> Vec<(&'a str, T)> {
+    let total = paths.len();
+    let checked = AtomicUsize::new(0);
+    if let Some(report) = progress {
+        report(DuplicateSearchProgress { stage, checked: 0, total });
+    }
     let inspect_batch = |batch: &'a [P]| {
         batch.iter().filter_map(|path| {
             let path = path.as_ref();
-            inspect(Path::new(path)).map(|file| (path, file))
+            let result = inspect(Path::new(path)).map(|file| (path, file));
+            if let Some(report) = progress {
+                let checked = checked.fetch_add(1, Ordering::Relaxed) + 1;
+                if checked % 256 == 0 || checked == total {
+                    report(DuplicateSearchProgress { stage, checked, total });
+                }
+            }
+            result
         }).collect::<Vec<_>>()
     };
     let workers = worker_limit.min(paths.len().div_ceil(DUPLICATE_FILES_PER_WORKER));
@@ -254,7 +284,18 @@ fn inspect_duplicate_paths<'a, P: AsRef<str> + Sync, T: Send>(
     })
 }
 
-fn duplicate_candidates(scope: &safe_fs::RootScope) -> Result<Vec<(String, FileFingerprint)>, String> {
+struct DuplicateCandidates {
+    files: Vec<(String, FileFingerprint)>,
+    unchecked_files: usize,
+}
+
+fn duplicate_candidates(scope: &safe_fs::RootScope, progress: ProgressReporter<'_>) -> Result<DuplicateCandidates, String> {
+    let unchecked_files = AtomicUsize::new(0);
+    let record_locked = |path: &Path| {
+        if scope.locked_review_file(path).is_some() {
+            unchecked_files.fetch_add(1, Ordering::Relaxed);
+        }
+    };
     let paths: Vec<_> = inventory_paths()?.into_iter().map(|row| row.path).collect();
     let parallel = (paths.len() > DUPLICATE_FILES_PER_WORKER)
         .then(|| PARALLEL_DUPLICATE_DISCOVERY.try_lock().ok()).flatten();
@@ -265,8 +306,8 @@ fn duplicate_candidates(scope: &safe_fs::RootScope) -> Result<Vec<(String, FileF
     };
     let mut seen = HashSet::new();
     let mut by_size: HashMap<u64, Vec<&str>> = HashMap::new();
-    for (path, (identity, size)) in inspect_duplicate_paths(&paths, worker_limit, |path| {
-        let current = scope.validate_file(path).ok()?;
+    for (path, (identity, size)) in inspect_duplicate_paths(&paths, worker_limit, "inspect", progress, |path| {
+        let current = scope.validate_file(path).inspect_err(|_| record_locked(path)).ok()?;
         // A hard-link entry does not independently reclaim a file's bytes.
         (current.link_count == 1).then(|| (current.identity, current.metadata.len()))
     }) {
@@ -278,24 +319,28 @@ fn duplicate_candidates(scope: &safe_fs::RootScope) -> Result<Vec<(String, FileF
     let mut seen = HashSet::new();
     // Size is a live, cheap candidate filter; every reported match still uses
     // one full-content digest domain and no persisted hash evidence.
-    Ok(inspect_duplicate_paths(&same_size, worker_limit, |path| fingerprint(scope, path).ok())
+    let files = inspect_duplicate_paths(&same_size, worker_limit, "compare", progress, |path| {
+        fingerprint(scope, path).inspect_err(|_| record_locked(path)).ok()
+    })
         .into_iter()
         .filter(|(_, current)| current.links == 1 && seen.insert(current.identity.clone()))
         .map(|(path, current)| (path.to_owned(), current))
-        .collect())
+        .collect();
+    Ok(DuplicateCandidates { files, unchecked_files: unchecked_files.into_inner() })
 }
 
-pub fn find_duplicates() -> Result<FinderResult<DuplicateGroup>, String> {
-    find_duplicates_with(duplicate_candidates)
+pub fn find_duplicates(progress: ProgressReporter<'_>) -> Result<FinderResult<DuplicateGroup>, String> {
+    find_duplicates_with(|scope| duplicate_candidates(scope, progress))
 }
 
 fn find_duplicates_with(
-    discover: impl FnOnce(&safe_fs::RootScope) -> Result<Vec<(String, FileFingerprint)>, String>,
+    discover: impl FnOnce(&safe_fs::RootScope) -> Result<DuplicateCandidates, String>,
 ) -> Result<FinderResult<DuplicateGroup>, String> {
     let coverage = RootCoverage::read()?;
     require_available_scope(&coverage.scope)?;
     let mut grouped: HashMap<(u64, String), Vec<DuplicateFile>> = HashMap::new();
-    for (path, current) in discover(&coverage.scope)? {
+    let candidates = discover(&coverage.scope)?;
+    for (path, current) in candidates.files {
         grouped.entry((current.size, current.hash)).or_default().push(DuplicateFile {
             path,
             size: current.size as i64,
@@ -319,7 +364,7 @@ fn find_duplicates_with(
     if current != coverage {
         return Err("Watched folders changed while finding duplicates. Run Find Duplicates again.".into());
     }
-    Ok(FinderResult::from_scope(groups, &current.scope))
+    Ok(FinderResult::with_unchecked_files(groups, &current.scope, candidates.unchecked_files))
 }
 
 fn current_inventory_files(scope: &safe_fs::RootScope) -> Result<Vec<CleanupFile>, String> {
@@ -444,7 +489,7 @@ pub fn prepare_cleanup(actions: &[CleanupRequest]) -> Result<CleanupPlanPreview,
     let root_identities = scope.root_identities();
     let inventory: HashSet<String> = inventory_paths()?.into_iter().map(|file| file.path).collect();
     let candidates = if actions.iter().any(|action| action.kind == "trash_duplicate") {
-        duplicate_candidates(&scope)?
+        duplicate_candidates(&scope, None)?.files
     } else { Vec::new() };
     #[derive(Default)]
     struct CandidateGroup {
@@ -934,7 +979,7 @@ mod tests {
         tree.inventory(&[&a, &b, &offline_match]);
         fs::rename(&offline, tree.0.join("retained")).unwrap();
 
-        let duplicates = serde_json::to_value(crate::commands::find_duplicates_cmd().unwrap()).unwrap();
+        let duplicates = serde_json::to_value(crate::commands::find_inventory_duplicates(None).unwrap()).unwrap();
         let large = serde_json::to_value(crate::commands::find_large_files_cmd(1).unwrap()).unwrap();
         let stale = serde_json::to_value(crate::commands::find_stale_files_cmd(1000).unwrap()).unwrap();
         let directories = serde_json::to_value(crate::commands::find_empty_dirs_cmd().unwrap()).unwrap();
@@ -974,14 +1019,14 @@ mod tests {
                 if replace {
                     fs::create_dir(&nested).unwrap();
                 }
-                duplicate_candidates(scope)
+                duplicate_candidates(scope, None)
             });
 
             assert_eq!(
                 result.unwrap_err(),
                 "Watched folders changed while finding duplicates. Run Find Duplicates again."
             );
-            let refreshed = find_duplicates().unwrap();
+            let refreshed = find_duplicates(None).unwrap();
             assert_eq!(refreshed.candidates()[0].files.len(), 2);
             let FinderResult::Partial { unavailable_roots, .. } = refreshed else {
                 panic!("Both a missing root and a replacement leave this registration unavailable");
@@ -1039,7 +1084,7 @@ mod tests {
             db::register_watched_folder(&nested.to_string_lossy(), mode, false).unwrap();
             fs::rename(&nested, &disconnected).unwrap();
 
-            let starting = find_duplicates().unwrap();
+            let starting = find_duplicates(None).unwrap();
             assert_eq!(starting.candidates()[0].files.len(), 2);
             match starting {
                 FinderResult::Complete(_) => assert_eq!(mode, db::FOLDER_MODE_PAUSED),
@@ -1050,13 +1095,13 @@ mod tests {
             }
             let result = find_duplicates_with(|scope| {
                 fs::rename(&disconnected, &nested).unwrap();
-                duplicate_candidates(scope)
+                duplicate_candidates(scope, None)
             });
             assert_eq!(
                 result.unwrap_err(),
                 "Watched folders changed while finding duplicates. Run Find Duplicates again."
             );
-            assert!(matches!(find_duplicates().unwrap(), FinderResult::Complete(groups) if groups.len() == 1));
+            assert!(matches!(find_duplicates(None).unwrap(), FinderResult::Complete(groups) if groups.len() == 1));
         }
     }
 
@@ -1071,8 +1116,8 @@ mod tests {
         tree.inventory(&[&a, &b]);
 
         let result = find_duplicates_with(|scope| {
-            let candidates = duplicate_candidates(scope)?;
-            assert_eq!(candidates.len(), 2);
+            let candidates = duplicate_candidates(scope, None)?;
+            assert_eq!(candidates.files.len(), 2);
             db::update_folder_mode(id, db::FOLDER_MODE_PAUSED).unwrap();
             Ok(candidates)
         });
@@ -1080,7 +1125,7 @@ mod tests {
             result.unwrap_err(),
             "Watched folders changed while finding duplicates. Run Find Duplicates again."
         );
-        assert!(matches!(find_duplicates().unwrap(), FinderResult::Complete(groups) if groups.is_empty()));
+        assert!(matches!(find_duplicates(None).unwrap(), FinderResult::Complete(groups) if groups.is_empty()));
     }
 
     #[test]
@@ -1095,7 +1140,7 @@ mod tests {
         tree.inventory(&[&a, &b, &omitted]);
         let result = find_duplicates_with(|scope| {
             fs::rename(omitted, tree.0.join("moved.txt")).unwrap();
-            duplicate_candidates(scope)
+            duplicate_candidates(scope, None)
         }).unwrap();
         assert!(matches!(result, FinderResult::Complete(groups) if groups.len() == 1
             && groups[0].files.iter().map(|file| &file.path).eq([&a, &b])));
@@ -1112,9 +1157,9 @@ mod tests {
         tree.inventory(&[&a, &b]);
         let metadata = fs::metadata(&a).unwrap();
         db::set_cached_hash(&a, 4, modified_epoch(metadata.modified().unwrap()), &blake3::hash(b"BBBB").to_hex().to_string(), true).unwrap();
-        assert!(find_duplicates().unwrap().candidates().is_empty(), "a cached digest cannot turn different live contents into duplicates");
+        assert!(find_duplicates(None).unwrap().candidates().is_empty(), "a cached digest cannot turn different live contents into duplicates");
         fs::write(&a, b"BBBB").unwrap();
-        let result = find_duplicates().unwrap();
+        let result = find_duplicates(None).unwrap();
         let groups = result.candidates();
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].files.len(), 2);
@@ -1137,7 +1182,7 @@ mod tests {
         let expected: Vec<_> = paths.iter().enumerate()
             .filter(|(index, _)| index % 3 != 0)
             .map(|(index, path)| (path.as_str(), index)).collect();
-        assert_eq!(inspect_duplicate_paths(&paths, 2, inspect), expected);
+        assert_eq!(inspect_duplicate_paths(&paths, 2, "inspect", None, inspect), expected);
     }
 
     #[test]
@@ -1152,8 +1197,39 @@ mod tests {
         let other = tree.file("b.txt", b"same");
         let linked = linked.to_string_lossy().into_owned();
         tree.inventory(&[&original, &linked, &other]);
-        assert!(find_duplicates().unwrap().candidates().is_empty());
+        assert!(find_duplicates(None).unwrap().candidates().is_empty());
         assert!(prepare_cleanup(&[duplicate(&linked, &original)]).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn duplicate_finder_reports_an_incomplete_search_when_a_copy_is_locked() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let _serial = db::serialise_test_db();
+        init();
+        let tree = TestTree::new();
+        tree.register();
+        let a = tree.file("source.txt", b"same contents");
+        let b = tree.file("copy.txt", b"same contents");
+        tree.inventory(&[&a, &b]);
+        let writer = fs::OpenOptions::new().write(true).share_mode(1 | 2 | 4).open(&b).unwrap();
+        let result = serde_json::to_value(crate::commands::find_inventory_duplicates(None).unwrap()).unwrap();
+        assert_eq!(result["uncheckedFiles"], 1, "A locked copy must not look like a complete search: {result}");
+        assert_eq!(result["candidates"], serde_json::json!([]));
+        let third = tree.file("another-copy.txt", b"same contents");
+        tree.inventory(&[&a, &b, &third]);
+        let partial = find_duplicates(None).unwrap();
+        assert!(matches!(partial, FinderResult::Partial { unchecked_files: Some(1), .. }));
+        assert_eq!(partial.candidates()[0].files.len(), 2);
+        drop(writer);
+        let messages = Mutex::new(Vec::new());
+        let report = |progress: DuplicateSearchProgress| {
+            messages.lock().unwrap().push((progress.stage, progress.checked, progress.total));
+        };
+        let complete = find_duplicates(Some(&report)).unwrap();
+        assert!(matches!(complete, FinderResult::Complete(_)));
+        assert_eq!(complete.candidates()[0].files.len(), 3);
+        assert_eq!(messages.into_inner().unwrap(), [("inspect", 0, 3), ("inspect", 3, 3), ("compare", 0, 3), ("compare", 3, 3)]);
     }
 
     #[test]
@@ -1191,14 +1267,14 @@ mod tests {
 
         assert!(!crate::commands::has_cleanup_inventory_cmd().unwrap());
         let before_scan = (
-            crate::commands::find_duplicates_cmd(),
+            crate::commands::find_inventory_duplicates(None),
             crate::commands::find_large_files_cmd(1),
             crate::commands::find_stale_files_cmd(1),
         );
         let summaries = crate::scan::scan_roots(&[root], |_| {});
         assert!(crate::commands::has_cleanup_inventory_cmd().unwrap());
         let after_scan = (
-            crate::commands::find_duplicates_cmd(),
+            crate::commands::find_inventory_duplicates(None),
             crate::commands::find_large_files_cmd(1),
             crate::commands::find_stale_files_cmd(1),
         );

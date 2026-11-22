@@ -36,7 +36,17 @@ interface CleanupReceipt {
   error: string | null;
 }
 
+export interface DuplicateProgress {
+  stage: "inspect" | "compare";
+  checked: number;
+  total: number;
+}
+
 interface CleanupState {
+  duplicateProgress: DuplicateProgress | "starting" | null;
+  duplicateUncheckedFiles: number;
+  duplicateSearchInterrupted: boolean;
+  reportDuplicateProgress: (searchId: number, progress: DuplicateProgress) => void;
   inventoryReady: boolean | null;
   duplicates: DuplicateGroup[] | null;
   duplicateKeepers: Record<string, string>;
@@ -78,10 +88,10 @@ let historyGeneration = 0;
 const HISTORY_PAGE_SIZE = 100;
 // A non-null selection keeps manual mode even when fresh finder results clear its paths.
 const noDuplicateVictims: ReadonlySet<string> = new Set();
-const emptyCandidates = { duplicates: null, duplicateKeepers: {}, duplicateVictims: null, largeFiles: null, staleFiles: null, emptyDirs: null };
+const emptyCandidates = { duplicateProgress: null, duplicateUncheckedFiles: 0, duplicateSearchInterrupted: false, duplicates: null, duplicateKeepers: {}, duplicateVictims: null, largeFiles: null, staleFiles: null, emptyDirs: null };
 const inventoryEvents = ["scan-complete", "scan-finished", "folders-changed", "mutation-completed"];
 type FinderKey = "duplicates" | "largeFiles" | "staleFiles" | "emptyDirs";
-type FinderResult<Candidates> = { candidates: Candidates; unavailableRoots: string[] };
+type FinderResult<Candidates> = { candidates: Candidates; unavailableRoots: string[]; uncheckedFiles?: number };
 
 function keepersIn(groups: DuplicateGroup[], choices: Record<string, string>): Record<string, string> {
   const retained: Record<string, string> = {};
@@ -132,7 +142,7 @@ export const useCleanupStore = create<CleanupState>((set, get) => {
 
   async function find<Key extends FinderKey>(
     key: Key,
-    request: () => Promise<FinderResult<NonNullable<CleanupState[Key]>>>,
+    request: (generation: number) => Promise<FinderResult<NonNullable<CleanupState[Key]>>>,
     waiting?: NonNullable<CleanupState[Key]>,
   ) {
     if (get().busy || get().preparedPlan) return;
@@ -144,18 +154,23 @@ export const useCleanupStore = create<CleanupState>((set, get) => {
       loading: true,
       error: null,
       [key]: waiting ?? null,
+      duplicateProgress: key === "duplicates" ? "starting" : null,
       ...(key === "duplicates" && {
+        duplicateUncheckedFiles: 0,
+        duplicateSearchInterrupted: false,
         duplicateKeepers: {},
         duplicateVictims: state.duplicateVictims === null ? null : noDuplicateVictims,
       }),
       unavailableRoots: { ...state.unavailableRoots, [key]: [] },
     }));
     try {
-      const { candidates, unavailableRoots } = await request();
+      const { candidates, unavailableRoots, uncheckedFiles } = await request(finder.generation);
       if (isCurrent()) {
         activeFinder = null;
         const found: Partial<CleanupState> = { [key]: candidates };
         if (found.duplicates) {
+          found.duplicateUncheckedFiles = uncheckedFiles ?? 0;
+          found.duplicateProgress = null;
           found.duplicateKeepers = keepersIn(found.duplicates, priorKeepers);
           if (duplicateCopyCount(found.duplicates) > CLEANUP_REVIEW_LIMIT) found.duplicateVictims = noDuplicateVictims;
         }
@@ -168,7 +183,7 @@ export const useCleanupStore = create<CleanupState>((set, get) => {
     } catch (error) {
       if (isCurrent()) {
         activeFinder = null;
-        set({ error: String(error), loading: false });
+        set({ error: String(error), loading: false, duplicateProgress: null });
       }
     }
   }
@@ -179,7 +194,15 @@ export const useCleanupStore = create<CleanupState>((set, get) => {
     unavailableRoots: {},
     loading: false, error: null, busy: false, preparedPlan: null,
     receipts: {}, history: null, historyCursor: null, historyLoading: false, historyError: null,
-    findDuplicates: () => find("duplicates", () => requestCandidates<DuplicateGroup>("find_duplicates_cmd")),
+    findDuplicates: () => find("duplicates", (searchId) => requestCandidates<DuplicateGroup>("find_duplicates_cmd", { searchId })),
+    reportDuplicateProgress: (searchId, next) => {
+      if (activeFinder?.key !== "duplicates" || activeFinder.generation !== searchId) return;
+      const previous = get().duplicateProgress;
+      if (previous && previous !== "starting"
+          && ((previous.stage === next.stage && previous.checked >= next.checked)
+          || (previous.stage === "compare" && next.stage === "inspect"))) return;
+      set({ duplicateProgress: next });
+    },
     keepDuplicate: (group, path) => set((state) => {
       if (!state.duplicates?.includes(group) || !group.files.some((file) => file.path === path)) return state;
       const duplicateKeepers = { ...state.duplicateKeepers, [group.hash]: path };
@@ -231,7 +254,7 @@ export const useCleanupStore = create<CleanupState>((set, get) => {
       };
       activeFinder = null;
       const snapshot = actions.map((action) => ({ ...action }));
-      set({ busy: true, loading: false, error: null });
+      set({ busy: true, loading: false, duplicateProgress: null, error: null });
       let plan: CleanupPlan | null = null;
       try {
         // A full native pool must receive our previous discard before this replacement.
@@ -303,6 +326,7 @@ export const useCleanupStore = create<CleanupState>((set, get) => {
       }
     },
     invalidateCandidates: () => {
+      const interrupted = activeFinder?.key === "duplicates";
       ++candidatesGeneration;
       ++historyGeneration;
       activeFinder = null;
@@ -314,6 +338,7 @@ export const useCleanupStore = create<CleanupState>((set, get) => {
         discard(get().preparedPlan);
         set((state) => ({
           ...emptyCandidates,
+          duplicateSearchInterrupted: interrupted || state.duplicateSearchInterrupted,
           duplicateVictims: state.duplicateVictims === null ? null : noDuplicateVictims,
           unavailableRoots: {}, preparedPlan: null, loading: false, history: null, historyLoading: false,
         }));
@@ -322,6 +347,7 @@ export const useCleanupStore = create<CleanupState>((set, get) => {
     invalidateFileCandidates: () => {
       // Scan publication replaces inventory rows. Live directory queries and
       // exact backend review plans have their own lifetimes.
+      const interrupted = activeFinder?.key === "duplicates";
       const stoppedFileFinder = activeFinder !== null && activeFinder.key !== "emptyDirs";
       if (stoppedFileFinder) activeFinder = null;
       set((state) => {
@@ -331,6 +357,9 @@ export const useCleanupStore = create<CleanupState>((set, get) => {
             && Object.keys(fileCoverage).length === 0) return state;
         return {
           duplicates: null,
+          duplicateProgress: null,
+          duplicateUncheckedFiles: 0,
+          duplicateSearchInterrupted: interrupted || state.duplicateSearchInterrupted,
           duplicateKeepers: {},
           duplicateVictims: state.duplicateVictims === null ? null : noDuplicateVictims,
           largeFiles: largeFiles && { minBytes: largeFiles.minBytes, files: null },
