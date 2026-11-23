@@ -132,7 +132,7 @@ On Windows, close Mouzi and run `npm run test:windows-ui` to build the Debug app
 
 Release builds retain `cc.mouzi.app` and `%APPDATA%\mouzi\mouzi\data\mouzi.db`, shared with baseline Mouzi. Side-by-side release installation and graceful installer upgrades still need a separate distribution decision. Quit both apps and preserve the full data directory, including import data and database journals, before an upgrade or migration. This repair has not run a live-profile migration.
 
-`MOUZI-AUDIT.md` and `.omo/` retain historical audit notes and plans.
+The September 2026 audit and the August 2026 work plan are kept in git history only, at `6464f2c` (`MOUZI-AUDIT.md`, `.omo/plans/mouzi-elevate.md`). They describe code that later rounds replaced and are not current findings.
 
 ## License
 
